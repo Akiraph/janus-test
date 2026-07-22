@@ -1,0 +1,7 @@
+name = "workspace-sync"
+public_root = "interface.rs"
+owned_tables = []
+publishes = []
+allowed_module_dependencies = ["projects"]
+specs = []
+tests = []

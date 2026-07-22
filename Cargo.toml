@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = ["apps/server", "tools/xtask", "tools/test-cli"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/OWNER/janus"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+fs2 = "0.4"
+futures-util = "0.3"
+http = "1.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+secrecy = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+utoipa = { version = "5.4", features = ["axum_extras", "chrono", "uuid"] }
+uuid = { version = "1.18", features = ["serde", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

@@ -1,0 +1,494 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "janus-server",
+    "description": "",
+    "license": {
+      "name": "AGPL-3.0-or-later",
+      "identifier": "AGPL-3.0-or-later"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/bootstrap": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "operationId": "bootstrap",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BootstrapResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "sse"
+        ],
+        "operationId": "events",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Global event cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Persistent Janus event stream",
+            "content": {
+              "text/event-stream": {}
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/info": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "operationId": "system_info",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemInfoResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "operationId": "live",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LiveResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "operationId": "ready",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BootstrapData": {
+        "type": "object",
+        "required": [
+          "state",
+          "development_auth",
+          "webauthn_rp_name",
+          "version",
+          "limits"
+        ],
+        "properties": {
+          "development_auth": {
+            "type": "boolean"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/PublicLimits"
+          },
+          "state": {
+            "$ref": "#/components/schemas/BootstrapState"
+          },
+          "version": {
+            "type": "string"
+          },
+          "webauthn_rp_name": {
+            "type": "string"
+          }
+        }
+      },
+      "BootstrapResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BootstrapData"
+          }
+        }
+      },
+      "BootstrapState": {
+        "type": "string",
+        "enum": [
+          "uninitialized",
+          "initialized"
+        ]
+      },
+      "CapabilityReason": {
+        "type": "string",
+        "enum": [
+          "LOCAL_EXECUTOR",
+          "CONFIG_MISSING",
+          "DEPENDENCY_MISSING",
+          "PLATFORM_UNSUPPORTED",
+          "POLICY_DISABLED",
+          "PROBE_FAILED"
+        ]
+      },
+      "CapabilityState": {
+        "type": "string",
+        "enum": [
+          "ready",
+          "degraded",
+          "unconfigured",
+          "unsupported"
+        ]
+      },
+      "DatabaseInfo": {
+        "type": "object",
+        "required": [
+          "engine",
+          "journal_mode",
+          "ready"
+        ],
+        "properties": {
+          "engine": {
+            "type": "string"
+          },
+          "journal_mode": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          }
+        }
+      },
+      "EventEnvelope": {
+        "type": "object",
+        "required": [
+          "schema_version",
+          "event_id",
+          "cursor",
+          "event_type",
+          "occurred_at",
+          "actor",
+          "correlation_id",
+          "payload"
+        ],
+        "properties": {
+          "actor": {},
+          "causation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "correlation_id": {
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "occurred_at": {
+            "type": "string"
+          },
+          "payload": {},
+          "resource": {},
+          "schema_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "EventInfo": {
+        "type": "object",
+        "required": [
+          "min_cursor",
+          "max_cursor"
+        ],
+        "properties": {
+          "max_cursor": {
+            "type": "string"
+          },
+          "min_cursor": {
+            "type": "string"
+          }
+        }
+      },
+      "LiveResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "version"
+        ],
+        "properties": {
+          "status": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "Problem": {
+        "type": "object",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code",
+          "detail"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "current_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        }
+      },
+      "PublicLimits": {
+        "type": "object",
+        "required": [
+          "max_file_bytes",
+          "max_message_bytes",
+          "max_attachments"
+        ],
+        "properties": {
+          "max_attachments": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "max_file_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "max_message_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "database",
+          "schema_version"
+        ],
+        "properties": {
+          "database": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "RuntimeCapability": {
+        "type": "object",
+        "required": [
+          "id",
+          "scope",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "reason_code": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CapabilityReason"
+              }
+            ]
+          },
+          "scope": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CapabilityState"
+          }
+        }
+      },
+      "SystemInfo": {
+        "type": "object",
+        "required": [
+          "version",
+          "schema_version",
+          "mode",
+          "database",
+          "events",
+          "capabilities",
+          "update_available"
+        ],
+        "properties": {
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RuntimeCapability"
+            }
+          },
+          "database": {
+            "$ref": "#/components/schemas/DatabaseInfo"
+          },
+          "events": {
+            "$ref": "#/components/schemas/EventInfo"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "update_available": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "SystemInfoResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SystemInfo"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "system",
+      "description": "Janus system probes"
+    }
+  ]
+}

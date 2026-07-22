@@ -1,0 +1,11 @@
+/target/
+/apps/web/node_modules/
+/apps/web/dist/
+/apps/web/playwright-report/
+/apps/web/test-results/
+/.janus-dev/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store

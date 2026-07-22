@@ -1,0 +1,7 @@
+name = "supervisor"
+public_root = "interface.rs"
+owned_tables = []
+publishes = []
+allowed_module_dependencies = ["models", "projects", "runtime", "sessions", "workspace-sync"]
+specs = []
+tests = []
