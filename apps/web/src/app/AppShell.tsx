@@ -2,7 +2,8 @@ import { A, useLocation } from "@solidjs/router";
 import { Activity, PanelsTopLeft, Settings, ShieldAlert } from "lucide-solid";
 import type { JSX } from "solid-js";
 import { Show } from "solid-js";
-import { useBootstrap } from "../lib/queries";
+import { LoginPage, SetupPage } from "../features/auth/AuthPage";
+import { useBootstrap, useMe } from "../lib/queries";
 import { useEventStream } from "../lib/useEventStream";
 
 interface AppShellProps {
@@ -19,7 +20,17 @@ const connectionLabels = {
 export function AppShell(props: AppShellProps) {
   const location = useLocation();
   const bootstrap = useBootstrap();
+  const me = useMe();
   const connection = useEventStream();
+
+  if (bootstrap.data?.data.state === "uninitialized" && !bootstrap.data?.data.development_auth)
+    return <SetupPage />;
+  if (
+    bootstrap.data?.data.state === "initialized" &&
+    me.isError &&
+    !bootstrap.data?.data.development_auth
+  )
+    return <LoginPage />;
 
   return (
     <div class="app-canvas">
@@ -38,6 +49,12 @@ export function AppShell(props: AppShellProps) {
             </A>
             <A href="/system" classList={{ active: location.pathname === "/system" }}>
               System
+            </A>
+            <A href="/models" classList={{ active: location.pathname === "/models" }}>
+              Models
+            </A>
+            <A href="/security" classList={{ active: location.pathname === "/security" }}>
+              Security
             </A>
           </nav>
 

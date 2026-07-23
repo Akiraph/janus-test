@@ -1,7 +1,7 @@
 name = "identity"
 public_root = "interface.rs"
-owned_tables = []
-publishes = []
+owned_tables = ["tenants", "owners", "initialization_tokens", "passkeys", "ceremonies", "login_sessions", "recovery_batches", "recovery_codes", "recovery_states"]
+publishes = ["identity.changed"]
 allowed_module_dependencies = []
 specs = []
 tests = []

@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, net::IpAddr, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use thiserror::Error;
 
@@ -24,6 +24,8 @@ pub struct Config {
     pub mode: RunMode,
     pub development_auth: bool,
     pub webauthn_rp_name: String,
+    pub webauthn_rp_id: String,
+    pub public_origin: url::Url,
     pub event_heartbeat: Duration,
 }
 
@@ -37,6 +39,12 @@ pub enum ConfigError {
     InvalidDevelopmentAuth,
     #[error("development authentication is forbidden in production")]
     UnsafeProductionAuth,
+    #[error("development authentication requires a loopback bind address")]
+    UnsafeDevelopmentBind,
+    #[error("JANUS_PUBLIC_ORIGIN must be an absolute http(s) origin without a path: {0}")]
+    InvalidPublicOrigin(String),
+    #[error("production WebAuthn requires an https public origin")]
+    InsecureProductionOrigin,
 }
 
 impl Config {
@@ -60,6 +68,10 @@ impl Config {
             "false" | "0" => false,
             _ => return Err(ConfigError::InvalidDevelopmentAuth),
         };
+        let origin_value =
+            env::var("JANUS_PUBLIC_ORIGIN").unwrap_or_else(|_| format!("http://{}", bind));
+        let public_origin = url::Url::parse(&origin_value)
+            .map_err(|_| ConfigError::InvalidPublicOrigin(origin_value.clone()))?;
         let config = Self {
             bind,
             data_root: env::var_os("JANUS_DATA_ROOT")
@@ -68,6 +80,9 @@ impl Config {
             mode,
             development_auth,
             webauthn_rp_name: env::var("JANUS_WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Janus".into()),
+            webauthn_rp_id: env::var("JANUS_WEBAUTHN_RP_ID")
+                .unwrap_or_else(|_| public_origin.host_str().unwrap_or("localhost").into()),
+            public_origin,
             event_heartbeat: Duration::from_secs(15),
         };
         config.validate()?;
@@ -77,6 +92,25 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.mode == RunMode::Production && self.development_auth {
             return Err(ConfigError::UnsafeProductionAuth);
+        }
+        if self.development_auth
+            && !matches!(self.bind.ip(), IpAddr::V4(ip) if ip.is_loopback())
+            && !matches!(self.bind.ip(), IpAddr::V6(ip) if ip.is_loopback())
+        {
+            return Err(ConfigError::UnsafeDevelopmentBind);
+        }
+        if !matches!(self.public_origin.scheme(), "http" | "https")
+            || self.public_origin.cannot_be_a_base()
+            || self.public_origin.path() != "/"
+            || self.public_origin.query().is_some()
+            || self.public_origin.fragment().is_some()
+        {
+            return Err(ConfigError::InvalidPublicOrigin(
+                self.public_origin.to_string(),
+            ));
+        }
+        if self.mode == RunMode::Production && self.public_origin.scheme() != "https" {
+            return Err(ConfigError::InsecureProductionOrigin);
         }
         Ok(())
     }
@@ -95,6 +129,8 @@ mod tests {
             mode: RunMode::Production,
             development_auth: true,
             webauthn_rp_name: "Janus".into(),
+            webauthn_rp_id: "localhost".into(),
+            public_origin: url::Url::parse("https://localhost").expect("static URL"),
             event_heartbeat: Duration::from_secs(15),
         };
 

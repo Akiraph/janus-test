@@ -23,6 +23,8 @@ fn test_config(data_root: PathBuf) -> Config {
         mode: RunMode::Development,
         development_auth: true,
         webauthn_rp_name: "Janus Test".into(),
+        webauthn_rp_id: "localhost".into(),
+        public_origin: url::Url::parse("http://localhost").expect("static test URL"),
         event_heartbeat: Duration::from_millis(50),
     }
 }

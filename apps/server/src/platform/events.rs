@@ -12,7 +12,11 @@ use super::{
     id::EventId,
 };
 
-pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[("system.started", 1, "platform")];
+pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[
+    ("system.started", 1, "platform"),
+    ("identity.changed", 1, "identity"),
+    ("model_config.changed", 1, "models"),
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EventEnvelope {

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -103,4 +104,38 @@ pub enum CapabilityReason {
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
     pub after: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DataResponse<T> {
+    pub data: T,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct InitializeOptionsRequest {
+    #[schema(write_only)]
+    pub initialization_token: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CeremonyCompleteRequest {
+    pub ceremony_id: String,
+    pub credential: Value,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PasskeyOptionsRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RenamePasskeyRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RecoveryExchangeRequest {
+    #[schema(write_only)]
+    pub code: String,
 }

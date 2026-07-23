@@ -38,3 +38,7 @@ typed_id!(CorrelationId);
 typed_id!(CausationId);
 typed_id!(TenantId);
 typed_id!(ActorId);
+typed_id!(OwnerId);
+typed_id!(PasskeyId);
+typed_id!(ProviderId);
+typed_id!(ModelId);

@@ -6,6 +6,7 @@ use axum::{
 
 use crate::{
     AppState,
+    modules::identity::interface::InitializationState,
     transport::http::{
         dto::{
             BootstrapData, BootstrapResponse, BootstrapState, CapabilityReason, CapabilityState,
@@ -73,7 +74,13 @@ pub async fn bootstrap(
         headers,
         Json(BootstrapResponse {
             data: BootstrapData {
-                state: BootstrapState::Uninitialized,
+                state: match state.identity().initialization_state().await.map_err(|error| {
+                    tracing::error!(request_id = %context.request_id, %error, "read initialization state");
+                    internal_problem(&context, "The initialization state could not be read.")
+                })? {
+                    InitializationState::Uninitialized => BootstrapState::Uninitialized,
+                    InitializationState::Initialized => BootstrapState::Initialized,
+                },
                 development_auth: state.config().development_auth,
                 webauthn_rp_name: state.config().webauthn_rp_name.clone(),
                 version: env!("CARGO_PKG_VERSION"),

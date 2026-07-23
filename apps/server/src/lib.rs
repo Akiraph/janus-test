@@ -10,7 +10,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::Router;
 use config::Config;
-use platform::{database::Database, events::EventStore};
+use modules::identity::interface::IdentityInterface;
+use modules::models::interface::ModelsInterface;
+use platform::{database::Database, events::EventStore, secret::SecretCipher};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,6 +23,9 @@ struct AppStateInner {
     pub config: Config,
     pub database: Database,
     pub events: EventStore,
+    pub secrets: SecretCipher,
+    pub identity: IdentityInterface,
+    pub models: ModelsInterface,
 }
 
 impl AppState {
@@ -29,11 +34,17 @@ impl AppState {
             .await
             .with_context(|| format!("initialize data root {}", config.data_root.display()))?;
         let events = EventStore::new(database.pool().clone());
+        let secrets = SecretCipher::load(&config.data_root, config.mode)?;
+        let identity = IdentityInterface::new(database.pool().clone(), &config).await?;
+        let models = ModelsInterface::new(database.pool().clone(), secrets.clone())?;
         Ok(Self {
             inner: Arc::new(AppStateInner {
                 config,
                 database,
                 events,
+                secrets,
+                identity,
+                models,
             }),
         })
     }
@@ -48,6 +59,18 @@ impl AppState {
 
     pub fn events(&self) -> &EventStore {
         &self.inner.events
+    }
+
+    pub fn secrets(&self) -> &SecretCipher {
+        &self.inner.secrets
+    }
+
+    pub fn identity(&self) -> &IdentityInterface {
+        &self.inner.identity
+    }
+
+    pub fn models(&self) -> &ModelsInterface {
+        &self.inner.models
     }
 }
 
