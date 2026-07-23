@@ -1,124 +1,52 @@
-import { A, useLocation } from "@solidjs/router";
-import {
-  Activity,
-  ArrowLeft,
-  Database,
-  Server,
-  Settings,
-  ShieldAlert,
-  ShieldCheck,
-} from "lucide-solid";
-import type { JSX } from "solid-js";
-import { Show } from "solid-js";
-import { JanusLogo } from "../components/JanusLogo";
-import { LoginPage, SetupPage } from "../features/auth/AuthPage";
-import { useBootstrap, useMe } from "../lib/queries";
-import { useEventStream } from "../lib/useEventStream";
+import type { ReactNode } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { TopNav } from "../components/layout/TopNav";
 
-interface AppShellProps {
-  children?: JSX.Element;
+export interface AppShellProps {
+  readonly children: ReactNode;
 }
 
-const connectionLabels = {
-  connecting: "Connecting",
-  live: "Live",
-  reconnecting: "Reconnecting",
-  offline: "Offline",
-} as const;
-
-export function AppShell(props: AppShellProps) {
+/**
+ * AppShell — Global layout container.
+ * - Renders the global TopNav only on list-style pages (home). The workspace
+ *   and settings pages own their full-height surface and provide their own
+ *   navigation, so the global TopNav is hidden there.
+ * - Home scrolls; the full-height pages clip and scroll internally.
+ */
+export function AppShell({ children }: AppShellProps) {
   const location = useLocation();
-  const bootstrap = useBootstrap();
-  const me = useMe();
-  const connection = useEventStream();
-  const isSettings = () => location.pathname !== "/";
-
-  if (bootstrap.data?.data.state === "uninitialized" && !bootstrap.data?.data.development_auth)
-    return <SetupPage />;
-  if (
-    bootstrap.data?.data.state === "initialized" &&
-    me.isError &&
-    !bootstrap.data?.data.development_auth
-  )
-    return <LoginPage />;
-
-  const banner = (
-    <Show when={bootstrap.data?.data.development_auth}>
-      <div class="dev-banner" role="status">
-        <ShieldAlert size={15} aria-hidden="true" />
-        <span>Development authentication</span>
-      </div>
-    </Show>
-  );
+  const navigate = useNavigate();
+  const isWorkspace = location.pathname.startsWith("/projects/");
+  const isSettings = location.pathname.startsWith("/settings");
+  const isAuthRoute =
+    location.pathname.startsWith("/login") ||
+    location.pathname.startsWith("/setup");
+  const fullHeight = isWorkspace || isSettings || isAuthRoute;
 
   return (
-    <Show
-      when={!isSettings()}
-      fallback={
-        <div class="settings-canvas">
-          <div class="legacy-settings-shell">
-            <nav class="settings-nav" aria-label="Settings navigation">
-              <A class="settings-back" href="/">
-                <ArrowLeft size={16} />
-                Back
-              </A>
-              <p>Settings</p>
-              <A href="/system" classList={{ active: location.pathname === "/system" }}>
-                <Database size={16} />
-                System
-              </A>
-              <A href="/models" classList={{ active: location.pathname === "/models" }}>
-                <Server size={16} />
-                Model providers
-              </A>
-              <A href="/security" classList={{ active: location.pathname === "/security" }}>
-                <ShieldCheck size={16} />
-                Security
-              </A>
-              <span class={`settings-connection connection-${connection()}`}>
-                <Activity size={14} />
-                {connectionLabels[connection()]}
-              </span>
-            </nav>
-            <div class="settings-content">
-              {banner}
-              <main class="settings-route">{props.children}</main>
-            </div>
-          </div>
+    <div className="flex h-screen flex-col bg-background">
+      {!fullHeight && (
+        <div className="p-4 pb-0">
+          <TopNav onSettingsClick={() => navigate("/settings")} />
         </div>
-      }
-    >
-      <div class="home-canvas">
-        <header class="legacy-topbar">
-          <div class="legacy-nav-inner">
-            <div class="legacy-nav-left">
-              <A class="brand" href="/" aria-label="Janus workspace">
-                <JanusLogo size={28} />
-                <span>Janus</span>
-              </A>
-              <fieldset class="mode-switch">
-                <legend class="sr-only">Product mode</legend>
-                <span class="active">Code</span>
-                <span class="disabled">
-                  MTC <small>soon</small>
-                </span>
-              </fieldset>
-            </div>
-            <div class="topbar-actions">
-              <span class={`connection connection-${connection()}`}>
-                <Activity size={14} aria-hidden="true" />
-                {connectionLabels[connection()]}
-              </span>
-              <A class="settings-link" href="/models">
-                <Settings size={16} />
-                Settings
-              </A>
-            </div>
-          </div>
-        </header>
-        {banner}
-        <main class="home-route">{props.children}</main>
-      </div>
-    </Show>
+      )}
+
+      <main
+        className={
+          fullHeight
+            ? "flex-1 overflow-hidden p-4"
+            : "flex-1 overflow-y-auto p-4"
+        }
+      >
+        <div
+          key={location.pathname}
+          className={
+            fullHeight ? "h-full animate-route-fade" : "animate-route-fade"
+          }
+        >
+          {children}
+        </div>
+      </main>
+    </div>
   );
 }
