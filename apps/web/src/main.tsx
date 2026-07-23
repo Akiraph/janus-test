@@ -1,32 +1,30 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import React from "react";
-import { createRoot } from "react-dom/client";
-import { App } from "./app/App";
-import "@fontsource/google-sans/400.css";
-import "@fontsource/google-sans/500.css";
-import "@fontsource/google-sans/600.css";
-import "@fontsource/google-sans/700.css";
+import "@fontsource-variable/google-sans";
 import "@fontsource-variable/jetbrains-mono";
+import { QueryClient, QueryClientProvider } from "@tanstack/solid-query";
+import { render } from "solid-js/web";
+import { App } from "./app/App";
 import "./styles.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      staleTime: 1000 * 30, // 30 seconds
-      refetchOnWindowFocus: false,
+      retry: 2,
+      staleTime: 10_000,
+      refetchOnWindowFocus: true,
     },
   },
 });
-const root = document.getElementById("root");
 
-if (root === null) {
-  throw new Error("Root element not found.");
+const root = document.getElementById("root");
+if (!root) {
+  throw new Error("Janus root element is missing");
 }
 
-createRoot(root).render(
-  <React.StrictMode>
+render(
+  () => (
     <QueryClientProvider client={queryClient}>
       <App />
     </QueryClientProvider>
-  </React.StrictMode>,
+  ),
+  root,
 );

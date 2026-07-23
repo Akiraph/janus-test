@@ -1,9 +1,6 @@
 /target/
 /apps/web/node_modules/
 /apps/web/dist/
-/node_modules/
-/packages/*/node_modules/
-/packages/*/dist/
 /apps/web/playwright-report/
 /apps/web/test-results/
 /.janus-dev/
