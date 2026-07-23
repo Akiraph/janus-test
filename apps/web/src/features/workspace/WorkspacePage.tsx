@@ -8,12 +8,12 @@ export function WorkspacePage() {
   const system = useSystemInfo();
 
   return (
-    <div class="workspace-layout route-enter">
+    <div class="legacy-home route-enter">
       <section class="workspace-main" aria-labelledby="workspace-title">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Workspace</p>
             <h1 id="workspace-title">Projects</h1>
+            <p class="page-subtitle">Pick a repository to start working.</p>
           </div>
           <Switch>
             <Match when={bootstrap.isPending}>
@@ -29,12 +29,12 @@ export function WorkspacePage() {
           <span class="empty-icon">
             <FolderGit2 size={28} strokeWidth={1.5} />
           </span>
-          <h2>No projects</h2>
-          <p>The workspace is ready.</p>
+          <h2>No projects yet</h2>
+          <p>Connect a Git repository to get started.</p>
         </div>
       </section>
 
-      <aside class="system-rail" aria-labelledby="control-plane-title">
+      <aside class="legacy-control-plane" aria-labelledby="control-plane-title">
         <div class="section-heading compact">
           <div>
             <p class="eyebrow">Local service</p>
@@ -62,10 +62,10 @@ export function WorkspacePage() {
                 { icon: Radio, label: "Event cursor", value: data().events.max_cursor },
               ];
               return (
-                <div class="status-list">
+                <div class="control-status-list">
                   <For each={rows()}>
                     {(row) => (
-                      <div class="status-row">
+                      <div class="control-status-row">
                         <span class="status-row-icon">
                           <row.icon size={16} />
                         </span>
@@ -74,7 +74,7 @@ export function WorkspacePage() {
                       </div>
                     )}
                   </For>
-                  <div class="service-summary">
+                  <div class="control-service-summary">
                     <span class="live-dot" />
                     <span>Operational</span>
                     <code>{data().mode}</code>
