@@ -108,7 +108,10 @@ mod tests {
 
     #[test]
     fn empty_nul_and_drive_are_rejected() {
-        assert!(matches!(validate_workspace_path(""), Err(PathError::Invalid)));
+        assert!(matches!(
+            validate_workspace_path(""),
+            Err(PathError::Invalid)
+        ));
         assert!(matches!(
             validate_workspace_path("a\0b"),
             Err(PathError::Nul)

@@ -88,12 +88,11 @@ impl WorkspaceSyncInterface {
         let handle = WorkspaceHandle::main(project_id);
         let now = format_utc(SystemClock.now());
 
-        let existing: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT current_revision_id FROM workspace_copies WHERE handle = ?",
-        )
-        .bind(handle.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
+                .bind(handle.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
 
         if let Some((Some(revision_id),)) = existing {
             return Ok(RevisionRef(revision_id));
@@ -156,12 +155,11 @@ impl WorkspaceSyncInterface {
         cause: &str,
         actor: serde_json::Value,
     ) -> Result<RevisionRef, WorkspaceSyncError> {
-        let current: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT current_revision_id FROM workspace_copies WHERE handle = ?",
-        )
-        .bind(handle.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let current: Option<Option<String>> =
+            sqlx::query_scalar("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
+                .bind(handle.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
         let current = current
             .ok_or(WorkspaceSyncError::NotFound)?
             .ok_or_else(|| WorkspaceSyncError::Internal(anyhow!("copy has no revision")))?;

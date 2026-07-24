@@ -274,6 +274,9 @@ async fn create_project_requires_idempotency_key() -> anyhow::Result<()> {
     )
     .await?;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
-    assert!(response.contains("VALIDATION_FAILED") || response.contains("Idempotency"), "{response}");
+    assert!(
+        response.contains("VALIDATION_FAILED") || response.contains("Idempotency"),
+        "{response}"
+    );
     Ok(())
 }

@@ -57,25 +57,20 @@ impl BlobStore {
     /// same-filesystem atomic rename -> fsync parent dir -> DB transaction
     /// registering object and reference. An existing object with the same hash
     /// is length-verified before reuse; we never trust the filename alone.
-    pub async fn write(
-        &self,
-        bytes: &[u8],
-        reference: BlobReference,
-    ) -> anyhow::Result<BlobSha> {
+    pub async fn write(&self, bytes: &[u8], reference: BlobReference) -> anyhow::Result<BlobSha> {
         let sha = hex_sha256(bytes);
         let target = object_path(&self.objects_root, &sha);
 
         // Idempotent fast path: object already present -> verify length, register ref.
         if tokio::fs::try_exists(&target).await.unwrap_or(false) {
             self.verify_length(&sha, bytes.len()).await?;
-            self.register_reference(&sha, bytes.len(), reference).await?;
+            self.register_reference(&sha, bytes.len(), reference)
+                .await?;
             return Ok(BlobSha::from_hex(sha));
         }
 
         // Slow path: write to incoming, fsync, atomic rename, fsync parent.
-        let incoming = self
-            .incoming_root
-            .join(format!("{}.tmp", random_name()));
+        let incoming = self.incoming_root.join(format!("{}.tmp", random_name()));
         {
             let mut file = tokio::fs::File::create(&incoming)
                 .await
@@ -100,7 +95,8 @@ impl BlobStore {
             dir.sync_all().await.ok();
         }
 
-        self.register_reference(&sha, bytes.len(), reference).await?;
+        self.register_reference(&sha, bytes.len(), reference)
+            .await?;
         Ok(BlobSha::from_hex(sha))
     }
 
@@ -112,12 +108,11 @@ impl BlobStore {
 
     /// Verify a present object's stored length matches the recorded size.
     pub async fn verify_length(&self, sha: &str, expected: usize) -> anyhow::Result<()> {
-        let row = sqlx::query_scalar::<_, i64>(
-            "SELECT byte_size FROM blob_objects WHERE sha256 = ?",
-        )
-        .bind(sha)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_scalar::<_, i64>("SELECT byte_size FROM blob_objects WHERE sha256 = ?")
+                .bind(sha)
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some(recorded) => {
                 if usize::try_from(recorded)? == expected {
@@ -217,7 +212,12 @@ pub struct BlobReference {
 }
 
 impl BlobReference {
-    pub fn new(owner_module: &'static str, owner_type: &'static str, owner_id: &str, purpose: &'static str) -> Self {
+    pub fn new(
+        owner_module: &'static str,
+        owner_type: &'static str,
+        owner_id: &str,
+        purpose: &'static str,
+    ) -> Self {
         Self {
             owner_module,
             owner_type,

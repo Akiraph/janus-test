@@ -156,11 +156,21 @@ impl OperationInterface {
                 .execute(&mut *tx)
                 .await?;
         }
-        self.emit_operation_changed(&mut tx, &operation_id, kind, "queued", &version, &request.correlation_id)
-            .await?;
+        self.emit_operation_changed(
+            &mut tx,
+            &operation_id,
+            kind,
+            "queued",
+            &version,
+            &request.correlation_id,
+        )
+        .await?;
         tx.commit().await?;
         Ok(CreatedOperation {
-            operation: self.get(&operation_id).await?.ok_or(OperationError::NotFound)?,
+            operation: self
+                .get(&operation_id)
+                .await?
+                .ok_or(OperationError::NotFound)?,
             outcome: IdempotencyOutcome::New,
         })
     }
@@ -246,19 +256,13 @@ impl OperationInterface {
 
     /// Mark a claimed item done (handler succeeded); removes it from the queue.
     /// Only the current lease holder (matching nonce) may complete.
-    pub async fn complete_work(
-        &self,
-        work_id: &str,
-        nonce: &str,
-    ) -> Result<bool, OperationError> {
-        let changed = sqlx::query(
-            "DELETE FROM work_items WHERE id = ? AND lease_nonce = ?",
-        )
-        .bind(work_id)
-        .bind(nonce)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+    pub async fn complete_work(&self, work_id: &str, nonce: &str) -> Result<bool, OperationError> {
+        let changed = sqlx::query("DELETE FROM work_items WHERE id = ? AND lease_nonce = ?")
+            .bind(work_id)
+            .bind(nonce)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
         Ok(changed > 0)
     }
 
@@ -293,12 +297,13 @@ impl OperationInterface {
     ) -> Result<StepState, OperationError> {
         let now = format_utc(SystemClock.now());
         let mut tx = self.pool.begin().await?;
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM operation_steps WHERE operation_id = ? AND step_key = ?")
-                .bind(operation_id)
-                .bind(step_key)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM operation_steps WHERE operation_id = ? AND step_key = ?",
+        )
+        .bind(operation_id)
+        .bind(step_key)
+        .fetch_optional(&mut *tx)
+        .await?;
         let state = match existing {
             Some((status,)) if status == "succeeded" => StepState::AlreadySucceeded,
             Some(_) => StepState::Running,
@@ -458,7 +463,8 @@ impl OperationInterface {
             "status": status,
         });
         let actor = serde_json::json!({"kind": "system", "id": null, "display_name": "Janus"});
-        let resource = serde_json::json!({"kind": "operation", "id": operation_id, "version": version});
+        let resource =
+            serde_json::json!({"kind": "operation", "id": operation_id, "version": version});
         sqlx::query("INSERT INTO public_events (event_id, event_type, schema_version, actor_json, resource_json, correlation_id, causation_id, payload_json, occurred_at) VALUES (?, 'operation.changed', 1, ?, ?, ?, NULL, ?, ?)")
             .bind(&event_id)
             .bind(serde_json::to_string(&actor)?)
@@ -539,7 +545,11 @@ fn view_from_row(row: OperationRow) -> Result<OperationView, OperationError> {
             .as_deref()
             .map(serde_json::from_str)
             .transpose()?,
-        result: row.result_json.as_deref().map(serde_json::from_str).transpose()?,
+        result: row
+            .result_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?,
         problem: row
             .problem_json
             .as_deref()

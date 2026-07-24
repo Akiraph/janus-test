@@ -67,13 +67,9 @@ enum ProjectsCommand {
         idempotency_key: Option<String>,
     },
     /// Fetch a single project's projection.
-    Get {
-        id: String,
-    },
+    Get { id: String },
     /// Git status projection for a project.
-    GitStatus {
-        id: String,
-    },
+    GitStatus { id: String },
 }
 
 #[tokio::main]
@@ -93,9 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 url,
                 branch,
                 idempotency_key,
-            } => {
-                projects_create(&client, &cli.base_url, name, url, branch, idempotency_key).await
-            }
+            } => projects_create(&client, &cli.base_url, name, url, branch, idempotency_key).await,
             ProjectsCommand::Get { id } => projects_get(&client, &cli.base_url, &id).await,
             ProjectsCommand::GitStatus { id } => {
                 projects_git_status(&client, &cli.base_url, &id).await

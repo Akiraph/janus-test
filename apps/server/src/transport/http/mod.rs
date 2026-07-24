@@ -174,20 +174,14 @@ pub fn router(state: AppState) -> Router {
                 .patch(projects::update_project)
                 .delete(projects::delete_project),
         )
-        .route(
-            "/api/v1/projects/{id}/retry",
-            post(projects::retry_project),
-        )
+        .route("/api/v1/projects/{id}/retry", post(projects::retry_project))
         .route("/api/v1/projects/{id}/files/meta", get(projects::file_meta))
         .route(
             "/api/v1/projects/{id}/files/content",
             get(projects::file_content),
         )
         .route("/api/v1/projects/{id}/files/text", put(projects::save_text))
-        .route(
-            "/api/v1/projects/{id}/files/tree",
-            get(projects::file_tree),
-        )
+        .route("/api/v1/projects/{id}/files/tree", get(projects::file_tree))
         .route(
             "/api/v1/projects/{id}/files/move",
             post(projects::move_file),

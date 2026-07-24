@@ -15,6 +15,9 @@ use sqlx::{FromRow, SqlitePool};
 use utoipa::ToSchema;
 
 use crate::adapters::git::{DiffView, GitCredential, GitError, GitRunner, GitStatus, SystemGit};
+use crate::modules::workspace_sync::interface::{
+    RevisionRef, WorkspaceHandle, WorkspaceSyncError, WorkspaceSyncInterface,
+};
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     id::{CorrelationId, GithubCredentialId, ProjectId},
@@ -24,9 +27,6 @@ use crate::platform::{
     },
     path::{PathError, validate_workspace_path},
     secret::{Secret, SecretCipher, fingerprint},
-};
-use crate::modules::workspace_sync::interface::{
-    RevisionRef, WorkspaceHandle, WorkspaceSyncError, WorkspaceSyncInterface,
 };
 
 const REPO_KIND_PUBLIC: &str = "public_https";
@@ -319,11 +319,37 @@ impl ProjectsInterface {
             return Err(ProjectsError::Validation("name is required".into()));
         }
 
-        let id = ProjectId::new();
+        // Allocate the Project id up front so a *new* Operation can point at it.
+        // On an idempotency hit, this provisional id is discarded and the stored
+        // Operation's `target_id` is used instead — no ghost Project row is written.
+        let provisional_id = ProjectId::new();
+        let created = self
+            .operations
+            .create(CreateOperation {
+                kind: crate::platform::operations::KIND_CLONE,
+                actor: serde_json::json!({"kind": "owner", "id": owner_id}),
+                target_kind: "project",
+                target_id: Some(&provisional_id.to_string()),
+                conditions: serde_json::json!({"project_id": provisional_id.to_string()}),
+                correlation_id,
+                idempotency,
+            })
+            .await?;
+
+        if !matches!(created.outcome, IdempotencyOutcome::New) {
+            let project_id = created.operation.target_id.as_deref().ok_or_else(|| {
+                ProjectsError::Internal(anyhow::anyhow!(
+                    "idempotent clone operation missing target_id"
+                ))
+            })?;
+            let view = self.get_project(owner_id, project_id).await?;
+            return Ok((view, created.operation));
+        }
+
         let now = format_utc(SystemClock.now());
         let version = format!("v_{}", ProjectId::new());
         sqlx::query("INSERT INTO projects (id, owner_id, tenant_id, name, state, repo_access, repo_url, repo_branch, github_credential_id, default_model_id, main_workspace_handle, clone_error, version, created_at, updated_at, last_activity_at) VALUES (?, ?, ?, ?, 'creating', ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)")
-            .bind(id.to_string())
+            .bind(provisional_id.to_string())
             .bind(owner_id)
             .bind(tenant_id)
             .bind(input.name.trim())
@@ -338,37 +364,21 @@ impl ProjectsInterface {
             .execute(&self.pool)
             .await?;
 
-        // Create the durable Operation first, then enqueue work. If work is
-        // enqueued before the Operation row exists, a fast worker can finish the
-        // clone and fail to mark the Operation terminal (no matching row yet).
-        let created = self
-            .operations
-            .create(CreateOperation {
-                kind: crate::platform::operations::KIND_CLONE,
-                actor: serde_json::json!({"kind": "owner", "id": owner_id}),
-                target_kind: "project",
-                target_id: Some(&id.to_string()),
-                conditions: serde_json::json!({"project_id": id.to_string()}),
-                correlation_id,
-                idempotency,
-            })
+        // Operation already exists; enqueue work only for the new attempt.
+        let payload = serde_json::json!({
+            "project_id": provisional_id.to_string(),
+            "operation_id": created.operation.id,
+            "url": input.repository.url,
+            "branch": input.repository.branch,
+            "access": input.repository.access.as_str(),
+            "github_credential_id": input.repository.github_credential_id,
+        });
+        self.operations
+            .enqueue_work(crate::platform::operations::KIND_CLONE, payload)
             .await?;
-        // Only enqueue for a freshly created Operation. A reused/stored
-        // idempotency hit already has (or had) its work item.
-        if matches!(created.outcome, IdempotencyOutcome::New) {
-            let payload = serde_json::json!({
-                "project_id": id.to_string(),
-                "operation_id": created.operation.id,
-                "url": input.repository.url,
-                "branch": input.repository.branch,
-                "access": input.repository.access.as_str(),
-                "github_credential_id": input.repository.github_credential_id,
-            });
-            self.operations
-                .enqueue_work(crate::platform::operations::KIND_CLONE, payload)
-                .await?;
-        }
-        let view = self.get_project(owner_id, &id.to_string()).await?;
+        let view = self
+            .get_project(owner_id, &provisional_id.to_string())
+            .await?;
         Ok((view, created.operation))
     }
 
@@ -624,7 +634,10 @@ impl ProjectsInterface {
 
     // ----- GitHub credentials (PAT) -----
 
-    pub async fn list_credentials(&self, owner_id: &str) -> Result<Vec<GithubCredentialView>, ProjectsError> {
+    pub async fn list_credentials(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<GithubCredentialView>, ProjectsError> {
         let rows = sqlx::query_as::<_, CredentialRow>(
             "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, version, created_at, updated_at FROM github_credentials WHERE owner_id = ? ORDER BY name",
         )
@@ -766,7 +779,11 @@ impl ProjectsInterface {
         }
     }
 
-    async fn fetch_credential(&self, owner_id: &str, id: &str) -> Result<CredentialRow, ProjectsError> {
+    async fn fetch_credential(
+        &self,
+        owner_id: &str,
+        id: &str,
+    ) -> Result<CredentialRow, ProjectsError> {
         sqlx::query_as::<_, CredentialRow>(
             "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, version, created_at, updated_at FROM github_credentials WHERE id = ? AND owner_id = ?",
         )
@@ -847,9 +864,14 @@ impl ProjectsInterface {
         };
 
         let dest = self.main_repo_dir(project_id);
-        let clone_result =
-            GitRunner::clone(&self.git, &row.repo_url, row.repo_branch.as_deref(), &dest, &credential)
-                .await;
+        let clone_result = GitRunner::clone(
+            &self.git,
+            &row.repo_url,
+            row.repo_branch.as_deref(),
+            &dest,
+            &credential,
+        )
+        .await;
         if let Err(error) = clone_result {
             self.mark_project_state(project_id, "error", Some(error.to_string()))
                 .await?;
@@ -895,11 +917,10 @@ impl ProjectsInterface {
     }
 
     async fn project_owner(&self, project_id: &str) -> Result<String, ProjectsError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT owner_id FROM projects WHERE id = ?")
-                .bind(project_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT owner_id FROM projects WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?;
         row.map(|(o,)| o).ok_or(ProjectsError::NotFound)
     }
 
@@ -948,7 +969,10 @@ impl ProjectsInterface {
     // ----- Main Workspace path helpers -----
 
     fn main_repo_dir(&self, project_id: &str) -> std::path::PathBuf {
-        self.workspaces_root.join("main").join(project_id).join("repo")
+        self.workspaces_root
+            .join("main")
+            .join(project_id)
+            .join("repo")
     }
 
     fn main_handle(&self, project_id: ProjectId) -> WorkspaceHandle {
@@ -985,9 +1009,13 @@ impl ProjectsInterface {
         let mime = guess_mime(&abs);
         let revision = self
             .workspace_sync
-            .current_revision(&self.main_handle(row.id.parse().map_err(|_| {
-                ProjectsError::Internal(anyhow::anyhow!("bad project id"))
-            })?))
+            .current_revision(
+                &self.main_handle(
+                    row.id
+                        .parse()
+                        .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("bad project id")))?,
+                ),
+            )
             .await
             .ok()
             .map(|r| r.0);
@@ -1104,7 +1132,11 @@ impl ProjectsInterface {
             };
             out.push(FileTreeView {
                 path: child_path,
-                kind: if meta.is_dir() { "dir".into() } else { "file".into() },
+                kind: if meta.is_dir() {
+                    "dir".into()
+                } else {
+                    "file".into()
+                },
                 size: meta.len(),
             });
         }
@@ -1312,7 +1344,8 @@ impl ProjectsInterface {
         correlation_id: CorrelationId,
     ) -> Result<OperationView, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
-        let payload = serde_json::json!({"project_id": project_id, "remote": remote, "branch": branch});
+        let payload =
+            serde_json::json!({"project_id": project_id, "remote": remote, "branch": branch});
         self.operations
             .enqueue_work(crate::platform::operations::KIND_GIT_PUSH, payload)
             .await?;
@@ -1343,7 +1376,13 @@ impl ProjectsInterface {
             return Err(error.into());
         }
         self.operations
-            .finish(&created.operation.id, OperationStatus::Succeeded, None, None, correlation_id)
+            .finish(
+                &created.operation.id,
+                OperationStatus::Succeeded,
+                None,
+                None,
+                correlation_id,
+            )
             .await?;
         Ok(created.operation)
     }
@@ -1417,7 +1456,8 @@ fn validate_repository_input(repo: &RepositoryInput) -> Result<(), ProjectsError
     // Production paths are http(s). `file://` is accepted for local bare-repo
     // fixtures and offline development clones; the access enum still documents
     // the product-facing public_https / github_private distinction.
-    if !matches!(url.scheme(), "http" | "https" | "file") || url.host_str().is_none() && url.scheme() != "file"
+    if !matches!(url.scheme(), "http" | "https" | "file")
+        || url.host_str().is_none() && url.scheme() != "file"
     {
         return Err(ProjectsError::Validation(
             "repository url must use http(s) or file".into(),

@@ -23,8 +23,8 @@ use crate::{
     AppState,
     modules::projects::interface::{
         CreateGithubCredentialInput, CreateProjectInput, CredentialProbeResult, DeleteFileInput,
-        FileMetaView, FileTreeView, GithubCredentialView, MoveFileInput, ProjectView, ProjectsError,
-        RetryProjectInput, SaveTextInput,
+        FileMetaView, FileTreeView, GithubCredentialView, MoveFileInput, ProjectView,
+        ProjectsError, RetryProjectInput, SaveTextInput,
     },
     platform::{events::NewEvent, id::CorrelationId},
     transport::http::{

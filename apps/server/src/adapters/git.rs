@@ -63,7 +63,10 @@ impl GitError {
 pub enum GitCredential {
     None,
     /// `(username, password)` for HTTPS basic auth. The password is the PAT.
-    HttpsBasic { username: String, password: String },
+    HttpsBasic {
+        username: String,
+        password: String,
+    },
 }
 
 /// Three-layer status projection (`WS-GIT-01`, HTTP API `git/status`).
@@ -125,7 +128,10 @@ pub trait GitRunner: Send + Sync {
         credential: &GitCredential,
     ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
 
-    fn status(&self, repo: &Path) -> impl std::future::Future<Output = Result<GitStatus, GitError>> + Send;
+    fn status(
+        &self,
+        repo: &Path,
+    ) -> impl std::future::Future<Output = Result<GitStatus, GitError>> + Send;
 
     fn diff(
         &self,
@@ -303,7 +309,10 @@ impl GitRunner for SystemGit {
         }
         command.arg(url).arg(into.file_name().unwrap_or_default());
         let askpass = Self::apply_credential(&mut command, credential)?;
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let output = command
             .output()
             .await
@@ -320,10 +329,7 @@ impl GitRunner for SystemGit {
 
     async fn status(&self, repo: &Path) -> Result<GitStatus, GitError> {
         let mut command = Self::base(repo);
-        command
-            .arg("status")
-            .arg("--porcelain=v2")
-            .arg("--branch");
+        command.arg("status").arg("--porcelain=v2").arg("--branch");
         let output = Self::run(&mut command).await?;
         Ok(parse_porcelain_v2(&output))
     }
@@ -362,7 +368,10 @@ impl GitRunner for SystemGit {
 
     async fn branches(&self, repo: &Path) -> Result<Vec<String>, GitError> {
         let mut command = Self::base(repo);
-        command.arg("for-each-ref").arg("--format=%(refname:short)").arg("refs/heads/");
+        command
+            .arg("for-each-ref")
+            .arg("--format=%(refname:short)")
+            .arg("refs/heads/");
         let output = Self::run(&mut command).await?;
         Ok(output.lines().map(str::to_owned).collect())
     }
@@ -463,17 +472,13 @@ impl GitRunner for SystemGit {
         let upstream = format!("{remote}/{branch}");
         // Check merge-base relationship to detect divergence without touching HEAD.
         let mut base = Self::base(repo);
-        base.arg("merge-base")
-            .arg("HEAD")
-            .arg(&upstream);
+        base.arg("merge-base").arg("HEAD").arg(&upstream);
         let base_sha = Self::run(&mut base).await?.trim().to_owned();
         let mut head = Self::base(repo);
         head.arg("rev-parse").arg("HEAD");
         let head_sha = Self::run(&mut head).await?.trim().to_owned();
         let mut remote_head = Self::base(repo);
-        remote_head
-            .arg("rev-parse")
-            .arg(&upstream);
+        remote_head.arg("rev-parse").arg(&upstream);
         let remote_sha = Self::run(&mut remote_head).await?.trim().to_owned();
 
         if base_sha == remote_sha {
@@ -496,7 +501,9 @@ impl GitRunner for SystemGit {
             .await
             .map_err(|e| GitError::CommandFailed(e.to_string()))?;
         if output.status.success() {
-            return Ok(UpdateOutcome::FastForward { new_head: remote_sha });
+            return Ok(UpdateOutcome::FastForward {
+                new_head: remote_sha,
+            });
         }
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         // A fast-forward should never conflict; if it does, surface the paths and
@@ -539,8 +546,14 @@ fn parse_porcelain_v2(output: &str) -> GitStatus {
             }
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
             let mut parts = rest.split_whitespace();
-            ahead = parts.next().and_then(|s| s.trim_start_matches('+').parse().ok()).unwrap_or(0);
-            behind = parts.next().and_then(|s| s.trim_start_matches('-').parse().ok()).unwrap_or(0);
+            ahead = parts
+                .next()
+                .and_then(|s| s.trim_start_matches('+').parse().ok())
+                .unwrap_or(0);
+            behind = parts
+                .next()
+                .and_then(|s| s.trim_start_matches('-').parse().ok())
+                .unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("u ") {
             // Unmerged entry: conflict in working tree.
             if let Some(path) = rest.split_whitespace().nth(8) {

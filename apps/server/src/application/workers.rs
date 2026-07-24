@@ -176,9 +176,7 @@ fn is_fatal(error: &anyhow::Error) -> bool {
     // should not be retried blindly; the user retries explicitly. Validation
     // is fatal. Transient issues (none modeled in M2) would be retried.
     let s = error.to_string();
-    s.contains("validation")
-        || s.contains("GIT_AUTH_FAILED")
-        || s.contains("not creating")
+    s.contains("validation") || s.contains("GIT_AUTH_FAILED") || s.contains("not creating")
 }
 
 #[cfg(test)]

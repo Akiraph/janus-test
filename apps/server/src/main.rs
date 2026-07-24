@@ -29,12 +29,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(error) = state.blobs().clean_incoming().await {
         warn!(%error, "clean incoming objects on startup");
     }
-    for op_id in state
-        .operations()
-        .stale_running()
-        .await
-        .unwrap_or_default()
-    {
+    for op_id in state.operations().stale_running().await.unwrap_or_default() {
         warn!(%op_id, "marking stale running operation as needs_attention");
         let _ = state
             .operations()

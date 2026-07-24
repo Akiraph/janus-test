@@ -15,11 +15,8 @@ use modules::models::interface::ModelsInterface;
 use modules::projects::interface::ProjectsInterface;
 use modules::workspace_sync::interface::WorkspaceSyncInterface;
 use platform::{
-    database::Database,
-    events::EventStore,
-    managed_storage::BlobStore,
-    operations::OperationInterface,
-    secret::SecretCipher,
+    database::Database, events::EventStore, managed_storage::BlobStore,
+    operations::OperationInterface, secret::SecretCipher,
 };
 
 #[derive(Clone)]
