@@ -370,6 +370,238 @@
         }
       }
     },
+    "/api/v1/github-credentials": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_credentials",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_GithubCredentialView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "create_credential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGithubCredentialInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GithubCredentialView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github-credentials/{id}": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "get_credential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Credential id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GithubCredentialView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "delete_credential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Credential id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github-credentials/{id}/probe": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "probe_credential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Credential id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_CredentialProbeResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/me": {
       "get": {
         "tags": [
@@ -803,19 +1035,83 @@
         }
       }
     },
-    "/api/v1/models": {
+    "/api/v1/operations/{id}": {
       "get": {
         "tags": [
-          "models"
+          "operations"
         ],
-        "operationId": "models",
+        "operationId": "get_operation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Operation id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_Vec_ModelView"
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "list_projects",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size (1-100, default 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_ProjectView"
                 }
               }
             }
@@ -834,26 +1130,46 @@
       },
       "post": {
         "tags": [
-          "models"
+          "projects"
         ],
-        "operationId": "create_model",
+        "operationId": "create_project",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ModelInput"
+                "$ref": "#/components/schemas/CreateProjectInput"
               }
             }
           },
           "required": true
         },
         "responses": {
-          "201": {
+          "202": {
             "description": "",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_ModelView"
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -871,16 +1187,17 @@
         }
       }
     },
-    "/api/v1/models/{id}": {
-      "delete": {
+    "/api/v1/projects/{id}": {
+      "get": {
         "tags": [
-          "models"
+          "projects"
         ],
-        "operationId": "delete_model",
+        "operationId": "get_project",
         "parameters": [
           {
             "name": "id",
             "in": "path",
+            "description": "Project id",
             "required": true,
             "schema": {
               "type": "string"
@@ -888,10 +1205,86 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_ProjectView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "delete_project",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "428": {
             "description": "",
             "content": {
               "application/json": {
@@ -905,13 +1298,14 @@
       },
       "patch": {
         "tags": [
-          "models"
+          "projects"
         ],
-        "operationId": "update_model",
+        "operationId": "update_project",
         "parameters": [
           {
             "name": "id",
             "in": "path",
+            "description": "Project id",
             "required": true,
             "schema": {
               "type": "string"
@@ -922,7 +1316,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ModelInput"
+                "$ref": "#/components/schemas/UpdateProjectRequest"
               }
             }
           },
@@ -934,7 +1328,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_ModelView"
+                  "$ref": "#/components/schemas/DataResponse_ProjectView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -948,20 +1352,41 @@
                 }
               }
             }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         }
       }
     },
-    "/api/v1/models/{id}/failover": {
-      "put": {
+    "/api/v1/projects/{id}/files": {
+      "delete": {
         "tags": [
-          "models"
+          "projects"
         ],
-        "operationId": "set_failover",
+        "operationId": "delete_file",
         "parameters": [
           {
             "name": "id",
             "in": "path",
+            "description": "Project id",
             "required": true,
             "schema": {
               "type": "string"
@@ -972,7 +1397,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FailoverInput"
+                "$ref": "#/components/schemas/DeleteFileInput"
               }
             }
           },
@@ -984,7 +1409,1219 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_FailoverView"
+                  "$ref": "#/components/schemas/DataResponse_RevisionRef"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/files/content": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "file_content",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Workspace-relative file path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Raw file bytes",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/files/meta": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "file_meta",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Workspace-relative file path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_FileMetaView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/files/move": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "move_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveFileInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_RevisionRef"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/files/text": {
+      "put": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "save_text",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveTextInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_RevisionRef"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/files/tree": {
+      "get": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "file_tree",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Workspace-relative directory; empty = root",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_FileTreeView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/branches": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_branches",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_String"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/commands/commit": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_commit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitCommitRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_String"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/commands/fetch": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_fetch",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitFetchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/commands/push": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_push",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitPushRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/commands/stage": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_stage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitStageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/commands/unstage": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_unstage",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitStageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/commands/update": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_update",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GitUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/diff": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_diff",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "description": "Diff view (working_vs_index | index_vs_head | working_vs_head; default working_vs_index)",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/DiffViewParam"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Unified diff text",
+            "content": {
+              "text/plain": {}
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/log": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_log",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Number of entries (1-200, default 50)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GitLogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/remotes": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_remotes",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_String"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/status": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "git_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GitStatusView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/retry": {
+      "post": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "retry_project",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetryProjectInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -1183,12 +2820,64 @@
           "public_key": {}
         }
       },
-      "ContextWindow": {
-        "type": "string",
-        "enum": [
-          "200k",
-          "1m"
-        ]
+      "CreateGithubCredentialInput": {
+        "type": "object",
+        "required": [
+          "name",
+          "github_host"
+        ],
+        "properties": {
+          "github_host": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pat": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "CreateProjectInput": {
+        "type": "object",
+        "required": [
+          "name",
+          "repository"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RepositoryInput"
+          }
+        }
+      },
+      "CredentialProbeResult": {
+        "type": "object",
+        "required": [
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "http_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string"
+          }
+        }
       },
       "DataResponse_CeremonyOptions": {
         "type": "object",
@@ -1211,7 +2900,7 @@
           }
         }
       },
-      "DataResponse_FailoverView": {
+      "DataResponse_CredentialProbeResult": {
         "type": "object",
         "required": [
           "data"
@@ -1220,21 +2909,142 @@
           "data": {
             "type": "object",
             "required": [
-              "enabled",
-              "candidate_ids",
-              "warnings"
+              "status",
+              "detail"
             ],
             "properties": {
-              "candidate_ids": {
+              "detail": {
+                "type": "string"
+              },
+              "http_status": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int32",
+                "minimum": 0
+              },
+              "status": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_FileMetaView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "path",
+              "size",
+              "editable"
+            ],
+            "properties": {
+              "editable": {
+                "type": "boolean"
+              },
+              "main_revision": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mime": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "path": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_GitLogResponse": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "entries"
+            ],
+            "properties": {
+              "entries": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/GitLogEntryView"
+                }
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_GitStatusView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "ahead",
+              "behind",
+              "working",
+              "index",
+              "untracked"
+            ],
+            "properties": {
+              "ahead": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "behind": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "head_sha": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 }
               },
-              "enabled": {
-                "type": "boolean"
+              "untracked": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
               },
-              "warnings": {
+              "working": {
                 "type": "array",
                 "items": {
                   "type": "string"
@@ -1244,7 +3054,7 @@
           }
         }
       },
-      "DataResponse_ModelView": {
+      "DataResponse_GithubCredentialView": {
         "type": "object",
         "required": [
           "data"
@@ -1254,61 +3064,101 @@
             "type": "object",
             "required": [
               "id",
-              "provider_id",
-              "display_name",
-              "upstream_model_id",
-              "context_window",
-              "supports_images",
-              "supports_tools",
-              "max_output_tokens",
-              "enabled",
-              "failover",
+              "name",
+              "github_host",
+              "pat_is_set",
+              "version",
               "created_at",
               "updated_at"
             ],
             "properties": {
-              "context_window": {
-                "$ref": "#/components/schemas/ContextWindow"
-              },
               "created_at": {
                 "type": "string"
               },
-              "display_name": {
+              "github_host": {
                 "type": "string"
-              },
-              "enabled": {
-                "type": "boolean"
-              },
-              "failover": {
-                "$ref": "#/components/schemas/FailoverView"
               },
               "id": {
                 "type": "string"
               },
-              "max_output_tokens": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "provider_id": {
+              "name": {
                 "type": "string"
               },
-              "reasoning_effort": {
+              "pat_fingerprint": {
                 "type": [
                   "string",
                   "null"
                 ]
               },
-              "supports_images": {
-                "type": "boolean"
-              },
-              "supports_tools": {
+              "pat_is_set": {
                 "type": "boolean"
               },
               "updated_at": {
                 "type": "string"
               },
-              "upstream_model_id": {
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_OperationView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "status",
+              "target_kind",
+              "correlation_id",
+              "version",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "correlation_id": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "current_step": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "problem": {},
+              "progress": {},
+              "result": {},
+              "status": {
+                "type": "string"
+              },
+              "target_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "target_kind": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "version": {
                 "type": "string"
               }
             }
@@ -1420,6 +3270,80 @@
           }
         }
       },
+      "DataResponse_ProjectView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "state",
+              "restrictions",
+              "repository",
+              "version",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "current_branch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "default_model_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "git_state_version": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "id": {
+                "type": "string"
+              },
+              "main_revision": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "repository": {
+                "$ref": "#/components/schemas/RepositoryView"
+              },
+              "restrictions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "state": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "DataResponse_ProviderView": {
         "type": "object",
         "required": [
@@ -1434,7 +3358,7 @@
               "display_name",
               "base_url",
               "api_key_is_set",
-              "supports_1m",
+              "models",
               "enabled",
               "created_at",
               "updated_at"
@@ -1448,6 +3372,12 @@
               },
               "api_key_is_set": {
                 "type": "boolean"
+              },
+              "api_key_preview": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "base_url": {
                 "type": "string"
@@ -1467,13 +3397,28 @@
               "kind": {
                 "$ref": "#/components/schemas/ProviderKind"
               },
-              "supports_1m": {
-                "type": "boolean"
+              "models": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/EmbeddedModelView"
+                }
               },
               "updated_at": {
                 "type": "string"
               }
             }
+          }
+        }
+      },
+      "DataResponse_RevisionRef": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "string",
+            "description": "A Content Revision identity. Exposed to clients as an opaque `v_01J...`\nstring via `main_revision` on the Project projection; used as an `If-Match`\ncondition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of\nhalf-writing."
           }
         }
       },
@@ -1488,7 +3433,39 @@
           }
         }
       },
-      "DataResponse_Vec_ModelView": {
+      "DataResponse_Vec_FileTreeView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "path",
+                "kind",
+                "size"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_Vec_GithubCredentialView": {
         "type": "object",
         "required": [
           "data"
@@ -1500,61 +3477,39 @@
               "type": "object",
               "required": [
                 "id",
-                "provider_id",
-                "display_name",
-                "upstream_model_id",
-                "context_window",
-                "supports_images",
-                "supports_tools",
-                "max_output_tokens",
-                "enabled",
-                "failover",
+                "name",
+                "github_host",
+                "pat_is_set",
+                "version",
                 "created_at",
                 "updated_at"
               ],
               "properties": {
-                "context_window": {
-                  "$ref": "#/components/schemas/ContextWindow"
-                },
                 "created_at": {
                   "type": "string"
                 },
-                "display_name": {
+                "github_host": {
                   "type": "string"
-                },
-                "enabled": {
-                  "type": "boolean"
-                },
-                "failover": {
-                  "$ref": "#/components/schemas/FailoverView"
                 },
                 "id": {
                   "type": "string"
                 },
-                "max_output_tokens": {
-                  "type": "integer",
-                  "format": "int32",
-                  "minimum": 0
-                },
-                "provider_id": {
+                "name": {
                   "type": "string"
                 },
-                "reasoning_effort": {
+                "pat_fingerprint": {
                   "type": [
                     "string",
                     "null"
                   ]
                 },
-                "supports_images": {
-                  "type": "boolean"
-                },
-                "supports_tools": {
+                "pat_is_set": {
                   "type": "boolean"
                 },
                 "updated_at": {
                   "type": "string"
                 },
-                "upstream_model_id": {
+                "version": {
                   "type": "string"
                 }
               }
@@ -1598,6 +3553,83 @@
           }
         }
       },
+      "DataResponse_Vec_ProjectView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "name",
+                "state",
+                "restrictions",
+                "repository",
+                "version",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "current_branch": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "default_model_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "git_state_version": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "main_revision": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                },
+                "repository": {
+                  "$ref": "#/components/schemas/RepositoryView"
+                },
+                "restrictions": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "state": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
       "DataResponse_Vec_ProviderView": {
         "type": "object",
         "required": [
@@ -1614,7 +3646,7 @@
                 "display_name",
                 "base_url",
                 "api_key_is_set",
-                "supports_1m",
+                "models",
                 "enabled",
                 "created_at",
                 "updated_at"
@@ -1628,6 +3660,12 @@
                 },
                 "api_key_is_set": {
                   "type": "boolean"
+                },
+                "api_key_preview": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "base_url": {
                   "type": "string"
@@ -1647,8 +3685,11 @@
                 "kind": {
                   "$ref": "#/components/schemas/ProviderKind"
                 },
-                "supports_1m": {
-                  "type": "boolean"
+                "models": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/EmbeddedModelView"
+                  }
                 },
                 "updated_at": {
                   "type": "string"
@@ -1688,6 +3729,86 @@
           },
           "ready": {
             "type": "boolean"
+          }
+        }
+      },
+      "DeleteFileInput": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "expected_main_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "recursive": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DiffViewParam": {
+        "type": "string",
+        "enum": [
+          "working_vs_index",
+          "index_vs_head",
+          "working_vs_head"
+        ]
+      },
+      "EmbeddedModelInput": {
+        "type": "object",
+        "description": "A model embedded inside its provider. Stored as an element of the\nprovider's `models_json` array; no standalone identity outside the parent.",
+        "required": [
+          "display_name",
+          "upstream_model_id"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "supports_1m": {
+            "type": "boolean"
+          },
+          "supports_images": {
+            "type": "boolean"
+          },
+          "upstream_model_id": {
+            "type": "string"
+          }
+        }
+      },
+      "EmbeddedModelView": {
+        "type": "object",
+        "required": [
+          "display_name",
+          "upstream_model_id",
+          "supports_1m",
+          "supports_images",
+          "enabled"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "supports_1m": {
+            "type": "boolean"
+          },
+          "supports_images": {
+            "type": "boolean"
+          },
+          "upstream_model_id": {
+            "type": "string"
           }
         }
       },
@@ -1750,46 +3871,253 @@
           }
         }
       },
-      "FailoverInput": {
+      "FileMetaView": {
         "type": "object",
         "required": [
-          "enabled",
-          "candidate_ids"
+          "path",
+          "size",
+          "editable"
         ],
         "properties": {
-          "candidate_ids": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "enabled": {
+          "editable": {
             "type": "boolean"
+          },
+          "main_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mime": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
-      "FailoverView": {
+      "FileTreeView": {
         "type": "object",
         "required": [
-          "enabled",
-          "candidate_ids",
-          "warnings"
+          "path",
+          "kind",
+          "size"
         ],
         "properties": {
-          "candidate_ids": {
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "GitCommitRequest": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "GitFetchRequest": {
+        "type": "object",
+        "required": [
+          "remote"
+        ],
+        "properties": {
+          "remote": {
+            "type": "string"
+          }
+        }
+      },
+      "GitLogEntryView": {
+        "type": "object",
+        "required": [
+          "sha",
+          "parents",
+          "author",
+          "message"
+        ],
+        "properties": {
+          "author": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "parents": {
             "type": "array",
             "items": {
               "type": "string"
             }
           },
-          "enabled": {
+          "sha": {
+            "type": "string"
+          }
+        }
+      },
+      "GitLogResponse": {
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GitLogEntryView"
+            }
+          }
+        }
+      },
+      "GitPushRequest": {
+        "type": "object",
+        "required": [
+          "remote",
+          "branch"
+        ],
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "remote": {
+            "type": "string"
+          }
+        }
+      },
+      "GitStageRequest": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "GitStatusView": {
+        "type": "object",
+        "required": [
+          "ahead",
+          "behind",
+          "working",
+          "index",
+          "untracked"
+        ],
+        "properties": {
+          "ahead": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "behind": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_sha": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "index": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "untracked": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "working": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "GitUpdateRequest": {
+        "type": "object",
+        "required": [
+          "remote",
+          "branch"
+        ],
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "remote": {
+            "type": "string"
+          }
+        }
+      },
+      "GithubCredentialView": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "github_host",
+          "pat_is_set",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "github_host": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pat_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pat_is_set": {
             "type": "boolean"
           },
-          "warnings": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
+          "updated_at": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
           }
         }
       },
@@ -1824,108 +4152,89 @@
           }
         }
       },
-      "ModelInput": {
+      "MoveFileInput": {
         "type": "object",
         "required": [
-          "provider_id",
-          "display_name",
-          "upstream_model_id",
-          "max_output_tokens"
+          "from",
+          "to"
         ],
         "properties": {
-          "context_window": {
-            "$ref": "#/components/schemas/ContextWindow"
-          },
-          "display_name": {
-            "type": "string"
-          },
-          "enabled": {
-            "type": "boolean"
-          },
-          "max_output_tokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "provider_id": {
-            "type": "string"
-          },
-          "reasoning_effort": {
+          "expected_main_revision": {
             "type": [
               "string",
               "null"
             ]
           },
-          "supports_images": {
-            "type": "boolean"
+          "from": {
+            "type": "string"
           },
-          "supports_tools": {
-            "type": "boolean"
-          },
-          "upstream_model_id": {
+          "to": {
             "type": "string"
           }
         }
       },
-      "ModelView": {
+      "OperationStatus": {
+        "type": "string",
+        "description": "Operation status. `needs_attention` means execution stopped at a decidable\nstate requiring an explicit follow-up command (e.g. a Git Update Conflict),\nnot \"still running\" or \"unknown failure\".",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "canceled",
+          "needs_attention"
+        ]
+      },
+      "OperationView": {
         "type": "object",
         "required": [
           "id",
-          "provider_id",
-          "display_name",
-          "upstream_model_id",
-          "context_window",
-          "supports_images",
-          "supports_tools",
-          "max_output_tokens",
-          "enabled",
-          "failover",
+          "kind",
+          "status",
+          "target_kind",
+          "correlation_id",
+          "version",
           "created_at",
           "updated_at"
         ],
         "properties": {
-          "context_window": {
-            "$ref": "#/components/schemas/ContextWindow"
+          "correlation_id": {
+            "type": "string"
           },
           "created_at": {
             "type": "string"
           },
-          "display_name": {
-            "type": "string"
-          },
-          "enabled": {
-            "type": "boolean"
-          },
-          "failover": {
-            "$ref": "#/components/schemas/FailoverView"
-          },
-          "id": {
-            "type": "string"
-          },
-          "max_output_tokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "provider_id": {
-            "type": "string"
-          },
-          "reasoning_effort": {
+          "current_step": {
             "type": [
               "string",
               "null"
             ]
           },
-          "supports_images": {
-            "type": "boolean"
+          "id": {
+            "type": "string"
           },
-          "supports_tools": {
-            "type": "boolean"
+          "kind": {
+            "type": "string"
+          },
+          "problem": {},
+          "progress": {},
+          "result": {},
+          "status": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_kind": {
+            "type": "string"
           },
           "updated_at": {
             "type": "string"
           },
-          "upstream_model_id": {
+          "version": {
             "type": "string"
           }
         }
@@ -2072,6 +4381,72 @@
           }
         }
       },
+      "ProjectView": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "state",
+          "restrictions",
+          "repository",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "current_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_model_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "git_state_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "main_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "repository": {
+            "$ref": "#/components/schemas/RepositoryView"
+          },
+          "restrictions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "state": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
       "ProviderInput": {
         "type": "object",
         "required": [
@@ -2099,8 +4474,11 @@
           "kind": {
             "$ref": "#/components/schemas/ProviderKind"
           },
-          "supports_1m": {
-            "type": "boolean"
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EmbeddedModelInput"
+            }
           }
         }
       },
@@ -2108,7 +4486,8 @@
         "type": "string",
         "enum": [
           "anthropic",
-          "openai_compatible"
+          "openai_chat",
+          "openai_responses"
         ]
       },
       "ProviderView": {
@@ -2119,7 +4498,7 @@
           "display_name",
           "base_url",
           "api_key_is_set",
-          "supports_1m",
+          "models",
           "enabled",
           "created_at",
           "updated_at"
@@ -2133,6 +4512,12 @@
           },
           "api_key_is_set": {
             "type": "boolean"
+          },
+          "api_key_preview": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "base_url": {
             "type": "string"
@@ -2152,8 +4537,11 @@
           "kind": {
             "$ref": "#/components/schemas/ProviderKind"
           },
-          "supports_1m": {
-            "type": "boolean"
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EmbeddedModelView"
+            }
           },
           "updated_at": {
             "type": "string"
@@ -2228,6 +4616,89 @@
           }
         }
       },
+      "RepoAccess": {
+        "type": "string",
+        "enum": [
+          "public_https",
+          "github_private"
+        ]
+      },
+      "RepositoryInput": {
+        "type": "object",
+        "required": [
+          "access",
+          "url"
+        ],
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/RepoAccess"
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_credential_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "RepositoryView": {
+        "type": "object",
+        "required": [
+          "access",
+          "url"
+        ],
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/RepoAccess"
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_credential_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only present for `github_private`; never exposes the PAT."
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "RetryProjectInput": {
+        "type": "object",
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "github_credential_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "RevisionRef": {
+        "type": "string",
+        "description": "A Content Revision identity. Exposed to clients as an opaque `v_01J...`\nstring via `main_revision` on the Project projection; used as an `If-Match`\ncondition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of\nhalf-writing."
+      },
       "RuntimeCapability": {
         "type": "object",
         "required": [
@@ -2254,6 +4725,27 @@
           },
           "state": {
             "$ref": "#/components/schemas/CapabilityState"
+          }
+        }
+      },
+      "SaveTextInput": {
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "expected_main_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
           }
         }
       },
@@ -2304,6 +4796,24 @@
         "properties": {
           "data": {
             "$ref": "#/components/schemas/SystemInfo"
+          }
+        }
+      },
+      "UpdateProjectRequest": {
+        "type": "object",
+        "properties": {
+          "default_model_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`null` clears the default model; omit to keep the current value."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }

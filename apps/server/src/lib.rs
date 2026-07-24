@@ -12,7 +12,15 @@ use axum::Router;
 use config::Config;
 use modules::identity::interface::IdentityInterface;
 use modules::models::interface::ModelsInterface;
-use platform::{database::Database, events::EventStore, secret::SecretCipher};
+use modules::projects::interface::ProjectsInterface;
+use modules::workspace_sync::interface::WorkspaceSyncInterface;
+use platform::{
+    database::Database,
+    events::EventStore,
+    managed_storage::BlobStore,
+    operations::OperationInterface,
+    secret::SecretCipher,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,8 +32,12 @@ struct AppStateInner {
     pub database: Database,
     pub events: EventStore,
     pub secrets: SecretCipher,
+    pub blobs: BlobStore,
+    pub operations: OperationInterface,
+    pub workspace_sync: WorkspaceSyncInterface,
     pub identity: IdentityInterface,
     pub models: ModelsInterface,
+    pub projects: ProjectsInterface,
 }
 
 impl AppState {
@@ -33,18 +45,33 @@ impl AppState {
         let database = Database::open(&config.data_root)
             .await
             .with_context(|| format!("initialize data root {}", config.data_root.display()))?;
-        let events = EventStore::new(database.pool().clone());
+        let pool = database.pool().clone();
+        let events = EventStore::new(pool.clone());
         let secrets = SecretCipher::load(&config.data_root, config.mode)?;
-        let identity = IdentityInterface::new(database.pool().clone(), &config).await?;
-        let models = ModelsInterface::new(database.pool().clone(), secrets.clone())?;
+        let blobs = BlobStore::new(pool.clone(), &config.data_root)?;
+        let operations = OperationInterface::new(pool.clone());
+        let workspace_sync = WorkspaceSyncInterface::new(pool.clone());
+        let identity = IdentityInterface::new(pool.clone(), &config).await?;
+        let models = ModelsInterface::new(pool.clone(), secrets.clone())?;
+        let projects = ProjectsInterface::new(
+            pool.clone(),
+            secrets.clone(),
+            operations.clone(),
+            workspace_sync.clone(),
+            &config.data_root,
+        );
         Ok(Self {
             inner: Arc::new(AppStateInner {
                 config,
                 database,
                 events,
                 secrets,
+                blobs,
+                operations,
+                workspace_sync,
                 identity,
                 models,
+                projects,
             }),
         })
     }
@@ -65,12 +92,28 @@ impl AppState {
         &self.inner.secrets
     }
 
+    pub fn blobs(&self) -> &BlobStore {
+        &self.inner.blobs
+    }
+
+    pub fn operations(&self) -> &OperationInterface {
+        &self.inner.operations
+    }
+
+    pub fn workspace_sync(&self) -> &WorkspaceSyncInterface {
+        &self.inner.workspace_sync
+    }
+
     pub fn identity(&self) -> &IdentityInterface {
         &self.inner.identity
     }
 
     pub fn models(&self) -> &ModelsInterface {
         &self.inner.models
+    }
+
+    pub fn projects(&self) -> &ProjectsInterface {
+        &self.inner.projects
     }
 }
 

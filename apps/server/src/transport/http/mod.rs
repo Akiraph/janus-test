@@ -1,8 +1,12 @@
 mod auth;
+mod conditions;
 pub mod dto;
+mod git;
 mod handlers;
 mod models;
+mod operations;
 mod problem;
+mod projects;
 mod request_id;
 mod sse;
 
@@ -30,8 +34,17 @@ pub use problem::Problem;
         auth::regenerate_recovery_codes, auth::recovery_exchange,
         auth::recovery_passkey_options, auth::recovery_passkey_complete,
         models::providers, models::create_provider, models::update_provider,
-        models::delete_provider, models::probe_provider, models::models,
-        models::create_model, models::update_model, models::delete_model, models::set_failover
+        models::delete_provider, models::probe_provider,
+        projects::list_projects, projects::create_project, projects::get_project,
+        projects::update_project, projects::delete_project, projects::retry_project,
+        projects::list_credentials, projects::create_credential,
+        projects::get_credential, projects::delete_credential, projects::probe_credential,
+        projects::file_meta, projects::file_content, projects::save_text,
+        projects::file_tree, projects::move_file, projects::delete_file,
+        git::git_status, git::git_diff, git::git_log, git::git_branches, git::git_remotes,
+        git::git_fetch, git::git_stage, git::git_unstage, git::git_commit, git::git_push,
+        git::git_update,
+        operations::get_operation
     ),
     components(schemas(
         dto::LiveResponse,
@@ -61,13 +74,37 @@ pub use problem::Problem;
         crate::modules::models::interface::ProviderKind,
         crate::modules::models::interface::ProbeResult,
         crate::modules::models::interface::ProbeStatus,
-        crate::modules::models::interface::ModelInput,
-        crate::modules::models::interface::ModelView,
-        crate::modules::models::interface::ContextWindow,
-        crate::modules::models::interface::FailoverInput,
-        crate::modules::models::interface::FailoverView,
+        crate::modules::models::interface::EmbeddedModelInput,
+        crate::modules::models::interface::EmbeddedModelView,
         problem::Problem,
-        crate::platform::events::EventEnvelope
+        crate::platform::events::EventEnvelope,
+        crate::modules::projects::interface::CreateProjectInput,
+        crate::modules::projects::interface::RepositoryInput,
+        crate::modules::projects::interface::ProjectView,
+        crate::modules::projects::interface::RepositoryView,
+        crate::modules::projects::interface::RepoAccess,
+        crate::modules::projects::interface::CreateGithubCredentialInput,
+        crate::modules::projects::interface::GithubCredentialView,
+        crate::modules::projects::interface::CredentialProbeResult,
+        crate::modules::projects::interface::SaveTextInput,
+        crate::modules::projects::interface::FileMetaView,
+        crate::modules::projects::interface::FileTreeView,
+        crate::modules::projects::interface::MoveFileInput,
+        crate::modules::projects::interface::DeleteFileInput,
+        crate::modules::projects::interface::RetryProjectInput,
+        crate::platform::operations::OperationView,
+        crate::platform::operations::OperationStatus,
+        crate::modules::workspace_sync::interface::RevisionRef,
+        projects::UpdateProjectRequest,
+        git::GitStatusView,
+        git::GitLogEntryView,
+        git::GitLogResponse,
+        git::DiffViewParam,
+        git::GitFetchRequest,
+        git::GitStageRequest,
+        git::GitCommitRequest,
+        git::GitPushRequest,
+        git::GitUpdateRequest
     )),
     tags((name = "system", description = "Janus system probes"))
 )]
@@ -128,14 +165,82 @@ pub fn router(state: AppState) -> Router {
             post(models::probe_provider),
         )
         .route(
-            "/api/v1/models",
-            get(models::models).post(models::create_model),
+            "/api/v1/projects",
+            get(projects::list_projects).post(projects::create_project),
         )
         .route(
-            "/api/v1/models/{id}",
-            patch(models::update_model).delete(models::delete_model),
+            "/api/v1/projects/{id}",
+            get(projects::get_project)
+                .patch(projects::update_project)
+                .delete(projects::delete_project),
         )
-        .route("/api/v1/models/{id}/failover", put(models::set_failover))
+        .route(
+            "/api/v1/projects/{id}/retry",
+            post(projects::retry_project),
+        )
+        .route("/api/v1/projects/{id}/files/meta", get(projects::file_meta))
+        .route(
+            "/api/v1/projects/{id}/files/content",
+            get(projects::file_content),
+        )
+        .route("/api/v1/projects/{id}/files/text", put(projects::save_text))
+        .route(
+            "/api/v1/projects/{id}/files/tree",
+            get(projects::file_tree),
+        )
+        .route(
+            "/api/v1/projects/{id}/files/move",
+            post(projects::move_file),
+        )
+        .route(
+            "/api/v1/projects/{id}/files",
+            axum::routing::delete(projects::delete_file),
+        )
+        .route(
+            "/api/v1/github-credentials",
+            get(projects::list_credentials).post(projects::create_credential),
+        )
+        .route(
+            "/api/v1/github-credentials/{id}",
+            get(projects::get_credential).delete(projects::delete_credential),
+        )
+        .route(
+            "/api/v1/github-credentials/{id}/probe",
+            post(projects::probe_credential),
+        )
+        // TODO(M2 follow-up): PATCH /api/v1/github-credentials/{id} for PAT
+        // rotation. M2 exposes list+create only; PAT replacement requires an
+        // update_credential path on the Module that re-encrypts the PAT.
+        .route("/api/v1/operations/{id}", get(operations::get_operation))
+        .route("/api/v1/projects/{id}/git/status", get(git::git_status))
+        .route("/api/v1/projects/{id}/git/diff", get(git::git_diff))
+        .route("/api/v1/projects/{id}/git/log", get(git::git_log))
+        .route("/api/v1/projects/{id}/git/branches", get(git::git_branches))
+        .route("/api/v1/projects/{id}/git/remotes", get(git::git_remotes))
+        .route(
+            "/api/v1/projects/{id}/git/commands/fetch",
+            post(git::git_fetch),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/commands/stage",
+            post(git::git_stage),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/commands/unstage",
+            post(git::git_unstage),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/commands/commit",
+            post(git::git_commit),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/commands/push",
+            post(git::git_push),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/commands/update",
+            post(git::git_update),
+        )
         .layer(middleware::from_fn(request_id::middleware))
         .with_state(state)
 }

@@ -164,6 +164,54 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/github-credentials": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_credentials"];
+    put?: never;
+    post: operations["create_credential"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/github-credentials/{id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_credential"];
+    put?: never;
+    post?: never;
+    delete: operations["delete_credential"];
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/github-credentials/{id}/probe": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["probe_credential"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/me": {
     parameters: {
       query?: never;
@@ -308,23 +356,55 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v1/models": {
+  "/api/v1/operations/{id}": {
     parameters: {
       query?: never;
       header?: never;
       path?: never;
       cookie?: never;
     };
-    get: operations["models"];
+    get: operations["get_operation"];
     put?: never;
-    post: operations["create_model"];
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
     patch?: never;
     trace?: never;
   };
-  "/api/v1/models/{id}": {
+  "/api/v1/projects": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_projects"];
+    put?: never;
+    post: operations["create_project"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_project"];
+    put?: never;
+    post?: never;
+    delete: operations["delete_project"];
+    options?: never;
+    head?: never;
+    patch: operations["update_project"];
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/files": {
     parameters: {
       query?: never;
       header?: never;
@@ -334,13 +414,45 @@ export interface paths {
     get?: never;
     put?: never;
     post?: never;
-    delete: operations["delete_model"];
+    delete: operations["delete_file"];
     options?: never;
     head?: never;
-    patch: operations["update_model"];
+    patch?: never;
     trace?: never;
   };
-  "/api/v1/models/{id}/failover": {
+  "/api/v1/projects/{id}/files/content": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["file_content"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/files/meta": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["file_meta"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/files/move": {
     parameters: {
       query?: never;
       header?: never;
@@ -348,8 +460,232 @@ export interface paths {
       cookie?: never;
     };
     get?: never;
-    put: operations["set_failover"];
+    put?: never;
+    post: operations["move_file"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/files/text": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put: operations["save_text"];
     post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/files/tree": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["file_tree"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/branches": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["git_branches"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/commands/commit": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["git_commit"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/commands/fetch": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["git_fetch"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/commands/push": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["git_push"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/commands/stage": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["git_stage"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/commands/unstage": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["git_unstage"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/commands/update": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["git_update"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/diff": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["git_diff"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/log": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["git_log"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/remotes": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["git_remotes"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/status": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["git_status"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/retry": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["retry_project"];
     delete?: never;
     options?: never;
     head?: never;
@@ -440,37 +776,90 @@ export interface components {
       ceremony_id: string;
       public_key: unknown;
     };
-    /** @enum {string} */
-    ContextWindow: "200k" | "1m";
+    CreateGithubCredentialInput: {
+      github_host: string;
+      name: string;
+      pat?: string | null;
+    };
+    CreateProjectInput: {
+      name: string;
+      repository: components["schemas"]["RepositoryInput"];
+    };
+    CredentialProbeResult: {
+      detail: string;
+      /** Format: int32 */
+      http_status?: number | null;
+      status: string;
+    };
     DataResponse_CeremonyOptions: {
       data: {
         ceremony_id: string;
         public_key: unknown;
       };
     };
-    DataResponse_FailoverView: {
+    DataResponse_CredentialProbeResult: {
       data: {
-        candidate_ids: string[];
-        enabled: boolean;
-        warnings: string[];
+        detail: string;
+        /** Format: int32 */
+        http_status?: number | null;
+        status: string;
       };
     };
-    DataResponse_ModelView: {
+    DataResponse_FileMetaView: {
       data: {
-        context_window: components["schemas"]["ContextWindow"];
-        created_at: string;
-        display_name: string;
-        enabled: boolean;
-        failover: components["schemas"]["FailoverView"];
-        id: string;
+        editable: boolean;
+        main_revision?: string | null;
+        mime?: string | null;
+        path: string;
+        /** Format: int64 */
+        size: number;
+      };
+    };
+    DataResponse_GitLogResponse: {
+      data: {
+        entries: components["schemas"]["GitLogEntryView"][];
+      };
+    };
+    DataResponse_GitStatusView: {
+      data: {
         /** Format: int32 */
-        max_output_tokens: number;
-        provider_id: string;
-        reasoning_effort?: string | null;
-        supports_images: boolean;
-        supports_tools: boolean;
+        ahead: number;
+        /** Format: int32 */
+        behind: number;
+        branch?: string | null;
+        head_sha?: string | null;
+        index: string[];
+        untracked: string[];
+        working: string[];
+      };
+    };
+    DataResponse_GithubCredentialView: {
+      data: {
+        created_at: string;
+        github_host: string;
+        id: string;
+        name: string;
+        pat_fingerprint?: string | null;
+        pat_is_set: boolean;
         updated_at: string;
-        upstream_model_id: string;
+        version: string;
+      };
+    };
+    DataResponse_OperationView: {
+      data: {
+        correlation_id: string;
+        created_at: string;
+        current_step?: string | null;
+        id: string;
+        kind: string;
+        problem?: unknown;
+        progress?: unknown;
+        result?: unknown;
+        status: string;
+        target_id?: string | null;
+        target_kind: string;
+        updated_at: string;
+        version: string;
       };
     };
     DataResponse_OwnerView: {
@@ -500,39 +889,67 @@ export interface components {
         status: components["schemas"]["ProbeStatus"];
       };
     };
+    DataResponse_ProjectView: {
+      data: {
+        created_at: string;
+        current_branch?: string | null;
+        default_model_id?: string | null;
+        git_state_version?: string | null;
+        id: string;
+        main_revision?: string | null;
+        name: string;
+        repository: components["schemas"]["RepositoryView"];
+        restrictions: string[];
+        state: string;
+        updated_at: string;
+        version: string;
+      };
+    };
     DataResponse_ProviderView: {
       data: {
         api_key_fingerprint?: string | null;
         api_key_is_set: boolean;
+        api_key_preview?: string | null;
         base_url: string;
         created_at: string;
         display_name: string;
         enabled: boolean;
         id: string;
         kind: components["schemas"]["ProviderKind"];
-        supports_1m: boolean;
+        models: components["schemas"]["EmbeddedModelView"][];
         updated_at: string;
       };
+    };
+    DataResponse_RevisionRef: {
+      /**
+       * @description A Content Revision identity. Exposed to clients as an opaque `v_01J...`
+       *     string via `main_revision` on the Project projection; used as an `If-Match`
+       *     condition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of
+       *     half-writing.
+       */
+      data: string;
     };
     DataResponse_String: {
       data: string;
     };
-    DataResponse_Vec_ModelView: {
+    DataResponse_Vec_FileTreeView: {
       data: {
-        context_window: components["schemas"]["ContextWindow"];
+        kind: string;
+        path: string;
+        /** Format: int64 */
+        size: number;
+      }[];
+    };
+    DataResponse_Vec_GithubCredentialView: {
+      data: {
         created_at: string;
-        display_name: string;
-        enabled: boolean;
-        failover: components["schemas"]["FailoverView"];
+        github_host: string;
         id: string;
-        /** Format: int32 */
-        max_output_tokens: number;
-        provider_id: string;
-        reasoning_effort?: string | null;
-        supports_images: boolean;
-        supports_tools: boolean;
+        name: string;
+        pat_fingerprint?: string | null;
+        pat_is_set: boolean;
         updated_at: string;
-        upstream_model_id: string;
+        version: string;
       }[];
     };
     DataResponse_Vec_PasskeyView: {
@@ -543,17 +960,34 @@ export interface components {
         name: string;
       }[];
     };
+    DataResponse_Vec_ProjectView: {
+      data: {
+        created_at: string;
+        current_branch?: string | null;
+        default_model_id?: string | null;
+        git_state_version?: string | null;
+        id: string;
+        main_revision?: string | null;
+        name: string;
+        repository: components["schemas"]["RepositoryView"];
+        restrictions: string[];
+        state: string;
+        updated_at: string;
+        version: string;
+      }[];
+    };
     DataResponse_Vec_ProviderView: {
       data: {
         api_key_fingerprint?: string | null;
         api_key_is_set: boolean;
+        api_key_preview?: string | null;
         base_url: string;
         created_at: string;
         display_name: string;
         enabled: boolean;
         id: string;
         kind: components["schemas"]["ProviderKind"];
-        supports_1m: boolean;
+        models: components["schemas"]["EmbeddedModelView"][];
         updated_at: string;
       }[];
     };
@@ -564,6 +998,31 @@ export interface components {
       engine: string;
       journal_mode: string;
       ready: boolean;
+    };
+    DeleteFileInput: {
+      expected_main_revision?: string | null;
+      path: string;
+      recursive?: boolean;
+    };
+    /** @enum {string} */
+    DiffViewParam: "working_vs_index" | "index_vs_head" | "working_vs_head";
+    /**
+     * @description A model embedded inside its provider. Stored as an element of the
+     *     provider's `models_json` array; no standalone identity outside the parent.
+     */
+    EmbeddedModelInput: {
+      display_name: string;
+      enabled?: boolean;
+      supports_1m?: boolean;
+      supports_images?: boolean;
+      upstream_model_id: string;
+    };
+    EmbeddedModelView: {
+      display_name: string;
+      enabled: boolean;
+      supports_1m: boolean;
+      supports_images: boolean;
+      upstream_model_id: string;
     };
     EventEnvelope: {
       actor: unknown;
@@ -582,14 +1041,66 @@ export interface components {
       max_cursor: string;
       min_cursor: string;
     };
-    FailoverInput: {
-      candidate_ids: string[];
-      enabled: boolean;
+    FileMetaView: {
+      editable: boolean;
+      main_revision?: string | null;
+      mime?: string | null;
+      path: string;
+      /** Format: int64 */
+      size: number;
     };
-    FailoverView: {
-      candidate_ids: string[];
-      enabled: boolean;
-      warnings: string[];
+    FileTreeView: {
+      kind: string;
+      path: string;
+      /** Format: int64 */
+      size: number;
+    };
+    GitCommitRequest: {
+      message: string;
+    };
+    GitFetchRequest: {
+      remote: string;
+    };
+    GitLogEntryView: {
+      author: string;
+      message: string;
+      parents: string[];
+      sha: string;
+    };
+    GitLogResponse: {
+      entries: components["schemas"]["GitLogEntryView"][];
+    };
+    GitPushRequest: {
+      branch: string;
+      remote: string;
+    };
+    GitStageRequest: {
+      paths?: string[];
+    };
+    GitStatusView: {
+      /** Format: int32 */
+      ahead: number;
+      /** Format: int32 */
+      behind: number;
+      branch?: string | null;
+      head_sha?: string | null;
+      index: string[];
+      untracked: string[];
+      working: string[];
+    };
+    GitUpdateRequest: {
+      branch: string;
+      remote: string;
+    };
+    GithubCredentialView: {
+      created_at: string;
+      github_host: string;
+      id: string;
+      name: string;
+      pat_fingerprint?: string | null;
+      pat_is_set: boolean;
+      updated_at: string;
+      version: string;
     };
     InitializeOptionsRequest: {
       display_name: string;
@@ -599,33 +1110,32 @@ export interface components {
       status: string;
       version: string;
     };
-    ModelInput: {
-      context_window?: components["schemas"]["ContextWindow"];
-      display_name: string;
-      enabled?: boolean;
-      /** Format: int32 */
-      max_output_tokens: number;
-      provider_id: string;
-      reasoning_effort?: string | null;
-      supports_images?: boolean;
-      supports_tools?: boolean;
-      upstream_model_id: string;
+    MoveFileInput: {
+      expected_main_revision?: string | null;
+      from: string;
+      to: string;
     };
-    ModelView: {
-      context_window: components["schemas"]["ContextWindow"];
+    /**
+     * @description Operation status. `needs_attention` means execution stopped at a decidable
+     *     state requiring an explicit follow-up command (e.g. a Git Update Conflict),
+     *     not "still running" or "unknown failure".
+     * @enum {string}
+     */
+    OperationStatus: "queued" | "running" | "succeeded" | "failed" | "canceled" | "needs_attention";
+    OperationView: {
+      correlation_id: string;
       created_at: string;
-      display_name: string;
-      enabled: boolean;
-      failover: components["schemas"]["FailoverView"];
+      current_step?: string | null;
       id: string;
-      /** Format: int32 */
-      max_output_tokens: number;
-      provider_id: string;
-      reasoning_effort?: string | null;
-      supports_images: boolean;
-      supports_tools: boolean;
+      kind: string;
+      problem?: unknown;
+      progress?: unknown;
+      result?: unknown;
+      status: string;
+      target_id?: string | null;
+      target_kind: string;
       updated_at: string;
-      upstream_model_id: string;
+      version: string;
     };
     OwnerView: {
       authentication_mode: components["schemas"]["AuthenticationMode"];
@@ -663,26 +1173,41 @@ export interface components {
       title: string;
       type: string;
     };
+    ProjectView: {
+      created_at: string;
+      current_branch?: string | null;
+      default_model_id?: string | null;
+      git_state_version?: string | null;
+      id: string;
+      main_revision?: string | null;
+      name: string;
+      repository: components["schemas"]["RepositoryView"];
+      restrictions: string[];
+      state: string;
+      updated_at: string;
+      version: string;
+    };
     ProviderInput: {
       api_key?: string | null;
       base_url: string;
       display_name: string;
       enabled?: boolean;
       kind: components["schemas"]["ProviderKind"];
-      supports_1m?: boolean;
+      models?: components["schemas"]["EmbeddedModelInput"][];
     };
     /** @enum {string} */
-    ProviderKind: "anthropic" | "openai_compatible";
+    ProviderKind: "anthropic" | "openai_chat" | "openai_responses";
     ProviderView: {
       api_key_fingerprint?: string | null;
       api_key_is_set: boolean;
+      api_key_preview?: string | null;
       base_url: string;
       created_at: string;
       display_name: string;
       enabled: boolean;
       id: string;
       kind: components["schemas"]["ProviderKind"];
-      supports_1m: boolean;
+      models: components["schemas"]["EmbeddedModelView"][];
       updated_at: string;
     };
     PublicLimits: {
@@ -705,11 +1230,42 @@ export interface components {
     RenamePasskeyRequest: {
       name: string;
     };
+    /** @enum {string} */
+    RepoAccess: "public_https" | "github_private";
+    RepositoryInput: {
+      access: components["schemas"]["RepoAccess"];
+      branch?: string | null;
+      github_credential_id?: string | null;
+      url: string;
+    };
+    RepositoryView: {
+      access: components["schemas"]["RepoAccess"];
+      branch?: string | null;
+      /** @description Only present for `github_private`; never exposes the PAT. */
+      github_credential_id?: string | null;
+      url: string;
+    };
+    RetryProjectInput: {
+      branch?: string | null;
+      github_credential_id?: string | null;
+    };
+    /**
+     * @description A Content Revision identity. Exposed to clients as an opaque `v_01J...`
+     *     string via `main_revision` on the Project projection; used as an `If-Match`
+     *     condition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of
+     *     half-writing.
+     */
+    RevisionRef: string;
     RuntimeCapability: {
       id: string;
       reason_code?: null | components["schemas"]["CapabilityReason"];
       scope: string;
       state: components["schemas"]["CapabilityState"];
+    };
+    SaveTextInput: {
+      content: string;
+      expected_main_revision?: string | null;
+      path: string;
     };
     SystemInfo: {
       capabilities: components["schemas"]["RuntimeCapability"][];
@@ -723,6 +1279,11 @@ export interface components {
     };
     SystemInfoResponse: {
       data: components["schemas"]["SystemInfo"];
+    };
+    UpdateProjectRequest: {
+      /** @description `null` clears the default model; omit to keep the current value. */
+      default_model_id?: string | null;
+      name?: string | null;
     };
   };
   responses: never;
@@ -1020,6 +1581,192 @@ export interface operations {
         };
       };
       409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_credentials: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_GithubCredentialView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  create_credential: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CreateGithubCredentialInput"];
+      };
+    };
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_GithubCredentialView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  get_credential: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Credential id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_GithubCredentialView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  delete_credential: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Credential id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  probe_credential: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Credential id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_CredentialProbeResult"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
         headers: {
           [name: string]: unknown;
         };
@@ -1377,9 +2124,50 @@ export interface operations {
       };
     };
   };
-  models: {
+  get_operation: {
     parameters: {
       query?: never;
+      header?: never;
+      path: {
+        /** @description Operation id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_projects: {
+    parameters: {
+      query?: {
+        /** @description Page size (1-100, default 50) */
+        limit?: number;
+      };
       header?: never;
       path?: never;
       cookie?: never;
@@ -1391,7 +2179,7 @@ export interface operations {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_Vec_ModelView"];
+          "application/json": components["schemas"]["DataResponse_Vec_ProjectView"];
         };
       };
       401: {
@@ -1404,7 +2192,7 @@ export interface operations {
       };
     };
   };
-  create_model: {
+  create_project: {
     parameters: {
       query?: never;
       header?: never;
@@ -1413,16 +2201,32 @@ export interface operations {
     };
     requestBody: {
       content: {
-        "application/json": components["schemas"]["ModelInput"];
+        "application/json": components["schemas"]["CreateProjectInput"];
       };
     };
     responses: {
-      201: {
+      202: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_ModelView"];
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
         };
       };
       422: {
@@ -1435,16 +2239,681 @@ export interface operations {
       };
     };
   };
-  delete_model: {
+  get_project: {
     parameters: {
       query?: never;
       header?: never;
       path: {
+        /** @description Project id */
         id: string;
       };
       cookie?: never;
     };
     requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_ProjectView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  delete_project: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      428: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  update_project: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpdateProjectRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_ProjectView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      428: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  delete_file: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["DeleteFileInput"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_RevisionRef"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  file_content: {
+    parameters: {
+      query: {
+        /** @description Workspace-relative file path */
+        path: string;
+      };
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Raw file bytes */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/octet-stream": unknown;
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  file_meta: {
+    parameters: {
+      query: {
+        /** @description Workspace-relative file path */
+        path: string;
+      };
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_FileMetaView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  move_file: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["MoveFileInput"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_RevisionRef"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  save_text: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SaveTextInput"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_RevisionRef"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  file_tree: {
+    parameters: {
+      query?: {
+        /** @description Workspace-relative directory; empty = root */
+        path?: string;
+      };
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_FileTreeView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_branches: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_String"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_commit: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["GitCommitRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_String"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_fetch: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["GitFetchRequest"];
+      };
+    };
+    responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_push: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["GitPushRequest"];
+      };
+    };
+    responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_stage: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["GitStageRequest"];
+      };
+    };
     responses: {
       204: {
         headers: {
@@ -1452,37 +2921,12 @@ export interface operations {
         };
         content?: never;
       };
-      404: {
+      401: {
         headers: {
           [name: string]: unknown;
         };
         content: {
           "application/json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  update_model: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["ModelInput"];
-      };
-    };
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_ModelView"];
         };
       };
       404: {
@@ -1493,29 +2937,351 @@ export interface operations {
           "application/json": components["schemas"]["Problem"];
         };
       };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
     };
   };
-  set_failover: {
+  git_unstage: {
     parameters: {
       query?: never;
       header?: never;
       path: {
+        /** @description Project id */
         id: string;
       };
       cookie?: never;
     };
     requestBody: {
       content: {
-        "application/json": components["schemas"]["FailoverInput"];
+        "application/json": components["schemas"]["GitStageRequest"];
       };
     };
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_update: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["GitUpdateRequest"];
+      };
+    };
+    responses: {
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      501: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_diff: {
+    parameters: {
+      query?: {
+        /** @description Diff view (working_vs_index | index_vs_head | working_vs_head; default working_vs_index) */
+        view?: components["schemas"]["DiffViewParam"];
+      };
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description Unified diff text */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "text/plain": unknown;
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_log: {
+    parameters: {
+      query?: {
+        /** @description Number of entries (1-200, default 50) */
+        limit?: number;
+      };
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
     responses: {
       200: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_FailoverView"];
+          "application/json": components["schemas"]["DataResponse_GitLogResponse"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_remotes: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_String"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  git_status: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_GitStatusView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  retry_project: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["RetryProjectInput"];
+      };
+    };
+    responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
         };
       };
       422: {

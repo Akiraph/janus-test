@@ -6,9 +6,23 @@ export type CeremonyOptions = components["schemas"]["CeremonyOptions"];
 export type OwnerView = components["schemas"]["OwnerView"];
 export type ProviderView = components["schemas"]["ProviderView"];
 export type ProviderInput = components["schemas"]["ProviderInput"];
-export type ModelView = components["schemas"]["ModelView"];
-export type ModelInput = components["schemas"]["ModelInput"];
+export type EmbeddedModelInput = components["schemas"]["EmbeddedModelInput"];
+export type EmbeddedModelView = components["schemas"]["EmbeddedModelView"];
 export type PasskeyView = components["schemas"]["PasskeyView"];
+export type ProjectView = components["schemas"]["ProjectView"];
+export type CreateProjectInput = components["schemas"]["CreateProjectInput"];
+export type RetryProjectInput = components["schemas"]["RetryProjectInput"];
+export type OperationView = components["schemas"]["OperationView"];
+export type GithubCredentialView = components["schemas"]["GithubCredentialView"];
+export type CreateGithubCredentialInput = components["schemas"]["CreateGithubCredentialInput"];
+export type FileMetaView = components["schemas"]["FileMetaView"];
+export type FileTreeView = components["schemas"]["FileTreeView"];
+export type GitStatusView = components["schemas"]["GitStatusView"];
+export type GitLogEntryView = components["schemas"]["GitLogEntryView"];
+export type GitLogResponse = components["schemas"]["GitLogResponse"];
+export type SaveTextInput = components["schemas"]["SaveTextInput"];
+export type RepositoryInput = components["schemas"]["RepositoryInput"];
+export type RepoAccess = components["schemas"]["RepoAccess"];
 let csrfToken: string | undefined;
 
 export class ApiError extends Error {
@@ -127,6 +141,15 @@ export async function createProvider(input: ProviderInput): Promise<ProviderView
     )
   ).data;
 }
+export async function updateProvider(id: string, input: ProviderInput): Promise<ProviderView> {
+  return (
+    await requestJson<{ data: ProviderView }>(
+      `/api/v1/model-providers/${id}`,
+      { method: "PATCH", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
 export async function deleteProvider(id: string): Promise<void> {
   await requestJson(`/api/v1/model-providers/${id}`, { method: "DELETE" }, () => true);
 }
@@ -139,29 +162,273 @@ export async function probeProvider(id: string): Promise<components["schemas"]["
     )
   ).data;
 }
-export async function getModels(): Promise<ModelView[]> {
-  return (await requestJson<{ data: ModelView[] }>("/api/v1/models", {}, isDataResponse)).data;
-}
-export async function createModel(input: ModelInput): Promise<ModelView> {
+
+export async function listProjects(limit = 50): Promise<ProjectView[]> {
+  const query = new URLSearchParams({ limit: String(limit) });
   return (
-    await requestJson<{ data: ModelView }>(
-      "/api/v1/models",
+    await requestJson<{ data: ProjectView[] }>(
+      `/api/v1/projects?${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function createProject(
+  input: CreateProjectInput,
+  idempotencyKey: string,
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      "/api/v1/projects",
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getProject(id: string): Promise<ProjectView> {
+  return (
+    await requestJson<{ data: ProjectView }>(
+      `/api/v1/projects/${id}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function retryProject(
+  id: string,
+  input: RetryProjectInput = {},
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/projects/${id}/retry`,
       { method: "POST", body: JSON.stringify(input) },
       isDataResponse,
     )
   ).data;
 }
-export async function deleteModel(id: string): Promise<void> {
-  await requestJson(`/api/v1/models/${id}`, { method: "DELETE" }, () => true);
+
+export async function deleteProject(
+  id: string,
+  ifMatch: string,
+  idempotencyKey: string,
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/projects/${id}`,
+      {
+        method: "DELETE",
+        headers: {
+          "If-Match": ifMatch,
+          "Idempotency-Key": idempotencyKey,
+        },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function listGithubCredentials(): Promise<GithubCredentialView[]> {
+  return (
+    await requestJson<{ data: GithubCredentialView[] }>(
+      "/api/v1/github-credentials",
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function createGithubCredential(
+  input: CreateGithubCredentialInput,
+): Promise<GithubCredentialView> {
+  return (
+    await requestJson<{ data: GithubCredentialView }>(
+      "/api/v1/github-credentials",
+      { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function listFileTree(projectId: string, path?: string): Promise<FileTreeView[]> {
+  const query = new URLSearchParams();
+  if (path) query.set("path", path);
+  const suffix = query.size > 0 ? `?${query}` : "";
+  return (
+    await requestJson<{ data: FileTreeView[] }>(
+      `/api/v1/projects/${projectId}/files/tree${suffix}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getFileMeta(projectId: string, path: string): Promise<FileMetaView> {
+  const query = new URLSearchParams({ path });
+  return (
+    await requestJson<{ data: FileMetaView }>(
+      `/api/v1/projects/${projectId}/files/meta?${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+/** Raw file bytes decoded as text. CodeMirror is optional; M2 uses native controls. */
+export async function getFileContentText(projectId: string, path: string): Promise<string> {
+  const query = new URLSearchParams({ path });
+  const response = await fetch(
+    `/api/v1/projects/${projectId}/files/content?${query}`,
+    requestInit("GET"),
+  );
+  if (!response.ok) throw await toApiError(response);
+  return response.text();
+}
+
+export async function saveFileText(projectId: string, input: SaveTextInput): Promise<string> {
+  return (
+    await requestJson<{ data: string }>(
+      `/api/v1/projects/${projectId}/files/text`,
+      { method: "PUT", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitStatus(projectId: string): Promise<GitStatusView> {
+  return (
+    await requestJson<{ data: GitStatusView }>(
+      `/api/v1/projects/${projectId}/git/status`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitLog(projectId: string, limit = 50): Promise<GitLogEntryView[]> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return (
+    await requestJson<{ data: GitLogResponse }>(
+      `/api/v1/projects/${projectId}/git/log?${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data.entries;
+}
+
+export async function gitBranches(projectId: string): Promise<string[]> {
+  return (
+    await requestJson<{ data: string[] }>(
+      `/api/v1/projects/${projectId}/git/branches`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitRemotes(projectId: string): Promise<string[]> {
+  return (
+    await requestJson<{ data: string[] }>(
+      `/api/v1/projects/${projectId}/git/remotes`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitStage(projectId: string, paths: string[]): Promise<void> {
+  await requestJson(
+    `/api/v1/projects/${projectId}/git/commands/stage`,
+    { method: "POST", body: JSON.stringify({ paths }) },
+    () => true,
+  );
+}
+
+export async function gitUnstage(projectId: string, paths: string[]): Promise<void> {
+  await requestJson(
+    `/api/v1/projects/${projectId}/git/commands/unstage`,
+    { method: "POST", body: JSON.stringify({ paths }) },
+    () => true,
+  );
+}
+
+export async function gitCommit(projectId: string, message: string): Promise<string> {
+  return (
+    await requestJson<{ data: string }>(
+      `/api/v1/projects/${projectId}/git/commands/commit`,
+      { method: "POST", body: JSON.stringify({ message }) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitFetch(
+  projectId: string,
+  remote: string,
+  idempotencyKey: string,
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/projects/${projectId}/git/commands/fetch`,
+      {
+        method: "POST",
+        body: JSON.stringify({ remote }),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitPush(
+  projectId: string,
+  remote: string,
+  branch: string,
+  idempotencyKey: string,
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/projects/${projectId}/git/commands/push`,
+      {
+        method: "POST",
+        body: JSON.stringify({ remote, branch }),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getOperation(id: string): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/operations/${id}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
 }
 
 async function getJson<T>(path: string, decode: (value: unknown) => value is T): Promise<T> {
   return requestJson(path, { method: "GET" }, decode);
 }
 
-function requestInit(method = "GET", body?: string | object): RequestInit {
+function requestInit(
+  method = "GET",
+  body?: string | object,
+  extraHeaders?: Record<string, string>,
+): RequestInit {
   const headers = new Headers({ "X-Request-Id": crypto.randomUUID(), Accept: "application/json" });
   if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  if (extraHeaders) {
+    for (const [key, value] of Object.entries(extraHeaders)) headers.set(key, value);
+  }
   if (body !== undefined) {
     headers.set("Content-Type", "application/json");
     body = typeof body === "string" ? body : JSON.stringify(body);
@@ -173,10 +440,10 @@ function requestInit(method = "GET", body?: string | object): RequestInit {
 
 async function requestJson<T>(
   path: string,
-  init: { method?: string; body?: string },
+  init: { method?: string; body?: string; headers?: Record<string, string> },
   decode: (value: unknown) => boolean,
 ): Promise<T> {
-  const response = await fetch(path, requestInit(init.method ?? "GET", init.body));
+  const response = await fetch(path, requestInit(init.method ?? "GET", init.body, init.headers));
   if (!response.ok) throw await toApiError(response);
   if (response.status === 204) return undefined as T;
   const value: unknown = await response.json();

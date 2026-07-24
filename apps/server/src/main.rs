@@ -1,13 +1,14 @@
 use anyhow::Context;
 use janus_server::{
     AppState,
+    application::workers,
     config::Config,
-    platform::{events::NewEvent, id::CorrelationId},
+    platform::{events::NewEvent, id::CorrelationId, operations::OperationStatus},
     router,
 };
 use serde_json::json;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -20,6 +21,33 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("invalid Janus configuration")?;
     let bind = config.bind;
     let state = AppState::initialize(config).await?;
+
+    // Startup recovery (`DAT-RECOVER-01` subset): clean leftover incoming temp
+    // objects from a crashed write, and mark operations left `running` by a
+    // prior process as `needs_attention` so a client can re-issue them rather
+    // than the control plane guessing whether a half-done clone happened.
+    if let Err(error) = state.blobs().clean_incoming().await {
+        warn!(%error, "clean incoming objects on startup");
+    }
+    for op_id in state
+        .operations()
+        .stale_running()
+        .await
+        .unwrap_or_default()
+    {
+        warn!(%op_id, "marking stale running operation as needs_attention");
+        let _ = state
+            .operations()
+            .finish(
+                &op_id,
+                OperationStatus::NeedsAttention,
+                None,
+                Some(json!({"code": "OPERATION_INTERRUPTED", "detail": "process restarted while operation was running"})),
+                CorrelationId::new(),
+            )
+            .await;
+    }
+
     state
         .events()
         .append(NewEvent {
@@ -32,6 +60,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .context("record system startup event")?;
+
+    workers::spawn(state.clone());
+
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind Janus listener at {bind}"))?;

@@ -1,7 +1,7 @@
 name = "projects"
 public_root = "interface.rs"
-owned_tables = []
-publishes = []
-allowed_module_dependencies = []
+owned_tables = ["projects", "github_credentials", "project_git_state", "git_update_conflicts", "git_update_conflict_paths"]
+publishes = ["project.changed", "project.main_revision_changed", "git.state_changed", "git.update_conflict_changed"]
+allowed_module_dependencies = ["workspace-sync"]
 specs = []
 tests = []

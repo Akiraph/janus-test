@@ -16,6 +16,11 @@ pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[
     ("system.started", 1, "platform"),
     ("identity.changed", 1, "identity"),
     ("model_config.changed", 1, "models"),
+    ("operation.changed", 1, "platform"),
+    ("project.changed", 1, "projects"),
+    ("project.main_revision_changed", 1, "projects"),
+    ("git.state_changed", 1, "projects"),
+    ("git.update_conflict_changed", 1, "projects"),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

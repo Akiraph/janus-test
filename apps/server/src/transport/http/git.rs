@@ -1,0 +1,586 @@
+//! HTTP transport for user Git queries and commands under a Project's Main
+//! Workspace (`/api/v1/projects/{id}/git/...`).
+//!
+//! Queries (`status`/`diff`/`log`/`branches`/`remotes`) are read-only and use
+//! `authenticate`. Commands under `/git/commands/*` are user-exclusive writes
+//! (`TST-GIT-03`): they use `authorized`, and the durable ones (`fetch`/`push`)
+//! return `202 + OperationView`. `stage`/`unstage`/`commit` are short synchronous
+//! commands. `update` is intentionally a `501` placeholder for M2 because the
+//! three-way conflict resolution flow lives in a later milestone.
+
+use axum::{
+    Extension, Json,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::{
+    AppState,
+    adapters::git::{DiffView, GitCredential, GitLogEntry, GitStatus},
+    modules::projects::interface::ProjectsError,
+    platform::id::CorrelationId,
+    transport::http::{
+        auth::{authenticate, authorized},
+        conditions::{RawBody, require_idempotency},
+        dto::DataResponse,
+        problem::Problem,
+        request_id::RequestContext,
+    },
+};
+
+// ----- Transport DTOs (adapters::git types do not derive ToSchema) --------
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GitStatusView {
+    pub head_sha: Option<String>,
+    pub branch: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub working: Vec<String>,
+    pub index: Vec<String>,
+    pub untracked: Vec<String>,
+}
+
+impl From<GitStatus> for GitStatusView {
+    fn from(status: GitStatus) -> Self {
+        Self {
+            head_sha: status.head_sha,
+            branch: status.branch,
+            ahead: status.ahead,
+            behind: status.behind,
+            working: status.working,
+            index: status.index,
+            untracked: status.untracked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GitLogEntryView {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub message: String,
+}
+
+impl From<GitLogEntry> for GitLogEntryView {
+    fn from(entry: GitLogEntry) -> Self {
+        Self {
+            sha: entry.sha,
+            parents: entry.parents,
+            author: entry.author,
+            message: entry.message,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GitLogResponse {
+    pub entries: Vec<GitLogEntryView>,
+}
+
+// ----- Query and request bodies -------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DiffQuery {
+    #[serde(default = "default_diff_view")]
+    pub view: DiffViewParam,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffViewParam {
+    WorkingVsIndex,
+    IndexVsHead,
+    WorkingVsHead,
+}
+
+impl DiffViewParam {
+    fn into_diff_view(self) -> DiffView {
+        match self {
+            Self::WorkingVsIndex => DiffView::WorkingVsIndex,
+            Self::IndexVsHead => DiffView::IndexVsHead,
+            Self::WorkingVsHead => DiffView::WorkingVsHead,
+        }
+    }
+}
+
+fn default_diff_view() -> DiffViewParam {
+    DiffViewParam::WorkingVsIndex
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct GitFetchRequest {
+    pub remote: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct GitStageRequest {
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct GitCommitRequest {
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct GitPushRequest {
+    pub remote: String,
+    pub branch: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[allow(dead_code)] // git_update returns 501 in M2; fields reserved for the follow-up milestone.
+pub struct GitUpdateRequest {
+    pub remote: String,
+    pub branch: String,
+}
+
+// ----- Git queries --------------------------------------------------------
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/status",
+    params(("id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, body = DataResponse<GitStatusView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn git_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DataResponse<GitStatusView>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let status = state
+        .projects()
+        .git_status(&auth.owner_id, &id)
+        .await
+        .map_err(problem)?;
+    Ok(Json(DataResponse {
+        data: status.into(),
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/diff",
+    params(
+        ("id" = String, Path, description = "Project id"),
+        ("view" = Option<DiffViewParam>, Query, description = "Diff view (working_vs_index | index_vs_head | working_vs_head; default working_vs_index)")
+    ),
+    responses(
+        (status = 200, description = "Unified diff text", content_type = "text/plain"),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn git_diff(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<DiffQuery>,
+) -> Result<Response, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let text = state
+        .projects()
+        .git_diff(&auth.owner_id, &id, query.view.into_diff_view())
+        .await
+        .map_err(problem)?;
+    let mut response = (StatusCode::OK, text).into_response();
+    if let Ok(value) = HeaderValue::from_str("text/plain; charset=utf-8") {
+        response.headers_mut().insert(CONTENT_TYPE, value);
+    }
+    Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/log",
+    params(
+        ("id" = String, Path, description = "Project id"),
+        ("limit" = Option<u32>, Query, description = "Number of entries (1-200, default 50)")
+    ),
+    responses(
+        (status = 200, body = DataResponse<GitLogResponse>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn git_log(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<DataResponse<GitLogResponse>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let limit = query.limit.unwrap_or(50);
+    let entries = state
+        .projects()
+        .git_log(&auth.owner_id, &id, limit)
+        .await
+        .map_err(problem)?;
+    let entries: Vec<GitLogEntryView> = entries.into_iter().map(GitLogEntryView::from).collect();
+    Ok(Json(DataResponse {
+        data: GitLogResponse { entries },
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/branches",
+    params(("id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, body = DataResponse<Vec<String>>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn git_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DataResponse<Vec<String>>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(DataResponse {
+        data: state
+            .projects()
+            .git_branches(&auth.owner_id, &id)
+            .await
+            .map_err(problem)?,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/remotes",
+    params(("id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, body = DataResponse<Vec<String>>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn git_remotes(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DataResponse<Vec<String>>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(DataResponse {
+        data: state
+            .projects()
+            .git_remotes(&auth.owner_id, &id)
+            .await
+            .map_err(problem)?,
+    }))
+}
+
+// ----- Git commands -------------------------------------------------------
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/commands/fetch",
+    params(("id" = String, Path, description = "Project id")),
+    request_body = GitFetchRequest,
+    responses(
+        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 422, body = Problem)
+    )
+)]
+pub async fn git_fetch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: RawBody,
+) -> Result<
+    (
+        StatusCode,
+        Json<DataResponse<crate::platform::operations::OperationView>>,
+    ),
+    Problem,
+> {
+    let auth = authorized(&state, &headers).await?;
+    let input: GitFetchRequest = serde_json::from_slice(body.as_slice()).map_err(|error| {
+        Problem::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+            "Validation failed",
+            error.to_string(),
+        )
+    })?;
+    let correlation_id = CorrelationId::new();
+    let _idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "POST",
+        &format!("/api/v1/projects/{id}/git/commands/fetch"),
+        body.as_slice(),
+    )?;
+    let operation = state
+        .projects()
+        .git_fetch(&auth.owner_id, &id, &input.remote, correlation_id)
+        .await
+        .map_err(problem)?;
+    Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/commands/stage",
+    params(("id" = String, Path, description = "Project id")),
+    request_body = GitStageRequest,
+    responses(
+        (status = 204),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 422, body = Problem)
+    )
+)]
+pub async fn git_stage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<GitStageRequest>,
+) -> Result<StatusCode, Problem> {
+    let auth = authorized(&state, &headers).await?;
+    state
+        .projects()
+        .git_stage(&auth.owner_id, &id, &input.paths)
+        .await
+        .map_err(problem)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/commands/unstage",
+    params(("id" = String, Path, description = "Project id")),
+    request_body = GitStageRequest,
+    responses(
+        (status = 204),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 422, body = Problem)
+    )
+)]
+pub async fn git_unstage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<GitStageRequest>,
+) -> Result<StatusCode, Problem> {
+    let auth = authorized(&state, &headers).await?;
+    state
+        .projects()
+        .git_unstage(&auth.owner_id, &id, &input.paths)
+        .await
+        .map_err(problem)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/commands/commit",
+    params(("id" = String, Path, description = "Project id")),
+    request_body = GitCommitRequest,
+    responses(
+        (status = 200, body = DataResponse<String>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 422, body = Problem)
+    )
+)]
+pub async fn git_commit(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<GitCommitRequest>,
+) -> Result<Json<DataResponse<String>>, Problem> {
+    let auth = authorized(&state, &headers).await?;
+    let sha = state
+        .projects()
+        .git_commit(&auth.owner_id, &id, &input.message)
+        .await
+        .map_err(problem)?;
+    emit_git_state_changed(&state, &auth.owner_id, &id, &context).await;
+    Ok(Json(DataResponse { data: sha }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/commands/push",
+    params(("id" = String, Path, description = "Project id")),
+    request_body = GitPushRequest,
+    responses(
+        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 422, body = Problem)
+    )
+)]
+pub async fn git_push(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: RawBody,
+) -> Result<
+    (
+        StatusCode,
+        Json<DataResponse<crate::platform::operations::OperationView>>,
+    ),
+    Problem,
+> {
+    let auth = authorized(&state, &headers).await?;
+    let input: GitPushRequest = serde_json::from_slice(body.as_slice()).map_err(|error| {
+        Problem::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+            "Validation failed",
+            error.to_string(),
+        )
+    })?;
+    let correlation_id = CorrelationId::new();
+    let _idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "POST",
+        &format!("/api/v1/projects/{id}/git/commands/push"),
+        body.as_slice(),
+    )?;
+    // M2 transport has no way to expose the encrypted PAT to the runner, so
+    // public repositories push without credentials. Resolving the GitHub PAT
+    // for private push happens in the worker once a credential-aware git_push
+    // path is added.
+    let operation = state
+        .projects()
+        .git_push(
+            &auth.owner_id,
+            &id,
+            &input.remote,
+            &input.branch,
+            &GitCredential::None,
+            correlation_id,
+        )
+        .await
+        .map_err(problem)?;
+    Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/commands/update",
+    params(("id" = String, Path, description = "Project id")),
+    request_body = GitUpdateRequest,
+    responses(
+        (status = 501, body = Problem),
+        (status = 401, body = Problem)
+    )
+)]
+pub async fn git_update(
+    State(state): State<AppState>,
+    Path(_id): Path<String>,
+    headers: HeaderMap,
+    Json(_input): Json<GitUpdateRequest>,
+) -> Result<StatusCode, Problem> {
+    let _auth = authorized(&state, &headers).await?;
+    // M2 placeholder: the three-way conflict resolution flow
+    // (`POST /git/update-conflicts/{id}/resolve`) is deferred. Return a stable
+    // `501 NOT_IMPLEMENTED` so the route is visible and the contract stays
+    // documented without a half-implemented side-effectful path.
+    Err(Problem::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "NOT_IMPLEMENTED",
+        "Git update not implemented",
+        "Git update with three-way conflict resolution arrives in a later milestone.",
+    ))
+}
+
+// ----- Events --------------------------------------------------------------
+
+async fn emit_git_state_changed(
+    state: &AppState,
+    owner_id: &str,
+    project_id: &str,
+    context: &RequestContext,
+) {
+    if let Err(error) = state
+        .events()
+        .append(crate::platform::events::NewEvent {
+            event_type: "git.state_changed".into(),
+            actor: serde_json::json!({ "kind": "owner", "id": owner_id }),
+            resource: Some(serde_json::json!({ "kind": "project", "id": project_id })),
+            correlation_id: context.request_id.clone(),
+            causation_id: None,
+            payload: serde_json::json!({ "cause": "commit" }),
+        })
+        .await
+    {
+        tracing::error!(%error, %project_id, "append git state changed event");
+    }
+}
+
+// ----- Problem mapping -----------------------------------------------------
+
+fn problem(error: ProjectsError) -> Problem {
+    let code = error.code();
+    let status = match code {
+        "VALIDATION_FAILED" | "INVALID_PATH" | "FILE_NOT_EDITABLE" => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        "RESOURCE_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "RESOURCE_VERSION_MISMATCH" => StatusCode::PRECONDITION_FAILED,
+        "INTERNAL_ERROR" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::CONFLICT,
+    };
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        return Problem::new(
+            status,
+            "INTERNAL_ERROR",
+            "Internal server error",
+            "The git operation could not be completed.",
+        );
+    }
+    Problem::new(
+        status,
+        code,
+        status_canonical_title(status),
+        error.to_string(),
+    )
+}
+
+fn status_canonical_title(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNPROCESSABLE_ENTITY => "Validation failed",
+        StatusCode::NOT_FOUND => "Resource not found",
+        StatusCode::PRECONDITION_FAILED => "Resource version mismatch",
+        StatusCode::CONFLICT => "Git operation conflict",
+        _ => "Request failed",
+    }
+}

@@ -29,6 +29,13 @@ macro_rules! typed_id {
                 self.0.fmt(formatter)
             }
         }
+
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Ok(Self(Uuid::parse_str(s)?))
+            }
+        }
     };
 }
 
@@ -42,3 +49,30 @@ typed_id!(OwnerId);
 typed_id!(PasskeyId);
 typed_id!(ProviderId);
 typed_id!(ModelId);
+typed_id!(ProjectId);
+typed_id!(OperationId);
+typed_id!(WorkItemId);
+typed_id!(GithubCredentialId);
+typed_id!(RevisionId);
+
+/// Lowercase hex SHA-256 of a content-addressed blob. Not a UUID: the value is
+/// derived from the bytes, so it is constructed from a string, not generated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(transparent)]
+pub struct BlobSha(String);
+
+impl BlobSha {
+    pub fn from_hex(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BlobSha {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
