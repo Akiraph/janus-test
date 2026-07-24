@@ -1,16 +1,26 @@
-import "@fontsource-variable/google-sans";
-import "@fontsource-variable/jetbrains-mono";
+import "@fontsource-variable/figtree";
+import "@fontsource-variable/cascadia-code";
 import { QueryClient, QueryClientProvider } from "@tanstack/solid-query";
 import { render } from "solid-js/web";
 import { App } from "./app/App";
+import { NotificationContainer } from "./components/ui/NotificationContainer";
+import { NotificationProvider } from "./components/ui/notifications";
+import { ApiError } from "./lib/api";
 import "./styles.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      retry: 2,
-      staleTime: 10_000,
-      refetchOnWindowFocus: true,
+      // Retry only transient/server or network failures; never retry client
+      // errors (4xx) so a missing endpoint doesn't burn seconds on retries.
+      retry: (failureCount, error) => {
+        if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+          return false;
+        }
+        return failureCount < 1;
+      },
+      staleTime: 30_000,
+      refetchOnWindowFocus: false,
     },
   },
 });
@@ -23,7 +33,10 @@ if (!root) {
 render(
   () => (
     <QueryClientProvider client={queryClient}>
-      <App />
+      <NotificationProvider>
+        <App />
+        <NotificationContainer />
+      </NotificationProvider>
     </QueryClientProvider>
   ),
   root,

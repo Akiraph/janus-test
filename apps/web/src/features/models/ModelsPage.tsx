@@ -1,355 +1,515 @@
 import { useQueryClient } from "@tanstack/solid-query";
-import { Activity, KeyRound, Plus, Trash2 } from "lucide-solid";
+import Activity from "lucide-solid/icons/activity";
+import ChevronDown from "lucide-solid/icons/chevron-down";
+import Pencil from "lucide-solid/icons/pencil";
+import Plus from "lucide-solid/icons/plus";
+import Trash2 from "lucide-solid/icons/trash-2";
 import { createSignal, For, Show } from "solid-js";
-import type { ProviderInput } from "../../lib/api";
-import {
-  createModel,
-  createProvider,
-  deleteModel,
-  deleteProvider,
-  probeProvider,
-} from "../../lib/api";
-import { useModels, useProviders } from "../../lib/queries";
+import { createStore, produce } from "solid-js/store";
+import { Badge } from "../../components/ui/Badge";
+import { Button } from "../../components/ui/Button";
+import { Dialog } from "../../components/ui/Dialog";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { ErrorBlock } from "../../components/ui/ErrorBlock";
+import { useNotifications } from "../../components/ui/notifications";
+import { Select, type SelectOption } from "../../components/ui/Select";
+import type { EmbeddedModelInput, ProviderInput, ProviderView } from "../../lib/api";
+import { createProvider, deleteProvider, probeProvider, updateProvider } from "../../lib/api";
+import { useProviders } from "../../lib/queries";
+
+type ProviderKind = ProviderInput["kind"];
+
+const KIND_OPTIONS: readonly SelectOption[] = [
+  { value: "anthropic", label: "Anthropic Messages" },
+  { value: "openai_chat", label: "OpenAI Chat Completions" },
+  { value: "openai_responses", label: "OpenAI Responses API" },
+];
+
+const KIND_BADGE_LABEL: Record<ProviderKind, string> = {
+  anthropic: "Anthropic Messages",
+  openai_chat: "OpenAI Chat Completions",
+  openai_responses: "OpenAI Responses API",
+};
+
+const KIND_BASE_URL_PLACEHOLDER: Record<ProviderKind, string> = {
+  anthropic: "https://api.anthropic.com",
+  openai_chat: "https://api.openai.com/v1",
+  openai_responses: "https://api.openai.com/v1",
+};
+
+type ModelRow = EmbeddedModelInput;
+
+function emptyModel(): ModelRow {
+  return {
+    display_name: "",
+    upstream_model_id: "",
+    supports_1m: false,
+    supports_images: false,
+    enabled: true,
+  };
+}
 
 export function ModelsPage() {
   const providers = useProviders();
-  const models = useModels();
   const queryClient = useQueryClient();
-  const [notice, setNotice] = createSignal("");
-  const [providerForm, setProviderForm] = createSignal(false);
-  const [modelForm, setModelForm] = createSignal(false);
+  const notify = useNotifications().notify;
+  const [providersOpen, setProvidersOpen] = createSignal(true);
+  const [editing, setEditing] = createSignal<ProviderView | null>(null);
+  const [formOpen, setFormOpen] = createSignal(false);
+
+  async function refresh() {
+    await queryClient.invalidateQueries({ queryKey: ["model-providers"] });
+  }
+
   async function removeProvider(id: string) {
-    if (!confirm("Delete this provider?")) return;
+    if (!confirm("Delete this provider and its models?")) return;
     try {
       await deleteProvider(id);
-      setNotice("Provider deleted");
-      await queryClient.invalidateQueries({ queryKey: ["model-providers"] });
+      notify("Provider deleted", { variant: "success" });
+      await refresh();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Delete failed");
+      notify(error instanceof Error ? error.message : "Delete failed", { variant: "danger" });
     }
   }
-  async function removeModel(id: string) {
-    if (!confirm("Delete this model?")) return;
-    try {
-      await deleteModel(id);
-      setNotice("Model deleted");
-      await queryClient.invalidateQueries({ queryKey: ["models"] });
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Delete failed");
-    }
-  }
+
   async function probe(id: string) {
     try {
       const result = await probeProvider(id);
-      setNotice(`${result.status}: ${result.detail}`);
+      notify(`${result.status}: ${result.detail}`);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Probe failed");
+      notify(error instanceof Error ? error.message : "Probe failed", { variant: "danger" });
     }
   }
+
+  function openCreate() {
+    setEditing(null);
+    setFormOpen(true);
+  }
+
+  function openEdit(provider: ProviderView) {
+    setEditing(provider);
+    setFormOpen(true);
+  }
+
   return (
-    <div class="settings-page route-enter">
-      <div class="page-heading">
-        <div>
-          <p class="eyebrow">Configuration</p>
-          <h1>Models</h1>
-          <p class="page-subtitle">
-            Manage provider credentials and the models available to Janus.
-          </p>
-        </div>
-        <Show when={notice()}>
-          <span class="notice" role="status">
-            {notice()}
-          </span>
-        </Show>
-      </div>
-      <section class="settings-section">
-        <div class="section-heading compact">
+    <div class="panel animate-panel-in">
+      <section class="settings-group">
+        <button
+          class="settings-group-trigger"
+          type="button"
+          aria-expanded={providersOpen()}
+          onClick={() => setProvidersOpen(!providersOpen())}
+        >
+          <ChevronDown classList={{ collapsed: !providersOpen() }} size={16} />
           <div>
-            <p class="eyebrow">Connections</p>
-            <h2>Providers</h2>
+            <span class="settings-group-title">
+              Model Providers
+              <Badge variant="neutral">{providers.data?.length ?? 0}</Badge>
+            </span>
+            <small>Connections used to access upstream model APIs.</small>
           </div>
-          <button
-            class="secondary-button"
-            type="button"
-            onClick={() => setProviderForm(!providerForm())}
-          >
-            <Plus size={16} />
-            Add provider
-          </button>
-        </div>
-        <Show when={providerForm()}>
-          <ProviderForm
-            done={async () => {
-              setProviderForm(false);
-              await queryClient.invalidateQueries({ queryKey: ["model-providers"] });
-            }}
-          />
-        </Show>
-        <Show when={providers.isPending}>
-          <p class="muted-copy">Loading providers...</p>
-        </Show>
-        <Show when={providers.data?.length === 0}>
-          <p class="muted-copy">No providers configured.</p>
-        </Show>
-        <div class="settings-list">
-          <For each={providers.data}>
-            {(provider) => (
-              <div class="settings-row">
-                <div class="row-icon">
-                  <KeyRound size={16} />
+        </button>
+
+        <Show when={providersOpen()}>
+          <div class="settings-group-body">
+            <Show
+              when={!providers.isPending}
+              fallback={<p class="files-tree-empty" role="status" aria-label="Loading...">Loading...</p>}
+            >
+              <Show
+                when={(providers.data?.length ?? 0) > 0}
+                fallback={
+                  <EmptyState
+                    icon={Plus}
+                    title="No model providers"
+                    description="Add a provider to enable model API access."
+                  />
+                }
+              >
+                <div class="record-list">
+                  <For each={providers.data}>
+                    {(provider) => (
+                      <article class="record-card provider-card">
+                        <div class="provider-card-main">
+                          <div class="record-copy">
+                            <div class="record-title">
+                              <h3>{provider.display_name}</h3>
+                              <Badge variant={provider.api_key_is_set ? "success" : "warning"}>
+                                {provider.api_key_is_set
+                                  ? (provider.api_key_preview ?? "Key set")
+                                  : "No API key"}
+                              </Badge>
+                              <Show when={!provider.enabled}>
+                                <Badge variant="neutral">Disabled</Badge>
+                              </Show>
+                            </div>
+                            <Badge variant="neutral">{KIND_BADGE_LABEL[provider.kind]}</Badge>
+                            <p>{provider.base_url}</p>
+                          </div>
+                          <div class="record-actions">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => void probe(provider.id)}
+                            >
+                              <Activity size={14} />
+                              Test
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              iconOnly
+                              aria-label={`Edit ${provider.display_name}`}
+                              onClick={() => openEdit(provider)}
+                            >
+                              <Pencil size={16} />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              iconOnly
+                              aria-label={`Delete ${provider.display_name}`}
+                              onClick={() => void removeProvider(provider.id)}
+                            >
+                              <Trash2 size={16} />
+                            </Button>
+                          </div>
+                        </div>
+
+                        <div class="provider-models">
+                          <div class="provider-models-heading">
+                            <span>
+                              Models
+                              <Badge variant="neutral">{provider.models.length}</Badge>
+                            </span>
+                          </div>
+                          <Show
+                            when={provider.models.length > 0}
+                            fallback={<p class="provider-model-empty">No models configured.</p>}
+                          >
+                            <div class="provider-model-list">
+                              <For each={provider.models}>
+                                {(model) => (
+                                  <div class="provider-model-row">
+                                    <div class="model-map-chip">
+                                      <strong>{model.display_name}</strong>
+                                      <span aria-hidden>→</span>
+                                      <span>{model.upstream_model_id}</span>
+                                    </div>
+                                    <div class="record-chips">
+                                      <Show when={model.supports_1m}>
+                                        <span>1M</span>
+                                      </Show>
+                                      <Show when={model.supports_images}>
+                                        <span>images</span>
+                                      </Show>
+                                    </div>
+                                    <Badge variant={model.enabled ? "success" : "neutral"}>
+                                      {model.enabled ? "Enabled" : "Disabled"}
+                                    </Badge>
+                                  </div>
+                                )}
+                              </For>
+                            </div>
+                          </Show>
+                        </div>
+                      </article>
+                    )}
+                  </For>
                 </div>
-                <div class="row-copy">
-                  <strong>{provider.display_name}</strong>
-                  <span>
-                    {provider.kind} · {provider.base_url}
-                  </span>
-                </div>
-                <span class={`status-chip ${provider.api_key_is_set ? "success" : "muted"}`}>
-                  {provider.api_key_is_set ? "Key set" : "No key"}
-                </span>
-                <button
-                  class="icon-button"
-                  type="button"
-                  aria-label={`Probe ${provider.display_name}`}
-                  title="Probe provider"
-                  onClick={() => void probe(provider.id)}
-                >
-                  <Activity size={16} />
-                </button>
-                <button
-                  class="icon-button danger-button"
-                  type="button"
-                  aria-label={`Delete ${provider.display_name}`}
-                  title="Delete provider"
-                  onClick={() => void removeProvider(provider.id)}
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            )}
-          </For>
-        </div>
-      </section>
-      <section class="settings-section">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Routing</p>
-            <h2>Models</h2>
+              </Show>
+            </Show>
+
+            <Button variant="outline" class="add-record" onClick={openCreate}>
+              <Plus size={16} />
+              Add Model Provider
+            </Button>
           </div>
-          <button
-            class="secondary-button"
-            type="button"
-            disabled={!providers.data?.length}
-            onClick={() => setModelForm(!modelForm())}
-          >
-            <Plus size={16} />
-            Add model
-          </button>
-        </div>
-        <Show when={modelForm()}>
-          <ModelForm
-            providers={providers.data ?? []}
-            done={async () => {
-              setModelForm(false);
-              await queryClient.invalidateQueries({ queryKey: ["models"] });
-            }}
-          />
         </Show>
-        <div class="settings-list">
-          <For each={models.data}>
-            {(model) => (
-              <div class="settings-row">
-                <div class="row-icon">
-                  <Activity size={16} />
-                </div>
-                <div class="row-copy">
-                  <strong>{model.display_name}</strong>
-                  <span>
-                    {model.upstream_model_id} · {model.context_window}
-                  </span>
-                </div>
-                <span class={`status-chip ${model.enabled ? "success" : "muted"}`}>
-                  {model.enabled ? "Enabled" : "Disabled"}
-                </span>
-                <button
-                  class="icon-button danger-button"
-                  type="button"
-                  aria-label={`Delete ${model.display_name}`}
-                  title="Delete model"
-                  onClick={() => void removeModel(model.id)}
-                >
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            )}
-          </For>
-        </div>
       </section>
+
+      <Show when={formOpen()}>
+        <ProviderForm
+          provider={editing()}
+          close={() => setFormOpen(false)}
+          saved={async () => {
+            setFormOpen(false);
+            await refresh();
+          }}
+        />
+      </Show>
     </div>
   );
 }
 
-function ProviderForm(props: { done: () => Promise<void> }) {
+interface ProviderFormProps {
+  provider: ProviderView | null;
+  close: () => void;
+  saved: () => Promise<void>;
+}
+
+function ProviderForm(props: ProviderFormProps) {
+  const notify = useNotifications().notify;
+  const isEditing = () => props.provider !== null;
+  const hasKey = () => props.provider?.api_key_is_set ?? false;
+
   const [name, setName] = createSignal("");
-  const [kind, setKind] = createSignal<ProviderInput["kind"]>("openai_compatible");
-  const [url, setUrl] = createSignal("https://api.openai.com/v1/");
+  const [kind, setKind] = createSignal<ProviderKind>("anthropic");
+  const [url, setUrl] = createSignal("");
   const [key, setKey] = createSignal("");
-  const [supports, setSupports] = createSignal(false);
+  const [editingKey, setEditingKey] = createSignal(false);
+  const [models, setModels] = createStore<ModelRow[]>([emptyModel()]);
   const [error, setError] = createSignal("");
+  const [submitting, setSubmitting] = createSignal(false);
+
+  // Seed the form whenever it opens for a given provider.
+  const seed = (provider: ProviderView | null) => {
+    if (provider) {
+      setName(provider.display_name);
+      setKind(provider.kind);
+      setUrl(provider.base_url);
+      setEditingKey(false);
+      setKey("");
+      setModels(
+        provider.models.length > 0
+          ? provider.models.map((model) => ({
+              display_name: model.display_name,
+              upstream_model_id: model.upstream_model_id,
+              supports_1m: model.supports_1m,
+              supports_images: model.supports_images,
+              enabled: model.enabled,
+            }))
+          : [emptyModel()],
+      );
+    } else {
+      setName("");
+      setKind("anthropic");
+      setUrl("");
+      setEditingKey(false);
+      setKey("");
+      setModels([emptyModel()]);
+    }
+    setError("");
+  };
+  // The dialog is mounted fresh on each open (parent gates it with <Show>),
+  // so reseeding once at mount with the current provider target is correct.
+  seed(props.provider);
+
+  const updateModel = (index: number, patch: Partial<ModelRow>) => setModels(index, patch);
+  const addModel = () => setModels(produce((rows) => rows.push(emptyModel())));
+  const removeModel = (index: number) =>
+    setModels(
+      produce((rows) => {
+        if (rows.length > 1) rows.splice(index, 1);
+      }),
+    );
+
+  function buildInput(): ProviderInput {
+    const cleanedModels: EmbeddedModelInput[] = models
+      .map((row) => ({
+        display_name: row.display_name.trim(),
+        upstream_model_id: row.upstream_model_id.trim(),
+        supports_1m: row.supports_1m ?? false,
+        supports_images: row.supports_images ?? false,
+        enabled: row.enabled ?? true,
+      }))
+      .filter((row) => row.display_name && row.upstream_model_id);
+
+    const input: ProviderInput = {
+      kind: kind(),
+      display_name: name().trim(),
+      base_url: url().trim(),
+      models: cleanedModels,
+      enabled: true,
+    };
+    // Send a new key only when the user typed one; omit to keep the stored key.
+    if (key().trim()) input.api_key = key().trim();
+    return input;
+  }
+
   async function submit(event: SubmitEvent) {
     event.preventDefault();
+    if (!name().trim()) {
+      setError("Name is required");
+      return;
+    }
+    // A new provider requires a key; an existing one can keep its stored key.
+    if (!isEditing() && !key().trim()) {
+      setError("API key is required");
+      return;
+    }
+    setSubmitting(true);
     try {
-      await createProvider({
-        display_name: name(),
-        kind: kind(),
-        base_url: url(),
-        api_key: key(),
-        supports_1m: supports(),
-        enabled: true,
-      });
-      await props.done();
+      const input = buildInput();
+      if (isEditing() && props.provider) {
+        await updateProvider(props.provider.id, input);
+        notify("Provider updated", { variant: "success" });
+      } else {
+        await createProvider(input);
+        notify("Provider added", { variant: "success" });
+      }
+      await props.saved();
     } catch (value) {
       setError(value instanceof Error ? value.message : "Provider could not be saved");
+    } finally {
+      setSubmitting(false);
     }
   }
+
   return (
-    <form class="inline-form" onSubmit={submit}>
-      <label>
-        Name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} required />
-      </label>
-      <label>
-        Type
-        <select
-          value={kind()}
-          onChange={(e) => setKind(e.currentTarget.value as ProviderInput["kind"])}
-        >
-          <option value="openai_compatible">OpenAI compatible</option>
-          <option value="anthropic">Anthropic</option>
-        </select>
-      </label>
-      <label>
-        Base URL
-        <input type="url" value={url()} onInput={(e) => setUrl(e.currentTarget.value)} required />
-      </label>
-      <label>
-        API key
-        <input
-          type="password"
-          value={key()}
-          onInput={(e) => setKey(e.currentTarget.value)}
-          autocomplete="off"
-          required
-        />
-      </label>
-      <label class="check-label">
-        <input
-          type="checkbox"
-          checked={supports()}
-          onChange={(e) => setSupports(e.currentTarget.checked)}
-        />
-        Provider confirmed 1m context
-      </label>
-      <Show when={error()}>
-        <p class="form-error">{error()}</p>
-      </Show>
-      <button class="primary-button" type="submit">
-        <Plus size={16} />
-        Save provider
-      </button>
-    </form>
-  );
-}
-function ModelForm(props: {
-  providers: { id: string; display_name: string }[];
-  done: () => Promise<void>;
-}) {
-  const [name, setName] = createSignal("");
-  const [provider, setProvider] = createSignal(props.providers[0]?.id ?? "");
-  const [upstream, setUpstream] = createSignal("");
-  const [context, setContext] = createSignal<"200k" | "1m">("200k");
-  const [images, setImages] = createSignal(false);
-  const [tools, setTools] = createSignal(true);
-  const [tokens, setTokens] = createSignal(4096);
-  const [error, setError] = createSignal("");
-  async function submit(event: SubmitEvent) {
-    event.preventDefault();
-    try {
-      await createModel({
-        display_name: name(),
-        provider_id: provider(),
-        upstream_model_id: upstream(),
-        context_window: context(),
-        supports_images: images(),
-        supports_tools: tools(),
-        max_output_tokens: tokens(),
-        enabled: true,
-      });
-      await props.done();
-    } catch (value) {
-      setError(value instanceof Error ? value.message : "Model could not be saved");
-    }
-  }
-  return (
-    <form class="inline-form" onSubmit={submit}>
-      <label>
-        Name
-        <input value={name()} onInput={(e) => setName(e.currentTarget.value)} required />
-      </label>
-      <label>
-        Provider
-        <select value={provider()} onChange={(e) => setProvider(e.currentTarget.value)}>
-          <For each={props.providers}>
-            {(item) => <option value={item.id}>{item.display_name}</option>}
+    <Dialog
+      title={isEditing() ? "Edit model provider" : "Add model provider"}
+      description="Configure the upstream endpoint, API credential, and models."
+      close={props.close}
+    >
+      <form class="dialog-form" onSubmit={submit}>
+        <div class="dialog-form-grid">
+          <div>
+            <span class="field-label">Name</span>
+            <input
+              id="provider-name"
+              class="ui-input"
+              value={name()}
+              onInput={(event) => setName(event.currentTarget.value)}
+              aria-label="Name"
+              required
+            />
+          </div>
+          <div>
+            <span class="field-label">API Format</span>
+            <Select
+              value={kind()}
+              options={KIND_OPTIONS}
+              onChange={(value) => setKind(value as ProviderKind)}
+              aria-label="API Format"
+            />
+          </div>
+          <div class="full-field">
+            <span class="field-label">Base URL</span>
+            <input
+              id="provider-base-url"
+              class="ui-input"
+              type="url"
+              value={url()}
+              onInput={(event) => setUrl(event.currentTarget.value)}
+              placeholder={KIND_BASE_URL_PLACEHOLDER[kind()]}
+              aria-label="Base URL"
+              required
+            />
+          </div>
+          <div class="full-field">
+            <span class="field-label">API key</span>
+            <Show
+              when={isEditing() && hasKey() && !editingKey()}
+              fallback={
+                <input
+                  id="provider-api-key"
+                  class="ui-input"
+                  type="password"
+                  value={key()}
+                  onInput={(event) => setKey(event.currentTarget.value)}
+                  placeholder={isEditing() ? "Enter a new API key" : "sk-..."}
+                  autocomplete="off"
+                  aria-label="API key"
+                  required={!isEditing() || !hasKey()}
+                />
+              }
+            >
+              <span class="api-key-preview">
+                <span class="api-key-preview-value">
+                  {props.provider?.api_key_preview ?? "Stored API key"}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  iconOnly
+                  aria-label="Change API key"
+                  onClick={() => setEditingKey(true)}
+                >
+                  <Pencil size={14} />
+                </Button>
+              </span>
+            </Show>
+          </div>
+        </div>
+
+        <div class="provider-form-models">
+          <div class="provider-form-models-heading">
+            <span>Models</span>
+            <Button variant="ghost" size="sm" type="button" onClick={addModel}>
+              <Plus size={14} />
+              Add model
+            </Button>
+          </div>
+          <For each={models}>
+            {(model, index) => (
+              <div class="provider-form-model-row">
+                <input
+                  class="ui-input"
+                  aria-label="Model name"
+                  placeholder="Display name"
+                  value={model.display_name}
+                  onInput={(event) =>
+                    updateModel(index(), { display_name: event.currentTarget.value })
+                  }
+                />
+                <input
+                  class="ui-input"
+                  aria-label="Upstream model ID"
+                  placeholder="Upstream model ID"
+                  value={model.upstream_model_id}
+                  onInput={(event) =>
+                    updateModel(index(), { upstream_model_id: event.currentTarget.value })
+                  }
+                />
+                <label class="model-chip-check" title="Supports 1m context">
+                  <input
+                    type="checkbox"
+                    checked={model.supports_1m}
+                    onChange={(event) =>
+                      updateModel(index(), { supports_1m: event.currentTarget.checked })
+                    }
+                  />
+                  1M
+                </label>
+                <label class="model-chip-check" title="Supports images">
+                  <input
+                    type="checkbox"
+                    checked={model.supports_images}
+                    onChange={(event) =>
+                      updateModel(index(), { supports_images: event.currentTarget.checked })
+                    }
+                  />
+                  Images
+                </label>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  iconOnly
+                  type="button"
+                  aria-label="Remove model"
+                  disabled={models.length === 1}
+                  onClick={() => removeModel(index())}
+                >
+                  <Trash2 size={14} />
+                </Button>
+              </div>
+            )}
           </For>
-        </select>
-      </label>
-      <label>
-        Upstream model ID
-        <input value={upstream()} onInput={(e) => setUpstream(e.currentTarget.value)} required />
-      </label>
-      <label>
-        Context
-        <select
-          value={context()}
-          onChange={(e) => setContext(e.currentTarget.value as "200k" | "1m")}
-        >
-          <option value="200k">200k</option>
-          <option value="1m">1m</option>
-        </select>
-      </label>
-      <label>
-        Max output tokens
-        <input
-          type="number"
-          min="1"
-          value={tokens()}
-          onInput={(e) => setTokens(Number(e.currentTarget.value))}
-        />
-      </label>
-      <label class="check-label">
-        <input
-          type="checkbox"
-          checked={images()}
-          onChange={(e) => setImages(e.currentTarget.checked)}
-        />
-        Images
-      </label>
-      <label class="check-label">
-        <input
-          type="checkbox"
-          checked={tools()}
-          onChange={(e) => setTools(e.currentTarget.checked)}
-        />
-        Tools
-      </label>
-      <Show when={error()}>
-        <p class="form-error">{error()}</p>
-      </Show>
-      <button class="primary-button" type="submit">
-        <Plus size={16} />
-        Save model
-      </button>
-    </form>
+        </div>
+
+        <Show when={error()}>
+          <ErrorBlock variant="inline" message={error()} />
+        </Show>
+        <div class="dialog-footer">
+          <Button variant="outline" type="button" onClick={props.close}>
+            Cancel
+          </Button>
+          <Button variant="primary" type="submit" disabled={submitting()}>
+            {isEditing() ? "Save changes" : "Add provider"}
+          </Button>
+        </div>
+      </form>
+    </Dialog>
   );
 }

@@ -1141,6 +1141,13 @@ export interface components {
     };
     GitLogEntryView: {
       author: string;
+      /** Format: int64 */
+      changed_files: number;
+      committed_at: string;
+      /** Format: int64 */
+      deletions: number;
+      /** Format: int64 */
+      insertions: number;
       message: string;
       parents: string[];
       sha: string;

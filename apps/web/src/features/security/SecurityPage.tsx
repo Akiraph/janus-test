@@ -1,76 +1,88 @@
 import { useQueryClient } from "@tanstack/solid-query";
-import { KeyRound, RefreshCw, ShieldCheck } from "lucide-solid";
-import { createSignal, Show } from "solid-js";
+import KeyRound from "lucide-solid/icons/key-round";
+import LogOut from "lucide-solid/icons/log-out";
+import RefreshCw from "lucide-solid/icons/refresh-cw";
+import ShieldCheck from "lucide-solid/icons/shield-check";
+import { Badge } from "../../components/ui/Badge";
+import { Button } from "../../components/ui/Button";
+import { useNotifications } from "../../components/ui/notifications";
 import { logout } from "../../lib/api";
 import { useMe } from "../../lib/queries";
 
 export function SecurityPage() {
   const me = useMe();
   const client = useQueryClient();
-  const [notice, setNotice] = createSignal("");
+  const notify = useNotifications().notify;
+
   async function signOut() {
     await logout();
-    setNotice("Signed out");
+    notify("Signed out", { variant: "success" });
     await client.invalidateQueries({ queryKey: ["me"] });
   }
+
   return (
-    <div class="settings-page route-enter">
-      <div class="page-heading">
-        <div>
-          <p class="eyebrow">Access</p>
-          <h1>Security</h1>
-          <p class="page-subtitle">Passkey-only access for this deployment.</p>
-        </div>
+    <div class="panel animate-panel-in">
+      <div class="panel-heading">
+        <h2>Security</h2>
+        <p>Local owner account</p>
       </div>
-      <section class="settings-section">
-        <div class="security-intro">
-          <span class="auth-icon small">
-            <ShieldCheck size={19} />
-          </span>
+
+      <div class="account-rows">
+        <div class="account-row">
           <div>
-            <h2>{me.data?.data.display_name ?? "Owner"}</h2>
-            <p>Authentication mode: {me.data?.data.authentication_mode ?? "passkey"}</p>
+            <strong>Owner</strong>
+            <span>Display name for this deployment</span>
           </div>
+          <span class="account-value">{me.data?.data.display_name ?? "Owner"}</span>
         </div>
-        <div class="settings-list">
-          <div class="settings-row">
-            <div class="row-icon">
-              <KeyRound size={16} />
-            </div>
-            <div class="row-copy">
+
+        <div class="account-row">
+          <div class="account-label-with-icon">
+            <KeyRound size={16} />
+            <div>
               <strong>Passkeys</strong>
               <span>Use your device authenticator for every sign-in.</span>
             </div>
-            <span class="status-chip success">Protected</span>
           </div>
-          <div class="settings-row">
-            <div class="row-icon">
-              <RefreshCw size={16} />
-            </div>
-            <div class="row-copy">
+          <Badge variant="success">
+            <ShieldCheck size={12} />
+            Protected
+          </Badge>
+        </div>
+
+        <div class="account-row">
+          <div class="account-label-with-icon">
+            <RefreshCw size={16} />
+            <div>
               <strong>Recovery codes</strong>
               <span>Generate a new one-time set from the recovery workflow.</span>
             </div>
-            <button
-              class="secondary-button"
-              type="button"
-              onClick={() =>
-                setNotice("Recovery code regeneration is available from the authenticated API.")
-              }
-            >
-              Manage
-            </button>
           </div>
+          <Button
+            variant="outline"
+            onClick={() =>
+              notify("Recovery code regeneration is available from the authenticated API.", {
+                variant: "info",
+              })
+            }
+          >
+            Manage
+          </Button>
         </div>
-        <Show when={notice()}>
-          <p class="notice" role="status">
-            {notice()}
-          </p>
-        </Show>
-        <button class="danger-action" type="button" onClick={() => void signOut()}>
-          Sign out
-        </button>
-      </section>
+
+        <div class="account-row">
+          <div class="account-label-with-icon">
+            <LogOut size={16} />
+            <div>
+              <strong>Session</strong>
+              <span>Sign out on this device.</span>
+            </div>
+          </div>
+          <Button variant="destructive" onClick={() => void signOut()}>
+            Sign out
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

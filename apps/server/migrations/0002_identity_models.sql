@@ -81,33 +81,10 @@ CREATE TABLE model_providers (
     base_url TEXT NOT NULL,
     api_key_ciphertext BLOB,
     api_key_fingerprint TEXT,
-    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    api_key_preview TEXT,
+    models_json TEXT NOT NULL DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX model_provider_name_idx ON model_providers(owner_id, display_name);
-
-CREATE TABLE models (
-    id TEXT PRIMARY KEY,
-    owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
-    provider_id TEXT NOT NULL REFERENCES model_providers(id) ON DELETE RESTRICT,
-    display_name TEXT NOT NULL,
-    upstream_model_id TEXT NOT NULL,
-    context_window TEXT NOT NULL CHECK(context_window IN ('200k', '1m')),
-    supports_images INTEGER NOT NULL DEFAULT 0,
-    supports_tools INTEGER NOT NULL DEFAULT 0,
-    max_output_tokens INTEGER NOT NULL,
-    reasoning_json TEXT NOT NULL DEFAULT '{}',
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE UNIQUE INDEX model_name_idx ON models(owner_id, display_name);
-
-CREATE TABLE model_failover (
-    model_id TEXT PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE,
-    enabled INTEGER NOT NULL DEFAULT 0,
-    candidate_ids_json TEXT NOT NULL DEFAULT '[]',
-    updated_at TEXT NOT NULL
-);

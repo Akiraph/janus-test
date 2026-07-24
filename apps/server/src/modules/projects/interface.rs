@@ -15,8 +15,8 @@ use sqlx::{FromRow, SqlitePool};
 use utoipa::ToSchema;
 
 use crate::adapters::git::{
-    apply_conflict_choice, complete_fast_forward, DiffView, GitCredential, GitError, GitRunner,
-    GitStatus, SystemGit, UpdateConflictPath, UpdateOutcome,
+    DiffView, GitCredential, GitError, GitRunner, GitStatus, SystemGit, UpdateConflictPath,
+    UpdateOutcome, apply_conflict_choice, complete_fast_forward,
 };
 use crate::modules::workspace_sync::interface::{
     RevisionRef, WorkspaceHandle, WorkspaceSyncError, WorkspaceSyncInterface,
@@ -25,8 +25,8 @@ use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     id::{CorrelationId, GitUpdateConflictId, GithubCredentialId, ProjectId},
     operations::{
-        CreateOperation, IdempotencyOutcome, IdempotencyRequest, OperationInterface,
-        OperationStatus, OperationView, KIND_GIT_UPDATE,
+        CreateOperation, IdempotencyOutcome, IdempotencyRequest, KIND_GIT_UPDATE,
+        OperationInterface, OperationStatus, OperationView,
     },
     path::{PathError, validate_workspace_path},
     secret::{Secret, SecretCipher, fingerprint},
@@ -780,7 +780,10 @@ impl ProjectsInterface {
         let (ciphertext, fingerprint) = if let Some(pat) = input.pat {
             self.encrypt_pat(owner_id, id, Some(pat))?
         } else {
-            (existing.pat_ciphertext.clone(), existing.pat_fingerprint.clone())
+            (
+                existing.pat_ciphertext.clone(),
+                existing.pat_fingerprint.clone(),
+            )
         };
         let changed = sqlx::query(
             "UPDATE github_credentials SET name = ?, github_host = ?, pat_ciphertext = ?, pat_fingerprint = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
@@ -1575,7 +1578,9 @@ impl ProjectsInterface {
                         &created.operation.id,
                         OperationStatus::Failed,
                         None,
-                        Some(serde_json::json!({"code": error.code(), "detail": error.to_string()})),
+                        Some(
+                            serde_json::json!({"code": error.code(), "detail": error.to_string()}),
+                        ),
                         correlation_id,
                     )
                     .await?;
@@ -1750,15 +1755,15 @@ impl ProjectsInterface {
         if unresolved > 0 {
             // Partial save — stay open.
             let new_version = format!("v_{}", GitUpdateConflictId::new());
-            sqlx::query(
-                "UPDATE git_update_conflicts SET version = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(&new_version)
-            .bind(&now)
-            .bind(conflict_id)
-            .execute(&self.pool)
-            .await?;
-            return self.get_update_conflict(owner_id, project_id, conflict_id).await;
+            sqlx::query("UPDATE git_update_conflicts SET version = ?, updated_at = ? WHERE id = ?")
+                .bind(&new_version)
+                .bind(&now)
+                .bind(conflict_id)
+                .execute(&self.pool)
+                .await?;
+            return self
+                .get_update_conflict(owner_id, project_id, conflict_id)
+                .await;
         }
 
         // All paths chosen: apply and complete.
@@ -1840,7 +1845,8 @@ impl ProjectsInterface {
                 correlation_id,
             )
             .await;
-        self.get_update_conflict(owner_id, project_id, conflict_id).await
+        self.get_update_conflict(owner_id, project_id, conflict_id)
+            .await
     }
 
     async fn credential_for_project(
@@ -1955,7 +1961,10 @@ impl ProjectsInterface {
         Ok(conflict_id)
     }
 
-    async fn conflict_view(&self, row: ConflictRow) -> Result<GitUpdateConflictView, ProjectsError> {
+    async fn conflict_view(
+        &self,
+        row: ConflictRow,
+    ) -> Result<GitUpdateConflictView, ProjectsError> {
         let paths: Vec<ConflictPathRow> = sqlx::query_as(
             "SELECT path, kind, base_hash, remote_hash, main_hash, choice, edited_blob_sha, version FROM git_update_conflict_paths WHERE conflict_id = ? ORDER BY path",
         )

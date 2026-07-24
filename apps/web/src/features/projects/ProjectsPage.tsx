@@ -1,6 +1,10 @@
 import { A, useNavigate } from "@solidjs/router";
 import { useQueryClient } from "@tanstack/solid-query";
-import { Folder, FolderGit2, Plus, RefreshCw, Trash2 } from "lucide-solid";
+import Folder from "lucide-solid/icons/folder";
+import FolderGit2 from "lucide-solid/icons/folder-git-2";
+import Plus from "lucide-solid/icons/plus";
+import RefreshCw from "lucide-solid/icons/refresh-cw";
+import Trash2 from "lucide-solid/icons/trash-2";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Badge, type BadgeVariant } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
@@ -9,7 +13,6 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { ErrorBlock } from "../../components/ui/ErrorBlock";
 import { useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
-import { Skeleton } from "../../components/ui/Skeleton";
 import type { CreateProjectInput, OperationView, ProjectView, RepoAccess } from "../../lib/api";
 import {
   createProject,
@@ -191,7 +194,7 @@ export function ProjectsPage() {
         )}
       </Show>
 
-      <Show when={!projects.isPending} fallback={<Skeleton aria-label="Loading projects" />}>
+      <Show when={!projects.isPending} fallback={<p class="files-tree-empty" role="status" aria-label="Loading...">Loading...</p>}>
         <Show
           when={!projects.isError}
           fallback={

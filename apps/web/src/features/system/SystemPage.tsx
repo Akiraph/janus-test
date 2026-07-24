@@ -1,24 +1,31 @@
-import { CheckCircle2, ChevronRight, CircleDashed, Database, Radio, Server } from "lucide-solid";
+import CheckCircle2 from "lucide-solid/icons/check-circle-2";
+import ChevronRight from "lucide-solid/icons/chevron-right";
+import CircleDashed from "lucide-solid/icons/circle-dashed";
+import Database from "lucide-solid/icons/database";
+import Radio from "lucide-solid/icons/radio";
+import Server from "lucide-solid/icons/server";
 import { For, Match, Switch } from "solid-js";
-import { QueryError, QuerySkeleton } from "../../components/QueryState";
+import { ErrorBlock } from "../../components/ui/ErrorBlock";
 import { useSystemInfo } from "../../lib/queries";
 
 export function SystemPage() {
   const system = useSystemInfo();
 
   return (
-    <section class="system-page route-enter" aria-labelledby="system-title">
-      <div class="page-heading">
-        <p class="eyebrow">Deployment</p>
-        <h1 id="system-title">System</h1>
+    <section class="panel animate-panel-in" aria-labelledby="system-title">
+      <div class="panel-heading">
+        <h2 id="system-title">System</h2>
+        <p>Deployment status and capabilities</p>
       </div>
 
       <Switch>
         <Match when={system.isPending}>
-          <QuerySkeleton />
+          <p class="files-tree-empty" role="status" aria-label="Loading...">
+            Loading...
+          </p>
         </Match>
         <Match when={system.isError}>
-          <QueryError retry={() => void system.refetch()} />
+          <ErrorBlock message="System status unavailable" retry={() => void system.refetch()} />
         </Match>
         <Match when={system.data}>
           {(response) => {

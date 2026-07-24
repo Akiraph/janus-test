@@ -96,6 +96,19 @@ pub fn fingerprint(value: &str) -> String {
     purpose_hash("secret-fingerprint", value)[..12].to_owned()
 }
 
+/// Mask an API key for display: fully masked when ≤8 chars, otherwise the
+/// first 4 and last 4 chars are visible with 8 `*` between them
+/// (e.g. `sk-r********-key`). Matches Janus-old `maskApiKey`.
+pub fn mask_key(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= 8 {
+        return "*".repeat(trimmed.len());
+    }
+    let head = &trimmed[..4];
+    let tail = &trimmed[trimmed.len() - 4..];
+    format!("{head}{}{tail}", "*".repeat(8))
+}
+
 fn decode_key(encoded: &str) -> anyhow::Result<[u8; 32]> {
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded)
@@ -132,7 +145,7 @@ impl std::fmt::Debug for Secret {
 
 #[cfg(test)]
 mod tests {
-    use super::{Secret, SecretCipher};
+    use super::{Secret, SecretCipher, mask_key};
 
     #[test]
     fn debug_is_redacted() {
@@ -155,5 +168,19 @@ mod tests {
             "sensitive"
         );
         assert!(cipher.decrypt(&stored, "other/provider/key").is_err());
+    }
+
+    #[test]
+    fn mask_key_hides_short_values_fully() {
+        assert_eq!(mask_key("abc"), "***");
+        assert_eq!(mask_key("12345678"), "********");
+        assert_eq!(mask_key("  short  "), "*****");
+    }
+
+    #[test]
+    fn mask_key_exposes_head_and_tail_for_long_values() {
+        assert_eq!(mask_key("sk-real-key"), "sk-r********-key");
+        assert_eq!(mask_key("sk-ant-api03-longtoken-xyz"), "sk-a********-xyz");
+        assert_eq!(mask_key("  sk-real-key  "), "sk-r********-key");
     }
 }

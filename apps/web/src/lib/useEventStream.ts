@@ -47,6 +47,9 @@ export function useEventStream() {
       if (resourceId) {
         void queryClient.invalidateQueries({ queryKey: ["project", resourceId] });
         void queryClient.invalidateQueries({ queryKey: ["file-tree", resourceId] });
+        // Editor saves dirty the working tree but only emit main_revision_changed;
+        // keep SCM Changes in sync without requiring a separate git.state_changed.
+        void queryClient.invalidateQueries({ queryKey: ["git-status", resourceId] });
       }
       return;
     }

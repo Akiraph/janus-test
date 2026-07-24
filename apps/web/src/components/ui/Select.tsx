@@ -1,4 +1,4 @@
-import { ChevronDown } from "lucide-solid";
+import ChevronDown from "lucide-solid/icons/chevron-down";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 
@@ -19,6 +19,9 @@ interface SelectProps {
  * Lightweight custom dropdown. Native <select> styling varies across platforms
  * and cannot match the ui-input look, so we render a trigger button + a portal
  * list positioned beneath it. The list closes on outside pointerdown or scroll.
+ *
+ * Open on pointerdown (not click) so the menu appears on press, not mouseup —
+ * that single frame difference is what makes it feel "attached" to the hand.
  */
 export function Select(props: SelectProps) {
   const [open, setOpen] = createSignal(false);
@@ -34,21 +37,29 @@ export function Select(props: SelectProps) {
   const position = () => {
     if (!triggerRef) return;
     const rect = triggerRef.getBoundingClientRect();
+    // Write coords synchronously before open so the first paint already has
+    // a correct fixed position — no empty-frame flash, no post-open reflow.
     setCoords({ top: rect.bottom + 2, left: rect.left, width: rect.width });
   };
 
-  const toggle = () => {
-    if (open()) {
-      setOpen(false);
-      return;
-    }
+  const openList = () => {
     position();
     setOpen(true);
   };
 
+  const closeList = () => setOpen(false);
+
+  const toggle = () => {
+    if (open()) {
+      closeList();
+      return;
+    }
+    openList();
+  };
+
   const choose = (value: string) => {
     props.onChange(value);
-    setOpen(false);
+    closeList();
   };
 
   // Close on outside click or any scroll while open.
@@ -58,15 +69,24 @@ export function Select(props: SelectProps) {
       const target = event.target as Node;
       if (triggerRef?.contains(target)) return;
       if (listRef?.contains(target)) return;
-      setOpen(false);
+      closeList();
     };
-    const onScroll = () => setOpen(false);
-    const onResize = () => setOpen(false);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeList();
+        triggerRef?.focus();
+      }
+    };
+    const onScroll = () => closeList();
+    const onResize = () => closeList();
     document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
     window.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", onResize);
     onCleanup(() => {
       document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onResize);
     });
@@ -87,7 +107,19 @@ export function Select(props: SelectProps) {
         aria-haspopup="listbox"
         aria-expanded={open()}
         aria-label={props["aria-label"]}
-        onClick={toggle}
+        onPointerDown={(event) => {
+          // Primary button only; ignore right-click / pen barrel.
+          if (event.button !== 0) return;
+          // Prevent the subsequent click from re-toggling after we open here.
+          event.preventDefault();
+          toggle();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
+            event.preventDefault();
+            if (!open()) openList();
+          }
+        }}
       >
         <span class="ui-select-value">{selectedLabel()}</span>
         <ChevronDown
@@ -114,7 +146,14 @@ export function Select(props: SelectProps) {
                       "ui-select-option": true,
                       "ui-select-option--selected": option.value === props.value,
                     }}
-                    onClick={() => choose(option.value)}
+                    onPointerDown={(event) => {
+                      if (event.button !== 0) return;
+                      // Choose on press so selection feels immediate; prevent
+                      // the document outside-click handler from racing us.
+                      event.preventDefault();
+                      event.stopPropagation();
+                      choose(option.value);
+                    }}
                   >
                     {option.label}
                   </button>

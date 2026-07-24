@@ -5,8 +5,8 @@
     "": {
       "name": "janus-web",
       "dependencies": {
-        "@fontsource-variable/google-sans": "^5.2.8",
-        "@fontsource-variable/jetbrains-mono": "^5.2.8",
+        "@fontsource-variable/cascadia-code": "^5.3.0",
+        "@fontsource-variable/figtree": "^5.3.0",
         "@solidjs/router": "^0.15.3",
         "@tanstack/solid-query": "^5.85.5",
         "lucide-solid": "^0.468.0",
@@ -129,9 +129,9 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.28.1", "", { "os": "win32", "cpu": "x64" }, "sha512-bm4Mowrv+GXMlpWX++EcXw/iLyd1o3+bJkC2DkWXYVvgZCqD/bSj9ctZeAMC3cIxgjRVR2Dufaiu4YPxr5gW1A=="],
 
-    "@fontsource-variable/google-sans": ["@fontsource-variable/google-sans@5.3.0", "", {}, "sha512-VEwy6YigBfQ/F2PwkiZtQxA35+X5V1BpuNT15/o3dXTymbeT6YZNsy356VfqasyLJLRWoUfSrJNzbdA8RF+S+w=="],
+    "@fontsource-variable/cascadia-code": ["@fontsource-variable/cascadia-code@5.3.0", "", {}, "sha512-6I6M029Lum62MGmP0o+rXRrIBiIiptNDC4slPKLPUJiSB7NHZTLb+Ihk9G7jLvUfWziGXHJLjJPJLBzlEPjS1g=="],
 
-    "@fontsource-variable/jetbrains-mono": ["@fontsource-variable/jetbrains-mono@5.3.0", "", {}, "sha512-F32xpS2NsGYoQi2ADSkKTgpJj7ozajsGgDJ8woTnqjmIB+dxDIqImjl4pXZVEExu8UFZ2ndhmX18EBS/hdz3Lw=="],
+    "@fontsource-variable/figtree": ["@fontsource-variable/figtree@5.3.0", "", {}, "sha512-VRVodD7OiG7apQwE8/2fMjaqpY/a0qRJqL5HtYj8CKIVps+9amaFcdfKmDIf7iqYQx6iPLlArVXAfKeIZmVcNQ=="],
 
     "@jridgewell/gen-mapping": ["@jridgewell/gen-mapping@0.3.13", "", { "dependencies": { "@jridgewell/sourcemap-codec": "^1.5.0", "@jridgewell/trace-mapping": "^0.3.24" } }, "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA=="],
 

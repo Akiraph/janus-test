@@ -1,4 +1,4 @@
-import { X } from "lucide-solid";
+import X from "lucide-solid/icons/x";
 import type { JSX } from "solid-js";
 import { Portal } from "solid-js/web";
 

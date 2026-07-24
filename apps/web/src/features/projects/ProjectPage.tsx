@@ -1,117 +1,241 @@
 import { A, useParams } from "@solidjs/router";
-import { useQueryClient } from "@tanstack/solid-query";
-import { ArrowLeft, FileCode2, Folder, GitBranch, Save, TerminalSquare } from "lucide-solid";
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import ArrowLeft from "lucide-solid/icons/arrow-left";
+import FileCode2 from "lucide-solid/icons/file-code-2";
+import Files from "lucide-solid/icons/files";
+import GitBranch from "lucide-solid/icons/git-branch";
+import GitCompare from "lucide-solid/icons/git-compare";
+import TerminalSquare from "lucide-solid/icons/terminal-square";
+import X from "lucide-solid/icons/x";
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createStore } from "solid-js/store";
 import { Badge } from "../../components/ui/Badge";
-import { Button } from "../../components/ui/Button";
+import { BootSplash } from "../../components/ui/BootSplash";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { ErrorBlock } from "../../components/ui/ErrorBlock";
-import { useNotifications } from "../../components/ui/notifications";
-import { Skeleton } from "../../components/ui/Skeleton";
-import { type TabItem, Tabs } from "../../components/ui/Tabs";
-import type { FileMetaView, FileTreeView, GitUpdateConflictView } from "../../lib/api";
-import {
-  getFileContentText,
-  getFileMeta,
-  gitCommit,
-  gitFetch,
-  gitPush,
-  gitRemotes,
-  gitStage,
-  gitUnstage,
-  gitUpdate,
-  listGitUpdateConflicts,
-  resolveGitUpdateConflict,
-  saveFileText,
-} from "../../lib/api";
-import { useFileTree, useGitLog, useGitStatus, useProject } from "../../lib/queries";
+import type { FileMetaView } from "../../lib/api";
+import { useProject } from "../../lib/queries";
+import { FileEditor } from "./workspace/FileEditor";
+import { FileTreePanel } from "./workspace/FileTreePanel";
+import { ScmPanel } from "./workspace/ScmPanel";
+import { basename } from "./workspace/utils";
 
-const PROJECT_TABS: TabItem[] = [
-  { value: "files", label: "Files" },
-  { value: "git", label: "Git" },
-  { value: "terminal", label: "Terminal" },
-];
+/**
+ * ProjectPage owns the main-area tab model. The main area is always the tab
+ * strip + a single surface; there is no "graph mode" and no surface gets
+ * painted over another. Graph history lives inside the Source Control side
+ * panel (inline list + hover details), never as a main-area tab.
+ */
 
-function basename(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? path;
+export interface FileTab {
+  id: string;
+  kind: "file";
+  path: string;
+  draft: string;
+  saved: string;
+  meta: FileMetaView | null;
+  loadError: string;
+  loading: boolean;
 }
 
-function parentPath(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  parts.pop();
-  return parts.join("/");
+export type MainTab = FileTab;
+
+type ActivityView = "explorer" | "scm" | "terminal";
+
+let tabIdSeq = 0;
+function nextTabId(): string {
+  tabIdSeq += 1;
+  return `tab-${tabIdSeq}`;
 }
 
 export function ProjectPage() {
   const params = useParams<{ id: string }>();
   const projectId = () => params.id;
   const project = useProject(projectId);
-  const [tab, setTab] = createSignal("files");
+
+  // --- Activity (switcher) rail state: only Explorer / Source Control / Terminal. ---
+  const [activeView, setActiveView] = createSignal<ActivityView>("explorer");
+  const [sidebarOpen, setSidebarOpen] = createSignal(true);
+
+  // --- Main-area tab model: the sole owner of what the main area renders. ---
+  const [tabs, setTabs] = createStore<MainTab[]>([]);
+  const [activeTabId, setActiveTabId] = createSignal<string | null>(null);
+
+  const activeTab = createMemo(() => {
+    const id = activeTabId();
+    if (!id) return undefined;
+    return tabs.find((tab) => tab.id === id);
+  });
+  const activeFilePath = createMemo(() => activeTab()?.path ?? null);
+
+  let treeRefreshToken = 0;
+  const [treeRefresh, setTreeRefresh] = createSignal(treeRefreshToken);
+  let lastMainRevision: string | null | undefined;
+  let trackedProjectId: string | undefined;
+
+  function selectActivity(view: ActivityView) {
+    if (activeView() === view) {
+      setSidebarOpen((open) => !open);
+      return;
+    }
+    setActiveView(view);
+    setSidebarOpen(true);
+  }
+
+  function openFile(path: string) {
+    const existing = tabs.find((tab) => tab.path === path);
+    if (existing) {
+      setActiveTabId(existing.id);
+      return;
+    }
+    const id = nextTabId();
+    setTabs(tabs.length, {
+      id,
+      kind: "file",
+      path,
+      draft: "",
+      saved: "",
+      meta: null,
+      loadError: "",
+      loading: false,
+    });
+    setActiveTabId(id);
+  }
+
+  function patchFileTab(id: string, mutator: (tab: FileTab) => void) {
+    setTabs((list) =>
+      list.map((tab) => {
+        if (tab.id !== id) return tab;
+        const next: FileTab = { ...tab };
+        mutator(next);
+        return next;
+      }),
+    );
+  }
+
+  function closeTab(id: string) {
+    const idx = tabs.findIndex((tab) => tab.id === id);
+    if (idx < 0) return;
+    const wasActive = activeTabId() === id;
+    const neighbor = tabs[idx + 1] ?? tabs[idx - 1] ?? null;
+    setTabs((list) => list.filter((tab) => tab.id !== id));
+    if (wasActive) setActiveTabId(neighbor ? neighbor.id : null);
+  }
+
+  async function handleSaved(_projectId: string) {
+    treeRefreshToken += 1;
+    setTreeRefresh(treeRefreshToken);
+  }
+
+  // Reset local IDE state when navigating between projects.
+  createEffect(() => {
+    const id = projectId();
+    if (!id) return;
+    if (trackedProjectId !== undefined && trackedProjectId !== id) {
+      setTabs([]);
+      setActiveTabId(null);
+      setActiveView("explorer");
+      setSidebarOpen(true);
+      treeRefreshToken = 0;
+      setTreeRefresh(0);
+      lastMainRevision = undefined;
+    }
+    trackedProjectId = id;
+  });
+
+  // Keep the lazy tree aligned with SSE / multi-client main revision bumps.
+  createEffect(() => {
+    const id = projectId();
+    const revision = project.data?.main_revision ?? null;
+    if (!id) {
+      lastMainRevision = undefined;
+      return;
+    }
+    if (revision === null) {
+      lastMainRevision = revision;
+      return;
+    }
+    if (lastMainRevision !== undefined && lastMainRevision !== revision) {
+      setTreeRefresh((n) => n + 1);
+    }
+    lastMainRevision = revision;
+  });
+
+  const branch = () => project.data?.current_branch ?? project.data?.repository.branch ?? null;
 
   return (
-    <section class="project-page route-enter" aria-labelledby="project-title">
-      <div class="project-page-header">
+    <section class="project-page project-page--ide route-enter" aria-labelledby="project-title">
+      <header class="workspace-topbar">
         <A class="project-back" href="/">
           <ArrowLeft size={16} />
-          Projects
+          Exit
         </A>
         <Show
-          when={!project.isPending}
-          fallback={<Skeleton class="project-header-skeleton" compact />}
-        >
-          <Show
-            when={project.data}
-            fallback={
+          when={project.data}
+          fallback={
+            <Show
+              when={project.isError}
+              fallback={
+                <div class="workspace-title-row" aria-busy="true">
+                  <div class="workspace-identity">
+                    <div class="workspace-name">
+                      <span>Workspace:</span>
+                      <h1 id="project-title">...</h1>
+                    </div>
+                  </div>
+                </div>
+              }
+            >
               <ErrorBlock
                 message={
                   project.error instanceof Error ? project.error.message : "Project not found"
                 }
                 retry={() => void project.refetch()}
               />
-            }
-          >
-            {(data) => (
-              <div class="project-title-row">
-                <div>
+            </Show>
+          }
+        >
+          {(data) => (
+            <div class="workspace-title-row">
+              <div class="workspace-identity">
+                <div class="workspace-name">
+                  <span>Workspace:</span>
                   <h1 id="project-title">{data().name}</h1>
-                  <p class="project-subtitle">
-                    {data().repository.url}
-                    <Show when={data().current_branch ?? data().repository.branch}>
-                      {(branch) => (
-                        <>
-                          {" · "}
-                          <GitBranch size={12} class="inline-icon" /> {branch()}
-                        </>
-                      )}
-                    </Show>
-                  </p>
                 </div>
-                <Badge
-                  variant={
-                    data().state === "ready"
-                      ? "success"
-                      : data().state === "error"
-                        ? "danger"
-                        : "warning"
-                  }
-                >
-                  {data().state}
-                </Badge>
+                <p class="project-subtitle">
+                  {data().repository.url}
+                  <Show when={data().current_branch ?? data().repository.branch}>
+                    {(b) => (
+                      <>
+                        {" · "}
+                        <GitBranch size={12} class="inline-icon" /> {b()}
+                      </>
+                    )}
+                  </Show>
+                </p>
               </div>
-            )}
-          </Show>
+              <Badge
+                variant={
+                  data().state === "ready"
+                    ? "success"
+                    : data().state === "error"
+                      ? "danger"
+                      : "warning"
+                }
+              >
+                {data().state}
+              </Badge>
+            </div>
+          )}
         </Show>
-        <Tabs value={tab()} onChange={setTab} tabs={PROJECT_TABS} aria-label="Project sections" />
-      </div>
+      </header>
 
       <Show
         when={project.data?.state === "ready"}
         fallback={
-          <Show when={project.data}>
+          <Show when={project.data} fallback={<BootSplash />}>
             {(data) => (
               <EmptyState
-                icon={Folder}
+                icon={Files}
                 title={`Project is ${data().state}`}
                 description={
                   data().state === "creating"
@@ -123,593 +247,181 @@ export function ProjectPage() {
           </Show>
         }
       >
-        <Show when={tab() === "files"}>
-          <FilesTab
-            projectId={projectId}
-            mainRevision={() => project.data?.main_revision ?? null}
-          />
-        </Show>
-        <Show when={tab() === "git"}>
-          <GitTab projectId={projectId} />
-        </Show>
-        <Show when={tab() === "terminal"}>
-          <TerminalTab />
-        </Show>
-      </Show>
-    </section>
-  );
-}
-
-function FilesTab(props: {
-  projectId: () => string | undefined;
-  mainRevision: () => string | null;
-}) {
-  const notify = useNotifications().notify;
-  const queryClient = useQueryClient();
-  const [dir, setDir] = createSignal("");
-  const tree = useFileTree(props.projectId, dir);
-  const [selectedPath, setSelectedPath] = createSignal<string | null>(null);
-  const [meta, setMeta] = createSignal<FileMetaView | null>(null);
-  const [content, setContent] = createSignal("");
-  const [draft, setDraft] = createSignal("");
-  const [loadError, setLoadError] = createSignal("");
-  const [saving, setSaving] = createSignal(false);
-  const dirty = createMemo(() => draft() !== content());
-
-  const sortedEntries = createMemo(() => {
-    const entries = [...(tree.data ?? [])];
-    return entries.sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
-      return a.path.localeCompare(b.path);
-    });
-  });
-
-  createEffect(() => {
-    const path = selectedPath();
-    const id = props.projectId();
-    if (!path || !id) {
-      setMeta(null);
-      setContent("");
-      setDraft("");
-      setLoadError("");
-      return;
-    }
-
-    let cancelled = false;
-    setLoadError("");
-    void (async () => {
-      try {
-        const nextMeta = await getFileMeta(id, path);
-        if (cancelled) return;
-        setMeta(nextMeta);
-        if (!nextMeta.editable) {
-          setContent("");
-          setDraft("");
-          return;
-        }
-        const text = await getFileContentText(id, path);
-        if (cancelled) return;
-        setContent(text);
-        setDraft(text);
-      } catch (error) {
-        if (cancelled) return;
-        setLoadError(error instanceof Error ? error.message : "Failed to load file");
-        setMeta(null);
-        setContent("");
-        setDraft("");
-      }
-    })();
-
-    onCleanup(() => {
-      cancelled = true;
-    });
-  });
-
-  async function openEntry(entry: FileTreeView) {
-    if (entry.kind === "dir") {
-      setDir(entry.path);
-      setSelectedPath(null);
-      return;
-    }
-    setSelectedPath(entry.path);
-  }
-
-  async function save() {
-    const id = props.projectId();
-    const path = selectedPath();
-    if (!id || !path) return;
-    setSaving(true);
-    setLoadError("");
-    try {
-      await saveFileText(id, {
-        path,
-        content: draft(),
-        expected_main_revision: props.mainRevision(),
-      });
-      setContent(draft());
-      notify("File saved", { variant: "success" });
-      await queryClient.invalidateQueries({ queryKey: ["project", id] });
-      await queryClient.invalidateQueries({ queryKey: ["file-tree", id] });
-      const nextMeta = await getFileMeta(id, path);
-      setMeta(nextMeta);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Save failed";
-      setLoadError(message);
-      notify(message, { variant: "danger" });
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div class="files-layout">
-      <aside class="files-tree" aria-label="File tree">
-        <div class="files-tree-toolbar">
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={!dir()}
-            onClick={() => setDir(parentPath(dir()))}
-          >
-            Up
-          </Button>
-          <span class="files-tree-path">{dir() || "/"}</span>
-        </div>
-        <Show when={!tree.isPending} fallback={<Skeleton compact />}>
-          <Show
-            when={!tree.isError}
-            fallback={
-              <ErrorBlock
-                message={tree.error instanceof Error ? tree.error.message : "Tree failed"}
-                retry={() => void tree.refetch()}
-              />
-            }
-          >
-            <Show
-              when={(sortedEntries().length ?? 0) > 0}
-              fallback={<p class="files-tree-empty">Empty directory</p>}
+        <div class="ide-shell" classList={{ "ide-shell--sidebar-collapsed": !sidebarOpen() }}>
+          <nav class="ide-activity-bar" aria-label="Workspace activity">
+            <ActivityButton
+              label="Explorer"
+              active={activeView() === "explorer" && sidebarOpen()}
+              onClick={() => selectActivity("explorer")}
             >
-              <ul class="files-tree-list">
-                <For each={sortedEntries()}>
-                  {(entry) => (
-                    <li>
-                      <button
-                        type="button"
-                        class="files-tree-item"
-                        classList={{
-                          "files-tree-item--active": selectedPath() === entry.path,
-                          "files-tree-item--dir": entry.kind === "dir",
-                        }}
-                        onClick={() => void openEntry(entry)}
-                      >
-                        {entry.kind === "dir" ? <Folder size={14} /> : <FileCode2 size={14} />}
-                        <span>{basename(entry.path)}</span>
-                      </button>
-                    </li>
-                  )}
-                </For>
-              </ul>
-            </Show>
-          </Show>
-        </Show>
-      </aside>
+              <Files size={18} />
+            </ActivityButton>
+            <ActivityButton
+              label="Source Control"
+              active={activeView() === "scm" && sidebarOpen()}
+              onClick={() => selectActivity("scm")}
+            >
+              <GitCompare size={18} />
+            </ActivityButton>
+            <ActivityButton
+              label="Terminal"
+              active={activeView() === "terminal" && sidebarOpen()}
+              onClick={() => selectActivity("terminal")}
+            >
+              <TerminalSquare size={18} />
+            </ActivityButton>
+          </nav>
 
-      <div class="files-editor">
-        <Show
-          when={selectedPath()}
-          fallback={
-            <EmptyState
-              icon={FileCode2}
-              title="Select a file"
-              description="Browse the tree to open a text file in the Main Workspace editor."
-            />
-          }
-        >
-          <div class="files-editor-toolbar">
-            <div>
-              <strong>{selectedPath()}</strong>
-              <Show when={meta()}>
-                {(value) => (
-                  <p class="files-editor-meta">
-                    {value().editable ? "Editable" : "Not editable"} · {value().size} bytes
-                  </p>
+          {/*
+            Keep the sidebar chrome mounted while open so activity switches only
+            swap panel content, not the whole rail. That avoids a layout flash.
+          */}
+          <Show when={sidebarOpen()}>
+            <aside class="ide-sidebar" aria-label="Workspace sidebar">
+              <div
+                class="ide-sidebar-view"
+                classList={{ "ide-sidebar-view--active": activeView() === "explorer" }}
+                hidden={activeView() !== "explorer"}
+              >
+                <FileTreePanel
+                  projectId={projectId}
+                  activePath={activeFilePath}
+                  onOpenFile={openFile}
+                  refreshToken={treeRefresh}
+                />
+              </div>
+              <div
+                class="ide-sidebar-view"
+                classList={{ "ide-sidebar-view--active": activeView() === "scm" }}
+                hidden={activeView() !== "scm"}
+              >
+                <ScmPanel projectId={projectId} onOpenFile={openFile} branch={branch} />
+              </div>
+              <div
+                class="ide-sidebar-view"
+                classList={{ "ide-sidebar-view--active": activeView() === "terminal" }}
+                hidden={activeView() !== "terminal"}
+              >
+                <div class="ide-sidebar-panel">
+                  <div class="ide-sidebar-header">Terminal</div>
+                  <EmptyState
+                    icon={TerminalSquare}
+                    title="Terminal unavailable"
+                    description="Main Workspace Terminal depends on RuntimeExecutor and lands in M4. This panel is a placeholder."
+                    class="terminal-placeholder"
+                  />
+                </div>
+              </div>
+            </aside>
+          </Show>
+
+          {/*
+            Main area is always owned by the tab strip. Files are the only tab
+            kind; Graph lives in the Source Control side panel. Nothing paints
+            over the editor or hides the tab strip.
+          */}
+          <main class="ide-main">
+            <Show when={tabs.length > 0}>
+              <div class="ide-main-tabs">
+                <div class="ide-tabs" role="tablist" aria-label="Open editors">
+                  <For each={tabs}>
+                    {(tab) => (
+                      <TabView
+                        tab={tab}
+                        active={activeTabId() === tab.id}
+                        onActivate={() => setActiveTabId(tab.id)}
+                        onClose={() => closeTab(tab.id)}
+                      />
+                    )}
+                  </For>
+                </div>
+              </div>
+            </Show>
+            <div class="ide-main-surface">
+              <Show
+                when={activeTab()}
+                fallback={
+                  <EmptyState
+                    icon={FileCode2}
+                    title="No file open"
+                    description="Open a file from the Explorer. Commit history lives under Source Control."
+                  />
+                }
+              >
+                {(tab) => (
+                  <FileEditor
+                    projectId={projectId}
+                    mainRevision={() => project.data?.main_revision ?? null}
+                    tab={() => tab() as FileTab}
+                    onPatch={(mutator) => patchFileTab(tab().id, mutator)}
+                    onSaved={handleSaved}
+                  />
                 )}
               </Show>
             </div>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={!meta()?.editable || !dirty() || saving()}
-              onClick={() => void save()}
-            >
-              <Save size={14} />
-              Save
-            </Button>
-          </div>
-          <Show when={loadError()}>
-            <ErrorBlock variant="inline" message={loadError()} />
-          </Show>
-          <Show
-            when={meta()?.editable}
-            fallback={
-              <EmptyState
-                icon={FileCode2}
-                title="File not editable"
-                description="Binary, oversized, or non-UTF-8 files can be downloaded via the API but not edited here."
-              />
-            }
-          >
-            {/* M2 uses a native monospace textarea; CodeMirror is not in package.json. */}
-            <textarea
-              class="files-textarea"
-              value={draft()}
-              spellcheck={false}
-              aria-label="File content"
-              onInput={(event) => setDraft(event.currentTarget.value)}
-            />
-          </Show>
-        </Show>
-      </div>
-    </div>
-  );
-}
-
-function GitTab(props: { projectId: () => string | undefined }) {
-  const notify = useNotifications().notify;
-  const queryClient = useQueryClient();
-  const status = useGitStatus(props.projectId);
-  const log = useGitLog(props.projectId, 20);
-  const [selected, setSelected] = createSignal<Set<string>>(new Set());
-  const [message, setMessage] = createSignal("");
-  const [busy, setBusy] = createSignal(false);
-  const [conflicts, setConflicts] = createSignal<GitUpdateConflictView[]>([]);
-  const [choices, setChoices] = createSignal<Record<string, string>>({});
-  const [editedText, setEditedText] = createSignal<Record<string, string>>({});
-
-  function toggle(path: string) {
-    setSelected((current) => {
-      const next = new Set(current);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }
-
-  async function refreshGit() {
-    const id = props.projectId();
-    if (!id) return;
-    await queryClient.invalidateQueries({ queryKey: ["git-status", id] });
-    await queryClient.invalidateQueries({ queryKey: ["git-log", id] });
-    try {
-      const next = await listGitUpdateConflicts(id);
-      setConflicts(next);
-    } catch {
-      // Conflicts endpoint failures shouldn't block status view.
-    }
-  }
-
-  createEffect(() => {
-    const id = props.projectId();
-    if (!id) return;
-    void refreshGit();
-  });
-
-  async function run(action: () => Promise<void>, success: string) {
-    setBusy(true);
-    try {
-      await action();
-      notify(success, { variant: "success" });
-      setSelected(new Set<string>());
-      await refreshGit();
-    } catch (error) {
-      notify(error instanceof Error ? error.message : "Git command failed", {
-        variant: "danger",
-      });
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const selectedPaths = () => [...selected()];
-  const openConflict = () => conflicts()[0];
-
-  return (
-    <div class="git-layout">
-      <Show when={!status.isPending} fallback={<Skeleton />}>
-        <Show
-          when={status.data}
-          fallback={
-            <ErrorBlock
-              message={status.error instanceof Error ? status.error.message : "Git status failed"}
-              retry={() => void status.refetch()}
-            />
-          }
-        >
-          {(data) => (
-            <>
-              <div class="git-summary">
-                <Badge variant="neutral">
-                  {data().branch ?? "detached"}
-                  {data().head_sha ? ` · ${data().head_sha?.slice(0, 7)}` : ""}
-                </Badge>
-                <span>
-                  ↑{data().ahead} ↓{data().behind}
-                </span>
-                <div class="git-actions">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy() || selectedPaths().length === 0}
-                    onClick={() =>
-                      void run(
-                        () => gitStage(props.projectId() as string, selectedPaths()),
-                        "Staged",
-                      )
-                    }
-                  >
-                    Stage
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy() || selectedPaths().length === 0}
-                    onClick={() =>
-                      void run(
-                        () => gitUnstage(props.projectId() as string, selectedPaths()),
-                        "Unstaged",
-                      )
-                    }
-                  >
-                    Unstage
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy()}
-                    onClick={() =>
-                      void run(async () => {
-                        const id = props.projectId() as string;
-                        const remotes = await gitRemotes(id);
-                        const remote = remotes.includes("origin")
-                          ? "origin"
-                          : (remotes[0] ?? "origin");
-                        await gitFetch(id, remote, crypto.randomUUID());
-                      }, "Fetch started")
-                    }
-                  >
-                    Fetch
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy() || !data().branch}
-                    onClick={() =>
-                      void run(async () => {
-                        const id = props.projectId() as string;
-                        const remotes = await gitRemotes(id);
-                        const remote = remotes.includes("origin")
-                          ? "origin"
-                          : (remotes[0] ?? "origin");
-                        const branch = data().branch ?? "main";
-                        await gitUpdate(id, remote, branch, crypto.randomUUID());
-                      }, "Update started")
-                    }
-                  >
-                    Update
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy() || !data().branch}
-                    onClick={() =>
-                      void run(async () => {
-                        const id = props.projectId() as string;
-                        const remotes = await gitRemotes(id);
-                        const remote = remotes.includes("origin")
-                          ? "origin"
-                          : (remotes[0] ?? "origin");
-                        const branch = data().branch ?? "main";
-                        await gitPush(id, remote, branch, crypto.randomUUID());
-                      }, "Push started")
-                    }
-                  >
-                    Push
-                  </Button>
-                </div>
-              </div>
-
-              <div class="git-sections">
-                <GitPathSection
-                  title="Working tree"
-                  paths={data().working}
-                  selected={selected()}
-                  onToggle={toggle}
-                />
-                <GitPathSection
-                  title="Index"
-                  paths={data().index}
-                  selected={selected()}
-                  onToggle={toggle}
-                />
-                <GitPathSection
-                  title="Untracked"
-                  paths={data().untracked}
-                  selected={selected()}
-                  onToggle={toggle}
-                />
-              </div>
-
-              <div class="git-commit">
-                <span class="field-label">Commit message</span>
-                <textarea
-                  class="ui-input git-commit-message"
-                  value={message()}
-                  onInput={(event) => setMessage(event.currentTarget.value)}
-                  placeholder="Describe the change"
-                  aria-label="Commit message"
-                />
-                <Button
-                  variant="primary"
-                  size="sm"
-                  disabled={busy() || !message().trim() || data().index.length === 0}
-                  onClick={() =>
-                    void run(async () => {
-                      await gitCommit(props.projectId() as string, message().trim());
-                      setMessage("");
-                    }, "Committed")
-                  }
-                >
-                  Commit
-                </Button>
-              </div>
-            </>
-          )}
-        </Show>
-      </Show>
-
-      <Show when={openConflict()}>
-        {(conflict) => (
-          <section class="git-conflict" aria-label="Git update conflict">
-            <h2>Update conflict</h2>
-            <p>
-              Remote changes collide with local working-tree edits. Choose a side for each path,
-              then apply.
-            </p>
-            <For each={conflict().paths}>
-              {(path) => (
-                <div class="git-conflict-path">
-                  <strong>{path.path}</strong>
-                  <span class="files-editor-meta">{path.kind}</span>
-                  <div class="git-actions">
-                    <For each={["main", "remote", "delete", "edited_text"] as const}>
-                      {(choice) => (
-                        <Button
-                          variant={choices()[path.path] === choice ? "primary" : "outline"}
-                          size="sm"
-                          onClick={() =>
-                            setChoices((current) => ({ ...current, [path.path]: choice }))
-                          }
-                        >
-                          {choice}
-                        </Button>
-                      )}
-                    </For>
-                  </div>
-                  <Show when={choices()[path.path] === "edited_text"}>
-                    <textarea
-                      class="ui-input git-commit-message"
-                      value={editedText()[path.path] ?? ""}
-                      onInput={(event) =>
-                        setEditedText((current) => ({
-                          ...current,
-                          [path.path]: event.currentTarget.value,
-                        }))
-                      }
-                      placeholder="Merged file content"
-                      aria-label={`Edited text for ${path.path}`}
-                    />
-                  </Show>
-                </div>
-              )}
-            </For>
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={busy()}
-              onClick={() =>
-                void run(async () => {
-                  const id = props.projectId() as string;
-                  const current = openConflict();
-                  if (!current) return;
-                  const paths = current.paths.map((path) => {
-                    const choice = choices()[path.path] ?? "main";
-                    return choice === "edited_text"
-                      ? {
-                          path: path.path,
-                          choice,
-                          edited_text: editedText()[path.path] ?? "",
-                        }
-                      : {
-                          path: path.path,
-                          choice,
-                        };
-                  });
-                  await resolveGitUpdateConflict(id, current.id, current.version, { paths });
-                  setChoices({});
-                  setEditedText({});
-                }, "Conflict resolved")
-              }
-            >
-              Apply resolution
-            </Button>
-          </section>
-        )}
-      </Show>
-
-      <section class="git-log" aria-label="Recent commits">
-        <h2>Recent commits</h2>
-        <Show when={!log.isPending} fallback={<Skeleton compact />}>
-          <Show
-            when={(log.data?.length ?? 0) > 0}
-            fallback={<p class="files-tree-empty">No commits yet</p>}
-          >
-            <ul class="git-log-list">
-              <For each={log.data ?? []}>
-                {(entry) => (
-                  <li>
-                    <code>{entry.sha.slice(0, 7)}</code> {entry.message}
-                    <span class="files-editor-meta"> · {entry.author}</span>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-        </Show>
-      </section>
-    </div>
-  );
-}
-
-function GitPathSection(props: {
-  title: string;
-  paths: string[];
-  selected: Set<string>;
-  onToggle: (path: string) => void;
-}) {
-  return (
-    <section class="git-path-section">
-      <h3>
-        {props.title} <span class="files-editor-meta">({props.paths.length})</span>
-      </h3>
-      <Show when={props.paths.length > 0} fallback={<p class="files-tree-empty">Clean</p>}>
-        <ul class="git-path-list">
-          <For each={props.paths}>
-            {(path) => (
-              <li>
-                <label class="git-path-item">
-                  <input
-                    type="checkbox"
-                    checked={props.selected.has(path)}
-                    onChange={() => props.onToggle(path)}
-                  />
-                  <span>{path}</span>
-                </label>
-              </li>
-            )}
-          </For>
-        </ul>
+          </main>
+        </div>
       </Show>
     </section>
   );
 }
 
-function TerminalTab() {
+function TabView(props: {
+  tab: FileTab;
+  active: boolean;
+  onActivate: () => void;
+  onClose: () => void;
+}) {
+  const dirty = () => Boolean(props.tab.meta?.editable) && props.tab.draft !== props.tab.saved;
   return (
-    <EmptyState
-      icon={TerminalSquare}
-      title="Terminal unavailable"
-      description="Main Workspace Terminal depends on RuntimeExecutor and lands in M4. This tab is a placeholder for M2."
-      class="terminal-placeholder"
-    />
+    <div class="ide-tab" classList={{ "ide-tab--active": props.active, "ide-tab--dirty": dirty() }}>
+      <button
+        type="button"
+        class="ide-tab-label"
+        role="tab"
+        aria-selected={props.active}
+        aria-label={`${basename(props.tab.path)}${dirty() ? ", unsaved changes" : ""}`}
+        title={props.tab.path}
+        onClick={props.onActivate}
+      >
+        <Show when={dirty()}>
+          <span class="ide-tab-dirty" aria-hidden="true" title="Unsaved changes" />
+        </Show>
+        <span>{basename(props.tab.path)}</span>
+      </button>
+      <button
+        type="button"
+        class="ide-tab-close"
+        aria-label={`Close ${basename(props.tab.path)}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          props.onClose();
+        }}
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
+function ActivityButton(props: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  children: import("solid-js").JSX.Element;
+}) {
+  return (
+    <button
+      type="button"
+      class="ide-activity-btn"
+      classList={{ "ide-activity-btn--active": props.active }}
+      aria-label={props.label}
+      aria-pressed={props.active}
+      title={props.label}
+      onClick={props.onClick}
+    >
+      {props.children}
+      <span>{props.label}</span>
+    </button>
   );
 }

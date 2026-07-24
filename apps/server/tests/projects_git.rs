@@ -346,7 +346,10 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, StatusCode::OK, "{response}");
     let project: Value = serde_json::from_str(&response)?;
-    let revision = project["data"]["main_revision"].as_str().unwrap().to_owned();
+    let revision = project["data"]["main_revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (status, response) = request(
         &app,
         "PUT",

@@ -89,9 +89,17 @@ fn dev(root: &Path) -> anyhow::Result<()> {
         .current_dir(root)
         .spawn()
         .context("start Vite development server")?;
+    // WebAuthn rejects an IP address as an RP ID, so the dev server must bind to
+    // a loopback hostname: derive both origin and RP ID from "localhost" rather
+    // than the numeric 127.0.0.1 default. Without these env vars the server
+    // fails to initialize with "configuration was invalid".
     let server_status = Command::new("cargo")
         .args(["run", "-p", "janus-server"])
         .current_dir(root)
+        .envs([
+            ("JANUS_PUBLIC_ORIGIN", "http://localhost:4317"),
+            ("JANUS_WEBAUTHN_RP_ID", "localhost"),
+        ])
         .status()
         .context("start Janus server")?;
     let _ = web.kill();

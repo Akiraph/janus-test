@@ -1,4 +1,5 @@
-import { AlertCircle, RefreshCw } from "lucide-solid";
+import AlertCircle from "lucide-solid/icons/alert-circle";
+import RefreshCw from "lucide-solid/icons/refresh-cw";
 import { Show } from "solid-js";
 
 export type ErrorBlockVariant = "inline" | "alert";

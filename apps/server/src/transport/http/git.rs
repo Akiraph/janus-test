@@ -65,7 +65,11 @@ pub struct GitLogEntryView {
     pub sha: String,
     pub parents: Vec<String>,
     pub author: String,
+    pub committed_at: String,
     pub message: String,
+    pub changed_files: u64,
+    pub insertions: u64,
+    pub deletions: u64,
 }
 
 impl From<GitLogEntry> for GitLogEntryView {
@@ -74,7 +78,11 @@ impl From<GitLogEntry> for GitLogEntryView {
             sha: entry.sha,
             parents: entry.parents,
             author: entry.author,
+            committed_at: entry.committed_at,
             message: entry.message,
+            changed_files: entry.changed_files,
+            insertions: entry.insertions,
+            deletions: entry.deletions,
         }
     }
 }
@@ -652,13 +660,13 @@ pub async fn resolve_update_conflict(
                 paths: input
                     .paths
                     .into_iter()
-                    .map(|p| {
-                        crate::modules::projects::interface::ResolveGitUpdateConflictPath {
+                    .map(
+                        |p| crate::modules::projects::interface::ResolveGitUpdateConflictPath {
                             path: p.path,
                             choice: p.choice,
                             edited_text: p.edited_text,
-                        }
-                    })
+                        },
+                    )
                     .collect(),
             },
             correlation_id,

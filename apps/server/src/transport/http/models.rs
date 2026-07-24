@@ -1,6 +1,6 @@
 use crate::{
     AppState,
-    modules::models::interface::{FailoverInput, ModelInput, ModelsError, ProviderInput},
+    modules::models::interface::{ModelsError, ProviderInput},
     platform::events::NewEvent,
     transport::http::{
         auth::{authenticate, authorized},
@@ -107,108 +107,6 @@ pub async fn probe_provider(
             .map_err(problem)?,
     }))
 }
-#[utoipa::path(get, path = "/api/v1/models", responses((status = 200, body = DataResponse<Vec<crate::modules::models::interface::ModelView>>), (status = 401, body = Problem)))]
-pub async fn models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<DataResponse<Vec<crate::modules::models::interface::ModelView>>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
-    Ok(Json(DataResponse {
-        data: state
-            .models()
-            .models(&auth.owner_id)
-            .await
-            .map_err(problem)?,
-    }))
-}
-#[utoipa::path(post, path = "/api/v1/models", request_body = ModelInput, responses((status = 201, body = DataResponse<crate::modules::models::interface::ModelView>), (status = 422, body = Problem)))]
-pub async fn create_model(
-    State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
-    headers: HeaderMap,
-    Json(input): Json<ModelInput>,
-) -> Result<
-    (
-        StatusCode,
-        Json<DataResponse<crate::modules::models::interface::ModelView>>,
-    ),
-    Problem,
-> {
-    let auth = authorized(&state, &headers).await?;
-    let view = state
-        .models()
-        .create_model(&auth.owner_id, input)
-        .await
-        .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &view.id,
-        "model",
-        "created",
-        &context,
-    )
-    .await;
-    Ok((StatusCode::CREATED, Json(DataResponse { data: view })))
-}
-#[utoipa::path(patch, path = "/api/v1/models/{id}", params(("id" = String, Path)), request_body = ModelInput, responses((status = 200, body = DataResponse<crate::modules::models::interface::ModelView>), (status = 404, body = Problem)))]
-pub async fn update_model(
-    State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(input): Json<ModelInput>,
-) -> Result<Json<DataResponse<crate::modules::models::interface::ModelView>>, Problem> {
-    let auth = authorized(&state, &headers).await?;
-    let view = state
-        .models()
-        .update_model(&auth.owner_id, &id, input)
-        .await
-        .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "model", "updated", &context).await;
-    Ok(Json(DataResponse { data: view }))
-}
-#[utoipa::path(delete, path = "/api/v1/models/{id}", params(("id" = String, Path)), responses((status = 204), (status = 404, body = Problem)))]
-pub async fn delete_model(
-    State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<StatusCode, Problem> {
-    let auth = authorized(&state, &headers).await?;
-    state
-        .models()
-        .delete_model(&auth.owner_id, &id)
-        .await
-        .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "model", "deleted", &context).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-#[utoipa::path(put, path = "/api/v1/models/{id}/failover", params(("id" = String, Path)), request_body = FailoverInput, responses((status = 200, body = DataResponse<crate::modules::models::interface::FailoverView>), (status = 422, body = Problem)))]
-pub async fn set_failover(
-    State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(input): Json<FailoverInput>,
-) -> Result<Json<DataResponse<crate::modules::models::interface::FailoverView>>, Problem> {
-    let auth = authorized(&state, &headers).await?;
-    let view = state
-        .models()
-        .set_failover(&auth.owner_id, &id, input)
-        .await
-        .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &id,
-        "model",
-        "failover_updated",
-        &context,
-    )
-    .await;
-    Ok(Json(DataResponse { data: view }))
-}
 
 async fn emit_change(
     state: &AppState,
@@ -241,16 +139,10 @@ fn problem(error: ModelsError) -> Problem {
             "Validation failed",
             error.to_string(),
         ),
-        ModelsError::ProviderNotFound | ModelsError::ModelNotFound => Problem::new(
+        ModelsError::ProviderNotFound => Problem::new(
             StatusCode::NOT_FOUND,
             "RESOURCE_NOT_FOUND",
             "Resource not found",
-            error.to_string(),
-        ),
-        ModelsError::ProviderInUse => Problem::new(
-            StatusCode::CONFLICT,
-            "PROVIDER_IN_USE",
-            "Provider in use",
             error.to_string(),
         ),
         ModelsError::Storage(_) | ModelsError::Data(_) | ModelsError::Internal(_) => Problem::new(

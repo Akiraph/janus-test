@@ -105,7 +105,11 @@ pub struct GitLogEntry {
     pub sha: String,
     pub parents: Vec<String>,
     pub author: String,
+    pub committed_at: String,
     pub message: String,
+    pub changed_files: u64,
+    pub insertions: u64,
+    pub deletions: u64,
 }
 
 /// One path that collides between local working-tree edits and the incoming
@@ -369,25 +373,10 @@ impl GitRunner for SystemGit {
         command
             .arg("log")
             .arg(format!("-n{limit}"))
-            .arg("--format=%H%x00%P%x00%an%x00%s");
+            .arg("--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s")
+            .arg("--numstat");
         let output = Self::run(&mut command).await?;
-        let mut entries = Vec::new();
-        for line in output.lines() {
-            let parts: Vec<&str> = line.split('\0').collect();
-            if parts.len() == 4 {
-                entries.push(GitLogEntry {
-                    sha: parts[0].to_owned(),
-                    parents: if parts[1].is_empty() {
-                        Vec::new()
-                    } else {
-                        parts[1].split(' ').map(str::to_owned).collect()
-                    },
-                    author: parts[2].to_owned(),
-                    message: parts[3].to_owned(),
-                });
-            }
-        }
-        Ok(entries)
+        Ok(parse_git_log(&output))
     }
 
     async fn branches(&self, repo: &Path) -> Result<Vec<String>, GitError> {
@@ -572,7 +561,8 @@ impl GitRunner for SystemGit {
                     }
                     if path.contains('/') || path.contains('.') {
                         let base_hash = blob_hash_at(repo, &base_sha, path).await.ok().flatten();
-                        let remote_hash = blob_hash_at(repo, &remote_sha, path).await.ok().flatten();
+                        let remote_hash =
+                            blob_hash_at(repo, &remote_sha, path).await.ok().flatten();
                         let main_hash = working_blob_hash(repo, path)
                             .await
                             .ok()
@@ -647,7 +637,12 @@ async fn compute_update_conflicts(
         // working file when it still exists.
         let working_hash = working_blob_hash(repo, path).await.ok().flatten();
         let main_hash = working_hash.or(main_hash);
-        let kind = classify_conflict_kind(remote_kind, base_hash.as_deref(), remote_hash.as_deref(), main_hash.as_deref());
+        let kind = classify_conflict_kind(
+            remote_kind,
+            base_hash.as_deref(),
+            remote_hash.as_deref(),
+            main_hash.as_deref(),
+        );
         conflicts.push(UpdateConflictPath {
             path: path.clone(),
             kind,
@@ -722,17 +717,9 @@ async fn working_dirty_paths(repo: &Path) -> Result<std::collections::HashSet<St
     Ok(set)
 }
 
-async fn blob_hash_at(
-    repo: &Path,
-    treeish: &str,
-    path: &str,
-) -> Result<Option<String>, GitError> {
+async fn blob_hash_at(repo: &Path, treeish: &str, path: &str) -> Result<Option<String>, GitError> {
     let mut command = SystemGit::base(repo);
-    command
-        .arg("ls-tree")
-        .arg(treeish)
-        .arg("--")
-        .arg(path);
+    command.arg("ls-tree").arg(treeish).arg("--").arg(path);
     let output = match SystemGit::run(&mut command).await {
         Ok(o) => o,
         Err(_) => return Ok(None),
@@ -824,9 +811,8 @@ pub async fn apply_conflict_choice(
             Ok(())
         }
         "edited_text" => {
-            let bytes = edited_bytes.ok_or_else(|| {
-                GitError::BadOutput("edited_text choice requires body".into())
-            })?;
+            let bytes = edited_bytes
+                .ok_or_else(|| GitError::BadOutput("edited_text choice requires body".into()))?;
             if let Some(parent) = abs.parent() {
                 tokio::fs::create_dir_all(parent).await.ok();
             }
@@ -835,7 +821,9 @@ pub async fn apply_conflict_choice(
                 .map_err(|e| GitError::CommandFailed(e.to_string()))?;
             Ok(())
         }
-        other => Err(GitError::BadOutput(format!("unknown conflict choice {other}"))),
+        other => Err(GitError::BadOutput(format!(
+            "unknown conflict choice {other}"
+        ))),
     }
 }
 
@@ -865,16 +853,67 @@ pub async fn complete_fast_forward(
     let upstream = format!("{remote}/{branch}");
     // Reset HEAD to remote tip without touching working tree, then re-read sha.
     let mut command = SystemGit::base(repo);
-    command
-        .arg("update-ref")
-        .arg("HEAD")
-        .arg(&upstream);
+    command.arg("update-ref").arg("HEAD").arg(&upstream);
     SystemGit::run(&mut command).await?;
     // Clear the index and re-add the working tree so status is consistent.
     let mut reset = SystemGit::base(repo);
     reset.arg("read-tree").arg("HEAD");
     let _ = SystemGit::run(&mut reset).await;
     rev_parse(repo, "HEAD").await
+}
+
+/// Parse records emitted by `git log --format=... --numstat`.
+///
+/// Record (`0x1e`) and unit (`0x1f`) separators keep user-authored subjects
+/// independent from the numstat lines. Binary changes use `-` for counts and
+/// still contribute to `changed_files`.
+fn parse_git_log(output: &str) -> Vec<GitLogEntry> {
+    output
+        .split('\x1e')
+        .filter_map(|record| {
+            let mut lines = record.trim_matches(['\r', '\n']).lines();
+            let header = lines.next()?.trim_end_matches('\r');
+            let mut fields = header.splitn(5, '\x1f');
+            let sha = fields.next()?;
+            let parents = fields.next()?;
+            let author = fields.next()?;
+            let committed_at = fields.next()?;
+            let message = fields.next()?;
+            if sha.is_empty() {
+                return None;
+            }
+
+            let mut changed_files = 0_u64;
+            let mut insertions = 0_u64;
+            let mut deletions = 0_u64;
+            for line in lines {
+                let mut numstat = line.trim_end_matches('\r').splitn(3, '\t');
+                let Some(added) = numstat.next() else {
+                    continue;
+                };
+                let Some(deleted) = numstat.next() else {
+                    continue;
+                };
+                if numstat.next().is_none() {
+                    continue;
+                }
+                changed_files += 1;
+                insertions += added.parse::<u64>().unwrap_or(0);
+                deletions += deleted.parse::<u64>().unwrap_or(0);
+            }
+
+            Some(GitLogEntry {
+                sha: sha.to_owned(),
+                parents: parents.split_whitespace().map(str::to_owned).collect(),
+                author: author.to_owned(),
+                committed_at: committed_at.to_owned(),
+                message: message.to_owned(),
+                changed_files,
+                insertions,
+                deletions,
+            })
+        })
+        .collect()
 }
 
 /// Parse `git status --porcelain=v2 --branch` into the three-layer projection.
@@ -904,13 +943,16 @@ fn parse_porcelain_v2(output: &str) -> GitStatus {
                 .and_then(|s| s.trim_start_matches('-').parse().ok())
                 .unwrap_or(0);
         } else if let Some(rest) = line.strip_prefix("u ") {
-            // Unmerged entry: conflict in working tree.
-            if let Some(path) = rest.split_whitespace().nth(8) {
+            // Unmerged: u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+            // path is field 9 (0-based) after the "u " prefix.
+            if let Some(path) = rest.split_whitespace().nth(9) {
                 working.push(path.to_owned());
             }
         } else if let Some(rest) = line.strip_prefix("? ") {
             untracked.push(rest.to_owned());
         } else {
+            // Ordinary: 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>  → path @ 7
+            // Rename:   2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <score> <path> <orig> → path @ 8
             let (rest, is_rename) = if let Some(rest) = line.strip_prefix("1 ") {
                 (rest, false)
             } else if let Some(rest) = line.strip_prefix("2 ") {
@@ -920,11 +962,10 @@ fn parse_porcelain_v2(output: &str) -> GitStatus {
             };
             let fields: Vec<&str> = rest.split_whitespace().collect();
             let xy = fields.first().copied().unwrap_or("");
-            // path index differs between "1" (8) and "2" (rename: oldpath at 8, new at 9).
             let path = if is_rename {
-                fields.get(9).copied().unwrap_or("")
-            } else {
                 fields.get(8).copied().unwrap_or("")
+            } else {
+                fields.get(7).copied().unwrap_or("")
             };
             if !path.is_empty() {
                 let (x, y) = (
@@ -983,6 +1024,8 @@ fn write_askpass_script(username: &str, password: &str) -> Result<std::path::Pat
 #[cfg(test)]
 mod tests {
     use super::classify_failure;
+    use super::parse_git_log;
+    use super::parse_porcelain_v2;
     use crate::adapters::git::GitError;
 
     #[test]
@@ -1007,5 +1050,54 @@ mod tests {
             classify_failure("fatal: refusing to merge unrelated histories (diverged)"),
             GitError::Diverged
         ));
+    }
+
+    /// Repro for "save file → git status shows no changes": real `git status
+    /// --porcelain=v2 --branch` output from a working tree with modified files
+    /// must populate `working`. The `1 .M N...` ordinary-changed entry has
+    /// staged==HEAD (x='.') but working differs (y='M'), so it belongs in
+    /// `working`, not `index`.
+    #[test]
+    fn parse_porcelain_v2_detects_working_tree_modifications() {
+        let output = "\
+# branch.oid 6523bfcfae7ad8b09b5b863def82400191c9578c
+# branch.head main
+# branch.upstream origin/main
+# branch.ab +0 -0
+1 .M N... 100644 100644 100644 2d438b3d37c196e94f40976c89fc8a6f6db946bd 2d438b3d37c196e94f40976c89fc8a6f6db946bd .dockerignore
+1 .M N... 100644 100644 100644 4070d6e2fd2e5aa1a6478f5e336fa295e743b79f 4070d6e2fd2e5aa1a6478f5e336fa295e743b79f .npmrc
+1 .M N... 100644 100644 100644 ab4a65267255f1799dbfe2c65ccd9713907c49f7 ab4a65267255f1799dbfe2c65ccd9713907c49f7 AGENTS.md
+";
+        let status = parse_porcelain_v2(output);
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(
+            status.head_sha.as_deref(),
+            Some("6523bfcfae7ad8b09b5b863def82400191c9578c")
+        );
+        assert_eq!(status.working, vec![".dockerignore", ".npmrc", "AGENTS.md"]);
+        assert!(status.index.is_empty());
+        assert!(status.untracked.is_empty());
+    }
+
+    #[test]
+    fn parse_git_log_preserves_topology_and_sums_numstat() {
+        let output = concat!(
+            "\x1eaaaaaaaa\x1fbbbbbbbb cccccccc\x1fAkiraph\x1f2026-07-24T10:13:00+08:00\x1ffeat: graph details\n\n",
+            "2664\t99\tapps/web/src/main.tsx\n",
+            "-\t-\tapps/web/public/logo.png\n",
+            "\x1ebbbbbbbb\x1f\x1fJanus\x1f2026-07-23T18:00:00+08:00\x1finitial commit\n\n",
+            "10\t0\tREADME.md\n",
+        );
+
+        let entries = parse_git_log(output);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].parents, vec!["bbbbbbbb", "cccccccc"]);
+        assert_eq!(entries[0].committed_at, "2026-07-24T10:13:00+08:00");
+        assert_eq!(entries[0].changed_files, 2);
+        assert_eq!(entries[0].insertions, 2664);
+        assert_eq!(entries[0].deletions, 99);
+        assert_eq!(entries[1].parents, Vec::<String>::new());
+        assert_eq!(entries[1].changed_files, 1);
+        assert_eq!(entries[1].insertions, 10);
     }
 }

@@ -4400,11 +4400,33 @@
           "sha",
           "parents",
           "author",
-          "message"
+          "committed_at",
+          "message",
+          "changed_files",
+          "insertions",
+          "deletions"
         ],
         "properties": {
           "author": {
             "type": "string"
+          },
+          "changed_files": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "committed_at": {
+            "type": "string"
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "insertions": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           },
           "message": {
             "type": "string"

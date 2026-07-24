@@ -1,6 +1,11 @@
 import { useQueryClient } from "@tanstack/solid-query";
-import { KeyRound, LockKeyhole, ShieldCheck } from "lucide-solid";
+import KeyRound from "lucide-solid/icons/key-round";
+import LockKeyhole from "lucide-solid/icons/lock-keyhole";
+import ShieldCheck from "lucide-solid/icons/shield-check";
+import type { Component } from "solid-js";
 import { createSignal, For, Show } from "solid-js";
+import { Button } from "../../components/ui/Button";
+import { ErrorBlock } from "../../components/ui/ErrorBlock";
 import {
   initializeComplete,
   initializeOptions,
@@ -47,6 +52,7 @@ export function SetupPage() {
       icon={ShieldCheck}
       title="Initialize Janus"
       subtitle="Bind the first passkey to the deployment."
+      wide
     >
       <Show
         when={codes().length === 0}
@@ -56,6 +62,7 @@ export function SetupPage() {
           <label>
             Display name
             <input
+              class="ui-input"
               value={name()}
               onInput={(event) => setName(event.currentTarget.value)}
               required
@@ -64,6 +71,7 @@ export function SetupPage() {
           <label>
             Initialization token
             <input
+              class="ui-input"
               type="password"
               value={token()}
               onInput={(event) => setToken(event.currentTarget.value)}
@@ -72,14 +80,12 @@ export function SetupPage() {
             />
           </label>
           <Show when={error()}>
-            <p class="form-error" role="alert">
-              {error()}
-            </p>
+            <ErrorBlock variant="inline" message={error()} />
           </Show>
-          <button class="primary-button" type="submit" disabled={busy()}>
+          <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
             <KeyRound size={17} />
             {busy() ? "Waiting for passkey..." : "Create owner passkey"}
-          </button>
+          </Button>
         </form>
       </Show>
     </AuthSurface>
@@ -138,14 +144,18 @@ export function LoginPage() {
     >
       <div class="auth-form">
         <Show when={error()}>
-          <p class="form-error" role="alert">
-            {error()}
-          </p>
+          <ErrorBlock variant="inline" message={error()} />
         </Show>
-        <button class="primary-button" type="button" onClick={() => void login()} disabled={busy()}>
+        <Button
+          variant="primary"
+          class="auth-submit"
+          type="button"
+          onClick={() => void login()}
+          disabled={busy()}
+        >
           <KeyRound size={17} />
           {busy() ? "Waiting for passkey..." : "Continue with passkey"}
-        </button>
+        </Button>
         <button class="text-button" type="button" onClick={() => setRecovery(!recovery())}>
           {recovery() ? "Use a passkey" : "Lost your passkey? Use a recovery code"}
         </button>
@@ -154,16 +164,17 @@ export function LoginPage() {
             <label>
               One-time recovery code
               <input
+                class="ui-input"
                 value={code()}
                 onInput={(event) => setCode(event.currentTarget.value)}
                 autocomplete="off"
                 required
               />
             </label>
-            <button class="secondary-button" type="submit" disabled={busy()}>
+            <Button variant="outline" class="auth-submit" type="submit" disabled={busy()}>
               <KeyRound size={16} />
               Bind a new passkey
-            </button>
+            </Button>
           </form>
         </Show>
       </div>
@@ -172,25 +183,30 @@ export function LoginPage() {
 }
 
 function AuthSurface(props: {
-  icon: typeof ShieldCheck;
+  icon: Component<{ size?: number }>;
   title: string;
   subtitle: string;
+  wide?: boolean;
   children: unknown;
 }) {
   return (
     <main class="auth-surface">
-      <section class="auth-panel">
-        <span class="auth-icon">
-          <props.icon size={26} />
-        </span>
-        <p class="eyebrow">Janus control plane</p>
-        <h1>{props.title}</h1>
-        <p class="auth-subtitle">{props.subtitle}</p>
+      <section class="auth-card" classList={{ wide: props.wide }}>
+        <div class="auth-card-heading">
+          <span class="auth-card-icon">
+            <props.icon size={16} />
+          </span>
+          <div>
+            <h1>{props.title}</h1>
+            <p>{props.subtitle}</p>
+          </div>
+        </div>
         {props.children as never}
       </section>
     </main>
   );
 }
+
 function RecoveryCodes(props: { codes: string[]; done: () => void }) {
   return (
     <div class="recovery-codes">
@@ -210,9 +226,9 @@ function RecoveryCodes(props: { codes: string[]; done: () => void }) {
           )}
         </For>
       </ol>
-      <button class="primary-button" type="button" onClick={props.done}>
+      <Button variant="primary" class="auth-submit" type="button" onClick={props.done}>
         I saved these codes
-      </button>
+      </Button>
     </div>
   );
 }

@@ -18,9 +18,21 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .init();
 
-    let config = Config::from_env().context("invalid Janus configuration")?;
+    let config = match Config::from_env().context("invalid Janus configuration") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[DEBUG config error] {:#}", e);
+            return Err(e);
+        }
+    };
     let bind = config.bind;
-    let state = AppState::initialize(config).await?;
+    let state = match AppState::initialize(config).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[DEBUG init error] {:#}", e);
+            return Err(e);
+        }
+    };
 
     // Startup recovery (`DAT-RECOVER-01` subset): clean leftover incoming temp
     // objects from a crashed write, and mark operations left `running` by a

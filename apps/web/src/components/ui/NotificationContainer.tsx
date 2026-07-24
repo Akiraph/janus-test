@@ -1,4 +1,8 @@
-import { CheckCircle2, Info, TriangleAlert, X, XCircle } from "lucide-solid";
+import CheckCircle2 from "lucide-solid/icons/check-circle-2";
+import Info from "lucide-solid/icons/info";
+import TriangleAlert from "lucide-solid/icons/triangle-alert";
+import X from "lucide-solid/icons/x";
+import XCircle from "lucide-solid/icons/x-circle";
 import { For } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { NotificationVariant } from "./notifications";
