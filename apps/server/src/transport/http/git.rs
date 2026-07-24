@@ -3,10 +3,10 @@
 //!
 //! Queries (`status`/`diff`/`log`/`branches`/`remotes`) are read-only and use
 //! `authenticate`. Commands under `/git/commands/*` are user-exclusive writes
-//! (`TST-GIT-03`): they use `authorized`, and the durable ones (`fetch`/`push`)
-//! return `202 + OperationView`. `stage`/`unstage`/`commit` are short synchronous
-//! commands. `update` is intentionally a `501` placeholder for M2 because the
-//! three-way conflict resolution flow lives in a later milestone.
+//! (`TST-GIT-03`): they use `authorized`, and the durable ones (`fetch`/`push`/
+//! `update`) return `202 + OperationView`. `stage`/`unstage`/`commit` are short
+//! synchronous commands. Update conflicts are listed and resolved under
+//! `/git/update-conflicts/*`.
 
 use axum::{
     Extension, Json,
@@ -19,12 +19,14 @@ use utoipa::ToSchema;
 
 use crate::{
     AppState,
-    adapters::git::{DiffView, GitCredential, GitLogEntry, GitStatus},
-    modules::projects::interface::ProjectsError,
+    adapters::git::{DiffView, GitLogEntry, GitStatus},
+    modules::projects::interface::{
+        GitUpdateConflictView, GitUpdateInput, ProjectsError, ResolveGitUpdateConflictInput,
+    },
     platform::id::CorrelationId,
     transport::http::{
         auth::{authenticate, authorized},
-        conditions::{RawBody, require_idempotency},
+        conditions::{RawBody, if_match_version, require_idempotency},
         dto::DataResponse,
         problem::Problem,
         request_id::RequestContext,
@@ -141,10 +143,22 @@ pub struct GitPushRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[allow(dead_code)] // git_update returns 501 in M2; fields reserved for the follow-up milestone.
 pub struct GitUpdateRequest {
     pub remote: String,
     pub branch: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveConflictRequest {
+    pub paths: Vec<ResolveConflictPathRequest>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResolveConflictPathRequest {
+    pub path: String,
+    pub choice: String,
+    #[serde(default)]
+    pub edited_text: Option<String>,
 }
 
 // ----- Git queries --------------------------------------------------------
@@ -474,10 +488,8 @@ pub async fn git_push(
         &format!("/api/v1/projects/{id}/git/commands/push"),
         body.as_slice(),
     )?;
-    // M2 transport has no way to expose the encrypted PAT to the runner, so
-    // public repositories push without credentials. Resolving the GitHub PAT
-    // for private push happens in the worker once a credential-aware git_push
-    // path is added.
+    // Resolve the Project's GitHub PAT (if any) inside the Module so private
+    // push works without the transport layer ever seeing the secret.
     let operation = state
         .projects()
         .git_push(
@@ -485,7 +497,6 @@ pub async fn git_push(
             &id,
             &input.remote,
             &input.branch,
-            &GitCredential::None,
             correlation_id,
         )
         .await
@@ -499,27 +510,162 @@ pub async fn git_push(
     params(("id" = String, Path, description = "Project id")),
     request_body = GitUpdateRequest,
     responses(
-        (status = 501, body = Problem),
-        (status = 401, body = Problem)
+        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 422, body = Problem)
     )
 )]
 pub async fn git_update(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
-    Json(_input): Json<GitUpdateRequest>,
-) -> Result<StatusCode, Problem> {
-    let _auth = authorized(&state, &headers).await?;
-    // M2 placeholder: the three-way conflict resolution flow
-    // (`POST /git/update-conflicts/{id}/resolve`) is deferred. Return a stable
-    // `501 NOT_IMPLEMENTED` so the route is visible and the contract stays
-    // documented without a half-implemented side-effectful path.
-    Err(Problem::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "NOT_IMPLEMENTED",
-        "Git update not implemented",
-        "Git update with three-way conflict resolution arrives in a later milestone.",
-    ))
+    body: RawBody,
+) -> Result<
+    (
+        StatusCode,
+        Json<DataResponse<crate::platform::operations::OperationView>>,
+    ),
+    Problem,
+> {
+    let auth = authorized(&state, &headers).await?;
+    let input: GitUpdateRequest = serde_json::from_slice(body.as_slice()).map_err(|error| {
+        Problem::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+            "Validation failed",
+            error.to_string(),
+        )
+    })?;
+    let correlation_id = CorrelationId::new();
+    let _idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "POST",
+        &format!("/api/v1/projects/{id}/git/commands/update"),
+        body.as_slice(),
+    )?;
+    let operation = state
+        .projects()
+        .git_update(
+            &auth.owner_id,
+            &id,
+            GitUpdateInput {
+                remote: input.remote,
+                branch: input.branch,
+            },
+            correlation_id,
+        )
+        .await
+        .map_err(problem)?;
+    Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/update-conflicts",
+    params(("id" = String, Path, description = "Project id")),
+    responses(
+        (status = 200, body = DataResponse<Vec<GitUpdateConflictView>>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem)
+    )
+)]
+pub async fn list_update_conflicts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<DataResponse<Vec<GitUpdateConflictView>>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(DataResponse {
+        data: state
+            .projects()
+            .list_update_conflicts(&auth.owner_id, &id)
+            .await
+            .map_err(problem)?,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}",
+    params(
+        ("id" = String, Path, description = "Project id"),
+        ("conflict_id" = String, Path, description = "Conflict id")
+    ),
+    responses(
+        (status = 200, body = DataResponse<GitUpdateConflictView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem)
+    )
+)]
+pub async fn get_update_conflict(
+    State(state): State<AppState>,
+    Path((id, conflict_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<DataResponse<GitUpdateConflictView>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    Ok(Json(DataResponse {
+        data: state
+            .projects()
+            .get_update_conflict(&auth.owner_id, &id, &conflict_id)
+            .await
+            .map_err(problem)?,
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}/resolve",
+    params(
+        ("id" = String, Path, description = "Project id"),
+        ("conflict_id" = String, Path, description = "Conflict id")
+    ),
+    request_body = ResolveConflictRequest,
+    responses(
+        (status = 200, body = DataResponse<GitUpdateConflictView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem),
+        (status = 412, body = Problem),
+        (status = 428, body = Problem)
+    )
+)]
+pub async fn resolve_update_conflict(
+    State(state): State<AppState>,
+    Path((id, conflict_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<ResolveConflictRequest>,
+) -> Result<Json<DataResponse<GitUpdateConflictView>>, Problem> {
+    let auth = authorized(&state, &headers).await?;
+    let expected_version = if_match_version(&headers)?;
+    let correlation_id = CorrelationId::new();
+    let view = state
+        .projects()
+        .resolve_update_conflict(
+            &auth.owner_id,
+            &id,
+            &conflict_id,
+            &expected_version,
+            ResolveGitUpdateConflictInput {
+                paths: input
+                    .paths
+                    .into_iter()
+                    .map(|p| {
+                        crate::modules::projects::interface::ResolveGitUpdateConflictPath {
+                            path: p.path,
+                            choice: p.choice,
+                            edited_text: p.edited_text,
+                        }
+                    })
+                    .collect(),
+            },
+            correlation_id,
+        )
+        .await
+        .map_err(problem)?;
+    Ok(Json(DataResponse { data: view }))
 }
 
 // ----- Events --------------------------------------------------------------

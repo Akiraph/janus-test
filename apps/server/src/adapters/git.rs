@@ -108,13 +108,37 @@ pub struct GitLogEntry {
     pub message: String,
 }
 
+/// One path that collides between local working-tree edits and the incoming
+/// remote update. Used to persist a Git Update Conflict without writing markers.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateConflictPath {
+    pub path: String,
+    pub kind: String,
+    pub base_hash: Option<String>,
+    pub remote_hash: Option<String>,
+    pub main_hash: Option<String>,
+}
+
 /// Result of a three-way `update`: fast-forward, a stable non-conflict failure,
 /// or a content conflict that records the affected paths (`WS-GIT-04`).
 #[derive(Debug, Clone)]
 pub enum UpdateOutcome {
-    FastForward { new_head: String },
+    /// HEAD advanced to the remote tip; working-tree-only edits were preserved.
+    FastForward {
+        new_head: String,
+        base_tree: String,
+        remote_tree: String,
+    },
     Failed(GitError),
-    Conflict { paths: Vec<String> },
+    /// Main was left completely unchanged. Caller persists the conflict rows.
+    Conflict {
+        paths: Vec<UpdateConflictPath>,
+        base_tree: String,
+        remote_tree: String,
+        main_tree: String,
+        head_sha: String,
+        remote_sha: String,
+    },
 }
 
 /// The GitRunner seam. The system implementation shells out to `git`; tests can
@@ -470,27 +494,46 @@ impl GitRunner for SystemGit {
         }
 
         let upstream = format!("{remote}/{branch}");
-        // Check merge-base relationship to detect divergence without touching HEAD.
-        let mut base = Self::base(repo);
-        base.arg("merge-base").arg("HEAD").arg(&upstream);
-        let base_sha = Self::run(&mut base).await?.trim().to_owned();
-        let mut head = Self::base(repo);
-        head.arg("rev-parse").arg("HEAD");
-        let head_sha = Self::run(&mut head).await?.trim().to_owned();
-        let mut remote_head = Self::base(repo);
-        remote_head.arg("rev-parse").arg(&upstream);
-        let remote_sha = Self::run(&mut remote_head).await?.trim().to_owned();
+        let head_sha = rev_parse(repo, "HEAD").await?;
+        let remote_sha = rev_parse(repo, &upstream).await?;
+        let base_sha = match merge_base(repo, "HEAD", &upstream).await {
+            Ok(sha) => sha,
+            Err(_) => {
+                return Ok(UpdateOutcome::Failed(GitError::Diverged));
+            }
+        };
 
         if base_sha == remote_sha {
             // Remote is behind or equal to HEAD: nothing to update.
-            return Ok(UpdateOutcome::FastForward { new_head: head_sha });
+            return Ok(UpdateOutcome::FastForward {
+                new_head: head_sha.clone(),
+                base_tree: head_sha.clone(),
+                remote_tree: remote_sha,
+            });
         }
         if base_sha != head_sha {
             // Local history diverged from the remote branch.
             return Ok(UpdateOutcome::Failed(GitError::Diverged));
         }
-        // base == HEAD: fast-forward possible. Attempt a fast-forward merge that
-        // does not commit conflicts; on conflict, leave HEAD/index/tree unchanged.
+
+        // Compute path-level conflicts between working tree edits and the
+        // incoming remote tree *before* mutating HEAD. If anything collides,
+        // leave HEAD/index/working tree completely unchanged.
+        let conflict_paths =
+            compute_update_conflicts(repo, &base_sha, &remote_sha, &head_sha).await?;
+        if !conflict_paths.is_empty() {
+            return Ok(UpdateOutcome::Conflict {
+                paths: conflict_paths,
+                base_tree: base_sha,
+                remote_tree: remote_sha.clone(),
+                main_tree: head_sha.clone(),
+                head_sha,
+                remote_sha,
+            });
+        }
+
+        // No path conflicts: advance HEAD with --ff-only. Working-tree-only
+        // edits on non-conflicting paths are preserved by git.
         let mut ff = Self::base(repo);
         ff.arg("merge")
             .arg("--ff-only")
@@ -502,22 +545,61 @@ impl GitRunner for SystemGit {
             .map_err(|e| GitError::CommandFailed(e.to_string()))?;
         if output.status.success() {
             return Ok(UpdateOutcome::FastForward {
-                new_head: remote_sha,
+                new_head: remote_sha.clone(),
+                base_tree: base_sha,
+                remote_tree: remote_sha,
             });
         }
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        // A fast-forward should never conflict; if it does, surface the paths and
-        // reset HEAD to its pre-merge state so Main is left untouched.
-        let conflict_paths = extract_conflict_paths(&stderr);
-        if conflict_paths.is_empty() {
-            return Ok(UpdateOutcome::Failed(classify_failure(&stderr)));
+        // If git refused because local edits would be overwritten, recompute
+        // path conflicts and surface them instead of a bare checkout error.
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("overwritten") || lower.contains("conflict") {
+            let mut conflict_paths =
+                compute_update_conflicts(repo, &base_sha, &remote_sha, &head_sha).await?;
+            if conflict_paths.is_empty() {
+                // Last-resort: parse "would be overwritten by merge:\n\t<path>" lines.
+                for line in stderr.lines() {
+                    let path = line.trim().trim_start_matches('\t');
+                    if path.is_empty()
+                        || path.contains(' ')
+                        || path.contains(':')
+                        || path.starts_with("error")
+                        || path.starts_with("Updating")
+                        || path.starts_with("hint")
+                    {
+                        continue;
+                    }
+                    if path.contains('/') || path.contains('.') {
+                        let base_hash = blob_hash_at(repo, &base_sha, path).await.ok().flatten();
+                        let remote_hash = blob_hash_at(repo, &remote_sha, path).await.ok().flatten();
+                        let main_hash = working_blob_hash(repo, path)
+                            .await
+                            .ok()
+                            .flatten()
+                            .or(blob_hash_at(repo, &head_sha, path).await.ok().flatten());
+                        conflict_paths.push(UpdateConflictPath {
+                            path: path.to_owned(),
+                            kind: "text".into(),
+                            base_hash,
+                            remote_hash,
+                            main_hash,
+                        });
+                    }
+                }
+            }
+            if !conflict_paths.is_empty() {
+                return Ok(UpdateOutcome::Conflict {
+                    paths: conflict_paths,
+                    base_tree: base_sha,
+                    remote_tree: remote_sha.clone(),
+                    main_tree: head_sha.clone(),
+                    head_sha,
+                    remote_sha,
+                });
+            }
         }
-        let mut reset = Self::base(repo);
-        reset.arg("merge").arg("--abort");
-        let _ = reset.output().await;
-        Ok(UpdateOutcome::Conflict {
-            paths: conflict_paths,
-        })
+        Ok(UpdateOutcome::Failed(classify_failure(&stderr)))
     }
 
     async fn checkout(&self, repo: &Path, branch: &str) -> Result<(), GitError> {
@@ -526,6 +608,273 @@ impl GitRunner for SystemGit {
         Self::run(&mut command).await?;
         Ok(())
     }
+}
+
+async fn rev_parse(repo: &Path, rev: &str) -> Result<String, GitError> {
+    let mut command = SystemGit::base(repo);
+    command.arg("rev-parse").arg(rev);
+    Ok(SystemGit::run(&mut command).await?.trim().to_owned())
+}
+
+async fn merge_base(repo: &Path, a: &str, b: &str) -> Result<String, GitError> {
+    let mut command = SystemGit::base(repo);
+    command.arg("merge-base").arg(a).arg(b);
+    Ok(SystemGit::run(&mut command).await?.trim().to_owned())
+}
+
+/// List paths whose working-tree content differs from HEAD, or whose remote
+/// tree differs from base, and mark true three-way collisions.
+async fn compute_update_conflicts(
+    repo: &Path,
+    base_sha: &str,
+    remote_sha: &str,
+    head_sha: &str,
+) -> Result<Vec<UpdateConflictPath>, GitError> {
+    // Paths changed on the remote side (base..remote).
+    let remote_changed = diff_name_status(repo, base_sha, remote_sha).await?;
+    // Paths dirty in the working tree relative to HEAD.
+    let working_dirty = working_dirty_paths(repo).await?;
+
+    let mut conflicts = Vec::new();
+    for (path, remote_kind) in &remote_changed {
+        if !working_dirty.contains(path) {
+            continue;
+        }
+        let base_hash = blob_hash_at(repo, base_sha, path).await.ok().flatten();
+        let remote_hash = blob_hash_at(repo, remote_sha, path).await.ok().flatten();
+        let main_hash = blob_hash_at(repo, head_sha, path).await.ok().flatten();
+        // Working tree may have uncommitted edits; prefer a content hash of the
+        // working file when it still exists.
+        let working_hash = working_blob_hash(repo, path).await.ok().flatten();
+        let main_hash = working_hash.or(main_hash);
+        let kind = classify_conflict_kind(remote_kind, base_hash.as_deref(), remote_hash.as_deref(), main_hash.as_deref());
+        conflicts.push(UpdateConflictPath {
+            path: path.clone(),
+            kind,
+            base_hash,
+            remote_hash,
+            main_hash,
+        });
+    }
+    Ok(conflicts)
+}
+
+async fn diff_name_status(
+    repo: &Path,
+    a: &str,
+    b: &str,
+) -> Result<Vec<(String, String)>, GitError> {
+    let mut command = SystemGit::base(repo);
+    command
+        .arg("diff")
+        .arg("--name-status")
+        .arg("--no-renames")
+        .arg(format!("{a}..{b}"));
+    let output = SystemGit::run(&mut command).await?;
+    let mut out = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let status = parts.next().unwrap_or("M").to_owned();
+        let path = parts.next().unwrap_or("").to_owned();
+        if !path.is_empty() {
+            out.push((path, status));
+        }
+    }
+    Ok(out)
+}
+
+async fn working_dirty_paths(repo: &Path) -> Result<std::collections::HashSet<String>, GitError> {
+    // Prefer name-only diffs so Windows autocrlf / porcelain quirks cannot hide
+    // a dirty path that would block merge --ff-only.
+    let mut set = std::collections::HashSet::new();
+    let mut modified = SystemGit::base(repo);
+    modified.arg("diff").arg("--name-only").arg("HEAD");
+    if let Ok(output) = SystemGit::run(&mut modified).await {
+        for line in output.lines() {
+            if !line.is_empty() {
+                set.insert(line.to_owned());
+            }
+        }
+    }
+    let mut untracked = SystemGit::base(repo);
+    untracked
+        .arg("ls-files")
+        .arg("--others")
+        .arg("--exclude-standard");
+    if let Ok(output) = SystemGit::run(&mut untracked).await {
+        for line in output.lines() {
+            if !line.is_empty() {
+                set.insert(line.to_owned());
+            }
+        }
+    }
+    // Fallback to porcelain status if the above is empty but status is dirty.
+    if set.is_empty() {
+        let status = SystemGit.status(repo).await?;
+        for path in status
+            .working
+            .into_iter()
+            .chain(status.untracked.into_iter())
+        {
+            set.insert(path);
+        }
+    }
+    Ok(set)
+}
+
+async fn blob_hash_at(
+    repo: &Path,
+    treeish: &str,
+    path: &str,
+) -> Result<Option<String>, GitError> {
+    let mut command = SystemGit::base(repo);
+    command
+        .arg("ls-tree")
+        .arg(treeish)
+        .arg("--")
+        .arg(path);
+    let output = match SystemGit::run(&mut command).await {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+    // format: <mode> <type> <hash>\t<path>
+    let line = output.lines().next().unwrap_or("");
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let hash = line.split_whitespace().nth(2).map(str::to_owned);
+    Ok(hash)
+}
+
+async fn working_blob_hash(repo: &Path, path: &str) -> Result<Option<String>, GitError> {
+    let abs = repo.join(path);
+    if !abs.exists() {
+        return Ok(None);
+    }
+    let mut command = SystemGit::base(repo);
+    command.arg("hash-object").arg("--").arg(path);
+    match SystemGit::run(&mut command).await {
+        Ok(o) => Ok(Some(o.trim().to_owned())),
+        Err(_) => Ok(None),
+    }
+}
+
+fn classify_conflict_kind(
+    remote_status: &str,
+    base: Option<&str>,
+    remote: Option<&str>,
+    main: Option<&str>,
+) -> String {
+    match (base, remote, main) {
+        (Some(_), None, Some(_)) => "deleted".into(),
+        (None, Some(_), Some(_)) => "added".into(),
+        (Some(_), Some(_), None) => "deleted".into(),
+        _ if remote_status.starts_with('A') => "added".into(),
+        _ if remote_status.starts_with('D') => "deleted".into(),
+        _ => "text".into(),
+    }
+}
+
+/// Apply a resolved path choice onto the Main working tree. Used by the
+/// conflict-resolve completion step after all paths have a choice.
+pub async fn apply_conflict_choice(
+    repo: &Path,
+    path: &str,
+    choice: &str,
+    remote_hash: Option<&str>,
+    main_hash: Option<&str>,
+    edited_bytes: Option<&[u8]>,
+) -> Result<(), GitError> {
+    let abs = repo.join(path);
+    match choice {
+        "main" => {
+            // Keep current working tree content. If the path is missing and
+            // main_hash is None, ensure it stays deleted.
+            if main_hash.is_none() && abs.exists() {
+                let _ = tokio::fs::remove_file(&abs).await;
+            }
+            Ok(())
+        }
+        "remote" => match remote_hash {
+            Some(hash) => {
+                let bytes = cat_blob(repo, hash).await?;
+                if let Some(parent) = abs.parent() {
+                    tokio::fs::create_dir_all(parent).await.ok();
+                }
+                tokio::fs::write(&abs, bytes)
+                    .await
+                    .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+                Ok(())
+            }
+            None => {
+                if abs.exists() {
+                    let _ = tokio::fs::remove_file(&abs).await;
+                }
+                Ok(())
+            }
+        },
+        "delete" => {
+            if abs.exists() {
+                if abs.is_dir() {
+                    let _ = tokio::fs::remove_dir_all(&abs).await;
+                } else {
+                    let _ = tokio::fs::remove_file(&abs).await;
+                }
+            }
+            Ok(())
+        }
+        "edited_text" => {
+            let bytes = edited_bytes.ok_or_else(|| {
+                GitError::BadOutput("edited_text choice requires body".into())
+            })?;
+            if let Some(parent) = abs.parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+            tokio::fs::write(&abs, bytes)
+                .await
+                .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+            Ok(())
+        }
+        other => Err(GitError::BadOutput(format!("unknown conflict choice {other}"))),
+    }
+}
+
+async fn cat_blob(repo: &Path, hash: &str) -> Result<Vec<u8>, GitError> {
+    let mut command = SystemGit::base(repo);
+    command.arg("cat-file").arg("blob").arg(hash);
+    let output = command
+        .output()
+        .await
+        .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::CommandFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Fast-forward HEAD/index to remote after conflicts are resolved in the
+/// working tree. Caller must ensure the working tree already holds the merged
+/// result and the index is empty or will be reset.
+pub async fn complete_fast_forward(
+    repo: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<String, GitError> {
+    let upstream = format!("{remote}/{branch}");
+    // Reset HEAD to remote tip without touching working tree, then re-read sha.
+    let mut command = SystemGit::base(repo);
+    command
+        .arg("update-ref")
+        .arg("HEAD")
+        .arg(&upstream);
+    SystemGit::run(&mut command).await?;
+    // Clear the index and re-add the working tree so status is consistent.
+    let mut reset = SystemGit::base(repo);
+    reset.arg("read-tree").arg("HEAD");
+    let _ = SystemGit::run(&mut reset).await;
+    rev_parse(repo, "HEAD").await
 }
 
 /// Parse `git status --porcelain=v2 --branch` into the three-layer projection.
@@ -602,14 +951,6 @@ fn parse_porcelain_v2(output: &str) -> GitStatus {
         index,
         untracked,
     }
-}
-
-fn extract_conflict_paths(stderr: &str) -> Vec<String> {
-    stderr
-        .lines()
-        .filter(|line| line.contains("CONFLICT") || line.starts_with("Merge conflict"))
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Write a one-shot `GIT_ASKPASS` shell script that prints the username or

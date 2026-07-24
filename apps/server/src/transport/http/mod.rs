@@ -38,12 +38,12 @@ pub use problem::Problem;
         projects::list_projects, projects::create_project, projects::get_project,
         projects::update_project, projects::delete_project, projects::retry_project,
         projects::list_credentials, projects::create_credential,
-        projects::get_credential, projects::delete_credential, projects::probe_credential,
+        projects::get_credential, projects::update_credential, projects::delete_credential, projects::probe_credential,
         projects::file_meta, projects::file_content, projects::save_text,
         projects::file_tree, projects::move_file, projects::delete_file,
         git::git_status, git::git_diff, git::git_log, git::git_branches, git::git_remotes,
         git::git_fetch, git::git_stage, git::git_unstage, git::git_commit, git::git_push,
-        git::git_update,
+        git::git_update, git::list_update_conflicts, git::get_update_conflict, git::resolve_update_conflict,
         operations::get_operation
     ),
     components(schemas(
@@ -84,6 +84,7 @@ pub use problem::Problem;
         crate::modules::projects::interface::RepositoryView,
         crate::modules::projects::interface::RepoAccess,
         crate::modules::projects::interface::CreateGithubCredentialInput,
+        crate::modules::projects::interface::UpdateGithubCredentialInput,
         crate::modules::projects::interface::GithubCredentialView,
         crate::modules::projects::interface::CredentialProbeResult,
         crate::modules::projects::interface::SaveTextInput,
@@ -92,6 +93,10 @@ pub use problem::Problem;
         crate::modules::projects::interface::MoveFileInput,
         crate::modules::projects::interface::DeleteFileInput,
         crate::modules::projects::interface::RetryProjectInput,
+        crate::modules::projects::interface::GitUpdateConflictView,
+        crate::modules::projects::interface::GitUpdateConflictPathView,
+        crate::modules::projects::interface::ResolveGitUpdateConflictInput,
+        crate::modules::projects::interface::ResolveGitUpdateConflictPath,
         crate::platform::operations::OperationView,
         crate::platform::operations::OperationStatus,
         crate::modules::workspace_sync::interface::RevisionRef,
@@ -104,7 +109,9 @@ pub use problem::Problem;
         git::GitStageRequest,
         git::GitCommitRequest,
         git::GitPushRequest,
-        git::GitUpdateRequest
+        git::GitUpdateRequest,
+        git::ResolveConflictRequest,
+        git::ResolveConflictPathRequest
     )),
     tags((name = "system", description = "Janus system probes"))
 )]
@@ -196,15 +203,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/v1/github-credentials/{id}",
-            get(projects::get_credential).delete(projects::delete_credential),
+            get(projects::get_credential)
+                .patch(projects::update_credential)
+                .delete(projects::delete_credential),
         )
         .route(
             "/api/v1/github-credentials/{id}/probe",
             post(projects::probe_credential),
         )
-        // TODO(M2 follow-up): PATCH /api/v1/github-credentials/{id} for PAT
-        // rotation. M2 exposes list+create only; PAT replacement requires an
-        // update_credential path on the Module that re-encrypts the PAT.
         .route("/api/v1/operations/{id}", get(operations::get_operation))
         .route("/api/v1/projects/{id}/git/status", get(git::git_status))
         .route("/api/v1/projects/{id}/git/diff", get(git::git_diff))
@@ -234,6 +240,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/projects/{id}/git/commands/update",
             post(git::git_update),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/update-conflicts",
+            get(git::list_update_conflicts),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}",
+            get(git::get_update_conflict),
+        )
+        .route(
+            "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}/resolve",
+            post(git::resolve_update_conflict),
         )
         .layer(middleware::from_fn(request_id::middleware))
         .with_state(state)

@@ -54,6 +54,7 @@ typed_id!(OperationId);
 typed_id!(WorkItemId);
 typed_id!(GithubCredentialId);
 typed_id!(RevisionId);
+typed_id!(GitUpdateConflictId);
 
 /// Lowercase hex SHA-256 of a content-addressed blob. Not a UUID: the value is
 /// derived from the bytes, so it is constructed from a string, not generated.

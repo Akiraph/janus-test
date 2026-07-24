@@ -15,11 +15,15 @@ export type RetryProjectInput = components["schemas"]["RetryProjectInput"];
 export type OperationView = components["schemas"]["OperationView"];
 export type GithubCredentialView = components["schemas"]["GithubCredentialView"];
 export type CreateGithubCredentialInput = components["schemas"]["CreateGithubCredentialInput"];
+export type UpdateGithubCredentialInput = components["schemas"]["UpdateGithubCredentialInput"];
 export type FileMetaView = components["schemas"]["FileMetaView"];
 export type FileTreeView = components["schemas"]["FileTreeView"];
 export type GitStatusView = components["schemas"]["GitStatusView"];
 export type GitLogEntryView = components["schemas"]["GitLogEntryView"];
 export type GitLogResponse = components["schemas"]["GitLogResponse"];
+export type GitUpdateConflictView = components["schemas"]["GitUpdateConflictView"];
+export type GitUpdateConflictPathView = components["schemas"]["GitUpdateConflictPathView"];
+export type ResolveGitUpdateConflictInput = components["schemas"]["ResolveGitUpdateConflictInput"];
 export type SaveTextInput = components["schemas"]["SaveTextInput"];
 export type RepositoryInput = components["schemas"]["RepositoryInput"];
 export type RepoAccess = components["schemas"]["RepoAccess"];
@@ -256,6 +260,28 @@ export async function createGithubCredential(
   ).data;
 }
 
+export async function updateGithubCredential(
+  id: string,
+  ifMatch: string,
+  input: UpdateGithubCredentialInput,
+): Promise<GithubCredentialView> {
+  return (
+    await requestJson<{ data: GithubCredentialView }>(
+      `/api/v1/github-credentials/${id}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(input),
+        headers: { "If-Match": ifMatch },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function deleteGithubCredential(id: string): Promise<void> {
+  await requestJson(`/api/v1/github-credentials/${id}`, { method: "DELETE" }, () => true);
+}
+
 export async function listFileTree(projectId: string, path?: string): Promise<FileTreeView[]> {
   const query = new URLSearchParams();
   if (path) query.set("path", path);
@@ -399,6 +425,54 @@ export async function gitPush(
         method: "POST",
         body: JSON.stringify({ remote, branch }),
         headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function gitUpdate(
+  projectId: string,
+  remote: string,
+  branch: string,
+  idempotencyKey: string,
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/projects/${projectId}/git/commands/update`,
+      {
+        method: "POST",
+        body: JSON.stringify({ remote, branch }),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function listGitUpdateConflicts(projectId: string): Promise<GitUpdateConflictView[]> {
+  return (
+    await requestJson<{ data: GitUpdateConflictView[] }>(
+      `/api/v1/projects/${projectId}/git/update-conflicts`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function resolveGitUpdateConflict(
+  projectId: string,
+  conflictId: string,
+  ifMatch: string,
+  input: ResolveGitUpdateConflictInput,
+): Promise<GitUpdateConflictView> {
+  return (
+    await requestJson<{ data: GitUpdateConflictView }>(
+      `/api/v1/projects/${projectId}/git/update-conflicts/${conflictId}/resolve`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+        headers: { "If-Match": ifMatch },
       },
       isDataResponse,
     )

@@ -549,6 +549,85 @@
             }
           }
         }
+      },
+      "patch": {
+        "tags": [
+          "projects"
+        ],
+        "operationId": "update_credential",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Credential id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateGithubCredentialInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GithubCredentialView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "428": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/api/v1/github-credentials/{id}/probe": {
@@ -2275,6 +2354,16 @@
           "required": true
         },
         "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
           "401": {
             "description": "",
             "content": {
@@ -2285,7 +2374,27 @@
               }
             }
           },
-          "501": {
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
             "description": "",
             "content": {
               "application/json": {
@@ -2546,6 +2655,217 @@
             }
           },
           "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/update-conflicts": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "list_update_conflicts",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_GitUpdateConflictView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}": {
+      "get": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "get_update_conflict",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "conflict_id",
+            "in": "path",
+            "description": "Conflict id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GitUpdateConflictView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}/resolve": {
+      "post": {
+        "tags": [
+          "git"
+        ],
+        "operationId": "resolve_update_conflict",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "conflict_id",
+            "in": "path",
+            "description": "Conflict id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveConflictRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_GitUpdateConflictView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "428": {
             "description": "",
             "content": {
               "application/json": {
@@ -3054,6 +3374,68 @@
           }
         }
       },
+      "DataResponse_GitUpdateConflictView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "project_id",
+              "state",
+              "base_tree",
+              "remote_tree",
+              "main_tree",
+              "operation_id",
+              "version",
+              "paths",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "base_tree": {
+                "type": "string"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "main_tree": {
+                "type": "string"
+              },
+              "operation_id": {
+                "type": "string"
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/GitUpdateConflictPathView"
+                }
+              },
+              "project_id": {
+                "type": "string"
+              },
+              "remote_tree": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "DataResponse_GithubCredentialView": {
         "type": "object",
         "required": [
@@ -3459,6 +3841,71 @@
                   "type": "integer",
                   "format": "int64",
                   "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_Vec_GitUpdateConflictView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "project_id",
+                "state",
+                "base_tree",
+                "remote_tree",
+                "main_tree",
+                "operation_id",
+                "version",
+                "paths",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "base_tree": {
+                  "type": "string"
+                },
+                "created_at": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "main_tree": {
+                  "type": "string"
+                },
+                "operation_id": {
+                  "type": "string"
+                },
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GitUpdateConflictPathView"
+                  }
+                },
+                "project_id": {
+                  "type": "string"
+                },
+                "remote_tree": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
                 }
               }
             }
@@ -4062,6 +4509,99 @@
             "items": {
               "type": "string"
             }
+          }
+        }
+      },
+      "GitUpdateConflictPathView": {
+        "type": "object",
+        "required": [
+          "path",
+          "kind"
+        ],
+        "properties": {
+          "base_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "choice": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "main_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "remote_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "GitUpdateConflictView": {
+        "type": "object",
+        "required": [
+          "id",
+          "project_id",
+          "state",
+          "base_tree",
+          "remote_tree",
+          "main_tree",
+          "operation_id",
+          "version",
+          "paths",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "base_tree": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "main_tree": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GitUpdateConflictPathView"
+            }
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "remote_tree": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
           }
         }
       },
@@ -4678,6 +5218,77 @@
           }
         }
       },
+      "ResolveConflictPathRequest": {
+        "type": "object",
+        "required": [
+          "path",
+          "choice"
+        ],
+        "properties": {
+          "choice": {
+            "type": "string"
+          },
+          "edited_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "ResolveConflictRequest": {
+        "type": "object",
+        "required": [
+          "paths"
+        ],
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolveConflictPathRequest"
+            }
+          }
+        }
+      },
+      "ResolveGitUpdateConflictInput": {
+        "type": "object",
+        "required": [
+          "paths"
+        ],
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolveGitUpdateConflictPath"
+            }
+          }
+        }
+      },
+      "ResolveGitUpdateConflictPath": {
+        "type": "object",
+        "required": [
+          "path",
+          "choice"
+        ],
+        "properties": {
+          "choice": {
+            "type": "string",
+            "description": "One of: main | remote | delete | edited_text"
+          },
+          "edited_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
       "RetryProjectInput": {
         "type": "object",
         "properties": {
@@ -4796,6 +5407,30 @@
         "properties": {
           "data": {
             "$ref": "#/components/schemas/SystemInfo"
+          }
+        }
+      },
+      "UpdateGithubCredentialInput": {
+        "type": "object",
+        "properties": {
+          "github_host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When set, replaces the stored PAT. When omitted, the existing PAT is kept."
           }
         }
       },

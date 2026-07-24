@@ -9,7 +9,7 @@ import { ErrorBlock } from "../../components/ui/ErrorBlock";
 import { useNotifications } from "../../components/ui/notifications";
 import { Skeleton } from "../../components/ui/Skeleton";
 import { type TabItem, Tabs } from "../../components/ui/Tabs";
-import type { FileMetaView, FileTreeView } from "../../lib/api";
+import type { FileMetaView, FileTreeView, GitUpdateConflictView } from "../../lib/api";
 import {
   getFileContentText,
   getFileMeta,
@@ -19,6 +19,9 @@ import {
   gitRemotes,
   gitStage,
   gitUnstage,
+  gitUpdate,
+  listGitUpdateConflicts,
+  resolveGitUpdateConflict,
   saveFileText,
 } from "../../lib/api";
 import { useFileTree, useGitLog, useGitStatus, useProject } from "../../lib/queries";
@@ -359,6 +362,9 @@ function GitTab(props: { projectId: () => string | undefined }) {
   const [selected, setSelected] = createSignal<Set<string>>(new Set());
   const [message, setMessage] = createSignal("");
   const [busy, setBusy] = createSignal(false);
+  const [conflicts, setConflicts] = createSignal<GitUpdateConflictView[]>([]);
+  const [choices, setChoices] = createSignal<Record<string, string>>({});
+  const [editedText, setEditedText] = createSignal<Record<string, string>>({});
 
   function toggle(path: string) {
     setSelected((current) => {
@@ -374,7 +380,19 @@ function GitTab(props: { projectId: () => string | undefined }) {
     if (!id) return;
     await queryClient.invalidateQueries({ queryKey: ["git-status", id] });
     await queryClient.invalidateQueries({ queryKey: ["git-log", id] });
+    try {
+      const next = await listGitUpdateConflicts(id);
+      setConflicts(next);
+    } catch {
+      // Conflicts endpoint failures shouldn't block status view.
+    }
   }
+
+  createEffect(() => {
+    const id = props.projectId();
+    if (!id) return;
+    void refreshGit();
+  });
 
   async function run(action: () => Promise<void>, success: string) {
     setBusy(true);
@@ -393,6 +411,7 @@ function GitTab(props: { projectId: () => string | undefined }) {
   }
 
   const selectedPaths = () => [...selected()];
+  const openConflict = () => conflicts()[0];
 
   return (
     <div class="git-layout">
@@ -472,6 +491,24 @@ function GitTab(props: { projectId: () => string | undefined }) {
                           ? "origin"
                           : (remotes[0] ?? "origin");
                         const branch = data().branch ?? "main";
+                        await gitUpdate(id, remote, branch, crypto.randomUUID());
+                      }, "Update started")
+                    }
+                  >
+                    Update
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy() || !data().branch}
+                    onClick={() =>
+                      void run(async () => {
+                        const id = props.projectId() as string;
+                        const remotes = await gitRemotes(id);
+                        const remote = remotes.includes("origin")
+                          ? "origin"
+                          : (remotes[0] ?? "origin");
+                        const branch = data().branch ?? "main";
                         await gitPush(id, remote, branch, crypto.randomUUID());
                       }, "Push started")
                     }
@@ -530,6 +567,85 @@ function GitTab(props: { projectId: () => string | undefined }) {
         </Show>
       </Show>
 
+      <Show when={openConflict()}>
+        {(conflict) => (
+          <section class="git-conflict" aria-label="Git update conflict">
+            <h2>Update conflict</h2>
+            <p>
+              Remote changes collide with local working-tree edits. Choose a side for each path,
+              then apply.
+            </p>
+            <For each={conflict().paths}>
+              {(path) => (
+                <div class="git-conflict-path">
+                  <strong>{path.path}</strong>
+                  <span class="files-editor-meta">{path.kind}</span>
+                  <div class="git-actions">
+                    <For each={["main", "remote", "delete", "edited_text"] as const}>
+                      {(choice) => (
+                        <Button
+                          variant={choices()[path.path] === choice ? "primary" : "outline"}
+                          size="sm"
+                          onClick={() =>
+                            setChoices((current) => ({ ...current, [path.path]: choice }))
+                          }
+                        >
+                          {choice}
+                        </Button>
+                      )}
+                    </For>
+                  </div>
+                  <Show when={choices()[path.path] === "edited_text"}>
+                    <textarea
+                      class="ui-input git-commit-message"
+                      value={editedText()[path.path] ?? ""}
+                      onInput={(event) =>
+                        setEditedText((current) => ({
+                          ...current,
+                          [path.path]: event.currentTarget.value,
+                        }))
+                      }
+                      placeholder="Merged file content"
+                      aria-label={`Edited text for ${path.path}`}
+                    />
+                  </Show>
+                </div>
+              )}
+            </For>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={busy()}
+              onClick={() =>
+                void run(async () => {
+                  const id = props.projectId() as string;
+                  const current = openConflict();
+                  if (!current) return;
+                  const paths = current.paths.map((path) => {
+                    const choice = choices()[path.path] ?? "main";
+                    return choice === "edited_text"
+                      ? {
+                          path: path.path,
+                          choice,
+                          edited_text: editedText()[path.path] ?? "",
+                        }
+                      : {
+                          path: path.path,
+                          choice,
+                        };
+                  });
+                  await resolveGitUpdateConflict(id, current.id, current.version, { paths });
+                  setChoices({});
+                  setEditedText({});
+                }, "Conflict resolved")
+              }
+            >
+              Apply resolution
+            </Button>
+          </section>
+        )}
+      </Show>
+
       <section class="git-log" aria-label="Recent commits">
         <h2>Recent commits</h2>
         <Show when={!log.isPending} fallback={<Skeleton compact />}>
@@ -538,14 +654,11 @@ function GitTab(props: { projectId: () => string | undefined }) {
             fallback={<p class="files-tree-empty">No commits yet</p>}
           >
             <ul class="git-log-list">
-              <For each={log.data}>
+              <For each={log.data ?? []}>
                 {(entry) => (
                   <li>
-                    <code>{entry.sha.slice(0, 7)}</code>
-                    <div>
-                      <strong>{entry.message}</strong>
-                      <p>{entry.author}</p>
-                    </div>
+                    <code>{entry.sha.slice(0, 7)}</code> {entry.message}
+                    <span class="files-editor-meta"> · {entry.author}</span>
                   </li>
                 )}
               </For>
@@ -566,17 +679,15 @@ function GitPathSection(props: {
   return (
     <section class="git-path-section">
       <h3>
-        {props.title}
-        <Badge variant="neutral">{props.paths.length}</Badge>
+        {props.title} <span class="files-editor-meta">({props.paths.length})</span>
       </h3>
       <Show when={props.paths.length > 0} fallback={<p class="files-tree-empty">Clean</p>}>
         <ul class="git-path-list">
           <For each={props.paths}>
             {(path) => (
               <li>
-                <label class="git-path-row">
+                <label class="git-path-item">
                   <input
-                    class="ui-checkbox"
                     type="checkbox"
                     checked={props.selected.has(path)}
                     onChange={() => props.onToggle(path)}

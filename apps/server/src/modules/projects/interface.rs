@@ -14,16 +14,19 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use utoipa::ToSchema;
 
-use crate::adapters::git::{DiffView, GitCredential, GitError, GitRunner, GitStatus, SystemGit};
+use crate::adapters::git::{
+    apply_conflict_choice, complete_fast_forward, DiffView, GitCredential, GitError, GitRunner,
+    GitStatus, SystemGit, UpdateConflictPath, UpdateOutcome,
+};
 use crate::modules::workspace_sync::interface::{
     RevisionRef, WorkspaceHandle, WorkspaceSyncError, WorkspaceSyncInterface,
 };
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
-    id::{CorrelationId, GithubCredentialId, ProjectId},
+    id::{CorrelationId, GitUpdateConflictId, GithubCredentialId, ProjectId},
     operations::{
         CreateOperation, IdempotencyOutcome, IdempotencyRequest, OperationInterface,
-        OperationStatus, OperationView,
+        OperationStatus, OperationView, KIND_GIT_UPDATE,
     },
     path::{PathError, validate_workspace_path},
     secret::{Secret, SecretCipher, fingerprint},
@@ -192,6 +195,62 @@ pub struct FileMetaView {
     pub main_revision: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct UpdateGithubCredentialInput {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub github_host: Option<String>,
+    /// When set, replaces the stored PAT. When omitted, the existing PAT is kept.
+    #[serde(default)]
+    pub pat: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct GitUpdateInput {
+    pub remote: String,
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GitUpdateConflictView {
+    pub id: String,
+    pub project_id: String,
+    pub state: String,
+    pub base_tree: String,
+    pub remote_tree: String,
+    pub main_tree: String,
+    pub operation_id: String,
+    pub version: String,
+    pub paths: Vec<GitUpdateConflictPathView>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GitUpdateConflictPathView {
+    pub path: String,
+    pub kind: String,
+    pub base_hash: Option<String>,
+    pub remote_hash: Option<String>,
+    pub main_hash: Option<String>,
+    pub choice: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ResolveGitUpdateConflictInput {
+    pub paths: Vec<ResolveGitUpdateConflictPath>,
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ResolveGitUpdateConflictPath {
+    pub path: String,
+    /// One of: main | remote | delete | edited_text
+    pub choice: String,
+    #[serde(default)]
+    pub edited_text: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectsError {
     #[error("validation failed: {0}")]
@@ -200,6 +259,8 @@ pub enum ProjectsError {
     NotFound,
     #[error("github credential not found")]
     CredentialNotFound,
+    #[error("git update conflict not found")]
+    ConflictNotFound,
     #[error("revision mismatch: expected {expected}, current {current}")]
     RevisionMismatch { expected: String, current: String },
     #[error("invalid path: {0}")]
@@ -240,7 +301,9 @@ impl ProjectsError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "VALIDATION_FAILED",
-            Self::NotFound | Self::CredentialNotFound => "RESOURCE_NOT_FOUND",
+            Self::NotFound | Self::CredentialNotFound | Self::ConflictNotFound => {
+                "RESOURCE_NOT_FOUND"
+            }
             Self::RevisionMismatch { .. } => "RESOURCE_VERSION_MISMATCH",
             Self::InvalidPath(_) => "INVALID_PATH",
             Self::NotEditable(_) => "FILE_NOT_EDITABLE",
@@ -682,6 +745,62 @@ impl ProjectsInterface {
     ) -> Result<GithubCredentialView, ProjectsError> {
         let row = self.fetch_credential(owner_id, id).await?;
         credential_view(row)
+    }
+
+    /// Replace name/host and optionally the PAT. Updating without a new PAT
+    /// keeps the existing ciphertext (same semantics as model provider keys).
+    pub async fn update_credential(
+        &self,
+        owner_id: &str,
+        id: &str,
+        expected_version: &str,
+        input: UpdateGithubCredentialInput,
+    ) -> Result<GithubCredentialView, ProjectsError> {
+        let existing = self.fetch_credential(owner_id, id).await?;
+        if existing.version != expected_version {
+            return Err(ProjectsError::RevisionMismatch {
+                expected: expected_version.into(),
+                current: existing.version,
+            });
+        }
+        let now = format_utc(SystemClock.now());
+        let new_version = format!("v_{}", GithubCredentialId::new());
+        let name = input
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(existing.name.as_str());
+        let host = input
+            .github_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(existing.github_host.as_str());
+        let (ciphertext, fingerprint) = if let Some(pat) = input.pat {
+            self.encrypt_pat(owner_id, id, Some(pat))?
+        } else {
+            (existing.pat_ciphertext.clone(), existing.pat_fingerprint.clone())
+        };
+        let changed = sqlx::query(
+            "UPDATE github_credentials SET name = ?, github_host = ?, pat_ciphertext = ?, pat_fingerprint = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
+        )
+        .bind(name)
+        .bind(host)
+        .bind(ciphertext)
+        .bind(fingerprint)
+        .bind(&new_version)
+        .bind(&now)
+        .bind(id)
+        .bind(owner_id)
+        .bind(expected_version)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Err(ProjectsError::CredentialNotFound);
+        }
+        self.get_credential(owner_id, id).await
     }
 
     /// Delete a credential. Refuses if a `github_private` Project still
@@ -1340,15 +1459,10 @@ impl ProjectsInterface {
         project_id: &str,
         remote: &str,
         branch: &str,
-        credential: &GitCredential,
         correlation_id: CorrelationId,
     ) -> Result<OperationView, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
-        let payload =
-            serde_json::json!({"project_id": project_id, "remote": remote, "branch": branch});
-        self.operations
-            .enqueue_work(crate::platform::operations::KIND_GIT_PUSH, payload)
-            .await?;
+        let credential = self.credential_for_project(owner_id, project_id).await?;
         let created = self
             .operations
             .create(CreateOperation {
@@ -1361,9 +1475,18 @@ impl ProjectsInterface {
                 idempotency: None,
             })
             .await?;
+        let payload = serde_json::json!({
+            "project_id": project_id,
+            "remote": remote,
+            "branch": branch,
+            "operation_id": created.operation.id,
+        });
+        self.operations
+            .enqueue_work(crate::platform::operations::KIND_GIT_PUSH, payload)
+            .await?;
         // Push executes inline (short) when possible; the Operation records it.
         let dir = self.main_repo_dir(project_id);
-        if let Err(error) = self.git.push(&dir, remote, branch, credential).await {
+        if let Err(error) = self.git.push(&dir, remote, branch, &credential).await {
             self.operations
                 .finish(
                     &created.operation.id,
@@ -1384,7 +1507,484 @@ impl ProjectsInterface {
                 correlation_id,
             )
             .await?;
+        let _ = self.refresh_git_state(project_id).await;
         Ok(created.operation)
+    }
+
+    /// Run a Git Update (fetch + three-way content merge). On conflict, Main is
+    /// left unchanged and a persistent Git Update Conflict is created; the
+    /// Operation enters `needs_attention`.
+    pub async fn git_update(
+        &self,
+        owner_id: &str,
+        project_id: &str,
+        input: GitUpdateInput,
+        correlation_id: CorrelationId,
+    ) -> Result<OperationView, ProjectsError> {
+        self.require_ready(owner_id, project_id).await?;
+        let credential = self.credential_for_project(owner_id, project_id).await?;
+        let created = self
+            .operations
+            .create(CreateOperation {
+                kind: KIND_GIT_UPDATE,
+                actor: serde_json::json!({"kind": "owner", "id": owner_id}),
+                target_kind: "project",
+                target_id: Some(project_id),
+                conditions: serde_json::json!({
+                    "project_id": project_id,
+                    "remote": input.remote,
+                    "branch": input.branch,
+                }),
+                correlation_id,
+                idempotency: None,
+            })
+            .await?;
+        let dir = self.main_repo_dir(project_id);
+        let outcome = self
+            .git
+            .update(&dir, &input.remote, &input.branch, &credential)
+            .await?;
+        match outcome {
+            UpdateOutcome::FastForward { new_head, .. } => {
+                let _ = self.refresh_git_state(project_id).await;
+                // Bump content revision so Diff consumers refresh.
+                if let Ok(handle) = self.main_handle_for(project_id).await {
+                    let _ = self
+                        .workspace_sync
+                        .bump_revision(
+                            &handle,
+                            None,
+                            "git.update",
+                            serde_json::json!({"kind": "owner", "id": owner_id}),
+                        )
+                        .await;
+                }
+                self.operations
+                    .finish(
+                        &created.operation.id,
+                        OperationStatus::Succeeded,
+                        Some(serde_json::json!({"new_head": new_head})),
+                        None,
+                        correlation_id,
+                    )
+                    .await?;
+            }
+            UpdateOutcome::Failed(error) => {
+                self.operations
+                    .finish(
+                        &created.operation.id,
+                        OperationStatus::Failed,
+                        None,
+                        Some(serde_json::json!({"code": error.code(), "detail": error.to_string()})),
+                        correlation_id,
+                    )
+                    .await?;
+                return Err(error.into());
+            }
+            UpdateOutcome::Conflict {
+                paths,
+                base_tree,
+                remote_tree,
+                main_tree,
+                ..
+            } => {
+                self.persist_update_conflict(
+                    project_id,
+                    &created.operation.id,
+                    &base_tree,
+                    &remote_tree,
+                    &main_tree,
+                    &paths,
+                )
+                .await?;
+                self.operations
+                    .finish(
+                        &created.operation.id,
+                        OperationStatus::NeedsAttention,
+                        Some(serde_json::json!({
+                            "conflict_paths": paths.len(),
+                            "base_tree": base_tree,
+                            "remote_tree": remote_tree,
+                            "main_tree": main_tree,
+                        })),
+                        Some(serde_json::json!({"code": "GIT_UPDATE_CONFLICT"})),
+                        correlation_id,
+                    )
+                    .await?;
+            }
+        }
+        self.operations
+            .get(&created.operation.id)
+            .await?
+            .ok_or(ProjectsError::NotFound)
+    }
+
+    pub async fn list_update_conflicts(
+        &self,
+        owner_id: &str,
+        project_id: &str,
+    ) -> Result<Vec<GitUpdateConflictView>, ProjectsError> {
+        self.require_ready(owner_id, project_id).await?;
+        let rows: Vec<ConflictRow> = sqlx::query_as(
+            "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE project_id = ? AND state IN ('open', 'applying') ORDER BY created_at DESC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(self.conflict_view(row).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn get_update_conflict(
+        &self,
+        owner_id: &str,
+        project_id: &str,
+        conflict_id: &str,
+    ) -> Result<GitUpdateConflictView, ProjectsError> {
+        self.require_ready(owner_id, project_id).await?;
+        let row: ConflictRow = sqlx::query_as(
+            "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE id = ? AND project_id = ?",
+        )
+        .bind(conflict_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(ProjectsError::ConflictNotFound)?;
+        self.conflict_view(row).await
+    }
+
+    /// Persist path choices; when every path has a choice, apply them and
+    /// complete the fast-forward. Version changes supersede the conflict.
+    pub async fn resolve_update_conflict(
+        &self,
+        owner_id: &str,
+        project_id: &str,
+        conflict_id: &str,
+        expected_version: &str,
+        input: ResolveGitUpdateConflictInput,
+        correlation_id: CorrelationId,
+    ) -> Result<GitUpdateConflictView, ProjectsError> {
+        self.require_ready(owner_id, project_id).await?;
+        let row: ConflictRow = sqlx::query_as(
+            "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE id = ? AND project_id = ?",
+        )
+        .bind(conflict_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(ProjectsError::ConflictNotFound)?;
+        if row.version != expected_version {
+            return Err(ProjectsError::RevisionMismatch {
+                expected: expected_version.into(),
+                current: row.version,
+            });
+        }
+        if row.state != "open" && row.state != "applying" {
+            return Err(ProjectsError::Validation(format!(
+                "conflict is not open (state: {})",
+                row.state
+            )));
+        }
+
+        // Save each path choice.
+        let now = format_utc(SystemClock.now());
+        for path in &input.paths {
+            if !matches!(
+                path.choice.as_str(),
+                "main" | "remote" | "delete" | "edited_text"
+            ) {
+                return Err(ProjectsError::Validation(format!(
+                    "invalid choice {}",
+                    path.choice
+                )));
+            }
+            let edited_blob = if path.choice == "edited_text" {
+                let text = path.edited_text.as_deref().ok_or_else(|| {
+                    ProjectsError::Validation("edited_text requires edited_text body".into())
+                })?;
+                Some(sha2_hash(text.as_bytes()))
+            } else {
+                None
+            };
+            // For edited_text we store the text in a side file under objects via
+            // a simple content hash name under the data root tmp; for M2 we keep
+            // the text in the path row by writing a blob file under the project
+            // staging dir when applying.
+            sqlx::query(
+                "UPDATE git_update_conflict_paths SET choice = ?, edited_blob_sha = ?, version = ? WHERE conflict_id = ? AND path = ?",
+            )
+            .bind(&path.choice)
+            .bind(edited_blob.as_deref())
+            .bind(format!("v_{}", GitUpdateConflictId::new()))
+            .bind(conflict_id)
+            .bind(&path.path)
+            .execute(&self.pool)
+            .await?;
+            if path.choice == "edited_text" {
+                if let Some(text) = &path.edited_text {
+                    let staging = self
+                        .workspaces_root
+                        .join("main")
+                        .join(project_id)
+                        .join(".janus-conflict-edits");
+                    tokio::fs::create_dir_all(&staging).await.ok();
+                    let safe = path.path.replace('/', "__");
+                    tokio::fs::write(staging.join(safe), text.as_bytes())
+                        .await
+                        .map_err(|e| ProjectsError::Internal(anyhow::anyhow!(e)))?;
+                }
+            }
+        }
+
+        // Check whether every path now has a choice.
+        let unresolved: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM git_update_conflict_paths WHERE conflict_id = ? AND choice IS NULL",
+        )
+        .bind(conflict_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let unresolved = unresolved.map(|(c,)| c).unwrap_or(0);
+        if unresolved > 0 {
+            // Partial save — stay open.
+            let new_version = format!("v_{}", GitUpdateConflictId::new());
+            sqlx::query(
+                "UPDATE git_update_conflicts SET version = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&new_version)
+            .bind(&now)
+            .bind(conflict_id)
+            .execute(&self.pool)
+            .await?;
+            return self.get_update_conflict(owner_id, project_id, conflict_id).await;
+        }
+
+        // All paths chosen: apply and complete.
+        sqlx::query(
+            "UPDATE git_update_conflicts SET state = 'applying', version = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(format!("v_{}", GitUpdateConflictId::new()))
+        .bind(&now)
+        .bind(conflict_id)
+        .execute(&self.pool)
+        .await?;
+
+        let path_rows: Vec<ConflictPathRow> = sqlx::query_as(
+            "SELECT path, kind, base_hash, remote_hash, main_hash, choice, edited_blob_sha, version FROM git_update_conflict_paths WHERE conflict_id = ?",
+        )
+        .bind(conflict_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let dir = self.main_repo_dir(project_id);
+        for path_row in &path_rows {
+            let choice = path_row.choice.as_deref().unwrap_or("main");
+            let edited_bytes = if choice == "edited_text" {
+                let safe = path_row.path.replace('/', "__");
+                let staging = self
+                    .workspaces_root
+                    .join("main")
+                    .join(project_id)
+                    .join(".janus-conflict-edits")
+                    .join(safe);
+                Some(tokio::fs::read(&staging).await.unwrap_or_default())
+            } else {
+                None
+            };
+            apply_conflict_choice(
+                &dir,
+                &path_row.path,
+                choice,
+                path_row.remote_hash.as_deref(),
+                path_row.main_hash.as_deref(),
+                edited_bytes.as_deref(),
+            )
+            .await?;
+        }
+
+        // Determine remote/branch from the operation conditions when possible;
+        // fall back to project branch + origin.
+        let project = self.fetch_project(owner_id, project_id).await?;
+        let remote = "origin";
+        let branch = project.repo_branch.as_deref().unwrap_or("main");
+        complete_fast_forward(&dir, remote, branch).await?;
+        let _ = self.refresh_git_state(project_id).await;
+        if let Ok(handle) = self.main_handle_for(project_id).await {
+            let _ = self
+                .workspace_sync
+                .bump_revision(
+                    &handle,
+                    None,
+                    "git.update.resolve",
+                    serde_json::json!({"kind": "owner", "id": owner_id}),
+                )
+                .await;
+        }
+        sqlx::query(
+            "UPDATE git_update_conflicts SET state = 'resolved', version = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(format!("v_{}", GitUpdateConflictId::new()))
+        .bind(&now)
+        .bind(conflict_id)
+        .execute(&self.pool)
+        .await?;
+        // Best-effort: mark the original operation succeeded if still open.
+        let _ = self
+            .operations
+            .finish(
+                &row.operation_id,
+                OperationStatus::Succeeded,
+                Some(serde_json::json!({"resolved_conflict": conflict_id})),
+                None,
+                correlation_id,
+            )
+            .await;
+        self.get_update_conflict(owner_id, project_id, conflict_id).await
+    }
+
+    async fn credential_for_project(
+        &self,
+        owner_id: &str,
+        project_id: &str,
+    ) -> Result<GitCredential, ProjectsError> {
+        let row = self.fetch_project(owner_id, project_id).await?;
+        match RepoAccess::parse(&row.repo_access) {
+            Some(RepoAccess::GithubPrivate) => {
+                let cred_id = row
+                    .github_credential_id
+                    .as_ref()
+                    .ok_or_else(|| ProjectsError::Validation("missing credential".into()))?;
+                let pat = self.pat_for(owner_id, cred_id).await?;
+                Ok(GitCredential::HttpsBasic {
+                    username: "x-access-token".into(),
+                    password: pat.unwrap_or_default(),
+                })
+            }
+            _ => Ok(GitCredential::None),
+        }
+    }
+
+    async fn refresh_git_state(&self, project_id: &str) -> Result<(), ProjectsError> {
+        let dir = self.main_repo_dir(project_id);
+        let status = self.git.status(&dir).await?;
+        let now = format_utc(SystemClock.now());
+        let version = format!("v_{}", ProjectId::new());
+        sqlx::query(
+            "INSERT INTO project_git_state (project_id, git_state_version, head_sha, branch, ahead, behind, last_scan_at, version, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(project_id) DO UPDATE SET
+               git_state_version = excluded.git_state_version,
+               head_sha = excluded.head_sha,
+               branch = excluded.branch,
+               ahead = excluded.ahead,
+               behind = excluded.behind,
+               last_scan_at = excluded.last_scan_at,
+               version = excluded.version,
+               updated_at = excluded.updated_at",
+        )
+        .bind(project_id)
+        .bind(&version)
+        .bind(status.head_sha.as_deref())
+        .bind(status.branch.as_deref())
+        .bind(i64::from(status.ahead))
+        .bind(i64::from(status.behind))
+        .bind(&now)
+        .bind(&version)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn main_handle_for(&self, project_id: &str) -> Result<WorkspaceHandle, ProjectsError> {
+        let project_id_typed: ProjectId = project_id
+            .parse()
+            .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("bad project id")))?;
+        Ok(self.main_handle(project_id_typed))
+    }
+
+    async fn persist_update_conflict(
+        &self,
+        project_id: &str,
+        operation_id: &str,
+        base_tree: &str,
+        remote_tree: &str,
+        main_tree: &str,
+        paths: &[UpdateConflictPath],
+    ) -> Result<String, ProjectsError> {
+        let conflict_id = GitUpdateConflictId::new().to_string();
+        let now = format_utc(SystemClock.now());
+        let version = format!("v_{}", GitUpdateConflictId::new());
+        // Supersede any previous open conflict for this project.
+        sqlx::query(
+            "UPDATE git_update_conflicts SET state = 'superseded', updated_at = ? WHERE project_id = ? AND state IN ('open', 'applying')",
+        )
+        .bind(&now)
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO git_update_conflicts (id, project_id, base_tree, remote_tree, main_tree, state, operation_id, prev_conflict_id, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', ?, NULL, ?, ?, ?)",
+        )
+        .bind(&conflict_id)
+        .bind(project_id)
+        .bind(base_tree)
+        .bind(remote_tree)
+        .bind(main_tree)
+        .bind(operation_id)
+        .bind(&version)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        for path in paths {
+            sqlx::query(
+                "INSERT INTO git_update_conflict_paths (conflict_id, path, kind, base_hash, remote_hash, main_hash, choice, edited_blob_sha, version) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+            )
+            .bind(&conflict_id)
+            .bind(&path.path)
+            .bind(&path.kind)
+            .bind(path.base_hash.as_deref())
+            .bind(path.remote_hash.as_deref())
+            .bind(path.main_hash.as_deref())
+            .bind(format!("v_{}", GitUpdateConflictId::new()))
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(conflict_id)
+    }
+
+    async fn conflict_view(&self, row: ConflictRow) -> Result<GitUpdateConflictView, ProjectsError> {
+        let paths: Vec<ConflictPathRow> = sqlx::query_as(
+            "SELECT path, kind, base_hash, remote_hash, main_hash, choice, edited_blob_sha, version FROM git_update_conflict_paths WHERE conflict_id = ? ORDER BY path",
+        )
+        .bind(&row.id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(GitUpdateConflictView {
+            id: row.id,
+            project_id: row.project_id,
+            state: row.state,
+            base_tree: row.base_tree,
+            remote_tree: row.remote_tree,
+            main_tree: row.main_tree,
+            operation_id: row.operation_id,
+            version: row.version,
+            paths: paths
+                .into_iter()
+                .map(|p| GitUpdateConflictPathView {
+                    path: p.path,
+                    kind: p.kind,
+                    base_hash: p.base_hash,
+                    remote_hash: p.remote_hash,
+                    main_hash: p.main_hash,
+                    choice: p.choice,
+                })
+                .collect(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        })
     }
 }
 
@@ -1398,6 +1998,34 @@ struct CredentialRow {
     version: String,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(FromRow)]
+struct ConflictRow {
+    id: String,
+    project_id: String,
+    base_tree: String,
+    remote_tree: String,
+    main_tree: String,
+    state: String,
+    operation_id: String,
+    version: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(FromRow)]
+struct ConflictPathRow {
+    path: String,
+    kind: String,
+    base_hash: Option<String>,
+    remote_hash: Option<String>,
+    main_hash: Option<String>,
+    choice: Option<String>,
+    #[allow(dead_code)]
+    edited_blob_sha: Option<String>,
+    #[allow(dead_code)]
+    version: String,
 }
 
 fn credential_view(row: CredentialRow) -> Result<GithubCredentialView, ProjectsError> {
@@ -1415,6 +2043,13 @@ fn credential_view(row: CredentialRow) -> Result<GithubCredentialView, ProjectsE
 
 fn pat_aad(owner_id: &str, id: &str) -> String {
     format!("v1/{owner_id}/github_credentials/{id}/pat")
+}
+
+fn sha2_hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn guess_mime(path: &std::path::Path) -> Option<String> {

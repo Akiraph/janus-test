@@ -193,7 +193,7 @@ export interface paths {
     delete: operations["delete_credential"];
     options?: never;
     head?: never;
-    patch?: never;
+    patch: operations["update_credential"];
     trace?: never;
   };
   "/api/v1/github-credentials/{id}/probe": {
@@ -676,6 +676,54 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/projects/{id}/git/update-conflicts": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_update_conflicts"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_update_conflict"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}/resolve": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["resolve_update_conflict"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/projects/{id}/retry": {
     parameters: {
       query?: never;
@@ -833,6 +881,21 @@ export interface components {
         working: string[];
       };
     };
+    DataResponse_GitUpdateConflictView: {
+      data: {
+        base_tree: string;
+        created_at: string;
+        id: string;
+        main_tree: string;
+        operation_id: string;
+        paths: components["schemas"]["GitUpdateConflictPathView"][];
+        project_id: string;
+        remote_tree: string;
+        state: string;
+        updated_at: string;
+        version: string;
+      };
+    };
     DataResponse_GithubCredentialView: {
       data: {
         created_at: string;
@@ -938,6 +1001,21 @@ export interface components {
         path: string;
         /** Format: int64 */
         size: number;
+      }[];
+    };
+    DataResponse_Vec_GitUpdateConflictView: {
+      data: {
+        base_tree: string;
+        created_at: string;
+        id: string;
+        main_tree: string;
+        operation_id: string;
+        paths: components["schemas"]["GitUpdateConflictPathView"][];
+        project_id: string;
+        remote_tree: string;
+        state: string;
+        updated_at: string;
+        version: string;
       }[];
     };
     DataResponse_Vec_GithubCredentialView: {
@@ -1087,6 +1165,27 @@ export interface components {
       index: string[];
       untracked: string[];
       working: string[];
+    };
+    GitUpdateConflictPathView: {
+      base_hash?: string | null;
+      choice?: string | null;
+      kind: string;
+      main_hash?: string | null;
+      path: string;
+      remote_hash?: string | null;
+    };
+    GitUpdateConflictView: {
+      base_tree: string;
+      created_at: string;
+      id: string;
+      main_tree: string;
+      operation_id: string;
+      paths: components["schemas"]["GitUpdateConflictPathView"][];
+      project_id: string;
+      remote_tree: string;
+      state: string;
+      updated_at: string;
+      version: string;
     };
     GitUpdateRequest: {
       branch: string;
@@ -1245,6 +1344,23 @@ export interface components {
       github_credential_id?: string | null;
       url: string;
     };
+    ResolveConflictPathRequest: {
+      choice: string;
+      edited_text?: string | null;
+      path: string;
+    };
+    ResolveConflictRequest: {
+      paths: components["schemas"]["ResolveConflictPathRequest"][];
+    };
+    ResolveGitUpdateConflictInput: {
+      paths: components["schemas"]["ResolveGitUpdateConflictPath"][];
+    };
+    ResolveGitUpdateConflictPath: {
+      /** @description One of: main | remote | delete | edited_text */
+      choice: string;
+      edited_text?: string | null;
+      path: string;
+    };
     RetryProjectInput: {
       branch?: string | null;
       github_credential_id?: string | null;
@@ -1279,6 +1395,12 @@ export interface components {
     };
     SystemInfoResponse: {
       data: components["schemas"]["SystemInfo"];
+    };
+    UpdateGithubCredentialInput: {
+      github_host?: string | null;
+      name?: string | null;
+      /** @description When set, replaces the stored PAT. When omitted, the existing PAT is kept. */
+      pat?: string | null;
     };
     UpdateProjectRequest: {
       /** @description `null` clears the default model; omit to keep the current value. */
@@ -1729,6 +1851,64 @@ export interface operations {
         };
       };
       409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  update_credential: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Credential id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpdateGithubCredentialInput"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_GithubCredentialView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      428: {
         headers: {
           [name: string]: unknown;
         };
@@ -3027,6 +3207,14 @@ export interface operations {
       };
     };
     responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
       401: {
         headers: {
           [name: string]: unknown;
@@ -3035,7 +3223,23 @@ export interface operations {
           "application/json": components["schemas"]["Problem"];
         };
       };
-      501: {
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
         headers: {
           [name: string]: unknown;
         };
@@ -3227,6 +3431,152 @@ export interface operations {
         };
       };
       409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_update_conflicts: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_GitUpdateConflictView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  get_update_conflict: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+        /** @description Conflict id */
+        conflict_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_GitUpdateConflictView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  resolve_update_conflict: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description Project id */
+        id: string;
+        /** @description Conflict id */
+        conflict_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ResolveConflictRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_GitUpdateConflictView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      412: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      428: {
         headers: {
           [name: string]: unknown;
         };

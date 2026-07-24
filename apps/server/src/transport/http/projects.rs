@@ -24,7 +24,7 @@ use crate::{
     modules::projects::interface::{
         CreateGithubCredentialInput, CreateProjectInput, CredentialProbeResult, DeleteFileInput,
         FileMetaView, FileTreeView, GithubCredentialView, MoveFileInput, ProjectView,
-        ProjectsError, RetryProjectInput, SaveTextInput,
+        ProjectsError, RetryProjectInput, SaveTextInput, UpdateGithubCredentialInput,
     },
     platform::{events::NewEvent, id::CorrelationId},
     transport::http::{
@@ -380,6 +380,45 @@ pub async fn get_credential(
             .await
             .map_err(problem)?,
     }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/github-credentials/{id}",
+    params(("id" = String, Path, description = "Credential id")),
+    request_body = UpdateGithubCredentialInput,
+    responses(
+        (status = 200, body = DataResponse<GithubCredentialView>),
+        (status = 401, body = Problem),
+        (status = 404, body = Problem),
+        (status = 412, body = Problem),
+        (status = 428, body = Problem)
+    )
+)]
+pub async fn update_credential(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateGithubCredentialInput>,
+) -> Result<Json<DataResponse<GithubCredentialView>>, Problem> {
+    let auth = authorized(&state, &headers).await?;
+    let expected_version = if_match_version(&headers)?;
+    let view = state
+        .projects()
+        .update_credential(&auth.owner_id, &id, &expected_version, input)
+        .await
+        .map_err(problem)?;
+    emit_change(
+        &state,
+        &auth.owner_id,
+        &id,
+        "github_credential",
+        "updated",
+        &context,
+    )
+    .await;
+    Ok(Json(DataResponse { data: view }))
 }
 
 #[utoipa::path(

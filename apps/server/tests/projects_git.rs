@@ -280,3 +280,218 @@ async fn create_project_requires_idempotency_key() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
+    // Bare remote with main.
+    let remote = make_public_repo()?;
+    let data_root = TempDir::new()?;
+    let state = AppState::initialize(test_config(data_root.path().into())).await?;
+    workers::spawn(state.clone());
+    let app = router(state.clone());
+
+    let remote_url = remote
+        .path()
+        .to_str()
+        .expect("utf8 remote path")
+        .replace('\\', "/");
+    let remote_url = format!("file:///{remote_url}");
+
+    let (status, response) = request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        &[("Idempotency-Key", "test-update-1")],
+        Some(json!({
+            "name": "Update Fixture",
+            "repository": {
+                "access": "public_https",
+                "url": remote_url,
+                "branch": "main"
+            }
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    let created: Value = serde_json::from_str(&response)?;
+    let operation_id = created["data"]["id"].as_str().unwrap().to_owned();
+    let mut project_id = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, response) = request(
+            &app,
+            "GET",
+            &format!("/api/v1/operations/{operation_id}"),
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let body: Value = serde_json::from_str(&response)?;
+        if body["data"]["status"] == "succeeded" {
+            project_id = body["data"]["target_id"].as_str().map(str::to_owned);
+            break;
+        }
+    }
+    let project_id = project_id.expect("clone finished");
+
+    // Local dirty edit on README.md.
+    let (status, response) = request(
+        &app,
+        "GET",
+        &format!("/api/v1/projects/{project_id}"),
+        &[],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let project: Value = serde_json::from_str(&response)?;
+    let revision = project["data"]["main_revision"].as_str().unwrap().to_owned();
+    let (status, response) = request(
+        &app,
+        "PUT",
+        &format!("/api/v1/projects/{project_id}/files/text"),
+        &[],
+        Some(json!({
+            "path": "README.md",
+            "content": "# local dirty\n",
+            "expected_main_revision": revision
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+
+    // Push a conflicting remote change by committing into a second clone of the bare repo.
+    let work = TempDir::new()?;
+    let status = std::process::Command::new("git")
+        .args([
+            "clone",
+            remote.path().to_str().unwrap(),
+            work.path().to_str().unwrap(),
+        ])
+        .status()?;
+    assert!(status.success());
+    std::fs::write(work.path().join("README.md"), "# remote change\n")?;
+    for args in [
+        vec!["config", "user.email", "remote@example.com"],
+        vec!["config", "user.name", "Remote"],
+        vec!["add", "README.md"],
+        vec!["commit", "-m", "remote"],
+        vec!["push", "origin", "main"],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(work.path())
+            .status()?;
+        assert!(status.success(), "{args:?}");
+    }
+
+    // Update should produce needs_attention + conflict.
+    let (status, response) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/git/commands/update"),
+        &[("Idempotency-Key", "test-update-cmd")],
+        Some(json!({"remote": "origin", "branch": "main"})),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    let update_op: Value = serde_json::from_str(&response)?;
+    let update_op_id = update_op["data"]["id"].as_str().unwrap().to_owned();
+    let mut needs_attention = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (status, response) = request(
+            &app,
+            "GET",
+            &format!("/api/v1/operations/{update_op_id}"),
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let body: Value = serde_json::from_str(&response)?;
+        let st = body["data"]["status"].as_str().unwrap_or("");
+        if st == "needs_attention" || st == "succeeded" || st == "failed" {
+            assert_eq!(st, "needs_attention", "{response}");
+            needs_attention = true;
+            break;
+        }
+    }
+    assert!(needs_attention);
+
+    let (status, response) = request(
+        &app,
+        "GET",
+        &format!("/api/v1/projects/{project_id}/git/update-conflicts"),
+        &[],
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let conflicts: Value = serde_json::from_str(&response)?;
+    let conflict = &conflicts["data"].as_array().unwrap()[0];
+    let conflict_id = conflict["id"].as_str().unwrap();
+    let version = conflict["version"].as_str().unwrap();
+
+    // Resolve by taking remote.
+    let (status, response) = request(
+        &app,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/git/update-conflicts/{conflict_id}/resolve"),
+        &[("If-Match", version)],
+        Some(json!({
+            "paths": [{"path": "README.md", "choice": "remote"}]
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let resolved: Value = serde_json::from_str(&response)?;
+    assert_eq!(resolved["data"]["state"], "resolved", "{response}");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn github_credential_patch_keeps_secret_when_omitted() -> anyhow::Result<()> {
+    let data_root = TempDir::new()?;
+    let state = AppState::initialize(test_config(data_root.path().into())).await?;
+    let app = router(state);
+    let secret = "ghp_test_secret_value_123456";
+    let (status, response) = request(
+        &app,
+        "POST",
+        "/api/v1/github-credentials",
+        &[],
+        Some(json!({
+            "name": "GitHub",
+            "github_host": "github.com",
+            "pat": secret
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert!(!response.contains(secret));
+    let created: Value = serde_json::from_str(&response)?;
+    let id = created["data"]["id"].as_str().unwrap();
+    let version = created["data"]["version"].as_str().unwrap();
+    let preview = created["data"]["pat_fingerprint"].clone();
+
+    let (status, response) = request(
+        &app,
+        "PATCH",
+        &format!("/api/v1/github-credentials/{id}"),
+        &[("If-Match", version)],
+        Some(json!({
+            "name": "GitHub Renamed"
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert!(!response.contains(secret));
+    let updated: Value = serde_json::from_str(&response)?;
+    assert_eq!(updated["data"]["name"], "GitHub Renamed");
+    assert_eq!(updated["data"]["pat_is_set"], true);
+    assert_eq!(updated["data"]["pat_fingerprint"], preview);
+    Ok(())
+}
