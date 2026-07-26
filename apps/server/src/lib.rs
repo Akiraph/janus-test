@@ -13,6 +13,8 @@ use config::Config;
 use modules::identity::interface::IdentityInterface;
 use modules::models::interface::ModelsInterface;
 use modules::projects::interface::ProjectsInterface;
+use modules::sessions::interface::SessionsInterface;
+use modules::supervisor::interface::SupervisorInterface;
 use modules::workspace_sync::interface::WorkspaceSyncInterface;
 use platform::{
     database::Database, events::EventStore, managed_storage::BlobStore,
@@ -35,6 +37,8 @@ struct AppStateInner {
     pub identity: IdentityInterface,
     pub models: ModelsInterface,
     pub projects: ProjectsInterface,
+    pub sessions: SessionsInterface,
+    pub supervisor: SupervisorInterface,
 }
 
 impl AppState {
@@ -47,7 +51,8 @@ impl AppState {
         let secrets = SecretCipher::load(&config.data_root, config.mode)?;
         let blobs = BlobStore::new(pool.clone(), &config.data_root)?;
         let operations = OperationInterface::new(pool.clone());
-        let workspace_sync = WorkspaceSyncInterface::new(pool.clone());
+        let workspace_sync =
+            WorkspaceSyncInterface::new(pool.clone(), &config.data_root, blobs.clone());
         let identity = IdentityInterface::new(pool.clone(), &config).await?;
         let models = ModelsInterface::new(pool.clone(), secrets.clone())?;
         let projects = ProjectsInterface::new(
@@ -57,6 +62,19 @@ impl AppState {
             workspace_sync.clone(),
             &config.data_root,
         );
+        let sessions = SessionsInterface::new(pool.clone(), events.clone(), workspace_sync.clone());
+        // Owner id used when spawning background turns; HTTP message handlers
+        // rebuild a request-scoped supervisor with the authenticated owner.
+        let supervisor = SupervisorInterface::new(
+            pool.clone(),
+            events.clone(),
+            models.clone(),
+            workspace_sync.clone(),
+            "owner-bootstrap".into(),
+        );
+        if let Err(error) = supervisor.recover_running_on_startup().await {
+            tracing::warn!(%error, "supervisor startup recovery failed");
+        }
         Ok(Self {
             inner: Arc::new(AppStateInner {
                 config,
@@ -69,6 +87,8 @@ impl AppState {
                 identity,
                 models,
                 projects,
+                sessions,
+                supervisor,
             }),
         })
     }
@@ -111,6 +131,26 @@ impl AppState {
 
     pub fn projects(&self) -> &ProjectsInterface {
         &self.inner.projects
+    }
+
+    pub fn sessions(&self) -> &SessionsInterface {
+        &self.inner.sessions
+    }
+
+    pub fn supervisor(&self) -> &SupervisorInterface {
+        &self.inner.supervisor
+    }
+
+    /// Build a request-scoped supervisor bound to the authenticated owner id
+    /// (provider credentials / model selection).
+    pub fn supervisor_for_owner(&self, owner_id: &str) -> SupervisorInterface {
+        SupervisorInterface::new(
+            self.inner.database.pool().clone(),
+            self.inner.events.clone(),
+            self.inner.models.clone(),
+            self.inner.workspace_sync.clone(),
+            owner_id.to_owned(),
+        )
     }
 }
 

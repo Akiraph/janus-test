@@ -4,12 +4,16 @@ import {
   getMe,
   getProject,
   getProviders,
+  getSession,
+  getSessionDiff,
+  getSessionTimeline,
   getSystemInfo,
   gitLog,
   gitStatus,
   listFileTree,
   listGithubCredentials,
   listProjects,
+  listSessions,
 } from "./api";
 
 export function useBootstrap() {
@@ -89,6 +93,69 @@ export function useGitLog(projectId: () => string | undefined, limit = 30) {
       queryKey: ["git-log", id, limit],
       queryFn: () => gitLog(id as string, limit),
       enabled: Boolean(id),
+    };
+  });
+}
+
+export function useSessions(projectId: () => string | undefined) {
+  return createQuery(() => {
+    const id = projectId();
+    return {
+      queryKey: ["sessions", id],
+      queryFn: () => listSessions(id as string),
+      enabled: Boolean(id),
+    };
+  });
+}
+
+export function useSession(sessionId: () => string | undefined) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["session", id],
+      queryFn: () => getSession(id as string),
+      enabled: Boolean(id),
+      refetchInterval: (query) => {
+        const state = query.state.data?.state;
+        return state === "active" ? 1500 : false;
+      },
+    };
+  });
+}
+
+export function useSessionTimeline(sessionId: () => string | undefined) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["session-timeline", id],
+      queryFn: () => getSessionTimeline(id as string, { limit: 100 }),
+      enabled: Boolean(id),
+      // Poll only while a turn is running. Constant 1.5s polling on idle sessions
+      // was burning requests and re-suspending the main surface for no benefit.
+      refetchInterval: (query) => {
+        // Parent session query lives under ["session", id]; if we cannot see
+        // activity from the timeline alone, fall back to a slow idle poll only
+        // when the last page already has items (active conversation). Empty
+        // timelines stay quiet until the user sends a message.
+        const items = query.state.data?.items ?? [];
+        if (items.length === 0) return false;
+        return 3000;
+      },
+    };
+  });
+}
+
+export function useSessionDiff(
+  sessionId: () => string | undefined,
+  /** Diff is expensive (full Merkle walk). Only enable when the Diff pane is open. */
+  enabled: () => boolean = () => true,
+) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["session-diff", id],
+      queryFn: () => getSessionDiff(id as string),
+      enabled: Boolean(id) && enabled(),
     };
   });
 }

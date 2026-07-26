@@ -64,7 +64,10 @@ export function ScmPanel(props: ScmPanelProps) {
       .catch(() => {
         // Conflicts endpoint failures shouldn't block status view.
       });
-    await Promise.all([queryClient.invalidateQueries({ queryKey: ["git-status", id] }), conflictsP]);
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["git-status", id] }),
+      conflictsP,
+    ]);
   }
 
   createEffect(() => {
@@ -103,10 +106,7 @@ export function ScmPanel(props: ScmPanelProps) {
       <Show
         when={status.data}
         fallback={
-          <Show
-            when={status.isError}
-            fallback={<p class="files-tree-empty">Loading...</p>}
-          >
+          <Show when={status.isError} fallback={<p class="files-tree-empty">Loading...</p>}>
             <ErrorBlock
               message={status.error instanceof Error ? status.error.message : "Git status failed"}
               retry={() => void status.refetch()}
@@ -114,9 +114,9 @@ export function ScmPanel(props: ScmPanelProps) {
           </Show>
         }
       >
-          {(data) => (
-            <div class="ide-scroll-host">
-              <div class="scm-body ide-sidebar-scroll" ref={setScrollHost}>
+        {(data) => (
+          <div class="ide-scroll-host">
+            <div class="scm-body ide-sidebar-scroll" ref={setScrollHost}>
               <div class="scm-summary">
                 <Badge variant="neutral">
                   {data().branch ?? "detached"}
@@ -390,7 +390,7 @@ export function ScmPanel(props: ScmPanelProps) {
                   <span>Graph</span>
                 </button>
                 <div
-                  class="scm-section-body"
+                  class="scm-section-body scm-section-body--graph"
                   classList={{ "scm-section-body--open": graphOpen() }}
                   aria-hidden={!graphOpen()}
                 >
@@ -399,10 +399,10 @@ export function ScmPanel(props: ScmPanelProps) {
                   </div>
                 </div>
               </section>
-              </div>
-              <SideScrollbar host={scrollHost} />
             </div>
-          )}
+            <SideScrollbar host={scrollHost} />
+          </div>
+        )}
       </Show>
     </section>
   );

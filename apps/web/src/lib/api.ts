@@ -27,6 +27,13 @@ export type ResolveGitUpdateConflictInput = components["schemas"]["ResolveGitUpd
 export type SaveTextInput = components["schemas"]["SaveTextInput"];
 export type RepositoryInput = components["schemas"]["RepositoryInput"];
 export type RepoAccess = components["schemas"]["RepoAccess"];
+export type SessionSummary = components["schemas"]["SessionSummary"];
+export type MessageRouteResult = components["schemas"]["MessageRouteResult"];
+export type TimelinePage = components["schemas"]["TimelinePage"];
+export type TimelineItemView = components["schemas"]["TimelineItemView"];
+export type TurnSummary = components["schemas"]["TurnSummary"];
+export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
+export type PostMessageRequest = components["schemas"]["PostMessageRequest"];
 let csrfToken: string | undefined;
 
 export class ApiError extends Error {
@@ -199,6 +206,85 @@ export async function getProject(id: string): Promise<ProjectView> {
   return (
     await requestJson<{ data: ProjectView }>(
       `/api/v1/projects/${id}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function listSessions(projectId: string, limit = 50): Promise<SessionSummary[]> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return (
+    await requestJson<{ data: SessionSummary[] }>(
+      `/api/v1/projects/${projectId}/sessions?${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function createSession(
+  projectId: string,
+  input: CreateSessionRequest = {},
+): Promise<SessionSummary> {
+  return (
+    await requestJson<{ data: SessionSummary }>(
+      `/api/v1/projects/${projectId}/sessions`,
+      { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getSession(id: string): Promise<SessionSummary> {
+  return (
+    await requestJson<{ data: SessionSummary }>(
+      `/api/v1/sessions/${id}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  await requestJson(`/api/v1/sessions/${id}`, { method: "DELETE" }, () => true);
+}
+
+export async function postSessionMessage(
+  id: string,
+  input: PostMessageRequest,
+): Promise<MessageRouteResult> {
+  return (
+    await requestJson<{ data: MessageRouteResult }>(
+      `/api/v1/sessions/${id}/messages`,
+      { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getSessionTimeline(
+  id: string,
+  opts: { before?: string; after?: string; limit?: number } = {},
+): Promise<TimelinePage> {
+  const query = new URLSearchParams();
+  if (opts.before) query.set("before", opts.before);
+  if (opts.after) query.set("after", opts.after);
+  if (opts.limit) query.set("limit", String(opts.limit));
+  const suffix = query.toString() ? `?${query}` : "";
+  return (
+    await requestJson<{ data: TimelinePage }>(
+      `/api/v1/sessions/${id}/timeline${suffix}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getSessionDiff(id: string): Promise<Record<string, unknown>> {
+  return (
+    await requestJson<{ data: Record<string, unknown> }>(
+      `/api/v1/sessions/${id}/diff`,
       { method: "GET" },
       isDataResponse,
     )

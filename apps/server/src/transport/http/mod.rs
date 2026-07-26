@@ -8,6 +8,7 @@ mod operations;
 mod problem;
 mod projects;
 mod request_id;
+mod sessions;
 mod sse;
 
 use axum::{
@@ -44,7 +45,10 @@ pub use problem::Problem;
         git::git_status, git::git_diff, git::git_log, git::git_branches, git::git_remotes,
         git::git_fetch, git::git_stage, git::git_unstage, git::git_commit, git::git_push,
         git::git_update, git::list_update_conflicts, git::get_update_conflict, git::resolve_update_conflict,
-        operations::get_operation
+        operations::get_operation,
+        sessions::list_sessions, sessions::create_session, sessions::get_session,
+        sessions::delete_session, sessions::post_message, sessions::timeline,
+        sessions::get_turn, sessions::session_diff
     ),
     components(schemas(
         dto::LiveResponse,
@@ -111,7 +115,14 @@ pub use problem::Problem;
         git::GitPushRequest,
         git::GitUpdateRequest,
         git::ResolveConflictRequest,
-        git::ResolveConflictPathRequest
+        git::ResolveConflictPathRequest,
+        crate::modules::sessions::types::SessionSummary,
+        crate::modules::sessions::types::TurnSummary,
+        crate::modules::sessions::types::MessageRouteResult,
+        crate::modules::sessions::types::TimelinePage,
+        crate::modules::sessions::types::TimelineItemView,
+        sessions::CreateSessionRequest,
+        sessions::PostMessageRequest
     )),
     tags((name = "system", description = "Janus system probes"))
 )]
@@ -253,6 +264,24 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}/resolve",
             post(git::resolve_update_conflict),
         )
+        .route(
+            "/api/v1/projects/{project_id}/sessions",
+            get(sessions::list_sessions).post(sessions::create_session),
+        )
+        .route(
+            "/api/v1/sessions/{id}",
+            get(sessions::get_session).delete(sessions::delete_session),
+        )
+        .route(
+            "/api/v1/sessions/{id}/messages",
+            post(sessions::post_message),
+        )
+        .route("/api/v1/sessions/{id}/timeline", get(sessions::timeline))
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}",
+            get(sessions::get_turn),
+        )
+        .route("/api/v1/sessions/{id}/diff", get(sessions::session_diff))
         .layer(middleware::from_fn(request_id::middleware))
         .with_state(state)
 }

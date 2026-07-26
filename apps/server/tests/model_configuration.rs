@@ -153,7 +153,13 @@ async fn provider_embeds_models_and_masks_key_without_leaking() -> anyhow::Resul
     let updated: Value = serde_json::from_str(&response)?;
     assert_eq!(updated["data"]["api_key_is_set"], true);
     assert_eq!(updated["data"]["api_key_preview"], preview);
-    assert_eq!(updated["data"]["models"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        updated["data"]["models"]
+            .as_array()
+            .expect("test value")
+            .len(),
+        1
+    );
     Ok(())
 }
 

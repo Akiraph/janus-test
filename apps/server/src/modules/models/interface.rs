@@ -125,18 +125,18 @@ pub struct ModelsInterface {
 }
 
 #[derive(FromRow)]
-struct ProviderRow {
-    id: String,
-    kind: String,
-    display_name: String,
-    base_url: String,
-    api_key_ciphertext: Option<Vec<u8>>,
-    api_key_fingerprint: Option<String>,
-    api_key_preview: Option<String>,
-    models_json: String,
-    enabled: i64,
-    created_at: String,
-    updated_at: String,
+pub(crate) struct ProviderRow {
+    pub id: String,
+    pub kind: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub api_key_ciphertext: Option<Vec<u8>>,
+    pub api_key_fingerprint: Option<String>,
+    pub api_key_preview: Option<String>,
+    pub models_json: String,
+    pub enabled: i64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 impl ModelsInterface {
@@ -290,15 +290,119 @@ impl ModelsInterface {
     async fn provider(&self, owner_id: &str, id: &str) -> Result<ProviderView, ModelsError> {
         provider_view(self.provider_row(owner_id, id).await?)
     }
-    async fn provider_row(&self, owner_id: &str, id: &str) -> Result<ProviderRow, ModelsError> {
+    pub(crate) async fn provider_row(
+        &self,
+        owner_id: &str,
+        id: &str,
+    ) -> Result<ProviderRow, ModelsError> {
         sqlx::query_as::<_, ProviderRow>("SELECT id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE id=? AND owner_id=?").bind(id).bind(owner_id).fetch_optional(&self.pool).await?.ok_or(ModelsError::ProviderNotFound)
     }
+
+    pub(crate) fn cipher_ref(&self) -> &SecretCipher {
+        &self.cipher
+    }
+
+    pub(crate) fn client_ref(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    pub(crate) async fn provider_row_public(
+        &self,
+        owner_id: &str,
+        id: &str,
+    ) -> Result<ProviderRow, ModelsError> {
+        self.provider_row(owner_id, id).await
+    }
+
+    pub(crate) async fn insert_attempt_running(
+        &self,
+        attempt_id: &str,
+        round_id: &str,
+        provider_id: &str,
+        upstream_model_id: &str,
+        created_at: &str,
+    ) -> Result<(), ModelsError> {
+        sqlx::query(
+            "INSERT INTO model_attempts \
+             (id, round_id, candidate_order, provider_id, upstream_model_id, attempt_type, \
+              status, normalized_error_json, upstream_request_id, input_tokens, output_tokens, \
+              created_at, ended_at) \
+             VALUES (?, ?, 0, ?, ?, 'normal', 'running', NULL, NULL, NULL, NULL, ?, NULL)",
+        )
+        .bind(attempt_id)
+        .bind(round_id)
+        .bind(provider_id)
+        .bind(upstream_model_id)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn finalize_attempt(
+        &self,
+        attempt_id: &str,
+        status: &str,
+        input_tokens: Option<i64>,
+        output_tokens: Option<i64>,
+        error_json: Option<&serde_json::Value>,
+        req: &super::stream_types::ModelRequest,
+    ) -> Result<(), ModelsError> {
+        let ended = format_utc(Utc::now());
+        sqlx::query(
+            "UPDATE model_attempts SET status = ?, input_tokens = ?, output_tokens = ?, \
+             normalized_error_json = ?, ended_at = ? WHERE id = ?",
+        )
+        .bind(status)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(error_json.map(|v| v.to_string()))
+        .bind(&ended)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await?;
+
+        // Ledger only when usage was reported (including failed attempts with tokens).
+        if let (Some(inp), Some(out)) = (input_tokens, output_tokens)
+            && let (Some(project_id), Some(session_id), Some(turn_id), Some(round_id)) = (
+                req.project_id.as_ref(),
+                req.session_id.as_ref(),
+                req.turn_id.as_ref(),
+                req.round_id.as_ref(),
+            )
+        {
+            let ledger_id = crate::platform::id::AttemptId::new().to_string();
+            sqlx::query(
+                "INSERT INTO model_usage_ledger \
+                 (id, attempt_id, project_id, session_id, turn_id, round_id, provider_id, \
+                  upstream_model_id, input_tokens, output_tokens, cache_tokens, \
+                  attempt_result, occurred_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+            )
+            .bind(&ledger_id)
+            .bind(attempt_id)
+            .bind(project_id)
+            .bind(session_id)
+            .bind(turn_id)
+            .bind(round_id)
+            .bind(&req.provider_id)
+            .bind(&req.upstream_model_id)
+            .bind(inp)
+            .bind(out)
+            .bind(status)
+            .bind(&ended)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     fn encrypt_key(
         &self,
         owner_id: &str,
         id: &str,
         key: Option<&str>,
-    ) -> Result<(Option<Vec<u8>>, Option<String>, Option<String>), ModelsError> {
+    ) -> Result<EncryptedKeyMaterial, ModelsError> {
         match key {
             Some(value) if !value.trim().is_empty() => Ok((
                 Some(
@@ -313,6 +417,8 @@ impl ModelsInterface {
         }
     }
 }
+
+type EncryptedKeyMaterial = (Option<Vec<u8>>, Option<String>, Option<String>);
 
 fn default_true() -> bool {
     true

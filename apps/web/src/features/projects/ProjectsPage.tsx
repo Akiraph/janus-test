@@ -194,7 +194,14 @@ export function ProjectsPage() {
         )}
       </Show>
 
-      <Show when={!projects.isPending} fallback={<p class="files-tree-empty" role="status" aria-label="Loading...">Loading...</p>}>
+      <Show
+        when={!projects.isPending}
+        fallback={
+          <p class="files-tree-empty" role="status" aria-label="Loading...">
+            Loading...
+          </p>
+        }
+      >
         <Show
           when={!projects.isError}
           fallback={

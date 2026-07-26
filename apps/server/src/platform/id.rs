@@ -55,6 +55,18 @@ typed_id!(WorkItemId);
 typed_id!(GithubCredentialId);
 typed_id!(RevisionId);
 typed_id!(GitUpdateConflictId);
+// M3 Session / Turn / Supervisor / Models identity surface.
+typed_id!(SessionId);
+typed_id!(TurnId);
+typed_id!(MessageId);
+typed_id!(RoundId);
+typed_id!(ToolCallId);
+typed_id!(CheckpointId);
+typed_id!(AttachmentId);
+typed_id!(UploadId);
+typed_id!(TimelineItemId);
+typed_id!(AttemptId);
+typed_id!(SnapshotId);
 
 /// Lowercase hex SHA-256 of a content-addressed blob. Not a UUID: the value is
 /// derived from the bytes, so it is constructed from a string, not generated.

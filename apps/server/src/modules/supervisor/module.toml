@@ -1,7 +1,7 @@
 name = "supervisor"
 public_root = "interface.rs"
-owned_tables = []
-publishes = []
+owned_tables = ["rounds", "tool_calls"]
+publishes = ["round.changed", "tool_call.created", "tool_call.changed"]
 allowed_module_dependencies = ["models", "projects", "runtime", "sessions", "workspace-sync"]
 specs = []
 tests = []

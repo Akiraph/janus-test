@@ -2959,6 +2959,377 @@
         }
       }
     },
+    "/api/v1/projects/{project_id}/sessions": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "list_sessions",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_SessionSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "create_session",
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_SessionSummary"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "get_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_SessionSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "delete_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/diff": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "session_diff",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Value"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/messages": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "post_message",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostMessageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_MessageRouteResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/timeline": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "timeline",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TimelinePage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/turns/{turn_id}": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "get_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "turn_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TurnSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/system/info": {
       "get": {
         "tags": [
@@ -3173,6 +3544,17 @@
           },
           "repository": {
             "$ref": "#/components/schemas/RepositoryInput"
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -3479,6 +3861,38 @@
                 "type": "string"
               },
               "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_MessageRouteResult": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "route",
+              "message_id",
+              "turn_id",
+              "session_version"
+            ],
+            "properties": {
+              "message_id": {
+                "type": "string"
+              },
+              "route": {
+                "type": "string",
+                "description": "M3 always starts immediately (no queue/handoff)."
+              },
+              "session_version": {
+                "type": "string"
+              },
+              "turn_id": {
                 "type": "string"
               }
             }
@@ -3800,7 +4214,80 @@
         "properties": {
           "data": {
             "type": "string",
-            "description": "A Content Revision identity. Exposed to clients as an opaque `v_01J...`\nstring via `main_revision` on the Project projection; used as an `If-Match`\ncondition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of\nhalf-writing."
+            "description": "Content Revision identity exposed as opaque `rev_<uuid>` string."
+          }
+        }
+      },
+      "DataResponse_SessionSummary": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "project_id",
+              "kind",
+              "state",
+              "workspace_handle",
+              "source_main_revision_id",
+              "version",
+              "created_at",
+              "updated_at",
+              "last_activity_at"
+            ],
+            "properties": {
+              "active_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "last_activity_at": {
+                "type": "string"
+              },
+              "project_id": {
+                "type": "string"
+              },
+              "source_main_revision_id": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "workspace_handle": {
+                "type": "string"
+              },
+              "workspace_revision": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
           }
         }
       },
@@ -3813,6 +4300,107 @@
           "data": {
             "type": "string"
           }
+        }
+      },
+      "DataResponse_TimelinePage": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "items",
+              "has_older",
+              "has_newer"
+            ],
+            "properties": {
+              "has_newer": {
+                "type": "boolean"
+              },
+              "has_older": {
+                "type": "boolean"
+              },
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TimelineItemView"
+                }
+              },
+              "newest_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "oldest_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_TurnSummary": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "session_id",
+              "sequence",
+              "status",
+              "version",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "input_message_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sequence": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_Value": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {}
         }
       },
       "DataResponse_Vec_FileTreeView": {
@@ -4140,6 +4728,82 @@
                 },
                 "updated_at": {
                   "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_Vec_SessionSummary": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "project_id",
+                "kind",
+                "state",
+                "workspace_handle",
+                "source_main_revision_id",
+                "version",
+                "created_at",
+                "updated_at",
+                "last_activity_at"
+              ],
+              "properties": {
+                "active_turn_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_at": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "last_activity_at": {
+                  "type": "string"
+                },
+                "project_id": {
+                  "type": "string"
+                },
+                "source_main_revision_id": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated_at": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "workspace_handle": {
+                  "type": "string"
+                },
+                "workspace_revision": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             }
@@ -4714,6 +5378,30 @@
           }
         }
       },
+      "MessageRouteResult": {
+        "type": "object",
+        "required": [
+          "route",
+          "message_id",
+          "turn_id",
+          "session_version"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string"
+          },
+          "route": {
+            "type": "string",
+            "description": "M3 always starts immediately (no queue/handoff)."
+          },
+          "session_version": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        }
+      },
       "MoveFileInput": {
         "type": "object",
         "required": [
@@ -4860,6 +5548,21 @@
             ]
           },
           "name": {
+            "type": "string"
+          }
+        }
+      },
+      "PostMessageRequest": {
+        "type": "object",
+        "required": [
+          "content",
+          "expected_session_version"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "expected_session_version": {
             "type": "string"
           }
         }
@@ -5330,7 +6033,7 @@
       },
       "RevisionRef": {
         "type": "string",
-        "description": "A Content Revision identity. Exposed to clients as an opaque `v_01J...`\nstring via `main_revision` on the Project projection; used as an `If-Match`\ncondition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of\nhalf-writing."
+        "description": "Content Revision identity exposed as opaque `rev_<uuid>` string."
       },
       "RuntimeCapability": {
         "type": "object",
@@ -5382,6 +6085,71 @@
           }
         }
       },
+      "SessionSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "project_id",
+          "kind",
+          "state",
+          "workspace_handle",
+          "source_main_revision_id",
+          "version",
+          "created_at",
+          "updated_at",
+          "last_activity_at"
+        ],
+        "properties": {
+          "active_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "last_activity_at": {
+            "type": "string"
+          },
+          "project_id": {
+            "type": "string"
+          },
+          "source_main_revision_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "workspace_handle": {
+            "type": "string"
+          },
+          "workspace_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "SystemInfo": {
         "type": "object",
         "required": [
@@ -5429,6 +6197,132 @@
         "properties": {
           "data": {
             "$ref": "#/components/schemas/SystemInfo"
+          }
+        }
+      },
+      "TimelineItemView": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "kind",
+          "display_order",
+          "projection",
+          "status",
+          "version",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "display_order": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "projection": {},
+          "session_id": {
+            "type": "string"
+          },
+          "source_resource_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "TimelinePage": {
+        "type": "object",
+        "required": [
+          "items",
+          "has_older",
+          "has_newer"
+        ],
+        "properties": {
+          "has_newer": {
+            "type": "boolean"
+          },
+          "has_older": {
+            "type": "boolean"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TimelineItemView"
+            }
+          },
+          "newest_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "oldest_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "TurnSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "sequence",
+          "status",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "input_message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
           }
         }
       },

@@ -1,8 +1,8 @@
 import ChevronRight from "lucide-solid/icons/chevron-right";
 import FileCode2 from "lucide-solid/icons/file-code-2";
 import { createEffect, createMemo, createSignal, For, Show, untrack } from "solid-js";
-import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { FileTreeView } from "../../../lib/api";
 import { listFileTree } from "../../../lib/api";
 import { basename, sortTreeEntries } from "./utils";
@@ -81,7 +81,11 @@ export function FileTreePanel(props: FileTreePanelProps) {
     const rootEntries = children()[""];
     if (!id || !rootEntries) return;
     for (const entry of rootEntries) {
-      if (entry.kind === "dir" && children()[entry.path] === undefined && !loading().has(entry.path)) {
+      if (
+        entry.kind === "dir" &&
+        children()[entry.path] === undefined &&
+        !loading().has(entry.path)
+      ) {
         void loadPath(entry.path);
       }
     }
@@ -188,10 +192,7 @@ function TreeNode(props: {
             (file glyph) align on the same left edge — no folder glyph anymore,
             the > / v chevron alone signals a directory. */}
         <span class="ide-tree-icon-slot">
-          <Show
-            when={isDir()}
-            fallback={<FileCode2 size={14} class="ide-tree-icon" />}
-          >
+          <Show when={isDir()} fallback={<FileCode2 size={14} class="ide-tree-icon" />}>
             <span
               class="ide-tree-chevron"
               classList={{ "ide-tree-chevron--open": isOpen() }}

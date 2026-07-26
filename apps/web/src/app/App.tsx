@@ -23,6 +23,8 @@ export function App() {
     <Router root={AppShell}>
       <Route path="/" component={ProjectsPage} />
       <Route path="/projects/:id" component={ProjectPage} />
+      {/* Legacy session routes collapse into the project shell (tabs, not pages). */}
+      <Route path="/projects/:id/sessions/*rest" component={ProjectPage} />
       <Route path="/settings" component={ModelsPage} />
       <Route path="/system" component={SystemPage} />
       <Route path="/models" component={ModelsPage} />

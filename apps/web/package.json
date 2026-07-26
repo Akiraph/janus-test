@@ -8,9 +8,9 @@
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check src",
-    "format": "biome check --write src",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
+    "lint": "biome check src e2e playwright.config.ts vite.config.ts",
+    "format": "biome check --write src e2e playwright.config.ts vite.config.ts",
     "generate:types": "openapi-typescript ../../generated/openapi.json -o src/generated/api.ts && biome check --write src/generated/api.ts",
     "test:e2e": "playwright test"
   },

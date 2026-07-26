@@ -72,11 +72,25 @@ impl Config {
             env::var("JANUS_PUBLIC_ORIGIN").unwrap_or_else(|_| format!("http://{}", bind));
         let public_origin = url::Url::parse(&origin_value)
             .map_err(|_| ConfigError::InvalidPublicOrigin(origin_value.clone()))?;
-        let config = Self {
-            bind,
-            data_root: env::var_os("JANUS_DATA_ROOT")
+        // Always absolute: relative data_root (the ".janus-dev" default) is resolved
+            // against process cwd, and later `git worktree add` runs with
+            // `current_dir = main_repo`. A relative session path would then be
+            // created *inside* the project Main clone — leaking `.janus-dev`
+            // into the workspace tree. Canonicalize up front so every consumer
+            // (clone, worktree, manifest) sees the same absolute root.
+            let data_root = env::var_os("JANUS_DATA_ROOT")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".janus-dev")),
+                .unwrap_or_else(|| PathBuf::from(".janus-dev"));
+            let data_root = if data_root.is_absolute() {
+                data_root
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(data_root)
+            };
+            let config = Self {
+            bind,
+            data_root,
             mode,
             development_auth,
             webauthn_rp_name: env::var("JANUS_WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Janus".into()),

@@ -37,9 +37,31 @@ export function Select(props: SelectProps) {
   const position = () => {
     if (!triggerRef) return;
     const rect = triggerRef.getBoundingClientRect();
+    // Default: open beneath the trigger. But when the trigger sits near the
+    // bottom of the viewport (composer selectors at the page foot), the list
+    // would clip off-screen — flip to open above the trigger instead.
+    const minListHeight = 160;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+    const openAbove = spaceBelow < minListHeight && spaceAbove >= spaceBelow;
+    const top = openAbove ? Math.max(8, rect.top - minListHeight - 2) : rect.bottom + 2;
     // Write coords synchronously before open so the first paint already has
     // a correct fixed position — no empty-frame flash, no post-open reflow.
-    setCoords({ top: rect.bottom + 2, left: rect.left, width: rect.width });
+    setCoords({ top, left: rect.left, width: rect.width });
+  };
+
+  // After the list renders, re-measure its real height and snap the menu to
+  // the trigger edge so a long option list does not float with the 160px guess.
+  const refine = () => {
+    const trigger = triggerRef;
+    const list = listRef;
+    if (!trigger || !list) return;
+    const rect = trigger.getBoundingClientRect();
+    const listRect = list.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const openAbove = spaceBelow < listRect.height && rect.top >= spaceBelow;
+    const top = openAbove ? Math.max(8, rect.top - listRect.height - 2) : rect.bottom + 2;
+    setCoords({ top, left: rect.left, width: rect.width });
   };
 
   const openList = () => {
@@ -65,6 +87,8 @@ export function Select(props: SelectProps) {
   // Close on outside click or any scroll while open.
   createEffect(() => {
     if (!open()) return;
+    // Re-measure now that the real list height is known and snap position.
+    requestAnimationFrame(refine);
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (triggerRef?.contains(target)) return;

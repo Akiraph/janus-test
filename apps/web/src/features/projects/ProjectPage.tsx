@@ -4,12 +4,13 @@ import FileCode2 from "lucide-solid/icons/file-code-2";
 import Files from "lucide-solid/icons/files";
 import GitBranch from "lucide-solid/icons/git-branch";
 import GitCompare from "lucide-solid/icons/git-compare";
+import Loader2 from "lucide-solid/icons/loader-2";
+import MessageSquare from "lucide-solid/icons/message-square";
 import TerminalSquare from "lucide-solid/icons/terminal-square";
 import X from "lucide-solid/icons/x";
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
-import { createStore } from "solid-js/store";
+import { createEffect, createMemo, createSignal, For, Show, Suspense } from "solid-js";
+import { createStore, produce } from "solid-js/store";
 import { Badge } from "../../components/ui/Badge";
-import { BootSplash } from "../../components/ui/BootSplash";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { ErrorBlock } from "../../components/ui/ErrorBlock";
 import type { FileMetaView } from "../../lib/api";
@@ -17,6 +18,8 @@ import { useProject } from "../../lib/queries";
 import { FileEditor } from "./workspace/FileEditor";
 import { FileTreePanel } from "./workspace/FileTreePanel";
 import { ScmPanel } from "./workspace/ScmPanel";
+import { SessionsPanel } from "./workspace/SessionsPanel";
+import { SessionTabView } from "./workspace/SessionTabView";
 import { basename } from "./workspace/utils";
 
 /**
@@ -37,9 +40,18 @@ export interface FileTab {
   loading: boolean;
 }
 
-export type MainTab = FileTab;
+export interface SessionTab {
+  id: string;
+  kind: "session";
+  sessionId: string;
+  title: string;
+  /** UX-SES-02: Main / Diff sub-view selection is UI state on the tab. */
+  subView: "main" | "diff";
+}
 
-type ActivityView = "explorer" | "scm" | "terminal";
+export type MainTab = FileTab | SessionTab;
+
+type ActivityView = "explorer" | "sessions" | "scm" | "terminal";
 
 let tabIdSeq = 0;
 function nextTabId(): string {
@@ -52,8 +64,14 @@ export function ProjectPage() {
   const projectId = () => params.id;
   const project = useProject(projectId);
 
-  // --- Activity (switcher) rail state: only Explorer / Source Control / Terminal. ---
-  const [activeView, setActiveView] = createSignal<ActivityView>("explorer");
+  // --- Activity rail: Sessions / Explorer / Source Control / Terminal. ---
+  // Sessions sits first (matches the legacy Janus rail) and is the default
+  // selection. This is local UI state only — deliberately NOT mirrored into
+  // the URL. The previous design pushed ?view=sessions on every switch, which
+  // made the Sessions panel read like a separate route from the rest of the
+  // workspace; it is just a sidebar provider, like Explorer or SCM, so it
+  // shares the same (URL-less) toggle model as they do.
+  const [activeView, setActiveView] = createSignal<ActivityView>("sessions");
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
 
   // --- Main-area tab model: the sole owner of what the main area renders. ---
@@ -65,7 +83,14 @@ export function ProjectPage() {
     if (!id) return undefined;
     return tabs.find((tab) => tab.id === id);
   });
-  const activeFilePath = createMemo(() => activeTab()?.path ?? null);
+  const activeFilePath = createMemo(() => {
+    const tab = activeTab();
+    return tab?.kind === "file" ? tab.path : null;
+  });
+  const activeSessionId = createMemo(() => {
+    const tab = activeTab();
+    return tab?.kind === "session" ? tab.sessionId : null;
+  });
 
   let treeRefreshToken = 0;
   const [treeRefresh, setTreeRefresh] = createSignal(treeRefreshToken);
@@ -82,7 +107,7 @@ export function ProjectPage() {
   }
 
   function openFile(path: string) {
-    const existing = tabs.find((tab) => tab.path === path);
+    const existing = tabs.find((tab) => tab.kind === "file" && tab.path === path);
     if (existing) {
       setActiveTabId(existing.id);
       return;
@@ -101,13 +126,59 @@ export function ProjectPage() {
     setActiveTabId(id);
   }
 
+  function openSession(sessionId: string, title?: string | null) {
+    const existing = tabs.find((tab) => tab.kind === "session" && tab.sessionId === sessionId);
+    if (existing) {
+      setActiveTabId(existing.id);
+      setActiveView("sessions");
+      setSidebarOpen(true);
+      return;
+    }
+    const id = nextTabId();
+    setTabs(tabs.length, {
+      id,
+      kind: "session",
+      sessionId,
+      title: title?.trim() || "New session",
+      subView: "main",
+    } satisfies SessionTab);
+    setActiveTabId(id);
+    setActiveView("sessions");
+    setSidebarOpen(true);
+  }
+
+  /** Drop any open tab whose underlying session was deleted from the panel. */
+  function closeSessionTabs(sessionId: string) {
+    const remaining = tabs.filter(
+      (tab) => !(tab.kind === "session" && tab.sessionId === sessionId),
+    );
+    if (remaining.length === tabs.length) return;
+    const droppedActivating =
+      activeTabId() !== null &&
+      tabs.some(
+        (tab) => tab.id === activeTabId() && tab.kind === "session" && tab.sessionId === sessionId,
+      );
+    setTabs(remaining);
+    if (droppedActivating) {
+      const neighbor = remaining[remaining.length - 1] ?? null;
+      setActiveTabId(neighbor ? neighbor.id : null);
+    }
+  }
+
   function patchFileTab(id: string, mutator: (tab: FileTab) => void) {
-    setTabs((list) =>
-      list.map((tab) => {
-        if (tab.id !== id) return tab;
-        const next: FileTab = { ...tab };
-        mutator(next);
-        return next;
+    setTabs(
+      produce((list) => {
+        const tab = list.find((t) => t.id === id);
+        if (tab && tab.kind === "file") mutator(tab);
+      }),
+    );
+  }
+
+  function patchSessionTab(id: string, mutator: (tab: SessionTab) => void) {
+    setTabs(
+      produce((list) => {
+        const tab = list.find((t) => t.id === id);
+        if (tab && tab.kind === "session") mutator(tab);
       }),
     );
   }
@@ -133,7 +204,7 @@ export function ProjectPage() {
     if (trackedProjectId !== undefined && trackedProjectId !== id) {
       setTabs([]);
       setActiveTabId(null);
-      setActiveView("explorer");
+      setActiveView("sessions");
       setSidebarOpen(true);
       treeRefreshToken = 0;
       setTreeRefresh(0);
@@ -161,6 +232,11 @@ export function ProjectPage() {
   });
 
   const branch = () => project.data?.current_branch ?? project.data?.repository.branch ?? null;
+  // The IDE shell (activity rail, sidebar, tab strip, main surface) is always
+  // mounted for the project route — the workspace scaffolding must not vanish
+  // while a query is on the wire or the project is briefly non-ready. Only the
+  // main-area *content* reflects project readiness; the chrome stays put.
+  const ready = () => project.data?.state === "ready";
 
   return (
     <section class="project-page project-page--ide route-enter" aria-labelledby="project-title">
@@ -229,170 +305,248 @@ export function ProjectPage() {
         </Show>
       </header>
 
-      <Show
-        when={project.data?.state === "ready"}
-        fallback={
-          <Show when={project.data} fallback={<BootSplash />}>
-            {(data) => (
-              <EmptyState
-                icon={Files}
-                title={`Project is ${data().state}`}
-                description={
-                  data().state === "creating"
-                    ? "Clone is still running. Files and Git unlock when the project is ready."
-                    : "This project is not ready for workspace tools yet."
-                }
-              />
-            )}
-          </Show>
-        }
-      >
-        <div class="ide-shell" classList={{ "ide-shell--sidebar-collapsed": !sidebarOpen() }}>
-          <nav class="ide-activity-bar" aria-label="Workspace activity">
-            <ActivityButton
-              label="Explorer"
-              active={activeView() === "explorer" && sidebarOpen()}
-              onClick={() => selectActivity("explorer")}
-            >
-              <Files size={18} />
-            </ActivityButton>
-            <ActivityButton
-              label="Source Control"
-              active={activeView() === "scm" && sidebarOpen()}
-              onClick={() => selectActivity("scm")}
-            >
-              <GitCompare size={18} />
-            </ActivityButton>
-            <ActivityButton
-              label="Terminal"
-              active={activeView() === "terminal" && sidebarOpen()}
-              onClick={() => selectActivity("terminal")}
-            >
-              <TerminalSquare size={18} />
-            </ActivityButton>
-          </nav>
+      <div class="ide-shell" classList={{ "ide-shell--sidebar-collapsed": !sidebarOpen() }}>
+        <nav class="ide-activity-bar" aria-label="Workspace activity">
+          <ActivityButton
+            label="Sessions"
+            active={activeView() === "sessions" && sidebarOpen()}
+            disabled={!ready()}
+            onClick={() => selectActivity("sessions")}
+          >
+            <MessageSquare size={18} />
+          </ActivityButton>
+          <ActivityButton
+            label="Explorer"
+            active={activeView() === "explorer" && sidebarOpen()}
+            disabled={!ready()}
+            onClick={() => selectActivity("explorer")}
+          >
+            <Files size={18} />
+          </ActivityButton>
+          <ActivityButton
+            label="Source Control"
+            active={activeView() === "scm" && sidebarOpen()}
+            disabled={!ready()}
+            onClick={() => selectActivity("scm")}
+          >
+            <GitCompare size={18} />
+          </ActivityButton>
+          <ActivityButton
+            label="Terminal"
+            active={activeView() === "terminal" && sidebarOpen()}
+            disabled={!ready()}
+            onClick={() => selectActivity("terminal")}
+          >
+            <TerminalSquare size={18} />
+          </ActivityButton>
+        </nav>
 
-          {/*
+        {/*
             Keep the sidebar chrome mounted while open so activity switches only
             swap panel content, not the whole rail. That avoids a layout flash.
           */}
-          <Show when={sidebarOpen()}>
-            <aside class="ide-sidebar" aria-label="Workspace sidebar">
-              <div
-                class="ide-sidebar-view"
-                classList={{ "ide-sidebar-view--active": activeView() === "explorer" }}
-                hidden={activeView() !== "explorer"}
-              >
-                <FileTreePanel
-                  projectId={projectId}
-                  activePath={activeFilePath}
-                  onOpenFile={openFile}
-                  refreshToken={treeRefresh}
+        <Show when={sidebarOpen()}>
+          <aside class="ide-sidebar" aria-label="Workspace sidebar">
+            <div
+              class="ide-sidebar-view"
+              classList={{ "ide-sidebar-view--active": activeView() === "explorer" }}
+              hidden={activeView() !== "explorer"}
+            >
+              <FileTreePanel
+                projectId={projectId}
+                activePath={activeFilePath}
+                onOpenFile={openFile}
+                refreshToken={treeRefresh}
+              />
+            </div>
+            <div
+              class="ide-sidebar-view"
+              classList={{ "ide-sidebar-view--active": activeView() === "sessions" }}
+              hidden={activeView() !== "sessions"}
+            >
+              <SessionsPanel
+                projectId={projectId}
+                projectReady={ready}
+                activeSessionId={activeSessionId}
+                onOpenSession={openSession}
+                onSessionDeleted={closeSessionTabs}
+              />
+            </div>
+            <div
+              class="ide-sidebar-view"
+              classList={{ "ide-sidebar-view--active": activeView() === "scm" }}
+              hidden={activeView() !== "scm"}
+            >
+              <ScmPanel projectId={projectId} onOpenFile={openFile} branch={branch} />
+            </div>
+            <div
+              class="ide-sidebar-view"
+              classList={{ "ide-sidebar-view--active": activeView() === "terminal" }}
+              hidden={activeView() !== "terminal"}
+            >
+              <div class="ide-sidebar-panel">
+                <div class="ide-sidebar-header">Terminal</div>
+                <EmptyState
+                  icon={TerminalSquare}
+                  title="Terminal unavailable"
+                  description="Main Workspace Terminal depends on RuntimeExecutor and lands in M4. This panel is a placeholder."
+                  class="terminal-placeholder"
                 />
               </div>
-              <div
-                class="ide-sidebar-view"
-                classList={{ "ide-sidebar-view--active": activeView() === "scm" }}
-                hidden={activeView() !== "scm"}
-              >
-                <ScmPanel projectId={projectId} onOpenFile={openFile} branch={branch} />
-              </div>
-              <div
-                class="ide-sidebar-view"
-                classList={{ "ide-sidebar-view--active": activeView() === "terminal" }}
-                hidden={activeView() !== "terminal"}
-              >
-                <div class="ide-sidebar-panel">
-                  <div class="ide-sidebar-header">Terminal</div>
-                  <EmptyState
-                    icon={TerminalSquare}
-                    title="Terminal unavailable"
-                    description="Main Workspace Terminal depends on RuntimeExecutor and lands in M4. This panel is a placeholder."
-                    class="terminal-placeholder"
-                  />
-                </div>
-              </div>
-            </aside>
-          </Show>
+            </div>
+          </aside>
+        </Show>
 
-          {/*
-            Main area is always owned by the tab strip. Files are the only tab
-            kind; Graph lives in the Source Control side panel. Nothing paints
-            over the editor or hides the tab strip.
+        {/*
+            Main area is owned by the tab strip. Tabs can be Main-workspace files
+            or Sessions (UX-SHELL-01). Graph stays in SCM side panel.
           */}
-          <main class="ide-main">
-            <Show when={tabs.length > 0}>
-              <div class="ide-main-tabs">
-                <div class="ide-tabs" role="tablist" aria-label="Open editors">
-                  <For each={tabs}>
-                    {(tab) => (
-                      <TabView
-                        tab={tab}
-                        active={activeTabId() === tab.id}
-                        onActivate={() => setActiveTabId(tab.id)}
-                        onClose={() => closeTab(tab.id)}
-                      />
-                    )}
-                  </For>
-                </div>
+        <main class="ide-main">
+          <Show when={tabs.length > 0}>
+            <div class="ide-main-tabs">
+              <div class="ide-tabs" role="tablist" aria-label="Open documents">
+                <For each={tabs}>
+                  {(tab) => (
+                    <TabView
+                      tab={tab}
+                      active={activeTabId() === tab.id}
+                      onActivate={() => setActiveTabId(tab.id)}
+                      onClose={() => closeTab(tab.id)}
+                    />
+                  )}
+                </For>
               </div>
-            </Show>
-            <div class="ide-main-surface">
-              <Show
-                when={activeTab()}
-                fallback={
+            </div>
+          </Show>
+          <div class="ide-main-surface">
+            <Show
+              when={ready() && activeTab()}
+              fallback={
+                <Show
+                  when={ready()}
+                  fallback={
+                    <Show
+                      when={project.data}
+                      fallback={
+                        <EmptyState
+                          icon={Files}
+                          title="Opening workspace…"
+                          description="Connecting to the project."
+                        />
+                      }
+                    >
+                      {(data) => (
+                        <EmptyState
+                          icon={Files}
+                          title={`Project is ${data().state}`}
+                          description={
+                            data().state === "creating"
+                              ? "Clone is still running. Files and Git unlock when the project is ready."
+                              : "This project is not ready for workspace tools yet."
+                          }
+                        />
+                      )}
+                    </Show>
+                  }
+                >
                   <EmptyState
                     icon={FileCode2}
-                    title="No file open"
-                    description="Open a file from the Explorer. Commit history lives under Source Control."
+                    title="No document open"
+                    description="Open a Session from the Sessions rail, or a file from Explorer."
                   />
-                }
-              >
-                {(tab) => (
-                  <FileEditor
-                    projectId={projectId}
-                    mainRevision={() => project.data?.main_revision ?? null}
-                    tab={() => tab() as FileTab}
-                    onPatch={(mutator) => patchFileTab(tab().id, mutator)}
-                    onSaved={handleSaved}
-                  />
-                )}
-              </Show>
-            </div>
-          </main>
-        </div>
-      </Show>
+                </Show>
+              }
+            >
+              {(tab) => (
+                <Suspense
+                  fallback={
+                    <div class="ide-shell-scaffold-loading" role="status" aria-label="Loading">
+                      <Loader2 size={22} class="ide-shell-scaffold-loading__spin" />
+                    </div>
+                  }
+                >
+                  <Show
+                    when={tab().kind === "session"}
+                    fallback={
+                      <FileEditor
+                        projectId={projectId}
+                        mainRevision={() => project.data?.main_revision ?? null}
+                        tab={() => tab() as FileTab}
+                        onPatch={(mutator) => patchFileTab(tab().id, mutator)}
+                        onSaved={handleSaved}
+                      />
+                    }
+                  >
+                    <SessionTabView
+                      projectId={projectId}
+                      sessionId={() => (tab() as SessionTab).sessionId}
+                      subView={() => (tab() as SessionTab).subView}
+                      onSubViewChange={(view) =>
+                        patchSessionTab(tab().id, (s) => {
+                          s.subView = view;
+                        })
+                      }
+                      onTitle={(title) =>
+                        patchSessionTab(tab().id, (s) => {
+                          s.title = title;
+                        })
+                      }
+                    />
+                  </Show>
+                </Suspense>
+              )}
+            </Show>
+          </div>
+        </main>
+      </div>
     </section>
   );
 }
 
 function TabView(props: {
-  tab: FileTab;
+  tab: MainTab;
   active: boolean;
   onActivate: () => void;
   onClose: () => void;
 }) {
-  const dirty = () => Boolean(props.tab.meta?.editable) && props.tab.draft !== props.tab.saved;
+  const label = () =>
+    props.tab.kind === "file" ? basename(props.tab.path) : props.tab.title || "Session";
+  const title = () =>
+    props.tab.kind === "file" ? props.tab.path : `Session ${props.tab.sessionId}`;
+  const dirty = () =>
+    props.tab.kind === "file" &&
+    Boolean(props.tab.meta?.editable) &&
+    props.tab.draft !== props.tab.saved;
   return (
-    <div class="ide-tab" classList={{ "ide-tab--active": props.active, "ide-tab--dirty": dirty() }}>
+    <div
+      class="ide-tab"
+      classList={{
+        "ide-tab--active": props.active,
+        "ide-tab--dirty": dirty(),
+        "ide-tab--session": props.tab.kind === "session",
+      }}
+    >
       <button
         type="button"
         class="ide-tab-label"
         role="tab"
         aria-selected={props.active}
-        aria-label={`${basename(props.tab.path)}${dirty() ? ", unsaved changes" : ""}`}
-        title={props.tab.path}
+        aria-label={`${label()}${dirty() ? ", unsaved changes" : ""}${props.tab.kind === "session" ? " (Session)" : ""}`}
+        title={title()}
         onClick={props.onActivate}
       >
+        <Show when={props.tab.kind === "session"}>
+          <MessageSquare size={12} class="ide-tab-kind-icon" />
+        </Show>
         <Show when={dirty()}>
           <span class="ide-tab-dirty" aria-hidden="true" title="Unsaved changes" />
         </Show>
-        <span>{basename(props.tab.path)}</span>
+        <span>{label()}</span>
       </button>
       <button
         type="button"
         class="ide-tab-close"
-        aria-label={`Close ${basename(props.tab.path)}`}
+        aria-label={`Close ${label()}`}
         onClick={(event) => {
           event.stopPropagation();
           props.onClose();
@@ -407,6 +561,7 @@ function TabView(props: {
 function ActivityButton(props: {
   label: string;
   active: boolean;
+  disabled?: boolean;
   onClick: () => void;
   children: import("solid-js").JSX.Element;
 }) {
@@ -418,6 +573,7 @@ function ActivityButton(props: {
       aria-label={props.label}
       aria-pressed={props.active}
       title={props.label}
+      disabled={props.disabled}
       onClick={props.onClick}
     >
       {props.children}

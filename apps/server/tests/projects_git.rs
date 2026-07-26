@@ -314,7 +314,10 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, StatusCode::ACCEPTED, "{response}");
     let created: Value = serde_json::from_str(&response)?;
-    let operation_id = created["data"]["id"].as_str().unwrap().to_owned();
+    let operation_id = created["data"]["id"]
+        .as_str()
+        .expect("string field")
+        .to_owned();
     let mut project_id = None;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -348,7 +351,7 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     let project: Value = serde_json::from_str(&response)?;
     let revision = project["data"]["main_revision"]
         .as_str()
-        .unwrap()
+        .expect("test value")
         .to_owned();
     let (status, response) = request(
         &app,
@@ -369,8 +372,8 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     let status = std::process::Command::new("git")
         .args([
             "clone",
-            remote.path().to_str().unwrap(),
-            work.path().to_str().unwrap(),
+            remote.path().to_str().expect("utf8 path"),
+            work.path().to_str().expect("utf8 path"),
         ])
         .status()?;
     assert!(status.success());
@@ -400,7 +403,10 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, StatusCode::ACCEPTED, "{response}");
     let update_op: Value = serde_json::from_str(&response)?;
-    let update_op_id = update_op["data"]["id"].as_str().unwrap().to_owned();
+    let update_op_id = update_op["data"]["id"]
+        .as_str()
+        .expect("string field")
+        .to_owned();
     let mut needs_attention = false;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -433,9 +439,9 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     .await?;
     assert_eq!(status, StatusCode::OK, "{response}");
     let conflicts: Value = serde_json::from_str(&response)?;
-    let conflict = &conflicts["data"].as_array().unwrap()[0];
-    let conflict_id = conflict["id"].as_str().unwrap();
-    let version = conflict["version"].as_str().unwrap();
+    let conflict = &conflicts["data"].as_array().expect("array field")[0];
+    let conflict_id = conflict["id"].as_str().expect("string field");
+    let version = conflict["version"].as_str().expect("string field");
 
     // Resolve by taking remote.
     let (status, response) = request(
@@ -476,8 +482,8 @@ async fn github_credential_patch_keeps_secret_when_omitted() -> anyhow::Result<(
     assert_eq!(status, StatusCode::CREATED, "{response}");
     assert!(!response.contains(secret));
     let created: Value = serde_json::from_str(&response)?;
-    let id = created["data"]["id"].as_str().unwrap();
-    let version = created["data"]["version"].as_str().unwrap();
+    let id = created["data"]["id"].as_str().expect("string field");
+    let version = created["data"]["version"].as_str().expect("string field");
     let preview = created["data"]["pat_fingerprint"].clone();
 
     let (status, response) = request(

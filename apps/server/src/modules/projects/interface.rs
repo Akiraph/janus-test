@@ -1728,19 +1728,19 @@ impl ProjectsInterface {
             .bind(&path.path)
             .execute(&self.pool)
             .await?;
-            if path.choice == "edited_text" {
-                if let Some(text) = &path.edited_text {
-                    let staging = self
-                        .workspaces_root
-                        .join("main")
-                        .join(project_id)
-                        .join(".janus-conflict-edits");
-                    tokio::fs::create_dir_all(&staging).await.ok();
-                    let safe = path.path.replace('/', "__");
-                    tokio::fs::write(staging.join(safe), text.as_bytes())
-                        .await
-                        .map_err(|e| ProjectsError::Internal(anyhow::anyhow!(e)))?;
-                }
+            if path.choice == "edited_text"
+                && let Some(text) = &path.edited_text
+            {
+                let staging = self
+                    .workspaces_root
+                    .join("main")
+                    .join(project_id)
+                    .join(".janus-conflict-edits");
+                tokio::fs::create_dir_all(&staging).await.ok();
+                let safe = path.path.replace('/', "__");
+                tokio::fs::write(staging.join(safe), text.as_bytes())
+                    .await
+                    .map_err(|e| ProjectsError::Internal(anyhow::anyhow!(e)))?;
             }
         }
 

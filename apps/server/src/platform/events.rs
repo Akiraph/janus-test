@@ -21,6 +21,24 @@ pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[
     ("project.main_revision_changed", 1, "projects"),
     ("git.state_changed", 1, "projects"),
     ("git.update_conflict_changed", 1, "projects"),
+    // M3 sessions
+    ("session.changed", 1, "sessions"),
+    ("session.deleted", 1, "sessions"),
+    ("turn.created", 1, "sessions"),
+    ("turn.status_changed", 1, "sessions"),
+    ("timeline.item_created", 1, "sessions"),
+    ("timeline.item_updated", 1, "sessions"),
+    ("checkpoint.created", 1, "sessions"),
+    // M3 models
+    ("model.stream_delta", 1, "models"),
+    ("model.attempt_changed", 1, "models"),
+    // M3 supervisor
+    ("round.changed", 1, "supervisor"),
+    ("tool_call.created", 1, "supervisor"),
+    ("tool_call.changed", 1, "supervisor"),
+    // M3 workspace-sync
+    ("session.revision_changed", 1, "workspace-sync"),
+    ("workspace.diff_changed", 1, "workspace-sync"),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

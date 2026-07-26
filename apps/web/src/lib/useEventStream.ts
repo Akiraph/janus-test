@@ -77,6 +77,36 @@ export function useEventStream() {
         void queryClient.invalidateQueries({ queryKey: ["project", targetId] });
         void queryClient.invalidateQueries({ queryKey: ["git-status", targetId] });
       }
+      return;
+    }
+
+    if (
+      type === "session.changed" ||
+      type === "session.deleted" ||
+      type === "turn.created" ||
+      type === "turn.status_changed" ||
+      type === "timeline.item_created" ||
+      type === "timeline.item_updated" ||
+      type === "model.stream_delta" ||
+      type === "tool_call.created" ||
+      type === "tool_call.changed" ||
+      type === "round.changed"
+    ) {
+      const sessionId =
+        (resourceKind === "session" ? resourceId : undefined) ??
+        (payload as { session_id?: string }).session_id;
+      if (sessionId) {
+        void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+        void queryClient.invalidateQueries({ queryKey: ["session-timeline", sessionId] });
+        void queryClient.invalidateQueries({ queryKey: ["session-diff", sessionId] });
+      }
+      // Project session lists are keyed by project id when known.
+      const projectId = (payload as { project_id?: string }).project_id;
+      if (projectId) {
+        void queryClient.invalidateQueries({ queryKey: ["sessions", projectId] });
+      } else {
+        void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      }
     }
   };
 

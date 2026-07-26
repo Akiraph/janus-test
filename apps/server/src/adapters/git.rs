@@ -706,11 +706,7 @@ async fn working_dirty_paths(repo: &Path) -> Result<std::collections::HashSet<St
     // Fallback to porcelain status if the above is empty but status is dirty.
     if set.is_empty() {
         let status = SystemGit.status(repo).await?;
-        for path in status
-            .working
-            .into_iter()
-            .chain(status.untracked.into_iter())
-        {
+        for path in status.working.into_iter().chain(status.untracked) {
             set.insert(path);
         }
     }

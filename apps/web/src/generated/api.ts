@@ -740,6 +740,102 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/projects/{project_id}/sessions": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_sessions"];
+    put?: never;
+    post: operations["create_session"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_session"];
+    put?: never;
+    post?: never;
+    delete: operations["delete_session"];
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/diff": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["session_diff"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/messages": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["post_message"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/timeline": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["timeline"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/turns/{turn_id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_turn"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/system/info": {
     parameters: {
       query?: never;
@@ -833,6 +929,9 @@ export interface components {
       name: string;
       repository: components["schemas"]["RepositoryInput"];
     };
+    CreateSessionRequest: {
+      title?: string | null;
+    };
     CredentialProbeResult: {
       detail: string;
       /** Format: int32 */
@@ -906,6 +1005,15 @@ export interface components {
         pat_is_set: boolean;
         updated_at: string;
         version: string;
+      };
+    };
+    DataResponse_MessageRouteResult: {
+      data: {
+        message_id: string;
+        /** @description M3 always starts immediately (no queue/handoff). */
+        route: string;
+        session_version: string;
+        turn_id: string;
       };
     };
     DataResponse_OperationView: {
@@ -984,16 +1092,53 @@ export interface components {
       };
     };
     DataResponse_RevisionRef: {
-      /**
-       * @description A Content Revision identity. Exposed to clients as an opaque `v_01J...`
-       *     string via `main_revision` on the Project projection; used as an `If-Match`
-       *     condition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of
-       *     half-writing.
-       */
+      /** @description Content Revision identity exposed as opaque `rev_<uuid>` string. */
       data: string;
+    };
+    DataResponse_SessionSummary: {
+      data: {
+        active_turn_id?: string | null;
+        created_at: string;
+        id: string;
+        kind: string;
+        last_activity_at: string;
+        project_id: string;
+        source_main_revision_id: string;
+        state: string;
+        title?: string | null;
+        updated_at: string;
+        version: string;
+        workspace_handle: string;
+        workspace_revision?: string | null;
+      };
     };
     DataResponse_String: {
       data: string;
+    };
+    DataResponse_TimelinePage: {
+      data: {
+        has_newer: boolean;
+        has_older: boolean;
+        items: components["schemas"]["TimelineItemView"][];
+        newest_cursor?: string | null;
+        oldest_cursor?: string | null;
+      };
+    };
+    DataResponse_TurnSummary: {
+      data: {
+        created_at: string;
+        id: string;
+        input_message_id?: string | null;
+        /** Format: int64 */
+        sequence: number;
+        session_id: string;
+        status: string;
+        updated_at: string;
+        version: string;
+      };
+    };
+    DataResponse_Value: {
+      data: unknown;
     };
     DataResponse_Vec_FileTreeView: {
       data: {
@@ -1067,6 +1212,23 @@ export interface components {
         kind: components["schemas"]["ProviderKind"];
         models: components["schemas"]["EmbeddedModelView"][];
         updated_at: string;
+      }[];
+    };
+    DataResponse_Vec_SessionSummary: {
+      data: {
+        active_turn_id?: string | null;
+        created_at: string;
+        id: string;
+        kind: string;
+        last_activity_at: string;
+        project_id: string;
+        source_main_revision_id: string;
+        state: string;
+        title?: string | null;
+        updated_at: string;
+        version: string;
+        workspace_handle: string;
+        workspace_revision?: string | null;
       }[];
     };
     DataResponse_Vec_String: {
@@ -1216,6 +1378,13 @@ export interface components {
       status: string;
       version: string;
     };
+    MessageRouteResult: {
+      message_id: string;
+      /** @description M3 always starts immediately (no queue/handoff). */
+      route: string;
+      session_version: string;
+      turn_id: string;
+    };
     MoveFileInput: {
       expected_main_revision?: string | null;
       from: string;
@@ -1258,6 +1427,10 @@ export interface components {
       id: string;
       last_used_at?: string | null;
       name: string;
+    };
+    PostMessageRequest: {
+      content: string;
+      expected_session_version: string;
     };
     ProbeResult: {
       detail: string;
@@ -1372,12 +1545,7 @@ export interface components {
       branch?: string | null;
       github_credential_id?: string | null;
     };
-    /**
-     * @description A Content Revision identity. Exposed to clients as an opaque `v_01J...`
-     *     string via `main_revision` on the Project projection; used as an `If-Match`
-     *     condition so concurrent edits return `RESOURCE_VERSION_MISMATCH` instead of
-     *     half-writing.
-     */
+    /** @description Content Revision identity exposed as opaque `rev_<uuid>` string. */
     RevisionRef: string;
     RuntimeCapability: {
       id: string;
@@ -1389,6 +1557,21 @@ export interface components {
       content: string;
       expected_main_revision?: string | null;
       path: string;
+    };
+    SessionSummary: {
+      active_turn_id?: string | null;
+      created_at: string;
+      id: string;
+      kind: string;
+      last_activity_at: string;
+      project_id: string;
+      source_main_revision_id: string;
+      state: string;
+      title?: string | null;
+      updated_at: string;
+      version: string;
+      workspace_handle: string;
+      workspace_revision?: string | null;
     };
     SystemInfo: {
       capabilities: components["schemas"]["RuntimeCapability"][];
@@ -1402,6 +1585,37 @@ export interface components {
     };
     SystemInfoResponse: {
       data: components["schemas"]["SystemInfo"];
+    };
+    TimelineItemView: {
+      created_at: string;
+      /** Format: int64 */
+      display_order: number;
+      id: string;
+      kind: string;
+      projection: unknown;
+      session_id: string;
+      source_resource_id?: string | null;
+      status: string;
+      turn_id?: string | null;
+      version: string;
+    };
+    TimelinePage: {
+      has_newer: boolean;
+      has_older: boolean;
+      items: components["schemas"]["TimelineItemView"][];
+      newest_cursor?: string | null;
+      oldest_cursor?: string | null;
+    };
+    TurnSummary: {
+      created_at: string;
+      id: string;
+      input_message_id?: string | null;
+      /** Format: int64 */
+      sequence: number;
+      session_id: string;
+      status: string;
+      updated_at: string;
+      version: string;
     };
     UpdateGithubCredentialInput: {
       github_host?: string | null;
@@ -3642,6 +3856,251 @@ export interface operations {
         };
       };
       422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_sessions: {
+    parameters: {
+      query?: {
+        limit?: number;
+      };
+      header?: never;
+      path: {
+        project_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_SessionSummary"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  create_session: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        project_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CreateSessionRequest"];
+      };
+    };
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_SessionSummary"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  get_session: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_SessionSummary"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  delete_session: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  session_diff: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Value"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  post_message: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["PostMessageRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_MessageRouteResult"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  timeline: {
+    parameters: {
+      query?: {
+        before?: string;
+        after?: string;
+        limit?: number;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TimelinePage"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  get_turn: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+        turn_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TurnSummary"];
+        };
+      };
+      404: {
         headers: {
           [name: string]: unknown;
         };

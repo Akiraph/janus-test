@@ -88,11 +88,12 @@ impl BlobStore {
             .await
             .with_context(|| format!("atomic rename to {}", target.display()))?;
         if let Some(parent) = target.parent() {
-            // fsync the directory so the rename survives power loss.
-            let dir = tokio::fs::File::open(parent)
-                .await
-                .with_context(|| format!("open parent dir {}", parent.display()))?;
-            dir.sync_all().await.ok();
+            // Best-effort fsync of the parent so the rename survives power loss.
+            // On Windows, opening a directory as a File often returns Access Denied;
+            // treat that as non-fatal (object bytes are already renamed into place).
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
         }
 
         self.register_reference(&sha, bytes.len(), reference)

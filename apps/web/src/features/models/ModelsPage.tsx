@@ -114,7 +114,11 @@ export function ModelsPage() {
           <div class="settings-group-body">
             <Show
               when={!providers.isPending}
-              fallback={<p class="files-tree-empty" role="status" aria-label="Loading...">Loading...</p>}
+              fallback={
+                <p class="files-tree-empty" role="status" aria-label="Loading...">
+                  Loading...
+                </p>
+              }
             >
               <Show
                 when={(providers.data?.length ?? 0) > 0}

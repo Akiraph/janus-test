@@ -1,6 +1,7 @@
 import { A, useLocation } from "@solidjs/router";
 import ArrowLeft from "lucide-solid/icons/arrow-left";
 import Database from "lucide-solid/icons/database";
+import Loader2 from "lucide-solid/icons/loader-2";
 import Server from "lucide-solid/icons/server";
 import Settings from "lucide-solid/icons/settings";
 import ShieldCheck from "lucide-solid/icons/shield-check";
@@ -8,8 +9,8 @@ import type { JSX } from "solid-js";
 import { Show, Suspense } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
 import { type TabItem, Tabs } from "../components/ui/Tabs";
-import { BootSplash } from "../components/ui/BootSplash";
 import { LoginPage, SetupPage } from "../features/auth/AuthPage";
+import { IdeShellScaffold } from "../features/projects/workspace/IdeShellScaffold";
 import { useBootstrap, useMe } from "../lib/queries";
 import { useEventStream } from "../lib/useEventStream";
 
@@ -17,6 +18,17 @@ const MODE_TABS: TabItem[] = [
   { value: "code", label: "Code" },
   { value: "mtc", label: "MTC", disabled: true, badge: "soon" },
 ];
+
+/** Inline route-loading marker for non-workspace routes while a lazy chunk
+ *  resolves. Workspace routes use IdeShellScaffold instead so the IDE chrome
+ *  never disappears into a bare spinner. */
+function RouteLoading() {
+  return (
+    <div class="route-loading" role="status" aria-label="Loading">
+      <Loader2 size={20} class="route-loading__spin" />
+    </div>
+  );
+}
 
 interface AppShellProps {
   children?: JSX.Element;
@@ -40,9 +52,9 @@ export function AppShell(props: AppShellProps) {
   // Bootstrap pending: the Setup/Login/normal decision needs it. We do NOT
   // return a full-screen splash here as a gate — if bootstrap ever hung (HMR
   // dirty state, a stalled fetch) it would freeze the whole app and block even
-  // a refresh. Instead, fall through: the Suspense/Lazy layer below already
-  // paints a BootSplash while chunks/queries resolve, and mode selection just
-  // re-runs the instant bootstrap lands.
+  // a refresh. Instead, fall through: the Suspense/Lazy layer below paints an
+  // inline route-loading marker while chunks/queries resolve, and mode
+  // selection just re-runs the instant bootstrap lands.
   if (bootstrap.data?.data.state === "uninitialized" && !bootstrap.data?.data.development_auth)
     return <SetupPage />;
   if (
@@ -57,7 +69,10 @@ export function AppShell(props: AppShellProps) {
       when={!isImmersive()}
       fallback={
         <main class="home-route home-route--immersive">
-          <Suspense fallback={<BootSplash />}>{props.children}</Suspense>
+          {/* ProjectPage is lazy + its createQueries suspend on cache miss.
+              Fallback must keep the IDE chrome (rail/sidebar/topbar), not a bare
+              spinner — otherwise every session open looks like a full reload. */}
+          <Suspense fallback={<IdeShellScaffold />}>{props.children}</Suspense>
         </main>
       }
     >
@@ -87,9 +102,7 @@ export function AppShell(props: AppShellProps) {
               </nav>
               <div class="settings-content">
                 <main class="settings-route">
-                  <Suspense fallback={<BootSplash />}>
-                    {props.children}
-                  </Suspense>
+                  <Suspense fallback={<RouteLoading />}>{props.children}</Suspense>
                 </main>
               </div>
             </div>
@@ -122,7 +135,7 @@ export function AppShell(props: AppShellProps) {
             </div>
           </header>
           <main class="home-route">
-            <Suspense fallback={<BootSplash />}>{props.children}</Suspense>
+            <Suspense fallback={<RouteLoading />}>{props.children}</Suspense>
           </main>
         </div>
       </Show>
