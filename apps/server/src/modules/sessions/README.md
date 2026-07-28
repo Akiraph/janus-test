@@ -19,6 +19,18 @@ Allowed Module dependencies: `workspace-sync`, `projects`.
 - `workspace-sync`: Session copy create/delete, revision handle, diff summary.
 - `projects`: Project existence / Main revision for Session create.
 
+## Deletion (M4)
+
+HTTP `DELETE /api/v1/sessions/{id}` does **not** call `SessionsInterface::delete_session`
+directly. It goes through `application::lifecycle::delete_session_with_runtime`,
+which first cancels live Jobs, stops Services, closes Terminals, and stops the
+Session Runtime, then drops the durable Session row + workspace copy. Sessions
+must not depend on the runtime module (architecture `module.toml`); the
+cross-module stop sequence therefore lives in `application`.
+
+A bare `SessionsInterface::delete_session` remains for internal callers that
+have already drained Runtime resources (or never had any).
+
 Does not depend on `supervisor` or `models` (sessions triggers turn execution via
 the supervisor Interface after writing the Turn projection; supervisor pulls
 sessions/models as needed).

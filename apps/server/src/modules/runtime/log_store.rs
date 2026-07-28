@@ -1,0 +1,615 @@
+use std::{path::Path, sync::Arc};
+
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, SqlitePool};
+use tokio::sync::Mutex;
+
+use super::interface::{
+    LogChannel, LogChunk, LogCursor, LogOwnerKind, LogRange, LogStreamProjection, RuntimeError,
+};
+use crate::platform::{
+    clock::{Clock, SystemClock, format_utc},
+    id::LogStreamId,
+};
+
+const CHUNK_BYTES: usize = 64 * 1024;
+const MAX_READ_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LogRetention {
+    pub raw_limit_bytes: u64,
+    pub head_bytes: u64,
+}
+
+impl LogRetention {
+    pub const JOB_SERVICE: Self = Self {
+        raw_limit_bytes: 512 * 1024 * 1024,
+        head_bytes: 1024 * 1024,
+    };
+    pub const TERMINAL: Self = Self {
+        raw_limit_bytes: 16 * 1024 * 1024,
+        head_bytes: 1024 * 1024,
+    };
+
+    fn validate(self) -> Result<(), RuntimeError> {
+        if self.raw_limit_bytes == 0 || self.head_bytes >= self.raw_limit_bytes {
+            return Err(RuntimeError::InvalidSpec(
+                "log retention requires a nonzero limit larger than the retained head".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct LogStore {
+    pool: SqlitePool,
+    root: Arc<std::path::PathBuf>,
+    gate: Arc<Mutex<()>>,
+}
+
+#[derive(FromRow)]
+struct StreamRow {
+    id: String,
+    relative_path: String,
+    first_cursor: i64,
+    next_cursor: i64,
+    retained_bytes: i64,
+    total_bytes: i64,
+    truncated: i64,
+    closed: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskChunk {
+    start: u64,
+    end: u64,
+    channel: LogChannel,
+    text: String,
+    marker: bool,
+}
+
+impl LogStore {
+    pub fn new(pool: SqlitePool, data_root: &Path) -> Self {
+        Self {
+            pool,
+            root: Arc::new(data_root.join("runtime").join("logs")),
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub async fn create(
+        &self,
+        owner: LogOwnerKind,
+        owner_id: &str,
+    ) -> Result<LogStreamProjection, RuntimeError> {
+        let _guard = self.gate.lock().await;
+        let id = LogStreamId::new();
+        let relative_path = id.to_string();
+        tokio::fs::create_dir_all(self.root.join(&relative_path))
+            .await
+            .map_err(storage_error)?;
+        let now = format_utc(SystemClock.now());
+        sqlx::query(
+            "INSERT INTO log_streams \
+             (id, owner_kind, owner_id, relative_path, first_cursor, next_cursor, retained_bytes, \
+              total_bytes, truncated, closed, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)",
+        )
+        .bind(id.to_string())
+        .bind(owner.as_str())
+        .bind(owner_id)
+        .bind(&relative_path)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        Ok(LogStreamProjection {
+            id,
+            first_cursor: LogCursor::new(0),
+            next_cursor: LogCursor::new(0),
+            retained_bytes: 0,
+            total_bytes: 0,
+            truncated: false,
+            closed: false,
+        })
+    }
+
+    pub async fn append(
+        &self,
+        id: LogStreamId,
+        channel: LogChannel,
+        input: &[u8],
+        secret_values: &[&str],
+        retention: LogRetention,
+    ) -> Result<LogStreamProjection, RuntimeError> {
+        retention.validate()?;
+        if input.is_empty() {
+            return self.projection(id).await;
+        }
+        let _guard = self.gate.lock().await;
+        let row = self.row(id).await?;
+        if row.closed != 0 {
+            return Err(RuntimeError::ResourceBusy);
+        }
+        let text = redact(&String::from_utf8_lossy(input), secret_values);
+        let mut cursor = to_u64(row.next_cursor, "next_cursor")?;
+        let directory = self.root.join(&row.relative_path);
+        for part in split_text(&text, CHUNK_BYTES) {
+            let start = cursor;
+            cursor = cursor.saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX));
+            write_chunk(
+                &directory,
+                &DiskChunk {
+                    start,
+                    end: cursor,
+                    channel,
+                    text: part.to_owned(),
+                    marker: false,
+                },
+            )
+            .await?;
+        }
+        let total_bytes = to_u64(row.total_bytes, "total_bytes")?
+            .saturating_add(u64::try_from(input.len()).unwrap_or(u64::MAX));
+        let (first_cursor, retained_bytes, truncated) =
+            enforce_retention(&directory, cursor, total_bytes, retention).await?;
+        let now = format_utc(SystemClock.now());
+        sqlx::query(
+            "UPDATE log_streams SET first_cursor = ?, next_cursor = ?, retained_bytes = ?, \
+             total_bytes = ?, truncated = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(to_i64(first_cursor)?)
+        .bind(to_i64(cursor)?)
+        .bind(to_i64(retained_bytes)?)
+        .bind(to_i64(total_bytes)?)
+        .bind(truncated)
+        .bind(now)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        self.projection_unlocked(id).await
+    }
+
+    pub async fn close(&self, id: LogStreamId) -> Result<LogStreamProjection, RuntimeError> {
+        let _guard = self.gate.lock().await;
+        let now = format_utc(SystemClock.now());
+        if sqlx::query("UPDATE log_streams SET closed = 1, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .rows_affected()
+            == 0
+        {
+            return Err(RuntimeError::RuntimeUnavailable);
+        }
+        self.projection_unlocked(id).await
+    }
+
+    pub async fn projection(&self, id: LogStreamId) -> Result<LogStreamProjection, RuntimeError> {
+        let _guard = self.gate.lock().await;
+        self.projection_unlocked(id).await
+    }
+
+    pub async fn read(
+        &self,
+        id: LogStreamId,
+        after: LogCursor,
+        limit_bytes: usize,
+    ) -> Result<LogRange, RuntimeError> {
+        let _guard = self.gate.lock().await;
+        let row = self.row(id).await?;
+        let stream = projection_from_row(&row)?;
+        if after.value() < stream.first_cursor.value() {
+            return Err(RuntimeError::TerminalScrollbackExpired {
+                first_cursor: stream.first_cursor,
+            });
+        }
+        let limit = limit_bytes.clamp(1, MAX_READ_BYTES);
+        let mut chunks = read_chunks(&self.root.join(&row.relative_path)).await?;
+        chunks.sort_by_key(|chunk| (chunk.start, !chunk.marker));
+        let mut remaining = limit;
+        let mut result = Vec::new();
+        for chunk in chunks.into_iter().filter(|chunk| chunk.end > after.value()) {
+            if remaining == 0 {
+                break;
+            }
+            let (start, source) = if chunk.marker {
+                (chunk.start, chunk.text.as_str())
+            } else {
+                let requested = usize::try_from(after.value().saturating_sub(chunk.start))
+                    .unwrap_or(usize::MAX)
+                    .min(chunk.text.len());
+                let offset = char_boundary_at_or_after(&chunk.text, requested);
+                (
+                    chunk
+                        .start
+                        .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
+                    &chunk.text[offset..],
+                )
+            };
+            let take = char_boundary_at_or_before(source, remaining);
+            if take == 0 {
+                break;
+            }
+            let text = source[..take].to_owned();
+            let end = if take == source.len() || chunk.marker {
+                chunk.end
+            } else {
+                start.saturating_add(u64::try_from(take).unwrap_or(u64::MAX))
+            };
+            result.push(LogChunk {
+                start_cursor: LogCursor::new(start),
+                end_cursor: LogCursor::new(end),
+                channel: chunk.channel,
+                text,
+            });
+            remaining = remaining.saturating_sub(take);
+        }
+        Ok(LogRange {
+            stream,
+            after,
+            chunks: result,
+        })
+    }
+
+    async fn projection_unlocked(
+        &self,
+        id: LogStreamId,
+    ) -> Result<LogStreamProjection, RuntimeError> {
+        projection_from_row(&self.row(id).await?)
+    }
+
+    async fn row(&self, id: LogStreamId) -> Result<StreamRow, RuntimeError> {
+        sqlx::query_as::<_, StreamRow>(
+            "SELECT id, relative_path, first_cursor, next_cursor, retained_bytes, total_bytes, \
+             truncated, closed FROM log_streams WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .ok_or(RuntimeError::RuntimeUnavailable)
+    }
+}
+
+fn projection_from_row(row: &StreamRow) -> Result<LogStreamProjection, RuntimeError> {
+    Ok(LogStreamProjection {
+        id: row
+            .id
+            .parse()
+            .map_err(|_| RuntimeError::RuntimeUnavailable)?,
+        first_cursor: LogCursor::new(to_u64(row.first_cursor, "first_cursor")?),
+        next_cursor: LogCursor::new(to_u64(row.next_cursor, "next_cursor")?),
+        retained_bytes: to_u64(row.retained_bytes, "retained_bytes")?,
+        total_bytes: to_u64(row.total_bytes, "total_bytes")?,
+        truncated: row.truncated != 0,
+        closed: row.closed != 0,
+    })
+}
+
+async fn enforce_retention(
+    directory: &Path,
+    next_cursor: u64,
+    total_bytes: u64,
+    retention: LogRetention,
+) -> Result<(u64, u64, bool), RuntimeError> {
+    let mut chunks = read_chunks(directory).await?;
+    if total_bytes <= retention.raw_limit_bytes {
+        let retained = chunks
+            .iter()
+            .filter(|chunk| !chunk.marker)
+            .fold(0_u64, |total, chunk| {
+                total.saturating_add(u64::try_from(chunk.text.len()).unwrap_or(u64::MAX))
+            });
+        return Ok((
+            chunks.first().map_or(0, |chunk| chunk.start),
+            retained,
+            false,
+        ));
+    }
+    let tail_bytes = retention
+        .raw_limit_bytes
+        .saturating_sub(retention.head_bytes);
+    let tail_start = next_cursor.saturating_sub(tail_bytes);
+    let marker_path = directory.join("truncation-marker.json");
+    let mut dropped_start = None::<u64>;
+    let mut dropped_end = 0_u64;
+    for chunk in chunks.iter().filter(|chunk| !chunk.marker) {
+        let requested_start = chunk.start.max(retention.head_bytes);
+        let requested_end = chunk.end.min(tail_start);
+        if requested_start >= requested_end {
+            continue;
+        }
+        let prefix_len = usize::try_from(requested_start.saturating_sub(chunk.start))
+            .unwrap_or(usize::MAX)
+            .min(chunk.text.len());
+        let prefix_len = char_boundary_at_or_before(&chunk.text, prefix_len);
+        let suffix_start = usize::try_from(requested_end.saturating_sub(chunk.start))
+            .unwrap_or(usize::MAX)
+            .min(chunk.text.len());
+        let suffix_start = char_boundary_at_or_after(&chunk.text, suffix_start);
+        let drop_start = chunk
+            .start
+            .saturating_add(u64::try_from(prefix_len).unwrap_or(u64::MAX));
+        let drop_end = chunk
+            .start
+            .saturating_add(u64::try_from(suffix_start).unwrap_or(u64::MAX));
+        dropped_start = Some(dropped_start.map_or(drop_start, |value| value.min(drop_start)));
+        dropped_end = dropped_end.max(drop_end);
+        let path = directory.join(chunk_file_name(chunk));
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+        if prefix_len != 0 {
+            write_chunk(
+                directory,
+                &DiskChunk {
+                    start: chunk.start,
+                    end: drop_start,
+                    channel: chunk.channel,
+                    text: chunk.text[..prefix_len].to_owned(),
+                    marker: false,
+                },
+            )
+            .await?;
+        }
+        if suffix_start < chunk.text.len() {
+            write_chunk(
+                directory,
+                &DiskChunk {
+                    start: drop_end,
+                    end: chunk.end,
+                    channel: chunk.channel,
+                    text: chunk.text[suffix_start..].to_owned(),
+                    marker: false,
+                },
+            )
+            .await?;
+        }
+    }
+    if let Some(start) = dropped_start {
+        let omitted = dropped_end.saturating_sub(start);
+        let marker = DiskChunk {
+            start,
+            end: dropped_end,
+            channel: LogChannel::System,
+            text: format!("[Janus log truncated: {omitted} bytes omitted]\n"),
+            marker: true,
+        };
+        tokio::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).map_err(storage_error)?,
+        )
+        .await
+        .map_err(storage_error)?;
+    }
+    chunks = read_chunks(directory).await?;
+    let retained = chunks.iter().fold(0_u64, |total, chunk| {
+        total.saturating_add(u64::try_from(chunk.text.len()).unwrap_or(u64::MAX))
+    });
+    let first = chunks
+        .iter()
+        .map(|chunk| chunk.start)
+        .min()
+        .unwrap_or(next_cursor);
+    Ok((first, retained, true))
+}
+
+async fn write_chunk(directory: &Path, chunk: &DiskChunk) -> Result<(), RuntimeError> {
+    let path = directory.join(chunk_file_name(chunk));
+    let bytes = serde_json::to_vec(chunk).map_err(storage_error)?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    use tokio::io::AsyncWriteExt;
+    let mut file = options.open(path).await.map_err(storage_error)?;
+    file.write_all(&bytes).await.map_err(storage_error)?;
+    file.sync_all().await.map_err(storage_error)
+}
+
+async fn read_chunks(directory: &Path) -> Result<Vec<DiskChunk>, RuntimeError> {
+    let mut entries = tokio::fs::read_dir(directory)
+        .await
+        .map_err(storage_error)?;
+    let mut chunks: Vec<DiskChunk> = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(storage_error)? {
+        if entry.file_type().await.map_err(storage_error)?.is_file() {
+            let bytes = tokio::fs::read(entry.path()).await.map_err(storage_error)?;
+            chunks.push(serde_json::from_slice(&bytes).map_err(storage_error)?);
+        }
+    }
+    chunks.sort_by_key(|chunk| chunk.start);
+    Ok(chunks)
+}
+
+fn chunk_file_name(chunk: &DiskChunk) -> String {
+    let channel = match chunk.channel {
+        LogChannel::Stdout => "stdout",
+        LogChannel::Stderr => "stderr",
+        LogChannel::System => "system",
+    };
+    format!("{:020}-{:020}-{channel}.json", chunk.start, chunk.end)
+}
+
+fn split_text(mut value: &str, max_bytes: usize) -> Vec<&str> {
+    let mut parts = Vec::new();
+    while !value.is_empty() {
+        let take = char_boundary_at_or_before(value, max_bytes);
+        parts.push(&value[..take]);
+        value = &value[take..];
+    }
+    parts
+}
+
+fn char_boundary_at_or_before(value: &str, limit: usize) -> usize {
+    let mut take = value.len().min(limit);
+    while take > 0 && !value.is_char_boundary(take) {
+        take -= 1;
+    }
+    take
+}
+
+fn char_boundary_at_or_after(value: &str, offset: usize) -> usize {
+    let mut take = value.len().min(offset);
+    while take < value.len() && !value.is_char_boundary(take) {
+        take += 1;
+    }
+    take
+}
+
+fn redact(value: &str, secret_values: &[&str]) -> String {
+    secret_values
+        .iter()
+        .filter(|secret| secret.len() >= 8)
+        .fold(value.into(), |current, secret| {
+            current.replace(secret, "[REDACTED]")
+        })
+}
+
+fn to_u64(value: i64, field: &str) -> Result<u64, RuntimeError> {
+    u64::try_from(value)
+        .map_err(|_| RuntimeError::InvalidSpec(format!("stored {field} is negative")))
+}
+
+fn to_i64(value: u64) -> Result<i64, RuntimeError> {
+    i64::try_from(value)
+        .map_err(|_| RuntimeError::InvalidSpec("log cursor exceeds SQLite range".into()))
+}
+
+fn storage_error(_error: impl Into<anyhow::Error>) -> RuntimeError {
+    RuntimeError::RuntimeUnavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::{LogRetention, LogStore};
+    use crate::{
+        modules::runtime::interface::{LogChannel, LogCursor, LogOwnerKind},
+        platform::{database::Database, id::JobId},
+    };
+
+    #[tokio::test]
+    async fn redacts_closes_and_retains_head_marker_and_tail() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let database = Database::open(temp.path()).await?;
+        let store = LogStore::new(database.pool().clone(), temp.path());
+        let stream = store
+            .create(LogOwnerKind::Job, &JobId::new().to_string())
+            .await?;
+        let retention = LogRetention {
+            raw_limit_bytes: 96,
+            head_bytes: 24,
+        };
+        let secret = "secret-value-123";
+        store
+            .append(
+                stream.id,
+                LogChannel::Stdout,
+                format!("head:{secret}\n").as_bytes(),
+                &[secret],
+                retention,
+            )
+            .await?;
+        let final_projection = store
+            .append(
+                stream.id,
+                LogChannel::Stderr,
+                format!("{}tail", "middle".repeat(30)).as_bytes(),
+                &[secret],
+                retention,
+            )
+            .await?;
+        assert!(final_projection.truncated);
+        assert!(final_projection.total_bytes > retention.raw_limit_bytes);
+
+        let range = store
+            .read(stream.id, LogCursor::new(0), 1024 * 1024)
+            .await?;
+        let text = range
+            .chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        assert!(text.contains("[REDACTED]"));
+        assert!(!text.contains(secret));
+        assert!(text.contains("Janus log truncated"));
+        assert!(text.contains("tail"));
+        assert!(
+            range
+                .chunks
+                .windows(2)
+                .all(|pair| { pair[0].end_cursor.value() <= pair[1].start_cursor.value() })
+        );
+
+        let closed = store.close(stream.id).await?;
+        assert!(closed.closed);
+        assert!(
+            store
+                .append(stream.id, LogChannel::Stdout, b"late", &[], retention,)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unicode_retention_and_cursor_ranges_use_utf8_boundaries() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let database = Database::open(temp.path()).await?;
+        let store = LogStore::new(database.pool().clone(), temp.path());
+        let retention = LogRetention {
+            raw_limit_bytes: 47,
+            head_bytes: 5,
+        };
+        let retained = store
+            .create(LogOwnerKind::Job, &JobId::new().to_string())
+            .await?;
+        store
+            .append(
+                retained.id,
+                LogChannel::Stdout,
+                "头🙂中间🙂尾部".repeat(8).as_bytes(),
+                &[],
+                retention,
+            )
+            .await?;
+        let retained_range = store.read(retained.id, LogCursor::ZERO, 1024).await?;
+        assert!(
+            retained_range
+                .chunks
+                .iter()
+                .any(|chunk| chunk.text.contains("Janus log truncated"))
+        );
+
+        let ranged = store
+            .create(LogOwnerKind::Job, &JobId::new().to_string())
+            .await?;
+        store
+            .append(
+                ranged.id,
+                LogChannel::Stdout,
+                "甲🙂乙".as_bytes(),
+                &[],
+                LogRetention::JOB_SERVICE,
+            )
+            .await?;
+        let first = store.read(ranged.id, LogCursor::ZERO, 3).await?;
+        assert_eq!(first.chunks[0].text, "甲");
+        assert_eq!(first.chunks[0].end_cursor.value(), 3);
+        let emoji = store.read(ranged.id, LogCursor::new(3), 4).await?;
+        assert_eq!(emoji.chunks[0].text, "🙂");
+        assert_eq!(emoji.chunks[0].end_cursor.value(), 7);
+        let inside = store.read(ranged.id, LogCursor::new(4), 16).await?;
+        assert_eq!(inside.chunks[0].start_cursor.value(), 7);
+        assert_eq!(inside.chunks[0].text, "乙");
+        Ok(())
+    }
+}

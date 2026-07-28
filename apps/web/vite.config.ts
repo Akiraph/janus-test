@@ -9,11 +9,7 @@ export default defineConfig({
   // in bulk (lucide-solid especially — named icon imports otherwise force vite
   // to crawl hundreds of tiny icon modules per cold visit).
   optimizeDeps: {
-    include: [
-      "@solidjs/router",
-      "@tanstack/solid-query",
-      "lucide-solid",
-    ],
+    include: ["@solidjs/router", "@tanstack/solid-query", "lucide-solid"],
   },
   server: {
     port: 5173,

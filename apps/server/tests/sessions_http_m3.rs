@@ -1,5 +1,7 @@
 //! Stage 5 HTTP smoke: create session + list + timeline via public routes.
 
+mod support;
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum::{
@@ -91,6 +93,7 @@ async fn sessions_http_create_list_get_diff() -> anyhow::Result<()> {
     let main_abs = directory.path().join(&main_managed);
     std::fs::create_dir_all(&main_abs)?;
     std::fs::write(main_abs.join("README.md"), b"# http\n")?;
+    support::init_git_repo(&main_abs)?;
     state
         .workspace_sync()
         .ensure_main_copy(

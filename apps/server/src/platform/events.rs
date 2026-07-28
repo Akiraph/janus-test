@@ -21,7 +21,7 @@ pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[
     ("project.main_revision_changed", 1, "projects"),
     ("git.state_changed", 1, "projects"),
     ("git.update_conflict_changed", 1, "projects"),
-    // M3 sessions
+    // sessions
     ("session.changed", 1, "sessions"),
     ("session.deleted", 1, "sessions"),
     ("turn.created", 1, "sessions"),
@@ -29,14 +29,21 @@ pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[
     ("timeline.item_created", 1, "sessions"),
     ("timeline.item_updated", 1, "sessions"),
     ("checkpoint.created", 1, "sessions"),
-    // M3 models
+    // models
     ("model.stream_delta", 1, "models"),
     ("model.attempt_changed", 1, "models"),
-    // M3 supervisor
+    // supervisor
     ("round.changed", 1, "supervisor"),
     ("tool_call.created", 1, "supervisor"),
     ("tool_call.changed", 1, "supervisor"),
-    // M3 workspace-sync
+    ("ask.changed", 1, "supervisor"),
+    ("context.changed", 1, "supervisor"),
+    // runtime
+    ("job.changed", 1, "runtime"),
+    ("service.changed", 1, "runtime"),
+    ("log.advanced", 1, "runtime"),
+    ("terminal.changed", 1, "runtime"),
+    // workspace-sync
     ("session.revision_changed", 1, "workspace-sync"),
     ("workspace.diff_changed", 1, "workspace-sync"),
 ];

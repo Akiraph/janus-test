@@ -3,6 +3,8 @@
 //! These exercise the public `WorkspaceSyncInterface` against a real temp
 //! data root (SQLite migrations + BlobStore + filesystem), without HTTP.
 
+mod support;
+
 use std::path::PathBuf;
 
 use janus_server::modules::workspace_sync::interface::{
@@ -49,20 +51,7 @@ impl Fixture {
         std::fs::write(main_abs.join("README.md"), b"# main\n")?;
         std::fs::create_dir_all(main_abs.join("src"))?;
         std::fs::write(main_abs.join("src").join("lib.rs"), b"fn main() {}\n")?;
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&main_abs)
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .status()?;
-            assert!(status.success(), "git {:?} failed in fixture", args);
-            Ok::<(), anyhow::Error>(())
-        };
-        git(&["init", "--initial-branch=main"])?;
-        git(&["config", "user.email", "janus@local"])?;
-        git(&["config", "user.name", "Janus"])?;
-        git(&["add", "-A"])?;
-        git(&["commit", "-m", "main baseline"])?;
+        support::init_git_repo(&main_abs)?;
 
         let _ = sync
             .ensure_main_copy(

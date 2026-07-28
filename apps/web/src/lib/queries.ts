@@ -8,12 +8,15 @@ import {
   getSessionDiff,
   getSessionTimeline,
   getSystemInfo,
+  getTurn,
   gitLog,
   gitStatus,
   listFileTree,
   listGithubCredentials,
   listProjects,
   listSessions,
+  listTerminals,
+  type TerminalOwnerFilter,
 } from "./api";
 
 export function useBootstrap() {
@@ -156,6 +159,45 @@ export function useSessionDiff(
       queryKey: ["session-diff", id],
       queryFn: () => getSessionDiff(id as string),
       enabled: Boolean(id) && enabled(),
+    };
+  });
+}
+
+export function useTurn(sessionId: () => string | undefined, turnId: () => string | undefined) {
+  return createQuery(() => {
+    const sid = sessionId();
+    const tid = turnId();
+    return {
+      queryKey: ["turn", sid, tid],
+      queryFn: () => getTurn(sid as string, tid as string),
+      enabled: Boolean(sid) && Boolean(tid),
+      refetchInterval: (query) => {
+        const status = query.state.data?.status;
+        if (
+          status === "running" ||
+          status === "waiting_for_job" ||
+          status === "waiting_for_ask" ||
+          status === "waiting_for_model" ||
+          status === "canceling"
+        ) {
+          return 1500;
+        }
+        return false;
+      },
+    };
+  });
+}
+
+export function useTerminals(
+  owner: () => TerminalOwnerFilter | undefined,
+  enabled: () => boolean = () => true,
+) {
+  return createQuery(() => {
+    const filter = owner();
+    return {
+      queryKey: ["terminals", filter?.kind, filter?.id],
+      queryFn: () => listTerminals(filter as TerminalOwnerFilter),
+      enabled: Boolean(filter?.id) && enabled(),
     };
   });
 }

@@ -10,6 +10,7 @@ mod projects;
 mod request_id;
 mod sessions;
 mod sse;
+mod terminal;
 
 use axum::{
     Router, middleware,
@@ -48,7 +49,10 @@ pub use problem::Problem;
         operations::get_operation,
         sessions::list_sessions, sessions::create_session, sessions::get_session,
         sessions::delete_session, sessions::post_message, sessions::timeline,
-        sessions::get_turn, sessions::session_diff
+        sessions::get_turn, sessions::session_diff,
+        terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
+        terminal::resize_terminal, terminal::signal_terminal, terminal::close_terminal,
+        terminal::terminal_scrollback, terminal::connect_terminal
     ),
     components(schemas(
         dto::LiveResponse,
@@ -62,6 +66,8 @@ pub use problem::Problem;
         dto::DatabaseInfo,
         dto::EventInfo,
         dto::RuntimeCapability,
+        dto::RuntimeCapabilityId,
+        dto::CapabilityScope,
         dto::CapabilityState,
         dto::CapabilityReason,
         dto::InitializeOptionsRequest,
@@ -122,7 +128,20 @@ pub use problem::Problem;
         crate::modules::sessions::types::TimelinePage,
         crate::modules::sessions::types::TimelineItemView,
         sessions::CreateSessionRequest,
-        sessions::PostMessageRequest
+        sessions::PostMessageRequest,
+        crate::modules::runtime::interface::TerminalProjection,
+        crate::modules::runtime::interface::TerminalOwner,
+        crate::modules::runtime::interface::TerminalStatus,
+        crate::modules::runtime::interface::TerminalSize,
+        crate::modules::runtime::interface::TerminalSignal,
+        crate::modules::runtime::interface::TerminalTicket,
+        crate::modules::runtime::interface::LogRange,
+        terminal::CreateTerminalRequest,
+        terminal::TerminalOwnerInput,
+        terminal::TerminalSizeInput,
+        terminal::EnvironmentInput,
+        terminal::ResizeTerminalRequest,
+        terminal::SignalTerminalRequest
     )),
     tags((name = "system", description = "Janus system probes"))
 )]
@@ -282,6 +301,34 @@ pub fn router(state: AppState) -> Router {
             get(sessions::get_turn),
         )
         .route("/api/v1/sessions/{id}/diff", get(sessions::session_diff))
+        .route(
+            "/api/v1/terminals",
+            get(terminal::list_terminals).post(terminal::create_terminal),
+        )
+        .route(
+            "/api/v1/terminals/{id}/scrollback",
+            get(terminal::terminal_scrollback),
+        )
+        .route(
+            "/api/v1/terminals/{id}/tickets",
+            post(terminal::issue_terminal_ticket),
+        )
+        .route(
+            "/api/v1/terminals/{id}/resize",
+            post(terminal::resize_terminal),
+        )
+        .route(
+            "/api/v1/terminals/{id}/signal",
+            post(terminal::signal_terminal),
+        )
+        .route(
+            "/api/v1/terminals/{id}/close",
+            post(terminal::close_terminal),
+        )
+        .route(
+            "/api/v1/terminals/{id}/connect",
+            get(terminal::connect_terminal),
+        )
         .layer(middleware::from_fn(request_id::middleware))
         .with_state(state)
 }

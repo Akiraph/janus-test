@@ -166,16 +166,105 @@ async fn data_root_lock_is_exclusive_and_reusable_after_close() -> anyhow::Resul
 
 #[test]
 fn openapi_contains_every_public_route() {
-    let document = janus_server::transport::http::openapi()
-        .to_json()
-        .expect("OpenAPI serializes");
-    for route in [
+    // The router is the single source of public routes. We mirror its route
+    // set here (kept in OpenAPI-path form, parameters as `{name}`) and assert
+    // the generated OpenAPI document exposes exactly that set, no more, no
+    // less. Drift in either direction fails loudly: a router route missing
+    // from the document means the frontend type surface is incomplete; an
+    // orphan document path means a route was retired without updating OpenAPI.
+    let expected: std::collections::BTreeSet<String> = [
         "/health/live",
         "/health/ready",
         "/api/v1/bootstrap",
         "/api/v1/system/info",
         "/api/v1/events",
-    ] {
-        assert!(document.contains(route), "missing OpenAPI route {route}");
+        "/api/v1/auth/initialize/options",
+        "/api/v1/auth/initialize/complete",
+        "/api/v1/auth/logout",
+        "/api/v1/me",
+        "/api/v1/me/passkeys",
+        "/api/v1/me/passkeys/options",
+        "/api/v1/me/passkeys/complete",
+        "/api/v1/me/passkeys/{id}",
+        "/api/v1/me/recovery-codes/regenerate",
+        "/api/v1/auth/passkey/options",
+        "/api/v1/auth/passkey/complete",
+        "/api/v1/auth/recovery/exchange",
+        "/api/v1/auth/recovery/passkey/options",
+        "/api/v1/auth/recovery/passkey/complete",
+        "/api/v1/model-providers",
+        "/api/v1/model-providers/{id}",
+        "/api/v1/model-providers/{id}/probe",
+        "/api/v1/operations/{id}",
+        "/api/v1/projects",
+        "/api/v1/projects/{id}",
+        "/api/v1/projects/{id}/retry",
+        "/api/v1/projects/{id}/files",
+        "/api/v1/projects/{id}/files/tree",
+        "/api/v1/projects/{id}/files/meta",
+        "/api/v1/projects/{id}/files/content",
+        "/api/v1/projects/{id}/files/text",
+        "/api/v1/projects/{id}/files/move",
+        "/api/v1/github-credentials",
+        "/api/v1/github-credentials/{id}",
+        "/api/v1/github-credentials/{id}/probe",
+        "/api/v1/projects/{id}/git/status",
+        "/api/v1/projects/{id}/git/diff",
+        "/api/v1/projects/{id}/git/log",
+        "/api/v1/projects/{id}/git/branches",
+        "/api/v1/projects/{id}/git/remotes",
+        "/api/v1/projects/{id}/git/commands/fetch",
+        "/api/v1/projects/{id}/git/commands/stage",
+        "/api/v1/projects/{id}/git/commands/unstage",
+        "/api/v1/projects/{id}/git/commands/commit",
+        "/api/v1/projects/{id}/git/commands/push",
+        "/api/v1/projects/{id}/git/commands/update",
+        "/api/v1/projects/{id}/git/update-conflicts",
+        "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}",
+        "/api/v1/projects/{id}/git/update-conflicts/{conflict_id}/resolve",
+        "/api/v1/projects/{project_id}/sessions",
+        "/api/v1/sessions/{id}",
+        "/api/v1/sessions/{id}/messages",
+        "/api/v1/sessions/{id}/timeline",
+        "/api/v1/sessions/{id}/turns/{turn_id}",
+        "/api/v1/sessions/{id}/diff",
+        "/api/v1/terminals",
+        "/api/v1/terminals/{id}/scrollback",
+        "/api/v1/terminals/{id}/tickets",
+        "/api/v1/terminals/{id}/resize",
+        "/api/v1/terminals/{id}/signal",
+        "/api/v1/terminals/{id}/close",
+        "/api/v1/terminals/{id}/connect",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+
+    let document = janus_server::transport::http::openapi().to_json().expect("OpenAPI serializes");
+    let value: serde_json::Value = serde_json::from_str(&document).expect("OpenAPI parses");
+    let paths = value
+        .get("paths")
+        .and_then(|node| node.as_object())
+        .expect("OpenAPI has a paths object");
+    let actual: std::collections::BTreeSet<String> =
+        paths.keys().cloned().collect();
+
+    assert_eq!(
+        actual, expected,
+        "router/OpenAPI route set diverged — missing from OpenAPI: {:?}, orphan in OpenAPI: {:?}",
+        expected.difference(&actual).collect::<Vec<_>>(),
+        actual.difference(&expected).collect::<Vec<_>>(),
+    );
+
+    // Every advertised path must carry at least one operation. An empty
+    // path object would quietly break the frontend type surface.
+    for (route, node) in paths {
+        let has_operation = ["get", "post", "put", "patch", "delete", "head", "options"]
+            .into_iter()
+            .any(|method| node.get(method).is_some());
+        assert!(
+            has_operation,
+            "OpenAPI path {route} declares no operation"
+        );
     }
 }

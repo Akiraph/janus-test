@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 const PROJECT_ID = "project-graph";
 
@@ -39,7 +39,7 @@ async function mockProjectGraph(page: Page) {
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
-      body: "event: cursor\ndata: {\"cursor\":\"0\"}\n\n",
+      body: 'event: cursor\ndata: {"cursor":"0"}\n\n',
     });
   });
   await page.route(`**/api/v1/projects/${PROJECT_ID}`, async (route) => {

@@ -39,6 +39,44 @@ pub fn spawn(state: AppState) {
     });
 }
 
+/// Spawn the Job-settled wake-up loop. Subscribes to Runtime's broadcast of
+/// terminal Job ids and resumes any `waiting_for_job` Turn that no longer has
+/// unfinished finite Jobs. Single-flight: each resume schedules one next
+/// Supervisor Round via `execute_turn`.
+pub fn spawn_job_wake(state: AppState) {
+    let mut rx = state.runtime().subscribe_job_settled();
+    tokio::spawn(async move {
+        info!("janus job-wake worker started");
+        loop {
+            match rx.recv().await {
+                Ok(job_id) => {
+                    match state.on_job_settled(job_id).await {
+                        Ok(Some(turn_id)) => {
+                            // Resume schedules one next Round. Owner is the
+                            // bootstrap supervisor; HTTP request-scoped owner
+                            // binding is not available on this path.
+                            let supervisor = state.supervisor().clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = supervisor.execute_turn(turn_id).await {
+                                    warn!(%error, %turn_id, "job-wake execute_turn failed");
+                                }
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(%error, %job_id, "on_job_settled failed");
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(lagged = n, "job-wake receiver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 async fn run_once(state: &AppState) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
         let Some(claimed) = state
@@ -87,16 +125,31 @@ async fn dispatch(state: &AppState, kind: &str, payload: &Value) -> anyhow::Resu
                 Err(anyhow::anyhow!("clone failed: {error}"))
             }
         },
-        KIND_DELETE_PROJECT => match state.projects().run_delete(project_id).await {
-            Ok(()) => {
-                record_operation_success(state, kind, project_id, payload).await;
-                Ok(())
+        KIND_DELETE_PROJECT => {
+            match crate::application::lifecycle::delete_project_with_runtime(state, project_id).await
+            {
+                Ok(()) => {
+                    record_operation_success(state, kind, project_id, payload).await;
+                    Ok(())
+                }
+                Err(error) => {
+                    // record_operation_failure expects a ProjectsError-shaped
+                    // display; wrap as a generic failure so the Operation still
+                    // lands in needs_attention / failed.
+                    record_operation_failure(
+                        state,
+                        kind,
+                        project_id,
+                        payload,
+                        &crate::modules::projects::interface::ProjectsError::Validation(
+                            error.to_string(),
+                        ),
+                    )
+                    .await;
+                    Err(error)
+                }
             }
-            Err(error) => {
-                record_operation_failure(state, kind, project_id, payload, &error).await;
-                Err(anyhow::anyhow!("delete failed: {error}"))
-            }
-        },
+        }
         other => Err(anyhow::anyhow!("no handler for kind {other}")),
     }
 }

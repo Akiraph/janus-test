@@ -398,16 +398,13 @@ mod tests {
             1
         );
         assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.kind == DiffLineKind::Add)
-                .count(),
+            lines.iter().filter(|l| l.kind == DiffLineKind::Add).count(),
             1
         );
         let add = lines
             .iter()
             .find(|l| l.kind == DiffLineKind::Add)
-            .unwrap();
+            .expect("an Add line is guaranteed by the previous count assert");
         assert_eq!(add.text, "CHANGED");
     }
 

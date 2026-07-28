@@ -13,6 +13,7 @@ use config::Config;
 use modules::identity::interface::IdentityInterface;
 use modules::models::interface::ModelsInterface;
 use modules::projects::interface::ProjectsInterface;
+use modules::runtime::interface::RuntimeInterface;
 use modules::sessions::interface::SessionsInterface;
 use modules::supervisor::interface::SupervisorInterface;
 use modules::workspace_sync::interface::WorkspaceSyncInterface;
@@ -37,8 +38,13 @@ struct AppStateInner {
     pub identity: IdentityInterface,
     pub models: ModelsInterface,
     pub projects: ProjectsInterface,
+    pub runtime: RuntimeInterface,
     pub sessions: SessionsInterface,
     pub supervisor: SupervisorInterface,
+    /// Set once startup recovery (runtime + supervisor + blob/ops) has finished.
+    /// `/health/ready` stays 503 until this is true so clients never land on a
+    /// half-recovered control plane.
+    pub recovery_complete: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -62,6 +68,16 @@ impl AppState {
             workspace_sync.clone(),
             &config.data_root,
         );
+        let runtime_logs =
+            modules::runtime::log_store::LogStore::new(pool.clone(), &config.data_root);
+        let local_executor = Arc::new(adapters::runtime::local::LocalExecutor::new(runtime_logs));
+        let runtime = RuntimeInterface::new(
+            pool.clone(),
+            events.clone(),
+            &config.data_root,
+            local_executor,
+        );
+        runtime.recover_uncertain().await?;
         let sessions = SessionsInterface::new(pool.clone(), events.clone(), workspace_sync.clone());
         // Owner id used when spawning background turns; HTTP message handlers
         // rebuild a request-scoped supervisor with the authenticated owner.
@@ -71,7 +87,8 @@ impl AppState {
             models.clone(),
             workspace_sync.clone(),
             "owner-bootstrap".into(),
-        );
+        )
+        .with_runtime(runtime.clone());
         if let Err(error) = supervisor.recover_running_on_startup().await {
             tracing::warn!(%error, "supervisor startup recovery failed");
         }
@@ -87,10 +104,39 @@ impl AppState {
                 identity,
                 models,
                 projects,
+                runtime,
                 sessions,
                 supervisor,
+                // main() flips this after the remaining recovery steps
+                // (incoming blobs + stale operations) complete, so unit tests
+                // that only call initialize() still see ready=true by default.
+                recovery_complete: std::sync::atomic::AtomicBool::new(true),
             }),
         })
+    }
+
+    /// Mark startup recovery finished. Called from `main` after blob/ops
+    /// cleanup so `/health/ready` can flip to 200.
+    pub fn mark_recovery_complete(&self) {
+        self.inner
+            .recovery_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True once startup recovery has finished. Used by `/health/ready`.
+    pub fn recovery_complete(&self) -> bool {
+        self.inner
+            .recovery_complete
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Begin process startup in the "not yet recovered" posture so a freshly
+    /// constructed AppState used by `main` keeps `/health/ready` at 503 until
+    /// `mark_recovery_complete` runs. Tests leave the default `true`.
+    pub fn begin_startup_recovery(&self) {
+        self.inner
+            .recovery_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn config(&self) -> &Config {
@@ -133,6 +179,10 @@ impl AppState {
         &self.inner.projects
     }
 
+    pub fn runtime(&self) -> &RuntimeInterface {
+        &self.inner.runtime
+    }
+
     pub fn sessions(&self) -> &SessionsInterface {
         &self.inner.sessions
     }
@@ -151,6 +201,7 @@ impl AppState {
             self.inner.workspace_sync.clone(),
             owner_id.to_owned(),
         )
+        .with_runtime(self.inner.runtime.clone())
     }
 }
 

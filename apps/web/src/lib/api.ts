@@ -34,6 +34,14 @@ export type TimelineItemView = components["schemas"]["TimelineItemView"];
 export type TurnSummary = components["schemas"]["TurnSummary"];
 export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
 export type PostMessageRequest = components["schemas"]["PostMessageRequest"];
+export type TerminalProjection = components["schemas"]["TerminalProjection"];
+export type TerminalTicket = components["schemas"]["TerminalTicket"];
+export type TerminalOwnerInput = components["schemas"]["TerminalOwnerInput"];
+export type TerminalSizeInput = components["schemas"]["TerminalSizeInput"];
+export type TerminalSignal = components["schemas"]["TerminalSignal"];
+export type CreateTerminalRequest = components["schemas"]["CreateTerminalRequest"];
+export type LogRange = components["schemas"]["LogRange"];
+export type RuntimeCapability = components["schemas"]["RuntimeCapability"];
 let csrfToken: string | undefined;
 
 export class ApiError extends Error {
@@ -289,6 +297,113 @@ export async function getSessionDiff(id: string): Promise<Record<string, unknown
       isDataResponse,
     )
   ).data;
+}
+
+export async function getTurn(sessionId: string, turnId: string): Promise<TurnSummary> {
+  return (
+    await requestJson<{ data: TurnSummary }>(
+      `/api/v1/sessions/${sessionId}/turns/${turnId}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export type TerminalOwnerFilter = {
+  kind: "project" | "session";
+  id: string;
+};
+
+export async function listTerminals(owner: TerminalOwnerFilter): Promise<TerminalProjection[]> {
+  const query = new URLSearchParams({
+    owner_kind: owner.kind,
+    owner_id: owner.id,
+  });
+  return (
+    await requestJson<{ data: TerminalProjection[] }>(
+      `/api/v1/terminals?${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function createTerminal(input: CreateTerminalRequest): Promise<TerminalProjection> {
+  return (
+    await requestJson<{ data: TerminalProjection }>(
+      "/api/v1/terminals",
+      { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function issueTerminalTicket(id: string): Promise<TerminalTicket> {
+  // Ticket issuance is Origin-bound. Browsers set Origin automatically for
+  // same-origin fetch; keep credentials so the session cookie travels too.
+  return (
+    await requestJson<{ data: TerminalTicket }>(
+      `/api/v1/terminals/${id}/tickets`,
+      { method: "POST" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getTerminalScrollback(
+  id: string,
+  opts: { after?: string; limit?: number } = {},
+): Promise<LogRange> {
+  const query = new URLSearchParams();
+  if (opts.after) query.set("after", opts.after);
+  if (opts.limit) query.set("limit", String(opts.limit));
+  const suffix = query.toString() ? `?${query}` : "";
+  return (
+    await requestJson<{ data: LogRange }>(
+      `/api/v1/terminals/${id}/scrollback${suffix}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function resizeTerminal(
+  id: string,
+  size: TerminalSizeInput,
+): Promise<TerminalProjection> {
+  return (
+    await requestJson<{ data: TerminalProjection }>(
+      `/api/v1/terminals/${id}/resize`,
+      { method: "POST", body: JSON.stringify(size) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function signalTerminal(id: string, signal: TerminalSignal): Promise<void> {
+  await requestJson(
+    `/api/v1/terminals/${id}/signal`,
+    { method: "POST", body: JSON.stringify({ signal }) },
+    () => true,
+  );
+}
+
+export async function closeTerminal(id: string): Promise<TerminalProjection> {
+  return (
+    await requestJson<{ data: TerminalProjection }>(
+      `/api/v1/terminals/${id}/close`,
+      { method: "POST" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+/** Build the WebSocket URL for a Terminal connect upgrade (ticket token in query). */
+export function terminalConnectUrl(id: string, token: string, after?: string | null): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const query = new URLSearchParams({ token });
+  if (after) query.set("after", after);
+  return `${protocol}//${window.location.host}/api/v1/terminals/${id}/connect?${query}`;
 }
 
 export async function retryProject(

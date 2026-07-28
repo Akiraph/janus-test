@@ -14,26 +14,29 @@ test("diag save + git", async ({ page }) => {
         const pd = req.postData();
         if (pd) body = pd.slice(0, 300);
       } catch {}
-      apiCalls.push({
+      const call: (typeof apiCalls)[number] = {
         method: req.method(),
         url: u.replace(/^https?:\/\/[^/]+/, ""),
         status: resp.status(),
-        body,
-      });
+      };
+      if (body !== undefined) call.body = body;
+      apiCalls.push(call);
     }
   });
   page.on("console", (msg) => {
     if (msg.type() === "error") console.log(`[BROWSER ERR]`, msg.text());
   });
 
-  await page.goto(`http://127.0.0.1:5173/projects/${PROJECT_ID}`, { waitUntil: "domcontentloaded" });
+  await page.goto(`http://127.0.0.1:5173/projects/${PROJECT_ID}`, {
+    waitUntil: "domcontentloaded",
+  });
   await page.waitForSelector(".ide-shell", { timeout: 15000 });
   await page.waitForTimeout(1000);
 
   // Open a small editable text file. Prefer AGENTS.md or TODO.
   const items = page.locator(".ide-tree-item");
   let opened = false;
-  for (let i = 0; i < await items.count(); i++) {
+  for (let i = 0; i < (await items.count()); i++) {
     const cls = await items.nth(i).getAttribute("class");
     if (cls?.includes("ide-tree-item--dir")) continue;
     const text = (await items.nth(i).innerText()).trim();
@@ -45,7 +48,7 @@ test("diag save + git", async ({ page }) => {
     }
   }
   if (!opened) {
-    for (let i = 0; i < await items.count(); i++) {
+    for (let i = 0; i < (await items.count()); i++) {
       const cls = await items.nth(i).getAttribute("class");
       if (cls?.includes("ide-tree-item--dir")) continue;
       await items.nth(i).click();
@@ -70,14 +73,20 @@ test("diag save + git", async ({ page }) => {
   await page.waitForTimeout(400);
 
   // click Save
-  const saveBtn = page.locator("button").filter({ hasText: /^Save$/ }).first();
+  const saveBtn = page
+    .locator("button")
+    .filter({ hasText: /^Save$/ })
+    .first();
   await saveBtn.click();
   await page.waitForTimeout(2500);
 
   // Switch to SCM and read
   await page.locator('.ide-activity-btn[aria-label="Source Control"]').click();
   await page.waitForTimeout(1500);
-  const scmText = await page.locator(".scm-panel").innerText().catch(() => "<none>");
+  const scmText = await page
+    .locator(".scm-panel")
+    .innerText()
+    .catch(() => "<none>");
   console.log("=== SCM AFTER SAVE ===");
   console.log(scmText.slice(0, 800));
 

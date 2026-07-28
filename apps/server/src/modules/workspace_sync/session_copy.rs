@@ -66,7 +66,10 @@ pub fn create_session_worktree(main_repo: &Path, session_repo: &Path) -> anyhow:
     let main_repo = absoluteish(main_repo.to_path_buf());
     let session_repo = absoluteish(session_repo.to_path_buf());
     if !main_repo.is_dir() {
-        anyhow::bail!("main managed dir is not a directory: {}", main_repo.display());
+        anyhow::bail!(
+            "main managed dir is not a directory: {}",
+            main_repo.display()
+        );
     }
     // Refuse a target that already exists (even with --force) when it is a
     // non-empty leftover. Clear any stale target first.
@@ -202,7 +205,10 @@ mod tests {
             .expect("git log");
         assert!(log.status.success(), "git log failed in worktree");
         let log_text = String::from_utf8_lossy(&log.stdout);
-        assert!(log_text.contains("baseline"), "worktree has no Main history: {log_text}");
+        assert!(
+            log_text.contains("baseline"),
+            "worktree has no Main history: {log_text}"
+        );
     }
 
     #[test]
@@ -217,7 +223,10 @@ mod tests {
         assert!(session_repo.is_dir());
 
         remove_session_tree(data_root.path(), session_id).expect("remove");
-        assert!(!session_repo.exists(), "session tree still on disk after remove");
+        assert!(
+            !session_repo.exists(),
+            "session tree still on disk after remove"
+        );
 
         // Main's worktree admin list no longer references the removed session.
         let list = Command::new("git")

@@ -80,4 +80,7 @@ pub struct ToolOutcome {
     pub error_code: Option<String>,
     /// When set, the Turn should complete with this summary.
     pub finish_summary: Option<serde_json::Value>,
+    /// When set, the Turn should pause in this status after the tool returns
+    /// (`waiting_for_job` / `waiting_for_ask`). Stage 5 runtime tools use this.
+    pub wait_state: Option<String>,
 }

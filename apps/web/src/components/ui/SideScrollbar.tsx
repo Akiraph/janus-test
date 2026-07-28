@@ -21,9 +21,7 @@ interface SideScrollbarProps {
   host: () => HTMLElement | null;
 }
 
-const THUMB_WIDTH = 3; // px — square, ultra-thin, matches the prior spec intent
 const THUMB_MIN = 24; // px — never let it shrink to an unusable sliver
-const HOVER_EXTEND = 10; // px — wider invisible hit area for grabbing
 
 export function SideScrollbar(props: SideScrollbarProps) {
   const [visible, setVisible] = createSignal(false);
@@ -132,6 +130,11 @@ export function SideScrollbar(props: SideScrollbarProps) {
   return (
     <Show when={visible()}>
       <div class="side-scroll-track" aria-hidden="true">
+        {/* The thumb is a non-accessible mirror of the host's scrollbar (the
+            track above is aria-hidden). Pointer handlers drive the visual drag
+            of that decorative thumb; the host element itself remains the
+            accessible scroll surface, so no interactive role belongs here. */}
+        {/* biome-ignore lint/a11y/noStaticElementInteractions: decorative thumb inside aria-hidden track */}
         <div
           class="side-scroll-thumb"
           classList={{ "side-scroll-thumb--active": dragging() || hovering() }}

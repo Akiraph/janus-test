@@ -44,10 +44,10 @@ impl Problem {
     }
 }
 
-/// Stable M3 (+ shared M0–M2) problem codes with recommended HTTP status + title.
+/// Stable public problem codes with recommended HTTP status and title.
 /// Handlers may still call `Problem::new` directly when they need a custom title.
 pub mod codes {
-    // Shared / pre-M3
+    // Shared
     pub const RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
     pub const RESOURCE_VERSION_MISMATCH: &str = "RESOURCE_VERSION_MISMATCH";
     pub const PRECONDITION_REQUIRED: &str = "PRECONDITION_REQUIRED";
@@ -56,22 +56,38 @@ pub mod codes {
     pub const VALIDATION_FAILED: &str = "VALIDATION_FAILED";
     pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
-    // M3 sessions / turn
+    // Sessions / Turn
     pub const SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
     pub const ACTIVE_TURN_EXISTS: &str = "ACTIVE_TURN_EXISTS";
     pub const SESSION_DELETING: &str = "SESSION_DELETING";
     pub const TIMELINE_CURSOR_INVALID: &str = "TIMELINE_CURSOR_INVALID";
 
-    // M3 models
+    // Models
     pub const PROVIDER_STREAM_FAILED: &str = "PROVIDER_STREAM_FAILED";
     pub const PROVIDER_AUTH_FAILED: &str = "PROVIDER_AUTH_FAILED";
     pub const MODEL_NOT_CONFIGURED: &str = "MODEL_NOT_CONFIGURED";
 
-    // M3 tools / media
+    // Tools / media
     pub const TOOL_NOT_ALLOWED: &str = "TOOL_NOT_ALLOWED";
     pub const TOOL_PATH_INVALID: &str = "TOOL_PATH_INVALID";
     pub const IMAGE_TOO_LARGE: &str = "IMAGE_TOO_LARGE";
     pub const UNSUPPORTED_IMAGE: &str = "UNSUPPORTED_IMAGE";
+
+    // Runtime and model resilience
+    pub const RESOURCE_BUSY: &str = "RESOURCE_BUSY";
+    pub const MODEL_CONTEXT_EXCEEDED: &str = "MODEL_CONTEXT_EXCEEDED";
+    pub const MODEL_CAPABILITY_MISMATCH: &str = "MODEL_CAPABILITY_MISMATCH";
+    pub const MODEL_CONFIGURATION_FAULT: &str = "MODEL_CONFIGURATION_FAULT";
+    pub const MODEL_UNAVAILABLE: &str = "MODEL_UNAVAILABLE";
+    pub const RATE_LIMITED: &str = "RATE_LIMITED";
+    pub const COMMAND_FORBIDDEN: &str = "COMMAND_FORBIDDEN";
+    pub const NETWORK_POLICY_DENIED: &str = "NETWORK_POLICY_DENIED";
+    pub const RUNTIME_UNAVAILABLE: &str = "RUNTIME_UNAVAILABLE";
+    pub const JOB_LOST: &str = "JOB_LOST";
+    pub const SERVICE_LOST: &str = "SERVICE_LOST";
+    pub const TERMINAL_TICKET_INVALID: &str = "TERMINAL_TICKET_INVALID";
+    pub const TERMINAL_SCROLLBACK_EXPIRED: &str = "TERMINAL_SCROLLBACK_EXPIRED";
+    pub const TERMINAL_NOT_WRITABLE: &str = "TERMINAL_NOT_WRITABLE";
 }
 
 fn code_status_title(code: &str) -> (StatusCode, &'static str) {
@@ -81,7 +97,7 @@ fn code_status_title(code: &str) -> (StatusCode, &'static str) {
         RESOURCE_VERSION_MISMATCH => (StatusCode::PRECONDITION_FAILED, "Resource version mismatch"),
         PRECONDITION_REQUIRED => (StatusCode::PRECONDITION_REQUIRED, "Precondition required"),
         IDEMPOTENCY_KEY_REUSED => (StatusCode::CONFLICT, "Idempotency key reused"),
-        OPERATION_IN_PROGRESS | ACTIVE_TURN_EXISTS | SESSION_DELETING => {
+        OPERATION_IN_PROGRESS | ACTIVE_TURN_EXISTS | SESSION_DELETING | RESOURCE_BUSY => {
             (StatusCode::CONFLICT, "Operation conflict")
         }
         VALIDATION_FAILED
@@ -92,9 +108,64 @@ fn code_status_title(code: &str) -> (StatusCode, &'static str) {
         | TOOL_NOT_ALLOWED => (StatusCode::UNPROCESSABLE_ENTITY, "Validation failed"),
         PROVIDER_AUTH_FAILED => (StatusCode::BAD_GATEWAY, "Provider authentication failed"),
         PROVIDER_STREAM_FAILED => (StatusCode::BAD_GATEWAY, "Provider stream failed"),
-        MODEL_NOT_CONFIGURED => (StatusCode::UNPROCESSABLE_ENTITY, "Model not configured"),
+        MODEL_NOT_CONFIGURED | MODEL_CONFIGURATION_FAULT => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Model configuration fault",
+        ),
+        MODEL_CONTEXT_EXCEEDED => (StatusCode::CONFLICT, "Model context exceeded"),
+        MODEL_CAPABILITY_MISMATCH => (StatusCode::CONFLICT, "Model capability mismatch"),
+        MODEL_UNAVAILABLE | RUNTIME_UNAVAILABLE | JOB_LOST | SERVICE_LOST => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Runtime dependency unavailable",
+        ),
+        RATE_LIMITED => (StatusCode::TOO_MANY_REQUESTS, "Rate limited"),
+        COMMAND_FORBIDDEN | NETWORK_POLICY_DENIED => {
+            (StatusCode::FORBIDDEN, "Runtime policy denied")
+        }
+        TERMINAL_TICKET_INVALID => (StatusCode::UNAUTHORIZED, "Terminal ticket invalid"),
+        TERMINAL_SCROLLBACK_EXPIRED => (StatusCode::GONE, "Terminal scrollback expired"),
+        TERMINAL_NOT_WRITABLE => (StatusCode::CONFLICT, "Terminal not writable"),
         INTERNAL_ERROR => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
         _ => (StatusCode::BAD_REQUEST, "Request failed"),
+    }
+}
+
+/// Map a `RuntimeError` to a stable public `Problem`. Runtime error codes are
+/// the single source of truth for HTTP status and problem code.
+pub fn map_runtime_error(error: crate::modules::runtime::interface::RuntimeError) -> Problem {
+    use codes::*;
+    let code = error.code();
+    match code {
+        crate::modules::runtime::interface::RuntimeErrorCode::ValidationFailed => {
+            Problem::from_code(VALIDATION_FAILED, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::ResourceBusy => {
+            Problem::from_code(RESOURCE_BUSY, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::CommandForbidden => {
+            Problem::from_code(COMMAND_FORBIDDEN, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::NetworkPolicyDenied => {
+            Problem::from_code(NETWORK_POLICY_DENIED, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::RuntimeUnavailable => {
+            Problem::from_code(RUNTIME_UNAVAILABLE, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::JobLost => {
+            Problem::from_code(JOB_LOST, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::ServiceLost => {
+            Problem::from_code(SERVICE_LOST, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::TerminalTicketInvalid => {
+            Problem::from_code(TERMINAL_TICKET_INVALID, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::TerminalScrollbackExpired => {
+            Problem::from_code(TERMINAL_SCROLLBACK_EXPIRED, error.to_string())
+        }
+        crate::modules::runtime::interface::RuntimeErrorCode::TerminalNotWritable => {
+            Problem::from_code(TERMINAL_NOT_WRITABLE, error.to_string())
+        }
     }
 }
 
@@ -116,7 +187,7 @@ mod tests {
     use axum::http::StatusCode;
 
     #[test]
-    fn m3_codes_map_to_stable_status() {
+    fn public_codes_map_to_stable_status() {
         let p = Problem::from_code(
             codes::ACTIVE_TURN_EXISTS,
             "session already has a running turn",
@@ -132,5 +203,14 @@ mod tests {
 
         let p = Problem::from_code(codes::PROVIDER_STREAM_FAILED, "upstream closed");
         assert_eq!(p.status, StatusCode::BAD_GATEWAY.as_u16());
+
+        let p = Problem::from_code(codes::RUNTIME_UNAVAILABLE, "probe failed");
+        assert_eq!(p.status, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+
+        let p = Problem::from_code(codes::RATE_LIMITED, "retry later");
+        assert_eq!(p.status, StatusCode::TOO_MANY_REQUESTS.as_u16());
+
+        let p = Problem::from_code(codes::TERMINAL_SCROLLBACK_EXPIRED, "range expired");
+        assert_eq!(p.status, StatusCode::GONE.as_u16());
     }
 }

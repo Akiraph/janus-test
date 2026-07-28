@@ -42,7 +42,7 @@ async function mockWorkspaceShell(page: import("@playwright/test").Page) {
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
-      body: "event: cursor\ndata: {\"cursor\":\"0\"}\n\n",
+      body: 'event: cursor\ndata: {"cursor":"0"}\n\n',
     });
   });
   await page.route("**/api/v1/projects**", async (route) => {
@@ -115,9 +115,7 @@ test("system route remains usable with reduced motion", async ({ page }) => {
           mode: "single",
           database: { engine: "sqlite", journal_mode: "wal", ready: true },
           events: { min_cursor: "0", max_cursor: "0" },
-          capabilities: [
-            { id: "delegated_cli.access", scope: "deployment", state: "ready" },
-          ],
+          capabilities: [{ id: "delegated_cli.access", scope: "deployment", state: "ready" }],
           update_available: false,
         },
       },

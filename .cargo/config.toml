@@ -1,2 +1,10 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Use Rust's bundled LLD linker on MSVC instead of the slow system link.exe.
+# lld-link is a drop-in for link.exe and substantially cuts incremental link
+# time for large dependency graphs. `linker-features.lld = true` lets rustc
+# invoke the self-contained rust-lld that ships with the toolchain (no
+# external LLVM install needed).
+[target.x86_64-pc-windows-msvc.linker-features]
+lld = "yes"

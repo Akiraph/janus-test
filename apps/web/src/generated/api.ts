@@ -852,6 +852,124 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/terminals": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_terminals"];
+    put?: never;
+    post: operations["create_terminal"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/terminals/{id}/close": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["close_terminal"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/terminals/{id}/connect": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * WebSocket upgrade for a Terminal. The client supplies a one-use ticket token
+     *     in the query string plus an optional scrollback resume cursor. After replay,
+     *     the server streams live scrollback output and accepts binary input or JSON
+     *     control frames (`input`/`resize`/`signal`/`close`).
+     */
+    get: operations["connect_terminal"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/terminals/{id}/resize": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["resize_terminal"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/terminals/{id}/scrollback": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["terminal_scrollback"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/terminals/{id}/signal": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["signal_terminal"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/terminals/{id}/tickets": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["issue_terminal_ticket"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/health/live": {
     parameters: {
       query?: never;
@@ -911,6 +1029,8 @@ export interface components {
       | "POLICY_DISABLED"
       | "PROBE_FAILED";
     /** @enum {string} */
+    CapabilityScope: "deployment" | "project" | "session";
+    /** @enum {string} */
     CapabilityState: "ready" | "degraded" | "unconfigured" | "unsupported";
     CeremonyCompleteRequest: {
       ceremony_id: string;
@@ -931,6 +1051,13 @@ export interface components {
     };
     CreateSessionRequest: {
       title?: string | null;
+    };
+    CreateTerminalRequest: {
+      environment?: null | components["schemas"]["EnvironmentInput"];
+      owner: components["schemas"]["TerminalOwnerInput"];
+      runtime_id: string;
+      size: components["schemas"]["TerminalSizeInput"];
+      working_directory?: string;
     };
     CredentialProbeResult: {
       detail: string;
@@ -1007,10 +1134,26 @@ export interface components {
         version: string;
       };
     };
+    DataResponse_LogRange: {
+      data: {
+        after: components["schemas"]["LogCursor"];
+        chunks: components["schemas"]["LogChunk"][];
+        stream: components["schemas"]["LogStreamProjection"];
+      };
+    };
     DataResponse_MessageRouteResult: {
       data: {
+        /**
+         * @description True when the active Turn is `waiting_for_job` and the just-queued
+         *     message is intended to take over via an atomic Handoff. The HTTP layer
+         *     hands this Turn to `application::session_flow::handoff_message`, which
+         *     promotes it to the successor and transfers the predecessor's finite
+         *     Jobs/Asks transactionally. `route` stays `queued` until the coordinator
+         *     promotes it.
+         */
+        awaiting_handoff?: boolean;
         message_id: string;
-        /** @description M3 always starts immediately (no queue/handoff). */
+        /** @description Current routing result for the accepted message. */
         route: string;
         session_version: string;
         turn_id: string;
@@ -1115,6 +1258,42 @@ export interface components {
     DataResponse_String: {
       data: string;
     };
+    DataResponse_TerminalProjection: {
+      data: {
+        created_at: string;
+        ended_at?: string | null;
+        exit?: null | components["schemas"]["ExitSummary"];
+        first_cursor: components["schemas"]["LogCursor"];
+        id: components["schemas"]["TerminalId"];
+        next_cursor: components["schemas"]["LogCursor"];
+        owner: components["schemas"]["TerminalOwner"];
+        runtime_id: components["schemas"]["RuntimeId"];
+        scrollback_stream_id: components["schemas"]["LogStreamId"];
+        size: components["schemas"]["TerminalSize"];
+        status: components["schemas"]["TerminalStatus"];
+        updated_at: string;
+        version: string;
+        writable: boolean;
+      };
+    };
+    DataResponse_TerminalTicket: {
+      /**
+       * @description Issued access material for a Terminal WebSocket upgrade.
+       *
+       *     The original token is returned once to the requesting actor and never
+       *     persisted. Only the [`TerminalTicket::token_hash`] and metadata needed to
+       *     validate a later upgrade are stored. Consumption is atomic and single-use.
+       */
+      data: {
+        expires_at: string;
+        terminal_id: components["schemas"]["TerminalId"];
+        /**
+         * @description The raw bearer token to hand to the WebSocket client. Never put this
+         *     into SQLite or an event payload.
+         */
+        token: string;
+      };
+    };
     DataResponse_TimelinePage: {
       data: {
         has_newer: boolean;
@@ -1126,9 +1305,14 @@ export interface components {
     };
     DataResponse_TurnSummary: {
       data: {
+        cancellation_reason?: string | null;
+        completion_reason?: string | null;
         created_at: string;
+        handoff_from_turn_id?: string | null;
+        handoff_to_turn_id?: string | null;
         id: string;
         input_message_id?: string | null;
+        predecessor_turn_id?: string | null;
         /** Format: int64 */
         sequence: number;
         session_id: string;
@@ -1234,6 +1418,24 @@ export interface components {
     DataResponse_Vec_String: {
       data: string[];
     };
+    DataResponse_Vec_TerminalProjection: {
+      data: {
+        created_at: string;
+        ended_at?: string | null;
+        exit?: null | components["schemas"]["ExitSummary"];
+        first_cursor: components["schemas"]["LogCursor"];
+        id: components["schemas"]["TerminalId"];
+        next_cursor: components["schemas"]["LogCursor"];
+        owner: components["schemas"]["TerminalOwner"];
+        runtime_id: components["schemas"]["RuntimeId"];
+        scrollback_stream_id: components["schemas"]["LogStreamId"];
+        size: components["schemas"]["TerminalSize"];
+        status: components["schemas"]["TerminalStatus"];
+        updated_at: string;
+        version: string;
+        writable: boolean;
+      }[];
+    };
     DatabaseInfo: {
       engine: string;
       journal_mode: string;
@@ -1264,6 +1466,11 @@ export interface components {
       supports_images: boolean;
       upstream_model_id: string;
     };
+    EnvironmentInput: {
+      ordinary?: {
+        [key: string]: string;
+      };
+    };
     EventEnvelope: {
       actor: unknown;
       causation_id?: string | null;
@@ -1280,6 +1487,11 @@ export interface components {
     EventInfo: {
       max_cursor: string;
       min_cursor: string;
+    };
+    ExitSummary: {
+      /** Format: int32 */
+      exit_code?: number | null;
+      signal?: string | null;
     };
     FileMetaView: {
       editable: boolean;
@@ -1378,9 +1590,46 @@ export interface components {
       status: string;
       version: string;
     };
+    /** @enum {string} */
+    LogChannel: "stdout" | "stderr" | "system";
+    LogChunk: {
+      channel: components["schemas"]["LogChannel"];
+      end_cursor: components["schemas"]["LogCursor"];
+      start_cursor: components["schemas"]["LogCursor"];
+      text: string;
+    };
+    /** @example 0 */
+    LogCursor: string;
+    LogRange: {
+      after: components["schemas"]["LogCursor"];
+      chunks: components["schemas"]["LogChunk"][];
+      stream: components["schemas"]["LogStreamProjection"];
+    };
+    /** Format: uuid */
+    LogStreamId: string;
+    LogStreamProjection: {
+      closed: boolean;
+      first_cursor: components["schemas"]["LogCursor"];
+      id: components["schemas"]["LogStreamId"];
+      next_cursor: components["schemas"]["LogCursor"];
+      /** Format: int64 */
+      retained_bytes: number;
+      /** Format: int64 */
+      total_bytes: number;
+      truncated: boolean;
+    };
     MessageRouteResult: {
+      /**
+       * @description True when the active Turn is `waiting_for_job` and the just-queued
+       *     message is intended to take over via an atomic Handoff. The HTTP layer
+       *     hands this Turn to `application::session_flow::handoff_message`, which
+       *     promotes it to the successor and transfers the predecessor's finite
+       *     Jobs/Asks transactionally. `route` stays `queued` until the coordinator
+       *     promotes it.
+       */
+      awaiting_handoff?: boolean;
       message_id: string;
-      /** @description M3 always starts immediately (no queue/handoff). */
+      /** @description Current routing result for the accepted message. */
       route: string;
       session_version: string;
       turn_id: string;
@@ -1452,6 +1701,8 @@ export interface components {
       title: string;
       type: string;
     };
+    /** Format: uuid */
+    ProjectId: string;
     ProjectView: {
       created_at: string;
       current_branch?: string | null;
@@ -1524,6 +1775,12 @@ export interface components {
       github_credential_id?: string | null;
       url: string;
     };
+    ResizeTerminalRequest: {
+      /** Format: int32 */
+      cols: number;
+      /** Format: int32 */
+      rows: number;
+    };
     ResolveConflictPathRequest: {
       choice: string;
       edited_text?: string | null;
@@ -1548,16 +1805,33 @@ export interface components {
     /** @description Content Revision identity exposed as opaque `rev_<uuid>` string. */
     RevisionRef: string;
     RuntimeCapability: {
-      id: string;
+      checked_at?: string | null;
+      effective_limits?: {
+        [key: string]: number;
+      };
+      id: components["schemas"]["RuntimeCapabilityId"];
       reason_code?: null | components["schemas"]["CapabilityReason"];
-      scope: string;
+      scope: components["schemas"]["CapabilityScope"];
       state: components["schemas"]["CapabilityState"];
     };
+    /** @enum {string} */
+    RuntimeCapabilityId:
+      | "process_execution"
+      | "container_isolation"
+      | "bash_egress"
+      | "browser"
+      | "live_preview"
+      | "delegated_cli.claude_code"
+      | "delegated_cli.codex";
+    /** Format: uuid */
+    RuntimeId: string;
     SaveTextInput: {
       content: string;
       expected_main_revision?: string | null;
       path: string;
     };
+    /** Format: uuid */
+    SessionId: string;
     SessionSummary: {
       active_turn_id?: string | null;
       created_at: string;
@@ -1573,6 +1847,9 @@ export interface components {
       workspace_handle: string;
       workspace_revision?: string | null;
     };
+    SignalTerminalRequest: {
+      signal: components["schemas"]["TerminalSignal"];
+    };
     SystemInfo: {
       capabilities: components["schemas"]["RuntimeCapability"][];
       database: components["schemas"]["DatabaseInfo"];
@@ -1585,6 +1862,88 @@ export interface components {
     };
     SystemInfoResponse: {
       data: components["schemas"]["SystemInfo"];
+    };
+    /** Format: uuid */
+    TerminalId: string;
+    TerminalOwner:
+      | {
+          id: components["schemas"]["ProjectId"];
+          /** @enum {string} */
+          kind: "project";
+        }
+      | {
+          id: components["schemas"]["SessionId"];
+          /** @enum {string} */
+          kind: "session";
+        };
+    TerminalOwnerInput:
+      | {
+          id: string;
+          /** @enum {string} */
+          kind: "project";
+        }
+      | {
+          id: string;
+          /** @enum {string} */
+          kind: "session";
+        };
+    TerminalProjection: {
+      created_at: string;
+      ended_at?: string | null;
+      exit?: null | components["schemas"]["ExitSummary"];
+      first_cursor: components["schemas"]["LogCursor"];
+      id: components["schemas"]["TerminalId"];
+      next_cursor: components["schemas"]["LogCursor"];
+      owner: components["schemas"]["TerminalOwner"];
+      runtime_id: components["schemas"]["RuntimeId"];
+      scrollback_stream_id: components["schemas"]["LogStreamId"];
+      size: components["schemas"]["TerminalSize"];
+      status: components["schemas"]["TerminalStatus"];
+      updated_at: string;
+      version: string;
+      writable: boolean;
+    };
+    /**
+     * @description Abstract signal a Terminal consumer may raise to the running shell.
+     *
+     *     The executor maps these to whatever the local execution backend supports.
+     *     It is intentionally not a raw POSIX signal value so the public contract
+     *     stays cross-platform: `ctrl_c` is an interrupt request and `terminate` is an
+     *     ungraceful kill request. Neither is required to be perfectly reliable on a
+     *     non-tty pipe backend; both are best-effort and the durable Terminal state
+     *     remains the source of truth.
+     * @enum {string}
+     */
+    TerminalSignal: "ctrl_c" | "terminate";
+    TerminalSize: {
+      /** Format: int32 */
+      cols: number;
+      /** Format: int32 */
+      rows: number;
+    };
+    TerminalSizeInput: {
+      /** Format: int32 */
+      cols: number;
+      /** Format: int32 */
+      rows: number;
+    };
+    /** @enum {string} */
+    TerminalStatus: "starting" | "running" | "closing" | "exited" | "failed" | "lost";
+    /**
+     * @description Issued access material for a Terminal WebSocket upgrade.
+     *
+     *     The original token is returned once to the requesting actor and never
+     *     persisted. Only the [`TerminalTicket::token_hash`] and metadata needed to
+     *     validate a later upgrade are stored. Consumption is atomic and single-use.
+     */
+    TerminalTicket: {
+      expires_at: string;
+      terminal_id: components["schemas"]["TerminalId"];
+      /**
+       * @description The raw bearer token to hand to the WebSocket client. Never put this
+       *     into SQLite or an event payload.
+       */
+      token: string;
     };
     TimelineItemView: {
       created_at: string;
@@ -1607,9 +1966,14 @@ export interface components {
       oldest_cursor?: string | null;
     };
     TurnSummary: {
+      cancellation_reason?: string | null;
+      completion_reason?: string | null;
       created_at: string;
+      handoff_from_turn_id?: string | null;
+      handoff_to_turn_id?: string | null;
       id: string;
       input_message_id?: string | null;
+      predecessor_turn_id?: string | null;
       /** Format: int64 */
       sequence: number;
       session_id: string;
@@ -4128,6 +4492,251 @@ export interface operations {
         };
       };
       500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_terminals: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_TerminalProjection"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  create_terminal: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CreateTerminalRequest"];
+      };
+    };
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TerminalProjection"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  close_terminal: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TerminalProjection"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  connect_terminal: {
+    parameters: {
+      query: {
+        token: string;
+        after?: string;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description websocket upgrade */
+      101: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  resize_terminal: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ResizeTerminalRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TerminalProjection"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  terminal_scrollback: {
+    parameters: {
+      query?: {
+        after?: string;
+        limit?: number;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_LogRange"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  signal_terminal: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SignalTerminalRequest"];
+      };
+    };
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  issue_terminal_ticket: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TerminalTicket"];
+        };
+      };
+      401: {
         headers: {
           [name: string]: unknown;
         };

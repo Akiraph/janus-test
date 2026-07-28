@@ -9,7 +9,7 @@ use crate::adapters::git::{GitRunner, SystemGit};
 use crate::modules::workspace_sync::interface::{
     FileMutation, WorkspaceHandle, WorkspaceSyncInterface,
 };
-use crate::platform::id::SessionId;
+use crate::platform::id::{SessionId, ToolCallId, TurnId};
 use crate::platform::path::PathError;
 
 use super::paths::resolve_session_path;
@@ -23,7 +23,11 @@ const MAX_PIXELS: u64 = 100_000_000;
 
 pub struct ToolContext<'a> {
     pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub tool_call_id: ToolCallId,
     pub workspace: &'a WorkspaceSyncInterface,
+    pub runtime: Option<&'a crate::modules::runtime::interface::RuntimeInterface>,
+    pub pool: &'a sqlx::SqlitePool,
     pub actor: Value,
 }
 
@@ -41,6 +45,7 @@ pub async fn execute_tool(
             summary: json!({"error": "TOOL_NOT_ALLOWED", "name": name}),
             error_code: Some("TOOL_NOT_ALLOWED".into()),
             finish_summary: None,
+            wait_state: None,
         });
     }
 
@@ -54,7 +59,13 @@ pub async fn execute_tool(
         "fs.patch" => tool_write(ctx, &handle, input, true).await,
         "fs.remove" => tool_remove(ctx, &handle, input).await,
         "git.inspect" => tool_git_status(&repo).await,
-        "finish" => tool_finish(input),
+        "finish" => tool_finish_checked(ctx, input).await,
+        "bash" => tool_bash(ctx, input).await,
+        "job" => tool_job(ctx, input).await,
+        "service" => tool_service(ctx, input).await,
+        "delegate_cli" => tool_delegate_cli(ctx, input).await,
+        "update_plan" => tool_update_plan(ctx, input).await,
+        "ask_user" => tool_ask_user(ctx, input).await,
         other => Ok(ToolOutcome {
             ok: false,
             parts: vec![ToolResultPart::Text {
@@ -63,6 +74,7 @@ pub async fn execute_tool(
             summary: json!({"error": "TOOL_NOT_ALLOWED"}),
             error_code: Some("TOOL_NOT_ALLOWED".into()),
             finish_summary: None,
+            wait_state: None,
         }),
     }
 }
@@ -122,6 +134,7 @@ async fn tool_list(repo: &Path, input: &Value) -> Result<ToolOutcome, Supervisor
         summary: json!({"count": entries.len()}),
         error_code: None,
         finish_summary: None,
+        wait_state: None,
     })
 }
 
@@ -138,6 +151,7 @@ fn fail_text(msg: &str, code: &str) -> ToolOutcome {
         summary: json!({"error": code, "detail": msg}),
         error_code: Some(code.into()),
         finish_summary: None,
+        wait_state: None,
     }
 }
 
@@ -199,6 +213,7 @@ async fn tool_read(
         summary: json!({"path": raw, "kind": "text", "bytes": text.len()}),
         error_code: None,
         finish_summary: None,
+        wait_state: None,
     })
 }
 
@@ -422,6 +437,7 @@ async fn read_image(
         summary,
         error_code: None,
         finish_summary: None,
+        wait_state: None,
     })
 }
 
@@ -476,6 +492,7 @@ async fn tool_write(
         summary: json!({"path": path, "revision": rev.0}),
         error_code: None,
         finish_summary: None,
+        wait_state: None,
     })
 }
 
@@ -510,6 +527,7 @@ async fn tool_remove(
         summary: json!({"path": path, "revision": rev.0}),
         error_code: None,
         finish_summary: None,
+        wait_state: None,
     })
 }
 
@@ -533,6 +551,7 @@ async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
                 summary,
                 error_code: None,
                 finish_summary: None,
+                wait_state: None,
             })
         }
         Err(e) => Ok(fail_text(
@@ -543,6 +562,8 @@ async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
 }
 
 fn tool_finish(input: &Value) -> Result<ToolOutcome, SupervisorError> {
+    // Async Job-check variant is tool_finish_checked; this keeps the pure
+    // summary path for callers that already verified no unfinished Jobs.
     let summary_text = input
         .get("summary")
         .and_then(|s| s.as_str())
@@ -560,5 +581,587 @@ fn tool_finish(input: &Value) -> Result<ToolOutcome, SupervisorError> {
         summary: finish.clone(),
         error_code: None,
         finish_summary: Some(finish),
+        wait_state: None,
+    })
+}
+
+async fn tool_finish_checked(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    // A Turn cannot complete while it still controls unfinished finite Jobs.
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(1) FROM jobs \
+         WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
+    )
+    .bind(ctx.turn_id.to_string())
+    .fetch_one(ctx.pool)
+    .await
+    .unwrap_or(0);
+    if remaining > 0 {
+        let summary = json!({
+            "waiting_for_job": true,
+            "unfinished_jobs": remaining,
+            "note": "finish deferred until finite Jobs settle",
+        });
+        return Ok(ToolOutcome {
+            ok: true,
+            parts: vec![ToolResultPart::Text {
+                text: format!("finish deferred: {remaining} unfinished job(s)"),
+            }],
+            summary,
+            error_code: None,
+            finish_summary: None,
+            wait_state: Some("waiting_for_job".into()),
+        });
+    }
+    tool_finish(input)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5 runtime tools
+// ---------------------------------------------------------------------------
+
+fn default_limits(timeout_ms: u64) -> crate::modules::runtime::interface::ResourceLimits {
+    crate::modules::runtime::interface::ResourceLimits {
+        timeout_ms,
+        memory_bytes: 256 * 1024 * 1024,
+        cpu_millis: 1_000,
+        pids: 64,
+        temporary_disk_bytes: 128 * 1024 * 1024,
+        open_files: 128,
+    }
+}
+
+fn require_runtime<'a>(
+    ctx: &'a ToolContext<'_>,
+) -> Result<&'a crate::modules::runtime::interface::RuntimeInterface, SupervisorError> {
+    ctx.runtime.ok_or_else(|| {
+        SupervisorError::Internal(anyhow::anyhow!("runtime is not bound to this supervisor"))
+    })
+}
+
+async fn ensure_session_runtime(
+    ctx: &ToolContext<'_>,
+) -> Result<crate::modules::runtime::interface::RuntimeProjection, SupervisorError> {
+    use crate::modules::runtime::interface::{ExecutorKind, NetworkPolicy, RuntimeSpec};
+    use crate::platform::id::RuntimeId;
+
+    let runtime = require_runtime(ctx)?;
+    if let Ok(existing) = runtime.current_runtime(ctx.session_id).await {
+        if let Some(r) = existing {
+            return Ok(r);
+        }
+    }
+    let workspace_root = session_repo(ctx.workspace, ctx.session_id)?;
+    let abs = workspace_root.canonicalize().unwrap_or(workspace_root);
+    let spec = RuntimeSpec::new(
+        RuntimeId::new(),
+        ctx.session_id,
+        ExecutorKind::Local,
+        abs,
+        default_limits(30_000),
+        NetworkPolicy::DenyAll,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("runtime spec: {e}")))?;
+    runtime
+        .ensure_runtime(&spec)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("ensure_runtime: {e}")))
+}
+
+fn working_directory(
+    input: &Value,
+) -> Result<crate::modules::runtime::interface::RelativeWorkingDirectory, SupervisorError> {
+    use crate::modules::runtime::interface::RelativeWorkingDirectory;
+    let raw = input
+        .get("working_directory")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+    RelativeWorkingDirectory::new(raw)
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("working_directory: {e}")))
+}
+
+fn timeout_ms(input: &Value, default: u64) -> u64 {
+    input
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
+    use crate::modules::runtime::interface::{
+        ExecutionEnvironment, ExecutionSpec, NetworkPolicy, ValidatedCommand,
+    };
+    use std::collections::BTreeMap;
+
+    let command = input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("command required")))?;
+    if command.trim().is_empty() {
+        return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
+    }
+    let runtime_proj = ensure_session_runtime(ctx).await?;
+    let runtime = require_runtime(ctx)?;
+    let timeout = timeout_ms(input, 30_000).min(120_000);
+    let spec = ExecutionSpec::new(
+        runtime_proj.id,
+        working_directory(input)?,
+        ValidatedCommand::shell(command)
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("command: {e}")))?,
+        ExecutionEnvironment::new(BTreeMap::new(), vec![])
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("env: {e}")))?,
+        default_limits(timeout),
+        NetworkPolicy::DenyAll,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("execution: {e}")))?;
+
+    let result = runtime
+        .execute_sync(spec)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("bash: {e}")))?;
+
+    let stdout = if result.stdout.len() > 8_000 {
+        format!("{}...[truncated]", &result.stdout[..8_000])
+    } else {
+        result.stdout.clone()
+    };
+    let stderr = if result.stderr.len() > 4_000 {
+        format!("{}...[truncated]", &result.stderr[..4_000])
+    } else {
+        result.stderr.clone()
+    };
+    let exit_code = result.exit.exit_code;
+    let ok = !result.timed_out && exit_code == Some(0);
+    let summary = json!({
+        "exit_code": exit_code,
+        "timed_out": result.timed_out,
+        "duration_ms": result.duration_ms,
+        "truncated": result.truncated,
+        "log_stream_id": result.log_stream_id.to_string(),
+        "stdout_bytes": result.stdout.len(),
+        "stderr_bytes": result.stderr.len(),
+    });
+    let text = format!(
+        "exit={:?} timed_out={} duration_ms={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        exit_code, result.timed_out, result.duration_ms, stdout, stderr
+    );
+    Ok(ToolOutcome {
+        ok,
+        parts: vec![ToolResultPart::Text { text }],
+        summary,
+        error_code: if ok {
+            None
+        } else if result.timed_out {
+            Some("COMMAND_TIMEOUT".into())
+        } else {
+            Some("COMMAND_FAILED".into())
+        },
+        finish_summary: None,
+        wait_state: None,
+    })
+}
+
+async fn tool_job(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
+    use crate::modules::runtime::interface::{
+        ExecutionEnvironment, ExecutionSpec, JobSpec, NetworkPolicy, ValidatedCommand,
+    };
+    use crate::platform::id::JobId;
+    use std::collections::BTreeMap;
+
+    let command = input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("command required")))?;
+    if command.trim().is_empty() {
+        return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
+    }
+    let runtime_proj = ensure_session_runtime(ctx).await?;
+    let runtime = require_runtime(ctx)?;
+    let timeout = timeout_ms(input, 300_000).min(3_600_000);
+    let execution = ExecutionSpec::new(
+        runtime_proj.id,
+        working_directory(input)?,
+        ValidatedCommand::shell(command)
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("command: {e}")))?,
+        ExecutionEnvironment::new(BTreeMap::new(), vec![])
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("env: {e}")))?,
+        default_limits(timeout),
+        NetworkPolicy::DenyAll,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("execution: {e}")))?;
+    let job_id = JobId::new();
+    let spec = JobSpec::new(
+        job_id,
+        ctx.session_id,
+        ctx.turn_id,
+        ctx.tool_call_id,
+        execution,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("job spec: {e}")))?;
+
+    let job = runtime
+        .start_job(spec)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("start_job: {e}")))?;
+
+    let _ = sqlx::query("UPDATE tool_calls SET job_id = ? WHERE id = ?")
+        .bind(job.id.to_string())
+        .bind(ctx.tool_call_id.to_string())
+        .execute(ctx.pool)
+        .await;
+
+    let summary = json!({
+        "job_id": job.id.to_string(),
+        "status": format!("{:?}", job.status).to_ascii_lowercase(),
+        "log_stream_id": job.log_stream_id.to_string(),
+        "command_summary": job.command_summary,
+    });
+    Ok(ToolOutcome {
+        ok: true,
+        parts: vec![ToolResultPart::Text {
+            text: format!("job {} started ({})", job.id, job.command_summary),
+        }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait_state: Some("waiting_for_job".into()),
+    })
+}
+
+async fn tool_service(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
+    use crate::modules::runtime::interface::{
+        ExecutionEnvironment, ExecutionSpec, NetworkPolicy, ServiceImpact, ServiceSpec,
+        ValidatedCommand,
+    };
+    use crate::platform::id::ServiceId;
+    use std::collections::BTreeMap;
+
+    let command = input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("command required")))?;
+    if command.trim().is_empty() {
+        return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
+    }
+    let impact = match input.get("impact").and_then(|v| v.as_str()).unwrap_or("") {
+        "read_only" => ServiceImpact::ReadOnly,
+        "ignored_output" => ServiceImpact::IgnoredOutput,
+        "source_writing" => ServiceImpact::SourceWriting,
+        other => {
+            return Ok(fail_text(
+                &format!("impact must be read_only|ignored_output|source_writing, got {other:?}"),
+                "VALIDATION_FAILED",
+            ));
+        }
+    };
+
+    let runtime_proj = ensure_session_runtime(ctx).await?;
+    let runtime = require_runtime(ctx)?;
+    // Services are long-lived; use a high timeout as a safety ceiling only.
+    let timeout = timeout_ms(input, 3_600_000).min(86_400_000);
+    let execution = ExecutionSpec::new(
+        runtime_proj.id,
+        working_directory(input)?,
+        ValidatedCommand::shell(command)
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("command: {e}")))?,
+        ExecutionEnvironment::new(BTreeMap::new(), vec![])
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("env: {e}")))?,
+        default_limits(timeout),
+        NetworkPolicy::DenyAll,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("execution: {e}")))?;
+    let service_id = ServiceId::new();
+    let spec = ServiceSpec::new(
+        service_id,
+        ctx.session_id,
+        ctx.tool_call_id,
+        impact,
+        execution,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("service spec: {e}")))?;
+
+    let service = runtime
+        .start_service(spec)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("start_service: {e}")))?;
+
+    let _ = sqlx::query("UPDATE tool_calls SET service_id = ? WHERE id = ?")
+        .bind(service.id.to_string())
+        .bind(ctx.tool_call_id.to_string())
+        .execute(ctx.pool)
+        .await;
+
+    let summary = json!({
+        "service_id": service.id.to_string(),
+        "status": format!("{:?}", service.status).to_ascii_lowercase(),
+        "impact": format!("{:?}", impact).to_ascii_lowercase(),
+        "log_stream_id": service.log_stream_id.to_string(),
+        "command_summary": service.command_summary,
+    });
+    // Services do not block the Turn: they are Session-owned and outlive a Turn.
+    Ok(ToolOutcome {
+        ok: true,
+        parts: vec![ToolResultPart::Text {
+            text: format!(
+                "service {} started ({}, impact={:?})",
+                service.id, service.command_summary, impact
+            ),
+        }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait_state: None,
+    })
+}
+
+async fn tool_delegate_cli(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    use crate::modules::runtime::interface::{
+        DeploymentCapabilityProbe, DelegatedCliKind, ExecutionEnvironment, ExecutionSpec,
+        JobSpec, NetworkPolicy, RuntimeCapabilityId, ValidatedCommand,
+    };
+    use crate::platform::id::{CliSessionId, JobId};
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    let cli_raw = input
+        .get("cli")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let cli = match cli_raw {
+        "claude_code" => DelegatedCliKind::ClaudeCode,
+        "codex" => DelegatedCliKind::Codex,
+        other => {
+            return Ok(fail_text(
+                &format!("cli must be claude_code|codex, got {other:?}"),
+                "VALIDATION_FAILED",
+            ));
+        }
+    };
+    let instruction = input
+        .get("instruction")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("instruction required")))?;
+    if instruction.trim().is_empty() {
+        return Ok(fail_text("instruction is empty", "VALIDATION_FAILED"));
+    }
+
+    // Capability probe: refuse when the CLI binary is not on PATH.
+    let probe = DeploymentCapabilityProbe::detect();
+    let available = match cli {
+        DelegatedCliKind::ClaudeCode => probe.claude_code_available,
+        DelegatedCliKind::Codex => probe.codex_available,
+    };
+    if !available {
+        let id = match cli {
+            DelegatedCliKind::ClaudeCode => RuntimeCapabilityId::DelegatedCliClaudeCode,
+            DelegatedCliKind::Codex => RuntimeCapabilityId::DelegatedCliCodex,
+        };
+        return Ok(fail_text(
+            &format!("delegated CLI not available on this host ({id:?})"),
+            "CAPABILITY_UNAVAILABLE",
+        ));
+    }
+
+    let cli_session_id = match input.get("cli_session_id").and_then(|v| v.as_str()) {
+        Some(raw) if !raw.is_empty() => Some(
+            CliSessionId::from_str(raw)
+                .map_err(|_| SupervisorError::Internal(anyhow::anyhow!("invalid cli_session_id")))?,
+        ),
+        _ => None,
+    };
+
+    let runtime_proj = ensure_session_runtime(ctx).await?;
+    let runtime = require_runtime(ctx)?;
+    let timeout = timeout_ms(input, 600_000).min(3_600_000);
+    let execution = ExecutionSpec::new(
+        runtime_proj.id,
+        working_directory(input)?,
+        ValidatedCommand::delegated_cli(cli, instruction, cli_session_id)
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("command: {e}")))?,
+        ExecutionEnvironment::new(BTreeMap::new(), vec![])
+            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("env: {e}")))?,
+        default_limits(timeout),
+        NetworkPolicy::DenyAll,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("execution: {e}")))?;
+
+    let job_id = JobId::new();
+    let spec = JobSpec::new(
+        job_id,
+        ctx.session_id,
+        ctx.turn_id,
+        ctx.tool_call_id,
+        execution,
+    )
+    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("job spec: {e}")))?;
+
+    let job = runtime
+        .start_job(spec)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("start_job: {e}")))?;
+
+    let _ = sqlx::query("UPDATE tool_calls SET job_id = ? WHERE id = ?")
+        .bind(job.id.to_string())
+        .bind(ctx.tool_call_id.to_string())
+        .execute(ctx.pool)
+        .await;
+
+    // Persist CLI session identity for follow-up when the adapter reports one.
+    // Local adapter does not yet emit a new session id; follow-up uses the
+    // caller-supplied cli_session_id when present.
+    let summary = json!({
+        "job_id": job.id.to_string(),
+        "cli": cli_raw,
+        "cli_session_id": cli_session_id.map(|id| id.to_string()),
+        "status": format!("{:?}", job.status).to_ascii_lowercase(),
+        "log_stream_id": job.log_stream_id.to_string(),
+        "command_summary": job.command_summary,
+        "follow_up": cli_session_id.is_some(),
+    });
+    Ok(ToolOutcome {
+        ok: true,
+        parts: vec![ToolResultPart::Text {
+            text: format!(
+                "delegate_cli ({cli_raw}) job {} started{}",
+                job.id,
+                if cli_session_id.is_some() {
+                    " (follow-up)"
+                } else {
+                    ""
+                }
+            ),
+        }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait_state: Some("waiting_for_job".into()),
+    })
+}
+
+async fn tool_update_plan(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    use crate::platform::clock::{Clock, SystemClock, format_utc};
+    use crate::platform::id::TimelineItemId;
+
+    let plan = input.get("plan").cloned().unwrap_or(json!({}));
+    let evidence = input.get("evidence").cloned().unwrap_or(json!([]));
+    let now = format_utc(SystemClock.now());
+    let plan_id = format!("pln_{}", TimelineItemId::new());
+    let next_seq: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM plan_versions WHERE turn_id = ?",
+    )
+    .bind(ctx.turn_id.to_string())
+    .fetch_one(ctx.pool)
+    .await
+    .unwrap_or(1);
+    sqlx::query(
+        "INSERT INTO plan_versions (id, turn_id, sequence, plan_json, evidence_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&plan_id)
+    .bind(ctx.turn_id.to_string())
+    .bind(next_seq)
+    .bind(plan.to_string())
+    .bind(evidence.to_string())
+    .bind(&now)
+    .execute(ctx.pool)
+    .await?;
+
+    let summary = json!({
+        "plan_version_id": plan_id,
+        "sequence": next_seq,
+    });
+    Ok(ToolOutcome {
+        ok: true,
+        parts: vec![ToolResultPart::Json {
+            value: summary.clone(),
+        }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait_state: None,
+    })
+}
+
+async fn tool_ask_user(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    use crate::platform::clock::{Clock, SystemClock, format_utc};
+    use crate::platform::id::AskId;
+
+    let prompt = input
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    if prompt.trim().is_empty() {
+        return Ok(fail_text("prompt is required", "VALIDATION_FAILED"));
+    }
+    let mode = input
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("blocking");
+    if mode != "blocking" && mode != "best_effort" {
+        return Ok(fail_text(
+            "mode must be blocking|best_effort",
+            "VALIDATION_FAILED",
+        ));
+    }
+    let choices = input.get("choices").cloned().unwrap_or(json!([]));
+    let default = input.get("default").cloned();
+    let expires_at = input.get("expires_in_ms").and_then(|v| v.as_u64()).map(|ms| {
+        let ts = SystemClock.now() + chrono::Duration::milliseconds(ms as i64);
+        format_utc(ts)
+    });
+    let ask_id = AskId::new();
+    let now = format_utc(SystemClock.now());
+    sqlx::query(
+        "INSERT INTO asks \
+         (id, turn_id, tool_call_id, mode, prompt_json, choices_json, default_json, \
+          answer_json, status, expires_at, answered_at, version, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'open', ?, NULL, ?, ?, ?)",
+    )
+    .bind(ask_id.to_string())
+    .bind(ctx.turn_id.to_string())
+    .bind(ctx.tool_call_id.to_string())
+    .bind(mode)
+    .bind(json!({"text": prompt}).to_string())
+    .bind(choices.to_string())
+    .bind(default.as_ref().map(|v| v.to_string()))
+    .bind(expires_at.as_deref())
+    .bind(format!("v_{}", AskId::new()))
+    .bind(&now)
+    .bind(&now)
+    .execute(ctx.pool)
+    .await?;
+
+    let summary = json!({
+        "ask_id": ask_id.to_string(),
+        "mode": mode,
+        "prompt": prompt,
+        "expires_at": expires_at,
+    });
+    Ok(ToolOutcome {
+        ok: true,
+        parts: vec![ToolResultPart::Text {
+            text: format!("ask_user ({mode}): {prompt}"),
+        }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait_state: if mode == "blocking" {
+            Some("waiting_for_ask".into())
+        } else {
+            None
+        },
     })
 }

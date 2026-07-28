@@ -2,6 +2,7 @@ import GitCompare from "lucide-solid/icons/git-compare";
 import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
 import Send from "lucide-solid/icons/send";
+import TerminalSquare from "lucide-solid/icons/terminal-square";
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
 import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
@@ -11,6 +12,9 @@ import { Select } from "../../../components/ui/Select";
 import type { SessionSummary } from "../../../lib/api";
 import { postSessionMessage } from "../../../lib/api";
 import { useProviders, useSession, useSessionDiff, useSessionTimeline } from "../../../lib/queries";
+import { useIsMobile } from "../../../lib/viewport";
+import { LazyTerminalPanel } from "./LazyTerminalPanel";
+import { ContextCompactPanel, renderSpecializedCard } from "./SessionCards";
 
 export type SessionSubView = "main" | "diff";
 
@@ -76,6 +80,15 @@ export function SessionTabView(props: SessionTabViewProps) {
   // the composer matches the legacy shape, wired when the contract grows.
   const [modelId, setModelId] = createSignal("");
   const [reasoning, setReasoning] = createSignal<ReasoningEffort>("medium");
+  // Desktop-only secondary surfaces, opened on demand.
+  // Context/Compact: focused panel over the timeline (no public Compact HTTP
+  //   yet — the panel renders an honest empty state until the supervisor
+  //   publishes context/compact timeline projections, see ContextCompactPanel).
+  // Terminal: a separate fully-hidden pane; the emulator only mounts while this
+  //   pane is active and is excluded on small screens via LazyTerminalPanel.
+  const [contextOpen, setContextOpen] = createSignal(false);
+  const [terminalOpen, setTerminalOpen] = createSignal(false);
+  const isMobile = useIsMobile();
   let scroller: HTMLDivElement | undefined;
   let textareaEl: HTMLTextAreaElement | undefined;
 
@@ -202,7 +215,34 @@ export function SessionTabView(props: SessionTabViewProps) {
             <span class="session-doc__subtab-count">{diffFiles().length}</span>
           </Show>
         </button>
+        {/* Desktop-only Session Terminal sub-tab. The emulator mounts lazily and
+            is entirely omitted on small screens (the panel renders an
+            intentional unavailable state instead). */}
+        <Show when={!isMobile()}>
+          <button
+            type="button"
+            role="tab"
+            class="session-doc__subtab"
+            classList={{ "session-doc__subtab--active": terminalOpen() }}
+            aria-selected={terminalOpen()}
+            onClick={() => setTerminalOpen((v) => !v)}
+          >
+            <TerminalSquare size={14} />
+            Terminal
+          </button>
+        </Show>
         <div class="session-doc__subtabs-spacer" />
+        {/* Context / Compact panel toggle — works on every viewport because it
+            only surfaces projected state, never the emulator. */}
+        <Button
+          variant={contextOpen() ? "outline" : "ghost"}
+          size="sm"
+          aria-pressed={contextOpen()}
+          aria-label="Toggle context and Compact panel"
+          onClick={() => setContextOpen((v) => !v)}
+        >
+          Context
+        </Button>
         <Badge
           variant={
             sess().state === "active" ? "warning" : sess().state === "ready" ? "success" : "warning"
@@ -258,6 +298,16 @@ export function SessionTabView(props: SessionTabViewProps) {
             />
           </Show>
         </div>
+
+        {/* Context / Compact panel — overlay alongside the timeline when open.
+            Surfaces an honest empty state because no public Compact HTTP route
+            exists yet; once the supervisor publishes context/compact timeline
+            projections the panel reads them via ContextCompactPanel. */}
+        <ContextCompactPanel
+          items={items()}
+          open={contextOpen() && props.subView() === "main"}
+          onClose={() => setContextOpen(false)}
+        />
 
         <form
           class="session-composer"
@@ -333,11 +383,32 @@ export function SessionTabView(props: SessionTabViewProps) {
         </form>
       </div>
 
+      {/* Session Terminal pane — fully distinct from Main/Diff. Desktop-only:
+          LazyTerminalPanel renders an intentional unavailable state on small
+          screens, so the pane itself stays mountable on every viewport. The
+          emulator only loads while this pane is visible (active=terminalOpen). */}
+      <div
+        class="session-doc__terminal"
+        classList={{ "session-doc__pane--hidden": !terminalOpen() }}
+      >
+        <LazyTerminalPanel
+          projectId={props.projectId}
+          ownerKind="session"
+          ownerId={props.sessionId}
+          warnAgentCopy
+          active={terminalOpen}
+          title="Session Terminal"
+        />
+      </div>
+
       <div
         class="session-doc__diff"
         classList={{ "session-doc__pane--hidden": props.subView() !== "diff" }}
       >
-        <p class="session-doc__diff-note">Read-only in M3. Apply / Sync enable in M5.</p>
+        <p class="session-doc__diff-note">
+          Reviewing changes against the project main branch. Applying and syncing changes becomes
+          available once collaboration controls ship.
+        </p>
         <div class="session-doc__diff-badges">
           <Badge>Apply disabled</Badge>
           <Badge>Sync disabled</Badge>
@@ -467,7 +538,11 @@ function TimelineCard(props: { kind: string; projection: unknown }) {
     );
   }
 
-  // Legacy supervisor output: left rail, plain text block (no card header).
+  // Assistant output begins as left-rail text; if this item carries one of
+  // the M4 specialized cards (plan / ask / model / job / service), render that
+  // instead. Specialized detection keys off the timeline `kind` and, for the
+  // `tool_call` kind, the `tool_name` field the supervisor stamps on the
+  // projection. Unknown tool calls fall back to the generic tool block below.
   if (props.kind === "assistant_message") {
     return (
       <div class="session-msg session-msg--assistant">
@@ -478,6 +553,11 @@ function TimelineCard(props: { kind: string; projection: unknown }) {
   }
 
   if (props.kind === "tool_call") {
+    const specialized = renderSpecializedCard({
+      kind: props.kind,
+      projection: props.projection,
+    });
+    if (specialized) return specialized;
     return (
       <div class="session-msg session-msg--tool">
         <header>
@@ -485,6 +565,22 @@ function TimelineCard(props: { kind: string; projection: unknown }) {
           <Badge>{projection().status ?? "unknown"}</Badge>
         </header>
         <pre>{JSON.stringify(projection().summary ?? {}, null, 2)}</pre>
+      </div>
+    );
+  }
+
+  // Steer is a durable control the user injected mid-Turn; render it as a
+  // quiet, attributed line so the timeline shows it without restoring a
+  // dedicated control surface (steer HTTP is not yet public).
+  if (props.kind === "steer") {
+    const steer = () => (props.projection ?? {}) as { kind?: string; text?: string };
+    return (
+      <div class="session-msg session-msg--steer" role="note" aria-label="Steer">
+        <span class="session-msg__dot" aria-hidden="true" />
+        <div class="session-msg__body">
+          <span class="muted">steer · </span>
+          {steer().text ?? ""}
+        </div>
       </div>
     );
   }

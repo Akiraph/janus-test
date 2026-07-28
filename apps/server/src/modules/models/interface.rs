@@ -4,14 +4,14 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
 use thiserror::Error;
 use url::Url;
 use utoipa::ToSchema;
 
 use crate::platform::{
     clock::format_utc,
-    id::ProviderId,
+    id::{ModelId, ProviderId},
     secret::{Secret, SecretCipher, fingerprint, mask_key},
 };
 
@@ -91,6 +91,27 @@ pub struct EmbeddedModelView {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelView {
+    pub id: String,
+    pub provider_id: String,
+    pub display_name: String,
+    pub upstream_model_id: String,
+    pub context_limit: u32,
+    pub supports_images: bool,
+    pub supports_tools: bool,
+    pub parameters: serde_json::Value,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelFailoverView {
+    pub primary_model_id: String,
+    pub candidates: Vec<String>,
+}
+
 impl EmbeddedModelInput {
     fn to_view(&self) -> EmbeddedModelView {
         EmbeddedModelView {
@@ -139,6 +160,21 @@ pub(crate) struct ProviderRow {
     pub updated_at: String,
 }
 
+#[derive(FromRow)]
+struct ModelRow {
+    id: String,
+    provider_id: String,
+    display_name: String,
+    upstream_model_id: String,
+    context_limit: i64,
+    supports_images: i64,
+    supports_tools: i64,
+    parameters_json: String,
+    enabled: i64,
+    created_at: String,
+    updated_at: String,
+}
+
 impl ModelsInterface {
     pub fn new(pool: SqlitePool, cipher: SecretCipher) -> anyhow::Result<Self> {
         Ok(Self {
@@ -155,6 +191,111 @@ impl ModelsInterface {
         let rows = sqlx::query_as::<_, ProviderRow>("SELECT id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE owner_id = ? ORDER BY display_name")
             .bind(owner_id).fetch_all(&self.pool).await?;
         rows.into_iter().map(provider_view).collect()
+    }
+
+    pub async fn models(&self, owner_id: &str) -> Result<Vec<ModelView>, ModelsError> {
+        let rows = sqlx::query_as::<_, ModelRow>(
+            "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
+             model.context_limit, model.supports_images, model.supports_tools, model.parameters_json, \
+             model.enabled, model.created_at, model.updated_at FROM models AS model \
+             JOIN model_providers AS provider ON provider.id = model.provider_id \
+             WHERE provider.owner_id = ? ORDER BY provider.display_name, model.display_name",
+        )
+        .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(model_view).collect()
+    }
+
+    pub async fn set_failover(
+        &self,
+        owner_id: &str,
+        primary_model_id: &str,
+        candidates: Vec<String>,
+    ) -> Result<ModelFailoverView, ModelsError> {
+        if candidates.len() > 2 {
+            return Err(ModelsError::Validation(
+                "a primary model supports at most two ordered fallback candidates".into(),
+            ));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        for candidate in &candidates {
+            if candidate == primary_model_id || !unique.insert(candidate.as_str()) {
+                return Err(ModelsError::Validation(
+                    "failover candidates must be unique and cannot contain the primary".into(),
+                ));
+            }
+        }
+        let mut ids = Vec::with_capacity(candidates.len() + 1);
+        ids.push(primary_model_id);
+        ids.extend(candidates.iter().map(String::as_str));
+        for id in ids {
+            let belongs: i64 = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM models AS model JOIN model_providers AS provider \
+                 ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ? \
+                 AND model.enabled = 1 AND provider.enabled = 1)",
+            )
+            .bind(id)
+            .bind(owner_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if belongs == 0 {
+                return Err(ModelsError::Validation(
+                    "every failover model must be enabled and owned by the current owner".into(),
+                ));
+            }
+        }
+        let now = format_utc(Utc::now());
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM model_failover WHERE primary_model_id = ?")
+            .bind(primary_model_id)
+            .execute(&mut *tx)
+            .await?;
+        for (ordinal, candidate) in candidates.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO model_failover \
+                 (primary_model_id, candidate_model_id, ordinal, created_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(primary_model_id)
+            .bind(candidate)
+            .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(ModelFailoverView {
+            primary_model_id: primary_model_id.into(),
+            candidates,
+        })
+    }
+
+    pub async fn failover(
+        &self,
+        owner_id: &str,
+        primary_model_id: &str,
+    ) -> Result<ModelFailoverView, ModelsError> {
+        let belongs: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM models AS model JOIN model_providers AS provider \
+             ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ?)",
+        )
+        .bind(primary_model_id)
+        .bind(owner_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if belongs == 0 {
+            return Err(ModelsError::ProviderNotFound);
+        }
+        let candidates = sqlx::query_scalar::<_, String>(
+            "SELECT candidate_model_id FROM model_failover WHERE primary_model_id = ? ORDER BY ordinal",
+        )
+        .bind(primary_model_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ModelFailoverView {
+            primary_model_id: primary_model_id.into(),
+            candidates,
+        })
     }
 
     pub async fn create_provider(
@@ -175,8 +316,12 @@ impl ModelsInterface {
                 .map(EmbeddedModelInput::to_view)
                 .collect::<Vec<_>>(),
         )?;
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO model_providers (id, owner_id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&id).bind(owner_id).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(&self.pool).await?;
+            .bind(&id).bind(owner_id).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(&mut *tx).await?;
+        self.sync_normalized_models(&mut tx, &id, &input.models, &now)
+            .await?;
+        tx.commit().await?;
         self.provider(owner_id, &id).await
     }
 
@@ -208,11 +353,16 @@ impl ModelsInterface {
                 .map(EmbeddedModelInput::to_view)
                 .collect::<Vec<_>>(),
         )?;
+        let now = format_utc(Utc::now());
+        let mut tx = self.pool.begin().await?;
         let changed = sqlx::query("UPDATE model_providers SET kind=?, display_name=?, base_url=?, api_key_ciphertext=?, api_key_fingerprint=?, api_key_preview=?, models_json=?, enabled=?, updated_at=? WHERE id=? AND owner_id=?")
-            .bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(format_utc(Utc::now())).bind(id).bind(owner_id).execute(&self.pool).await?.rows_affected();
+            .bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(&mut *tx).await?.rows_affected();
         if changed == 0 {
             return Err(ModelsError::ProviderNotFound);
         }
+        self.sync_normalized_models(&mut tx, id, &input.models, &now)
+            .await?;
+        tx.commit().await?;
         self.provider(owner_id, id).await
     }
 
@@ -397,6 +547,66 @@ impl ModelsInterface {
         Ok(())
     }
 
+    async fn sync_normalized_models(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        provider_id: &str,
+        inputs: &[EmbeddedModelInput],
+        now: &str,
+    ) -> Result<(), ModelsError> {
+        let existing: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id, display_name, upstream_model_id FROM models WHERE provider_id = ?",
+        )
+        .bind(provider_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut retained = std::collections::BTreeSet::new();
+        for input in inputs {
+            let display_name = input.display_name.trim();
+            let upstream_model_id = input.upstream_model_id.trim();
+            let existing_id = existing
+                .iter()
+                .find(|(_, _, upstream)| upstream == upstream_model_id)
+                .or_else(|| {
+                    existing
+                        .iter()
+                        .find(|(_, display, _)| display == display_name)
+                })
+                .map(|(id, _, _)| id.clone());
+            let id = existing_id.unwrap_or_else(|| ModelId::new().to_string());
+            retained.insert(id.clone());
+            sqlx::query(
+                "INSERT INTO models \
+                 (id, provider_id, display_name, upstream_model_id, context_limit, supports_images, \
+                  supports_tools, parameters_json, enabled, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, 1, '{}', ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, \
+                  upstream_model_id=excluded.upstream_model_id, context_limit=excluded.context_limit, \
+                  supports_images=excluded.supports_images, enabled=excluded.enabled, updated_at=excluded.updated_at",
+            )
+            .bind(&id)
+            .bind(provider_id)
+            .bind(display_name)
+            .bind(upstream_model_id)
+            .bind(if input.supports_1m { 1_000_000 } else { 200_000 })
+            .bind(input.supports_images)
+            .bind(input.enabled)
+            .bind(now)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        for (id, _, _) in existing {
+            if !retained.contains(&id) {
+                sqlx::query("DELETE FROM models WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     fn encrypt_key(
         &self,
         owner_id: &str,
@@ -541,6 +751,23 @@ fn provider_view(row: ProviderRow) -> Result<ProviderView, ModelsError> {
         api_key_fingerprint: row.api_key_fingerprint,
         api_key_preview: row.api_key_preview,
         models,
+        enabled: row.enabled != 0,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn model_view(row: ModelRow) -> Result<ModelView, ModelsError> {
+    Ok(ModelView {
+        id: row.id,
+        provider_id: row.provider_id,
+        display_name: row.display_name,
+        upstream_model_id: row.upstream_model_id,
+        context_limit: u32::try_from(row.context_limit)
+            .map_err(|_| ModelsError::Validation("invalid stored context limit".into()))?,
+        supports_images: row.supports_images != 0,
+        supports_tools: row.supports_tools != 0,
+        parameters: serde_json::from_str(&row.parameters_json)?,
         enabled: row.enabled != 0,
         created_at: row.created_at,
         updated_at: row.updated_at,

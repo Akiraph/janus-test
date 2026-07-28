@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
+pub use crate::modules::runtime::interface::{
+    CapabilityReason, CapabilityScope, CapabilityState, RuntimeCapability, RuntimeCapabilityId,
+};
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LiveResponse {
     pub status: &'static str,
@@ -70,35 +74,6 @@ pub struct DatabaseInfo {
 pub struct EventInfo {
     pub min_cursor: String,
     pub max_cursor: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct RuntimeCapability {
-    pub id: &'static str,
-    pub scope: &'static str,
-    pub state: CapabilityState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<CapabilityReason>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityState {
-    Ready,
-    Degraded,
-    Unconfigured,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CapabilityReason {
-    LocalExecutor,
-    ConfigMissing,
-    DependencyMissing,
-    PlatformUnsupported,
-    PolicyDisabled,
-    ProbeFailed,
 }
 
 #[derive(Debug, Deserialize)]

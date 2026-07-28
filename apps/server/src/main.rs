@@ -33,11 +33,15 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
+    // Hold ready=503 until the recovery steps below finish. initialize() leaves
+    // the flag true for unit tests; main flips it off for the real process.
+    state.begin_startup_recovery();
 
     // Startup recovery (`DAT-RECOVER-01` subset): clean leftover incoming temp
     // objects from a crashed write, and mark operations left `running` by a
     // prior process as `needs_attention` so a client can re-issue them rather
     // than the control plane guessing whether a half-done clone happened.
+    // Runtime + supervisor recovery already ran inside AppState::initialize.
     if let Err(error) = state.blobs().clean_incoming().await {
         warn!(%error, "clean incoming objects on startup");
     }
@@ -54,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
     }
+    state.mark_recovery_complete();
 
     state
         .events()
@@ -69,16 +74,26 @@ async fn main() -> anyhow::Result<()> {
         .context("record system startup event")?;
 
     workers::spawn(state.clone());
+    workers::spawn_job_wake(state.clone());
 
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind Janus listener at {bind}"))?;
     info!(address = %listener.local_addr()?, "janus control plane ready");
 
+    // Capture state for the post-serve graceful shutdown path. axum stops
+    // accepting once `shutdown_signal` fires; we then bound-stop live Runtimes
+    // before dropping the process so Local process groups do not leak.
+    let shutdown_state = state.clone();
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serve Janus")?;
+    janus_server::application::lifecycle::graceful_shutdown(
+        &shutdown_state,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     Ok(())
 }
 

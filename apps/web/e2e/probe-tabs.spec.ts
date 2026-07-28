@@ -18,7 +18,11 @@ async function mockProjectShell(page: import("@playwright/test").Page) {
           development_auth: true,
           webauthn_rp_name: "Janus",
           version: "0.1.0",
-          limits: { max_file_bytes: 20_971_520, max_message_bytes: 26_214_400, max_attachments: 20 },
+          limits: {
+            max_file_bytes: 20_971_520,
+            max_message_bytes: 26_214_400,
+            max_attachments: 20,
+          },
         },
       },
     });
@@ -41,7 +45,7 @@ async function mockProjectShell(page: import("@playwright/test").Page) {
     await route.fulfill({
       status: 200,
       contentType: "text/event-stream",
-      body: "event: cursor\ndata: {\"cursor\":\"0\"}\n\n",
+      body: 'event: cursor\ndata: {"cursor":"0"}\n\n',
     });
   });
   // project fetch
@@ -142,7 +146,9 @@ async function mockProjectShell(page: import("@playwright/test").Page) {
 test("tabs close when X clicked (Bug 1)", async ({ page }) => {
   test.setTimeout(60_000);
   await mockProjectShell(page);
-  await page.goto(`http://127.0.0.1:5173/projects/${PROJECT_ID}`, { waitUntil: "domcontentloaded" });
+  await page.goto(`http://127.0.0.1:5173/projects/${PROJECT_ID}`, {
+    waitUntil: "domcontentloaded",
+  });
   await page.waitForSelector(".ide-shell", { timeout: 15000 });
   await page.waitForSelector(".ide-tree-item", { timeout: 10000 });
   await page.waitForTimeout(400);
@@ -171,7 +177,9 @@ test("tabs close when X clicked (Bug 1)", async ({ page }) => {
   expect(tabCountAfterClose).toBe(1);
 });
 
-test("legacy workspace shell exposes SCM and selectable Git Graph details", async ({ page }, testInfo) => {
+test("legacy workspace shell exposes SCM and selectable Git Graph details", async ({
+  page,
+}, testInfo) => {
   test.setTimeout(60_000);
   await mockProjectShell(page);
   await page.goto(`/projects/${PROJECT_ID}`, { waitUntil: "domcontentloaded" });

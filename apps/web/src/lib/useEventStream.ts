@@ -88,9 +88,15 @@ export function useEventStream() {
       type === "timeline.item_created" ||
       type === "timeline.item_updated" ||
       type === "model.stream_delta" ||
+      type === "model.attempt_changed" ||
       type === "tool_call.created" ||
       type === "tool_call.changed" ||
-      type === "round.changed"
+      type === "round.changed" ||
+      type === "ask.changed" ||
+      type === "job.changed" ||
+      type === "service.changed" ||
+      type === "context.changed" ||
+      type === "log.advanced"
     ) {
       const sessionId =
         (resourceKind === "session" ? resourceId : undefined) ??
@@ -99,6 +105,8 @@ export function useEventStream() {
         void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["session-timeline", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["session-diff", sessionId] });
+        void queryClient.invalidateQueries({ queryKey: ["turn", sessionId] });
+        void queryClient.invalidateQueries({ queryKey: ["terminals", "session", sessionId] });
       }
       // Project session lists are keyed by project id when known.
       const projectId = (payload as { project_id?: string }).project_id;
@@ -106,6 +114,35 @@ export function useEventStream() {
         void queryClient.invalidateQueries({ queryKey: ["sessions", projectId] });
       } else {
         void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      }
+      // Job/Service/Ask resource ids still land in the Session document via timeline.
+      if (
+        resourceKind === "job" ||
+        resourceKind === "service" ||
+        resourceKind === "ask" ||
+        resourceKind === "tool_call"
+      ) {
+        void queryClient.invalidateQueries({ queryKey: ["session-timeline"] });
+      }
+      return;
+    }
+
+    if (type === "terminal.changed") {
+      const terminalId =
+        (resourceKind === "terminal" ? resourceId : undefined) ??
+        (payload as { terminal_id?: string }).terminal_id;
+      if (terminalId) {
+        void queryClient.invalidateQueries({ queryKey: ["terminal", terminalId] });
+      }
+      const ownerKind = (payload as { owner_kind?: string }).owner_kind;
+      const ownerId =
+        (payload as { owner_id?: string; project_id?: string; session_id?: string }).owner_id ??
+        (payload as { project_id?: string }).project_id ??
+        (payload as { session_id?: string }).session_id;
+      if (ownerKind && ownerId) {
+        void queryClient.invalidateQueries({ queryKey: ["terminals", ownerKind, ownerId] });
+      } else {
+        void queryClient.invalidateQueries({ queryKey: ["terminals"] });
       }
     }
   };

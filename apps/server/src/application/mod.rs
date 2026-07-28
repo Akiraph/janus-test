@@ -5,4 +5,7 @@
 //! owning Module's handler, so clone/delete/git operations survive HTTP
 //! disconnects and process restarts (`DAT-OP-01/02`).
 
+pub mod lifecycle;
+pub mod runtime_events;
+pub mod session_flow;
 pub mod workers;

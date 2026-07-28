@@ -4,8 +4,8 @@ import { createEffect, createSignal, For, Show } from "solid-js";
 import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
-import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import { useNotifications } from "../../../components/ui/notifications";
+import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { GitUpdateConflictView } from "../../../lib/api";
 import {
   gitCommit,

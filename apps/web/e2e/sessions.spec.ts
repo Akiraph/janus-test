@@ -195,6 +195,89 @@ async function mockSessionApis(page: import("@playwright/test").Page) {
               version: "v1",
               created_at: new Date().toISOString(),
             },
+            // M4 specialized cards surface from `tool_call` timeline items keyed
+            // by `tool_name`. One of each kind so the desktop test asserts the
+            // cards render in the timeline without needing public control HTTP.
+            {
+              id: "tl-4",
+              session_id: sessionId,
+              turn_id: "turn-1",
+              kind: "tool_call",
+              source_resource_id: "tc-plan",
+              display_order: 4,
+              projection: {
+                kind: "tool_call",
+                tool_name: "update_plan",
+                status: "succeeded",
+                summary: {
+                  plan_version_id: "pln-1",
+                  sequence: 1,
+                  plan: { title: "Demo plan", steps: [{ text: "Step 1" }] },
+                },
+              },
+              status: "active",
+              version: "v1",
+              created_at: new Date().toISOString(),
+            },
+            {
+              id: "tl-5",
+              session_id: sessionId,
+              turn_id: "turn-1",
+              kind: "tool_call",
+              source_resource_id: "tc-ask",
+              display_order: 5,
+              projection: {
+                kind: "tool_call",
+                tool_name: "ask_user",
+                status: "succeeded",
+                summary: {
+                  prompt: "Which file should I edit?",
+                  mode: "blocking",
+                  status: "open",
+                },
+              },
+              status: "active",
+              version: "v1",
+              created_at: new Date().toISOString(),
+            },
+            {
+              id: "tl-6",
+              session_id: sessionId,
+              turn_id: "turn-1",
+              kind: "tool_call",
+              source_resource_id: "tc-job",
+              display_order: 6,
+              projection: {
+                kind: "tool_call",
+                tool_name: "job",
+                status: "running",
+                summary: { job_id: "job-1", command_summary: "cargo build" },
+              },
+              status: "active",
+              version: "v1",
+              created_at: new Date().toISOString(),
+            },
+            {
+              id: "tl-7",
+              session_id: sessionId,
+              turn_id: "turn-1",
+              kind: "tool_call",
+              source_resource_id: "tc-svc",
+              display_order: 7,
+              projection: {
+                kind: "tool_call",
+                tool_name: "service",
+                status: "starting",
+                summary: {
+                  service_id: "svc-1",
+                  command_summary: "vite dev",
+                  impact: "source_writing",
+                },
+              },
+              status: "active",
+              version: "v1",
+              created_at: new Date().toISOString(),
+            },
           ],
           oldest_cursor: "1",
           newest_cursor: "3",
@@ -211,7 +294,7 @@ async function mockSessionApis(page: import("@playwright/test").Page) {
         data: {
           apply_enabled: false,
           sync_enabled: false,
-          note: "Apply/Sync land in M5",
+          note: "Apply and sync controls are not available yet.",
           summary: {
             files: [{ path: "hello.txt", change: "added" }],
           },
@@ -246,10 +329,11 @@ for (const viewport of viewports) {
 
     // Sessions activity rail + list (sidebar)
     await expect(page.getByRole("button", { name: "Sessions" }).first()).toBeVisible();
-    await expect(page.getByRole("button", { name: /Demo chat/i })).toBeVisible();
+    const sessionRow = page.getByRole("button", { name: "Demo chat", exact: true });
+    await expect(sessionRow).toBeVisible();
 
     // Open as a main-area tab (not a route change)
-    await page.getByRole("button", { name: /Demo chat/i }).click();
+    await sessionRow.click();
     await expect(
       page.getByRole("tablist", { name: "Open documents" }).getByRole("tab").filter({
         hasText: "Demo chat",
@@ -260,6 +344,36 @@ for (const viewport of viewports) {
     await expect(page.getByText("List the files")).toBeVisible();
     await expect(page.getByText("fs.list")).toBeVisible();
     await expect(page.getByText("Found README.md and src/.")).toBeVisible();
+
+    // M4 specialized cards render from tool_call timeline items (Stage 9). Ask /
+    // Plan / Job / Service cards all surface from the timeline projection on
+    // every viewport — they carry no emulator dependency.
+    await expect(page.getByRole("article", { name: "Plan" })).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.getByRole("article", { name: "Ask" })).toBeVisible();
+    await expect(page.getByRole("article", { name: "Job" })).toBeVisible();
+    await expect(page.getByRole("article", { name: "Service" })).toBeVisible();
+
+    // Context / Compact panel is a toolbar toggle that overlays the timeline.
+    // It opens an honest empty state because no public Compact HTTP exists yet.
+    await page.getByRole("button", { name: "Toggle context and Compact panel" }).click();
+    await expect(page.getByRole("complementary", { name: "Context and Compact" })).toBeVisible();
+    await expect(page.getByText(/No Compact summary yet/i)).toBeVisible();
+    await page.getByRole("button", { name: "Toggle context and Compact panel" }).click();
+    await expect(page.getByRole("complementary", { name: "Context and Compact" })).toBeHidden();
+
+    // Session Terminal sub-tab is desktop-only. On small screens the tab button
+    // must not exist at all (the emulator never mounts).
+    if (viewport.name === "desktop") {
+      await expect(
+        page.getByRole("tablist", { name: "Session views" }).getByRole("tab", { name: "Terminal" }),
+      ).toBeVisible();
+    } else {
+      await expect(
+        page.getByRole("tablist", { name: "Session views" }).getByRole("tab", { name: "Terminal" }),
+      ).toHaveCount(0);
+    }
 
     // Diff is a Session sub-tab (UX-SES-02). Name may include a count badge ("Diff 1").
     await page
@@ -273,8 +387,8 @@ for (const viewport of viewports) {
       .getByRole("tablist", { name: "Session views" })
       .getByRole("tab", { name: /^Main$/i })
       .click();
-    await page.getByPlaceholder(/Message the Supervisor/i).fill("Thanks");
-    await page.getByRole("button", { name: "Send" }).click();
+    await page.getByPlaceholder(/Send a message/i).fill("Thanks");
+    await page.getByRole("button", { name: "Send message" }).click();
 
     const overflow = await page.evaluate(
       () => document.documentElement.scrollWidth > document.documentElement.clientWidth,

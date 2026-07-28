@@ -144,9 +144,10 @@ pub async fn delete_session(
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
     let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
-    state
-        .sessions()
-        .delete_session(session_id, actor)
+    // Runtime cleanup first (Jobs/Services/Terminals/Runtime), then the durable
+    // Session row + workspace copy. Lives in application so sessions does not
+    // depend on the runtime module.
+    crate::application::lifecycle::delete_session_with_runtime(&state, session_id, actor)
         .await
         .map_err(sessions_problem)?;
     Ok(StatusCode::NO_CONTENT)
@@ -182,17 +183,44 @@ pub async fn post_message(
         .await
         .map_err(sessions_problem)?;
 
-    // Spawn turn execution in the background with the authenticated owner.
-    let turn_id: TurnId = data
-        .turn_id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::INTERNAL_ERROR, "invalid turn id"))?;
-    let supervisor = state.supervisor_for_owner(&auth.owner_id);
-    tokio::spawn(async move {
-        if let Err(error) = supervisor.execute_turn(turn_id).await {
-            tracing::error!(%error, %turn_id, "execute_turn failed");
-        }
-    });
+    // Route the message through the M4 state machine: started -> execute the
+    // Turn now; queued behind an active Turn -> nothing to run (promoted later);
+    // awaiting_handoff (active Turn is `waiting_for_job`) -> perform the atomic
+    // Handoff in `application::session_flow` and execute the successor Turn.
+    let content = body.content.clone();
+    let owner_id = auth.owner_id.clone();
+    let outcome = state
+        .clone()
+        .handle_message(session_id, data.clone(), &content, &owner_id)
+        .await
+        .map_err(sessions_problem)?;
+    if let Some(run_turn) = outcome.run_turn {
+        let supervisor = state.supervisor_for_owner(&owner_id);
+        let sess_state = state.clone();
+        let sess_session_id = session_id;
+        let sess_owner_id = owner_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = supervisor.execute_turn(run_turn).await {
+                tracing::error!(%error, turn_id = %run_turn, "execute_turn failed");
+            }
+            // After the Turn settles, drain the FIFO queue: completed/canceled
+            // promote the next queued Turn (supervisor re-enters it); the queue
+            // stays paused for failed/interrupted. promote_oldest_queued is a
+            // no-op when the queue is empty or the slot is held.
+            if let Some(next) = sess_state
+                .sessions()
+                .promote_oldest_queued(sess_session_id)
+                .await
+                .ok()
+                .flatten()
+            {
+                let supervisor = sess_state.supervisor_for_owner(&sess_owner_id);
+                if let Err(error) = supervisor.execute_turn(next).await {
+                    tracing::error!(%error, turn_id = %next, "promoted execute_turn failed");
+                }
+            }
+        });
+    }
 
     Ok(Json(DataResponse { data }))
 }
@@ -286,7 +314,7 @@ pub async fn session_diff(
     let data = serde_json::json!({
         "apply_enabled": false,
         "sync_enabled": false,
-        "note": "Apply/Sync land in M5",
+        "note": "Apply and sync controls are not available yet.",
         "summary": summary,
     });
     Ok(Json(DataResponse { data }))

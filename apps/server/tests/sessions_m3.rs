@@ -1,5 +1,7 @@
 //! Stage 2: sessions projection — TST-SES-01 / TST-SES-03.
 
+mod support;
+
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -45,11 +47,7 @@ impl Fixture {
         std::fs::create_dir_all(main_abs.join("src"))?;
         std::fs::write(main_abs.join("README.md"), b"# main\n")?;
         std::fs::write(main_abs.join("src").join("lib.rs"), b"fn main() {}\n")?;
-        std::fs::create_dir_all(main_abs.join(".git"))?;
-        std::fs::write(
-            main_abs.join(".git").join("HEAD"),
-            b"ref: refs/heads/main\n",
-        )?;
+        support::init_git_repo(&main_abs)?;
 
         let _ = sync
             .ensure_main_copy(
@@ -164,7 +162,11 @@ async fn tst_ses_01_create_and_delete_session() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// TST-SES-03: second message while turn running is rejected.
+/// TST-SES-03: a second message while a Turn is active is queued (M4 state
+/// machine). M3 used to reject with `ActiveTurnExists`; M4 routes it as
+/// `queued`. The single-active-Turn invariant is still preserved by the
+/// `turns_one_active_per_session` partial index, and the queued Turn only
+/// becomes active once the predecessor settles and the queue is promoted.
 #[tokio::test]
 async fn tst_ses_03_single_active_turn() -> anyhow::Result<()> {
     let fx = Fixture::new().await?;
@@ -181,27 +183,38 @@ async fn tst_ses_03_single_active_turn() -> anyhow::Result<()> {
         .await?;
     assert_eq!(first.route, "started");
 
+    // While the first Turn is running, the second message is queued, not rejected.
     let second = fx
         .sessions
         .post_message(session_id, "second", &first.session_version, actor.clone())
-        .await;
-    assert!(
-        matches!(second, Err(SessionsError::ActiveTurnExists)),
-        "expected ActiveTurnExists, got {second:?}"
-    );
+        .await?;
+    assert_eq!(second.route, "queued");
 
-    // After force-complete, a new message can start.
+    // The queue reflects the single queued Turn waiting to be promoted.
+    let queued = fx.sessions.list_queued_turns(session_id).await?;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].turn_id, second.turn_id);
+    assert_eq!(queued[0].source, "message");
+
+    // Completing the predecessor frees the active slot. Promoting the queue
+    // starts the second Turn without taking a second message checkpoint yet.
     let turn_id = TurnId::from_str(&first.turn_id)?;
     fx.sessions
         .force_complete_turn_for_test(session_id, turn_id)
         .await?;
-    let after = fx.sessions.get_session(session_id).await?;
-    let third = fx
-        .sessions
-        .post_message(session_id, "third", &after.version, actor)
-        .await?;
-    assert_eq!(third.route, "started");
+    let promoted = fx.sessions.promote_oldest_queued(session_id).await?;
+    assert_eq!(promoted.map(|t| t.to_string()), Some(second.turn_id.clone()));
 
+    let session = fx.sessions.get_session(session_id).await?;
+    assert_eq!(session.active_turn_id.as_deref(), Some(second.turn_id.as_str()));
+    let promoted_turn = fx
+        .sessions
+        .get_turn(session_id, TurnId::from_str(&second.turn_id)?)
+        .await?;
+    assert_eq!(promoted_turn.status, "running");
+
+    let actor_clone = actor.clone();
+    let _ = actor_clone;
     Ok(())
 }
 

@@ -1,5 +1,7 @@
 //! Stage 4: supervisor tools + execute_turn against OpenAI fixture.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::str::FromStr;
 
@@ -20,11 +22,12 @@ use janus_server::modules::workspace_sync::interface::WorkspaceSyncInterface;
 use janus_server::platform::{
     database::Database,
     events::EventStore,
-    id::{ProjectId, SessionId, TurnId},
+    id::{ProjectId, SessionId, ToolCallId, TurnId},
     managed_storage::BlobStore,
     secret::SecretCipher,
 };
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 async fn openai_finish_fixture(Json(_body): Json<Value>) -> Response {
@@ -56,6 +59,7 @@ async fn spawn_openai() -> anyhow::Result<SocketAddr> {
 struct Fx {
     _temp: TempDir,
     _db: Database,
+    pool: SqlitePool,
     sessions: SessionsInterface,
     supervisor: SupervisorInterface,
     workspace: WorkspaceSyncInterface,
@@ -108,6 +112,7 @@ impl Fx {
         std::fs::write(main_abs.join("src/lib.rs"), b"fn main() {}\n")?;
         let minimal_png = minimal_png_1x1();
         std::fs::write(main_abs.join("dot.png"), &minimal_png)?;
+        support::init_git_repo(&main_abs)?;
 
         workspace
             .ensure_main_copy(project_id, &main_managed, "test", json!({"kind": "test"}))
@@ -134,12 +139,18 @@ impl Fx {
             .await?;
 
         let sessions = SessionsInterface::new(pool.clone(), events.clone(), workspace.clone());
-        let supervisor =
-            SupervisorInterface::new(pool, events, models, workspace.clone(), "owner-test".into());
+        let supervisor = SupervisorInterface::new(
+            pool.clone(),
+            events,
+            models,
+            workspace.clone(),
+            "owner-test".into(),
+        );
 
         Ok(Self {
             _temp: temp,
             _db: database,
+            pool,
             sessions,
             supervisor,
             workspace,
@@ -164,7 +175,8 @@ fn registry_forbids_git_write() {
     assert!(is_registered("fs.read"));
     assert!(is_registered("finish"));
     assert!(is_forbidden_tool("git.commit"));
-    assert!(is_forbidden_tool("bash"));
+    assert!(is_forbidden_tool("shell"));
+    assert!(is_registered("bash"));
     assert!(!is_registered("git.commit"));
 }
 
@@ -180,7 +192,11 @@ async fn tools_list_read_write_and_image() -> anyhow::Result<()> {
     let session_id = SessionId::from_str(&session.id)?;
     let ctx = ToolContext {
         session_id,
+        turn_id: TurnId::new(),
+        tool_call_id: ToolCallId::new(),
         workspace: &fx.workspace,
+        runtime: None,
+        pool: &fx.pool,
         actor,
     };
 

@@ -6,12 +6,13 @@ use axum::{
 
 use crate::{
     AppState,
+    config::RunMode,
     modules::identity::interface::InitializationState,
+    modules::runtime::interface::{DeploymentCapabilityProbe, RuntimeCapabilityEvaluator},
     transport::http::{
         dto::{
-            BootstrapData, BootstrapResponse, BootstrapState, CapabilityReason, CapabilityState,
-            DatabaseInfo, EventInfo, LiveResponse, PublicLimits, ReadyResponse, RuntimeCapability,
-            SystemInfo, SystemInfoResponse,
+            BootstrapData, BootstrapResponse, BootstrapState, DatabaseInfo, EventInfo,
+            LiveResponse, PublicLimits, ReadyResponse, SystemInfo, SystemInfoResponse,
         },
         problem::Problem,
         request_id::RequestContext,
@@ -40,6 +41,14 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>,
             "SERVICE_NOT_READY",
             "Service not ready",
             "The database readiness probe failed.",
+        ));
+    }
+    if !state.recovery_complete() {
+        return Err(Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SERVICE_NOT_READY",
+            "Service not ready",
+            "Startup recovery has not finished.",
         ));
     }
     let schema_version = state.database().schema_version().await.map_err(|error| {
@@ -129,64 +138,14 @@ pub async fn system_info(
                     min_cursor: bounds.min.to_string(),
                     max_cursor: bounds.max.to_string(),
                 },
-                capabilities: capabilities(),
+                capabilities: RuntimeCapabilityEvaluator::deployment(
+                    &DeploymentCapabilityProbe::detect(),
+                    state.config().mode == RunMode::Production,
+                ),
                 update_available: false,
             },
         }),
     ))
-}
-
-fn capabilities() -> Vec<RuntimeCapability> {
-    vec![
-        capability(
-            "process_execution",
-            CapabilityState::Degraded,
-            Some(CapabilityReason::LocalExecutor),
-        ),
-        capability(
-            "container_isolation",
-            CapabilityState::Unconfigured,
-            Some(CapabilityReason::ConfigMissing),
-        ),
-        capability(
-            "bash_egress",
-            CapabilityState::Degraded,
-            Some(CapabilityReason::LocalExecutor),
-        ),
-        capability(
-            "browser",
-            CapabilityState::Unconfigured,
-            Some(CapabilityReason::DependencyMissing),
-        ),
-        capability(
-            "live_preview",
-            CapabilityState::Unconfigured,
-            Some(CapabilityReason::ConfigMissing),
-        ),
-        capability(
-            "delegated_cli.claude_code",
-            CapabilityState::Unconfigured,
-            Some(CapabilityReason::DependencyMissing),
-        ),
-        capability(
-            "delegated_cli.codex",
-            CapabilityState::Unconfigured,
-            Some(CapabilityReason::DependencyMissing),
-        ),
-    ]
-}
-
-const fn capability(
-    id: &'static str,
-    state: CapabilityState,
-    reason_code: Option<CapabilityReason>,
-) -> RuntimeCapability {
-    RuntimeCapability {
-        id,
-        scope: "deployment",
-        state,
-        reason_code,
-    }
 }
 
 async fn high_water(state: &AppState, context: &RequestContext) -> Result<u64, Problem> {

@@ -3360,6 +3360,361 @@
         }
       }
     },
+    "/api/v1/terminals": {
+      "get": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "list_terminals",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_TerminalProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "create_terminal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTerminalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TerminalProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terminals/{id}/close": {
+      "post": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "close_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TerminalProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terminals/{id}/connect": {
+      "get": {
+        "tags": [
+          "terminal"
+        ],
+        "summary": "WebSocket upgrade for a Terminal. The client supplies a one-use ticket token\nin the query string plus an optional scrollback resume cursor. After replay,\nthe server streams live scrollback output and accepts binary input or JSON\ncontrol frames (`input`/`resize`/`signal`/`close`).",
+        "operationId": "connect_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "websocket upgrade"
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terminals/{id}/resize": {
+      "post": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "resize_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResizeTerminalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TerminalProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terminals/{id}/scrollback": {
+      "get": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "terminal_scrollback",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_LogRange"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terminals/{id}/signal": {
+      "post": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "signal_terminal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignalTerminalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "default": null
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/terminals/{id}/tickets": {
+      "post": {
+        "tags": [
+          "terminal"
+        ],
+        "operationId": "issue_terminal_ticket",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TerminalTicket"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health/live": {
       "get": {
         "tags": [
@@ -3476,6 +3831,14 @@
           "PROBE_FAILED"
         ]
       },
+      "CapabilityScope": {
+        "type": "string",
+        "enum": [
+          "deployment",
+          "project",
+          "session"
+        ]
+      },
       "CapabilityState": {
         "type": "string",
         "enum": [
@@ -3555,6 +3918,38 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "CreateTerminalRequest": {
+        "type": "object",
+        "required": [
+          "runtime_id",
+          "owner",
+          "size"
+        ],
+        "properties": {
+          "environment": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EnvironmentInput"
+              }
+            ]
+          },
+          "owner": {
+            "$ref": "#/components/schemas/TerminalOwnerInput"
+          },
+          "runtime_id": {
+            "type": "string"
+          },
+          "size": {
+            "$ref": "#/components/schemas/TerminalSizeInput"
+          },
+          "working_directory": {
+            "type": "string"
           }
         }
       },
@@ -3867,6 +4262,36 @@
           }
         }
       },
+      "DataResponse_LogRange": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "stream",
+              "after",
+              "chunks"
+            ],
+            "properties": {
+              "after": {
+                "$ref": "#/components/schemas/LogCursor"
+              },
+              "chunks": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/LogChunk"
+                }
+              },
+              "stream": {
+                "$ref": "#/components/schemas/LogStreamProjection"
+              }
+            }
+          }
+        }
+      },
       "DataResponse_MessageRouteResult": {
         "type": "object",
         "required": [
@@ -3882,12 +4307,16 @@
               "session_version"
             ],
             "properties": {
+              "awaiting_handoff": {
+                "type": "boolean",
+                "description": "True when the active Turn is `waiting_for_job` and the just-queued\nmessage is intended to take over via an atomic Handoff. The HTTP layer\nhands this Turn to `application::session_flow::handoff_message`, which\npromotes it to the successor and transfers the predecessor's finite\nJobs/Asks transactionally. `route` stays `queued` until the coordinator\npromotes it."
+              },
               "message_id": {
                 "type": "string"
               },
               "route": {
                 "type": "string",
-                "description": "M3 always starts immediately (no queue/handoff)."
+                "description": "Current routing result for the accepted message."
               },
               "session_version": {
                 "type": "string"
@@ -4302,6 +4731,114 @@
           }
         }
       },
+      "DataResponse_TerminalProjection": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "runtime_id",
+              "owner",
+              "status",
+              "size",
+              "scrollback_stream_id",
+              "first_cursor",
+              "next_cursor",
+              "writable",
+              "version",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "ended_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "exit": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExitSummary"
+                  }
+                ]
+              },
+              "first_cursor": {
+                "$ref": "#/components/schemas/LogCursor"
+              },
+              "id": {
+                "$ref": "#/components/schemas/TerminalId"
+              },
+              "next_cursor": {
+                "$ref": "#/components/schemas/LogCursor"
+              },
+              "owner": {
+                "$ref": "#/components/schemas/TerminalOwner"
+              },
+              "runtime_id": {
+                "$ref": "#/components/schemas/RuntimeId"
+              },
+              "scrollback_stream_id": {
+                "$ref": "#/components/schemas/LogStreamId"
+              },
+              "size": {
+                "$ref": "#/components/schemas/TerminalSize"
+              },
+              "status": {
+                "$ref": "#/components/schemas/TerminalStatus"
+              },
+              "updated_at": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              },
+              "writable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_TerminalTicket": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "description": "Issued access material for a Terminal WebSocket upgrade.\n\nThe original token is returned once to the requesting actor and never\npersisted. Only the [`TerminalTicket::token_hash`] and metadata needed to\nvalidate a later upgrade are stored. Consumption is atomic and single-use.",
+            "required": [
+              "terminal_id",
+              "token",
+              "expires_at"
+            ],
+            "properties": {
+              "expires_at": {
+                "type": "string"
+              },
+              "terminal_id": {
+                "$ref": "#/components/schemas/TerminalId"
+              },
+              "token": {
+                "type": "string",
+                "description": "The raw bearer token to hand to the WebSocket client. Never put this\ninto SQLite or an event payload."
+              }
+            }
+          }
+        }
+      },
       "DataResponse_TimelinePage": {
         "type": "object",
         "required": [
@@ -4362,13 +4899,43 @@
               "updated_at"
             ],
             "properties": {
+              "cancellation_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "completion_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "created_at": {
                 "type": "string"
+              },
+              "handoff_from_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "handoff_to_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "id": {
                 "type": "string"
               },
               "input_message_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "predecessor_turn_id": {
                 "type": [
                   "string",
                   "null"
@@ -4824,6 +5391,88 @@
           }
         }
       },
+      "DataResponse_Vec_TerminalProjection": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "runtime_id",
+                "owner",
+                "status",
+                "size",
+                "scrollback_stream_id",
+                "first_cursor",
+                "next_cursor",
+                "writable",
+                "version",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "ended_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "exit": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ExitSummary"
+                    }
+                  ]
+                },
+                "first_cursor": {
+                  "$ref": "#/components/schemas/LogCursor"
+                },
+                "id": {
+                  "$ref": "#/components/schemas/TerminalId"
+                },
+                "next_cursor": {
+                  "$ref": "#/components/schemas/LogCursor"
+                },
+                "owner": {
+                  "$ref": "#/components/schemas/TerminalOwner"
+                },
+                "runtime_id": {
+                  "$ref": "#/components/schemas/RuntimeId"
+                },
+                "scrollback_stream_id": {
+                  "$ref": "#/components/schemas/LogStreamId"
+                },
+                "size": {
+                  "$ref": "#/components/schemas/TerminalSize"
+                },
+                "status": {
+                  "$ref": "#/components/schemas/TerminalStatus"
+                },
+                "updated_at": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "string"
+                },
+                "writable": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      },
       "DatabaseInfo": {
         "type": "object",
         "required": [
@@ -4923,6 +5572,20 @@
           }
         }
       },
+      "EnvironmentInput": {
+        "type": "object",
+        "properties": {
+          "ordinary": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "EventEnvelope": {
         "type": "object",
         "required": [
@@ -4979,6 +5642,24 @@
           },
           "min_cursor": {
             "type": "string"
+          }
+        }
+      },
+      "ExitSummary": {
+        "type": "object",
+        "properties": {
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "signal": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -5378,6 +6059,106 @@
           }
         }
       },
+      "LogChannel": {
+        "type": "string",
+        "enum": [
+          "stdout",
+          "stderr",
+          "system"
+        ]
+      },
+      "LogChunk": {
+        "type": "object",
+        "required": [
+          "start_cursor",
+          "end_cursor",
+          "channel",
+          "text"
+        ],
+        "properties": {
+          "channel": {
+            "$ref": "#/components/schemas/LogChannel"
+          },
+          "end_cursor": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "start_cursor": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "LogCursor": {
+        "type": "string",
+        "example": "0"
+      },
+      "LogRange": {
+        "type": "object",
+        "required": [
+          "stream",
+          "after",
+          "chunks"
+        ],
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogChunk"
+            }
+          },
+          "stream": {
+            "$ref": "#/components/schemas/LogStreamProjection"
+          }
+        }
+      },
+      "LogStreamId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "LogStreamProjection": {
+        "type": "object",
+        "required": [
+          "id",
+          "first_cursor",
+          "next_cursor",
+          "retained_bytes",
+          "total_bytes",
+          "truncated",
+          "closed"
+        ],
+        "properties": {
+          "closed": {
+            "type": "boolean"
+          },
+          "first_cursor": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "id": {
+            "$ref": "#/components/schemas/LogStreamId"
+          },
+          "next_cursor": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "retained_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
+      },
       "MessageRouteResult": {
         "type": "object",
         "required": [
@@ -5387,12 +6168,16 @@
           "session_version"
         ],
         "properties": {
+          "awaiting_handoff": {
+            "type": "boolean",
+            "description": "True when the active Turn is `waiting_for_job` and the just-queued\nmessage is intended to take over via an atomic Handoff. The HTTP layer\nhands this Turn to `application::session_flow::handoff_message`, which\npromotes it to the successor and transfers the predecessor's finite\nJobs/Asks transactionally. `route` stays `queued` until the coordinator\npromotes it."
+          },
           "message_id": {
             "type": "string"
           },
           "route": {
             "type": "string",
-            "description": "M3 always starts immediately (no queue/handoff)."
+            "description": "Current routing result for the accepted message."
           },
           "session_version": {
             "type": "string"
@@ -5645,6 +6430,10 @@
             "type": "string"
           }
         }
+      },
+      "ProjectId": {
+        "type": "string",
+        "format": "uuid"
       },
       "ProjectView": {
         "type": "object",
@@ -5943,6 +6732,25 @@
           }
         }
       },
+      "ResizeTerminalRequest": {
+        "type": "object",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "ResolveConflictPathRequest": {
         "type": "object",
         "required": [
@@ -6043,8 +6851,25 @@
           "state"
         ],
         "properties": {
+          "checked_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective_limits": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "id": {
-            "type": "string"
+            "$ref": "#/components/schemas/RuntimeCapabilityId"
           },
           "reason_code": {
             "oneOf": [
@@ -6057,12 +6882,28 @@
             ]
           },
           "scope": {
-            "type": "string"
+            "$ref": "#/components/schemas/CapabilityScope"
           },
           "state": {
             "$ref": "#/components/schemas/CapabilityState"
           }
         }
+      },
+      "RuntimeCapabilityId": {
+        "type": "string",
+        "enum": [
+          "process_execution",
+          "container_isolation",
+          "bash_egress",
+          "browser",
+          "live_preview",
+          "delegated_cli.claude_code",
+          "delegated_cli.codex"
+        ]
+      },
+      "RuntimeId": {
+        "type": "string",
+        "format": "uuid"
       },
       "SaveTextInput": {
         "type": "object",
@@ -6084,6 +6925,10 @@
             "type": "string"
           }
         }
+      },
+      "SessionId": {
+        "type": "string",
+        "format": "uuid"
       },
       "SessionSummary": {
         "type": "object",
@@ -6150,6 +6995,17 @@
           }
         }
       },
+      "SignalTerminalRequest": {
+        "type": "object",
+        "required": [
+          "signal"
+        ],
+        "properties": {
+          "signal": {
+            "$ref": "#/components/schemas/TerminalSignal"
+          }
+        }
+      },
       "SystemInfo": {
         "type": "object",
         "required": [
@@ -6197,6 +7053,239 @@
         "properties": {
           "data": {
             "$ref": "#/components/schemas/SystemInfo"
+          }
+        }
+      },
+      "TerminalId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "TerminalOwner": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/ProjectId"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "project"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/SessionId"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "session"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "TerminalOwnerInput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "project"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "session"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "TerminalProjection": {
+        "type": "object",
+        "required": [
+          "id",
+          "runtime_id",
+          "owner",
+          "status",
+          "size",
+          "scrollback_stream_id",
+          "first_cursor",
+          "next_cursor",
+          "writable",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExitSummary"
+              }
+            ]
+          },
+          "first_cursor": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "id": {
+            "$ref": "#/components/schemas/TerminalId"
+          },
+          "next_cursor": {
+            "$ref": "#/components/schemas/LogCursor"
+          },
+          "owner": {
+            "$ref": "#/components/schemas/TerminalOwner"
+          },
+          "runtime_id": {
+            "$ref": "#/components/schemas/RuntimeId"
+          },
+          "scrollback_stream_id": {
+            "$ref": "#/components/schemas/LogStreamId"
+          },
+          "size": {
+            "$ref": "#/components/schemas/TerminalSize"
+          },
+          "status": {
+            "$ref": "#/components/schemas/TerminalStatus"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "writable": {
+            "type": "boolean"
+          }
+        }
+      },
+      "TerminalSignal": {
+        "type": "string",
+        "description": "Abstract signal a Terminal consumer may raise to the running shell.\n\nThe executor maps these to whatever the local execution backend supports.\nIt is intentionally not a raw POSIX signal value so the public contract\nstays cross-platform: `ctrl_c` is an interrupt request and `terminate` is an\nungraceful kill request. Neither is required to be perfectly reliable on a\nnon-tty pipe backend; both are best-effort and the durable Terminal state\nremains the source of truth.",
+        "enum": [
+          "ctrl_c",
+          "terminate"
+        ]
+      },
+      "TerminalSize": {
+        "type": "object",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "TerminalSizeInput": {
+        "type": "object",
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "properties": {
+          "cols": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "rows": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "TerminalStatus": {
+        "type": "string",
+        "enum": [
+          "starting",
+          "running",
+          "closing",
+          "exited",
+          "failed",
+          "lost"
+        ]
+      },
+      "TerminalTicket": {
+        "type": "object",
+        "description": "Issued access material for a Terminal WebSocket upgrade.\n\nThe original token is returned once to the requesting actor and never\npersisted. Only the [`TerminalTicket::token_hash`] and metadata needed to\nvalidate a later upgrade are stored. Consumption is atomic and single-use.",
+        "required": [
+          "terminal_id",
+          "token",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string"
+          },
+          "terminal_id": {
+            "$ref": "#/components/schemas/TerminalId"
+          },
+          "token": {
+            "type": "string",
+            "description": "The raw bearer token to hand to the WebSocket client. Never put this\ninto SQLite or an event payload."
           }
         }
       },
@@ -6296,13 +7385,43 @@
           "updated_at"
         ],
         "properties": {
+          "cancellation_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completion_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "type": "string"
+          },
+          "handoff_from_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handoff_to_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "type": "string"
           },
           "input_message_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "predecessor_turn_id": {
             "type": [
               "string",
               "null"

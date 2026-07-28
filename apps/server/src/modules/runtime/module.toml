@@ -1,7 +1,15 @@
 name = "runtime"
 public_root = "interface.rs"
-owned_tables = []
-publishes = []
+owned_tables = [
+  "runtimes",
+  "log_streams",
+  "jobs",
+  "services",
+  "runtime_ports",
+  "terminals",
+  "runtime_access_tickets",
+]
+publishes = ["job.changed", "service.changed", "log.advanced", "terminal.changed"]
 allowed_module_dependencies = []
 specs = []
-tests = []
+tests = ["tests/runtime_contract.rs"]

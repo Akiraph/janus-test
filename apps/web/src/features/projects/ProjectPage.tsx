@@ -8,6 +8,7 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
 import TerminalSquare from "lucide-solid/icons/terminal-square";
 import X from "lucide-solid/icons/x";
+// TerminalSquare still used by the activity rail icon.
 import { createEffect, createMemo, createSignal, For, Show, Suspense } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { Badge } from "../../components/ui/Badge";
@@ -17,6 +18,7 @@ import type { FileMetaView } from "../../lib/api";
 import { useProject } from "../../lib/queries";
 import { FileEditor } from "./workspace/FileEditor";
 import { FileTreePanel } from "./workspace/FileTreePanel";
+import { LazyTerminalPanel } from "./workspace/LazyTerminalPanel";
 import { ScmPanel } from "./workspace/ScmPanel";
 import { SessionsPanel } from "./workspace/SessionsPanel";
 import { SessionTabView } from "./workspace/SessionTabView";
@@ -384,14 +386,16 @@ export function ProjectPage() {
               classList={{ "ide-sidebar-view--active": activeView() === "terminal" }}
               hidden={activeView() !== "terminal"}
             >
-              <div class="ide-sidebar-panel">
-                <div class="ide-sidebar-header">Terminal</div>
-                <EmptyState
-                  icon={TerminalSquare}
-                  title="Terminal unavailable"
-                  description="Main Workspace Terminal depends on RuntimeExecutor and lands in M4. This panel is a placeholder."
-                  class="terminal-placeholder"
-                />
+              <div class="ide-sidebar-panel terminal-sidebar-panel">
+                <Show when={activeView() === "terminal"}>
+                  <LazyTerminalPanel
+                    projectId={projectId}
+                    ownerKind="project"
+                    ownerId={projectId}
+                    title="Main Terminal"
+                    active={() => activeView() === "terminal"}
+                  />
+                </Show>
               </div>
             </div>
           </aside>
