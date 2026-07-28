@@ -1,5 +1,6 @@
 import type { Component, JSX } from "solid-js";
 import { Show } from "solid-js";
+import "./empty-state.css";
 
 interface EmptyStateProps {
   icon: Component<{ size?: number; strokeWidth?: number }>;

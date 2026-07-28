@@ -1,0 +1,52 @@
+/* --- Tabs:分段式单选切换器(WAI-ARIA tab) --- */
+.ui-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-muted);
+}
+
+.ui-tabs__tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 28px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  background: transparent;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--easing),
+    background var(--dur-fast) var(--easing),
+    box-shadow var(--dur-fast) var(--easing);
+}
+
+.ui-tabs__tab:hover:not(.ui-tabs__tab--disabled):not(.ui-tabs__tab--active) {
+  color: var(--text);
+}
+
+.ui-tabs__tab--active {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-weight: var(--weight-semibold);
+}
+
+.ui-tabs__tab--disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.ui-tabs__badge {
+  font-size: var(--text-xs);
+  color: var(--text-faint);
+}

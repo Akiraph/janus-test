@@ -3,19 +3,19 @@ import { lazy } from "solid-js";
 import { AppShell } from "./AppShell";
 
 const ModelsPage = lazy(() =>
-  import("../features/models/ModelsPage").then((m) => ({ default: m.ModelsPage })),
+  import("../pages/ModelsPage").then((m) => ({ default: m.ModelsPage })),
 );
 const SecurityPage = lazy(() =>
-  import("../features/security/SecurityPage").then((m) => ({ default: m.SecurityPage })),
+  import("../pages/SecurityPage").then((m) => ({ default: m.SecurityPage })),
 );
 const SystemPage = lazy(() =>
-  import("../features/system/SystemPage").then((m) => ({ default: m.SystemPage })),
+  import("../pages/SystemPage").then((m) => ({ default: m.SystemPage })),
 );
 const ProjectsPage = lazy(() =>
-  import("../features/projects/ProjectsPage").then((m) => ({ default: m.ProjectsPage })),
+  import("../pages/ProjectsPage").then((m) => ({ default: m.ProjectsPage })),
 );
 const ProjectPage = lazy(() =>
-  import("../features/projects/ProjectPage").then((m) => ({ default: m.ProjectPage })),
+  import("../pages/ProjectPage").then((m) => ({ default: m.ProjectPage })),
 );
 
 export function App() {

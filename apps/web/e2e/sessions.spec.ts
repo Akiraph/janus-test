@@ -363,18 +363,6 @@ for (const viewport of viewports) {
     await page.getByRole("button", { name: "Toggle context and Compact panel" }).click();
     await expect(page.getByRole("complementary", { name: "Context and Compact" })).toBeHidden();
 
-    // Session Terminal sub-tab is desktop-only. On small screens the tab button
-    // must not exist at all (the emulator never mounts).
-    if (viewport.name === "desktop") {
-      await expect(
-        page.getByRole("tablist", { name: "Session views" }).getByRole("tab", { name: "Terminal" }),
-      ).toBeVisible();
-    } else {
-      await expect(
-        page.getByRole("tablist", { name: "Session views" }).getByRole("tab", { name: "Terminal" }),
-      ).toHaveCount(0);
-    }
-
     // Diff is a Session sub-tab (UX-SES-02). Name may include a count badge ("Diff 1").
     await page
       .getByRole("tablist", { name: "Session views" })

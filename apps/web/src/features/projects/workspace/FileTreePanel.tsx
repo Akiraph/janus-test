@@ -108,10 +108,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
       <div class="ide-sidebar-header">Explorer</div>
       <div class="ide-scroll-host">
         <div class="ide-tree ide-sidebar-scroll" ref={setScrollHost}>
-          <Show
-            when={children()[""] !== undefined}
-            fallback={<p class="files-tree-empty">Loading…</p>}
-          >
+          <Show when={children()[""] !== undefined} fallback={<p class="surface-note">Loading…</p>}>
             <Show
               when={!errors()[""]}
               fallback={
@@ -123,7 +120,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
             >
               <Show
                 when={(children()[""]?.length ?? 0) > 0}
-                fallback={<p class="files-tree-empty">Empty repository</p>}
+                fallback={<p class="surface-note">Empty repository</p>}
               >
                 <ul class="ide-tree-list">
                   <For each={children()[""] ?? []}>

@@ -6,7 +6,9 @@ import { App } from "./app/App";
 import { NotificationContainer } from "./components/ui/NotificationContainer";
 import { NotificationProvider } from "./components/ui/notifications";
 import { ApiError } from "./lib/api";
-import "./styles.css";
+import "./components/ui/fields.css";
+import "./components/ui/primitives.css";
+import "./styles/index.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {

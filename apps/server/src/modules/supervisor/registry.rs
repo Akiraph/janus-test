@@ -83,10 +83,18 @@ pub fn registry() -> Vec<ToolSpecEntry> {
                 "type": "object",
                 "properties": {
                     "summary": {"type": "string"},
-                    "main_changes": {"type": "string"},
-                    "risks": {"type": "string"}
+                    "main_changes": {"type": "array", "items": {"type": "string"}},
+                    "validation_performed": {"type": "array", "items": {"type": "string"}},
+                    "validation_not_performed": {"type": "array", "items": {"type": "string"}},
+                    "remaining_risks": {"type": "array", "items": {"type": "string"}}
                 },
-                "required": ["summary"]
+                "required": [
+                    "summary",
+                    "main_changes",
+                    "validation_performed",
+                    "validation_not_performed",
+                    "remaining_risks"
+                ]
             }),
         },
         // M4 Stage 5 runtime tools. Execution lands in tools.rs; registry

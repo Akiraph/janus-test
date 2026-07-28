@@ -61,6 +61,21 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
         if let Some(id) = &msg.tool_call_id {
             v["tool_call_id"] = json!(id);
         }
+        if !msg.tool_calls.is_empty() {
+            v["tool_calls"] = json!(
+                msg.tool_calls
+                    .iter()
+                    .map(|call| json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments_json,
+                        },
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
         return v;
     }
     let content: Vec<Value> = msg
@@ -77,7 +92,26 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
             }
         })
         .collect();
-    json!({"role": role, "content": content})
+    let mut value = json!({"role": role, "content": content});
+    if let Some(id) = &msg.tool_call_id {
+        value["tool_call_id"] = json!(id);
+    }
+    if !msg.tool_calls.is_empty() {
+        value["tool_calls"] = json!(
+            msg.tool_calls
+                .iter()
+                .map(|call| json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments_json,
+                    },
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    value
 }
 
 /// Mutable state while consuming OpenAI chat.completion.chunk SSE.

@@ -16,8 +16,9 @@ import {
   recoveryOptions,
 } from "../../lib/api";
 import { authenticationOptions, credentialPayload, registrationOptions } from "../../lib/webauthn";
+import "./auth.css";
 
-export function SetupPage() {
+export function SetupView() {
   const queryClient = useQueryClient();
   const [token, setToken] = createSignal("");
   const [name, setName] = createSignal("Owner");
@@ -92,7 +93,7 @@ export function SetupPage() {
   );
 }
 
-export function LoginPage() {
+export function LoginView() {
   const queryClient = useQueryClient();
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(false);

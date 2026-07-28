@@ -162,12 +162,24 @@ async fn completing_predecessor_promotes_oldest_queued() -> anyhow::Result<()> {
     let first_turn = TurnId::from_str(&first.turn_id)?;
     let promoted = fx
         .sessions
-        .settle_terminal_turn(session_id, first_turn, "completed", Some("finish"), actor.clone())
+        .settle_terminal_turn(
+            session_id,
+            first_turn,
+            "completed",
+            Some("finish"),
+            actor.clone(),
+        )
         .await?;
-    assert_eq!(promoted.map(|t| t.to_string()), Some(second.turn_id.clone()));
+    assert_eq!(
+        promoted.map(|t| t.to_string()),
+        Some(second.turn_id.clone())
+    );
 
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(second.turn_id.as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(second.turn_id.as_str())
+    );
 
     let turn = fx
         .sessions
@@ -199,7 +211,13 @@ async fn failed_predecessor_leaves_queue_paused() -> anyhow::Result<()> {
     let first_turn = TurnId::from_str(&first.turn_id)?;
     let promoted = fx
         .sessions
-        .settle_terminal_turn(session_id, first_turn, "failed", Some("model"), actor.clone())
+        .settle_terminal_turn(
+            session_id,
+            first_turn,
+            "failed",
+            Some("model"),
+            actor.clone(),
+        )
         .await?;
     assert!(promoted.is_none(), "queue must stay paused on failure");
 
@@ -230,7 +248,13 @@ async fn cancel_transitions_running_to_canceling_then_canceled() -> anyhow::Resu
 
     let cancel = fx
         .sessions
-        .cancel_turn(session_id, turn_id, "user_request", &started.session_version, actor.clone())
+        .cancel_turn(
+            session_id,
+            turn_id,
+            "user_request",
+            &started.session_version,
+            actor.clone(),
+        )
         .await?;
     assert_eq!(cancel.from_status, "running");
     assert_eq!(cancel.to_status, "canceling");
@@ -298,13 +322,21 @@ async fn steer_binds_to_running_turn_without_stealing_slot() -> anyhow::Result<(
 
     let steer = fx
         .sessions
-        .steer(session_id, "and also check logs", &started.session_version, actor.clone())
+        .steer(
+            session_id,
+            "and also check logs",
+            &started.session_version,
+            actor.clone(),
+        )
         .await?;
     assert_eq!(steer.turn_id, started.turn_id);
 
     // Steer must not take the active slot or change Turn status.
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(turn_id.to_string().as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(turn_id.to_string().as_str())
+    );
     let turn = fx.sessions.get_turn(session_id, turn_id).await?;
     assert_eq!(turn.status, "running");
     Ok(())
@@ -322,9 +354,17 @@ async fn steer_without_running_turn_is_rejected() -> anyhow::Result<()> {
 
     let res = fx
         .sessions
-        .steer(session_id, "no turn to steer", &summary.version, actor.clone())
+        .steer(
+            session_id,
+            "no turn to steer",
+            &summary.version,
+            actor.clone(),
+        )
         .await;
-    assert!(matches!(res, Err(SessionsError::TurnNotInteractive)), "{res:?}");
+    assert!(
+        matches!(res, Err(SessionsError::TurnNotInteractive)),
+        "{res:?}"
+    );
     Ok(())
 }
 
@@ -362,7 +402,10 @@ async fn queued_start_after_terminal_progresses_full_queue() -> anyhow::Result<(
             actor.clone(),
         )
         .await?;
-    assert_eq!(promoted_first.map(|t| t.to_string()), Some(second.turn_id.clone()));
+    assert_eq!(
+        promoted_first.map(|t| t.to_string()),
+        Some(second.turn_id.clone())
+    );
 
     let promoted_second = fx
         .sessions
@@ -374,10 +417,16 @@ async fn queued_start_after_terminal_progresses_full_queue() -> anyhow::Result<(
             actor.clone(),
         )
         .await?;
-    assert_eq!(promoted_second.map(|t| t.to_string()), Some(third.turn_id.clone()));
+    assert_eq!(
+        promoted_second.map(|t| t.to_string()),
+        Some(third.turn_id.clone())
+    );
 
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(third.turn_id.as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(third.turn_id.as_str())
+    );
     let queued = fx.sessions.list_queued_turns(session_id).await?;
     assert!(queued.is_empty());
     Ok(())
@@ -401,18 +450,31 @@ async fn pause_and_resume_round_trip_keeps_active_slot() -> anyhow::Result<()> {
     // running -> waiting_for_job
     let v1 = fx
         .sessions
-        .pause_turn_for(session_id, turn_id, "waiting_for_job", json!({"kind": "supervisor"}))
+        .pause_turn_for(
+            session_id,
+            turn_id,
+            "waiting_for_job",
+            json!({"kind": "supervisor"}),
+        )
         .await?;
     let turn = fx.sessions.get_turn(session_id, turn_id).await?;
     assert_eq!(turn.status, "waiting_for_job");
     // Slot still held.
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(turn_id.to_string().as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(turn_id.to_string().as_str())
+    );
 
     // waiting_for_job -> running
     let _v2 = fx
         .sessions
-        .resume_turn(session_id, turn_id, "waiting_for_job", json!({"kind": "supervisor"}))
+        .resume_turn(
+            session_id,
+            turn_id,
+            "waiting_for_job",
+            json!({"kind": "supervisor"}),
+        )
         .await?;
     let turn = fx.sessions.get_turn(session_id, turn_id).await?;
     assert_eq!(turn.status, "running");
@@ -438,7 +500,12 @@ async fn handoff_tx_primitives_settle_predecessor_and_promote_successor() -> any
     let predecessor = TurnId::from_str(&first.turn_id)?;
     let paused_version = fx
         .sessions
-        .pause_turn_for(session_id, predecessor, "waiting_for_job", json!({"kind": "supervisor"}))
+        .pause_turn_for(
+            session_id,
+            predecessor,
+            "waiting_for_job",
+            json!({"kind": "supervisor"}),
+        )
         .await?;
 
     // Successor: a second user message while the predecessor waits is queued
@@ -448,7 +515,10 @@ async fn handoff_tx_primitives_settle_predecessor_and_promote_successor() -> any
         .post_message(session_id, "second", &paused_version, actor.clone())
         .await?;
     assert_eq!(second.route, "queued");
-    assert!(second.awaiting_handoff, "queued successor should report awaiting_handoff");
+    assert!(
+        second.awaiting_handoff,
+        "queued successor should report awaiting_handoff"
+    );
     let successor = TurnId::from_str(&second.turn_id)?;
 
     // Drive the Handoff in one transaction, exactly as session_flow would.
@@ -477,13 +547,25 @@ async fn handoff_tx_primitives_settle_predecessor_and_promote_successor() -> any
     // Predecessor is terminal handed_off; successor owns the active slot.
     let predecessor_turn = fx.sessions.get_turn(session_id, predecessor).await?;
     assert_eq!(predecessor_turn.status, "handed_off");
-    assert_eq!(predecessor_turn.handoff_to_turn_id.as_deref(), Some(successor.to_string().as_str()));
+    assert_eq!(
+        predecessor_turn.handoff_to_turn_id.as_deref(),
+        Some(successor.to_string().as_str())
+    );
     let successor_turn = fx.sessions.get_turn(session_id, successor).await?;
     assert_eq!(successor_turn.status, "running");
-    assert_eq!(successor_turn.handoff_from_turn_id.as_deref(), Some(predecessor.to_string().as_str()));
-    assert_eq!(successor_turn.predecessor_turn_id.as_deref(), Some(predecessor.to_string().as_str()));
+    assert_eq!(
+        successor_turn.handoff_from_turn_id.as_deref(),
+        Some(predecessor.to_string().as_str())
+    );
+    assert_eq!(
+        successor_turn.predecessor_turn_id.as_deref(),
+        Some(predecessor.to_string().as_str())
+    );
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(successor.to_string().as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(successor.to_string().as_str())
+    );
     Ok(())
 }
 
@@ -511,15 +593,33 @@ async fn settle_terminal_canceled_promotes_queue() -> anyhow::Result<()> {
     // Use the version after the second message (post_message bumps it).
     let _ = fx
         .sessions
-        .cancel_turn(session_id, first_turn, "user", &second.session_version, actor.clone())
+        .cancel_turn(
+            session_id,
+            first_turn,
+            "user",
+            &second.session_version,
+            actor.clone(),
+        )
         .await?;
     let promoted = fx
         .sessions
-        .settle_terminal_turn(session_id, first_turn, "canceled", Some("user"), actor.clone())
+        .settle_terminal_turn(
+            session_id,
+            first_turn,
+            "canceled",
+            Some("user"),
+            actor.clone(),
+        )
         .await?;
-    assert_eq!(promoted.map(|t| t.to_string()), Some(second.turn_id.clone()));
+    assert_eq!(
+        promoted.map(|t| t.to_string()),
+        Some(second.turn_id.clone())
+    );
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(second.turn_id.as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(second.turn_id.as_str())
+    );
     Ok(())
 }
 
@@ -578,7 +678,12 @@ async fn pause_for_model_keeps_active_slot() -> anyhow::Result<()> {
     let turn_id = TurnId::from_str(&started.turn_id)?;
 
     fx.sessions
-        .pause_turn_for(session_id, turn_id, "waiting_for_model", json!({"kind": "supervisor"}))
+        .pause_turn_for(
+            session_id,
+            turn_id,
+            "waiting_for_model",
+            json!({"kind": "supervisor"}),
+        )
         .await?;
     let turn = fx.sessions.get_turn(session_id, turn_id).await?;
     assert_eq!(turn.status, "waiting_for_model");
@@ -588,6 +693,9 @@ async fn pause_for_model_keeps_active_slot() -> anyhow::Result<()> {
         .sessions
         .steer(session_id, "late steer", &session.version, actor.clone())
         .await;
-    assert!(matches!(res, Err(SessionsError::SteerBlockedByModel)), "{res:?}");
+    assert!(
+        matches!(res, Err(SessionsError::SteerBlockedByModel)),
+        "{res:?}"
+    );
     Ok(())
 }

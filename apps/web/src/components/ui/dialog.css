@@ -1,0 +1,95 @@
+/* --- Dialog --- */
+.ui-dialog-overlay {
+  position: fixed;
+  z-index: 50;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--space-4);
+  background: hsl(210 30% 12% / 12%);
+  backdrop-filter: blur(2px);
+  animation: overlay-fade var(--dur) var(--easing) both;
+}
+
+.ui-dialog {
+  position: relative;
+  display: flex;
+  width: min(100%, 560px);
+  max-height: 85vh;
+  flex-direction: column;
+  gap: var(--space-3);
+  overflow-y: auto;
+  padding: var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  animation: dialog-pop var(--dur) var(--easing) both;
+}
+
+.ui-dialog header {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.ui-dialog header h2 {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+}
+
+.ui-dialog header p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.ui-dialog-close {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.ui-dialog-close:hover {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+@keyframes dialog-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes overlay-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 560px) {
+  .ui-dialog {
+    width: 100%;
+    max-height: 92vh;
+    margin: 0;
+    border-radius: 0;
+  }
+}

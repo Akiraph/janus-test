@@ -9,8 +9,8 @@ mod support;
 
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::Body;
 use axum::http::StatusCode;
@@ -24,11 +24,11 @@ use janus_server::modules::models::interface::{
 use janus_server::modules::sessions::interface::SessionsInterface;
 use janus_server::modules::supervisor::interface::SupervisorInterface;
 use janus_server::modules::supervisor::retry::{FaultClass, classify};
+use janus_server::modules::workspace_sync::interface::WorkspaceSyncInterface;
 use janus_server::platform::id::{ProjectId, SessionId, TurnId};
 use janus_server::platform::sleeper::FakeSleeper;
-use janus_server::platform::{events::EventStore, secret::SecretCipher};
 use janus_server::platform::{database::Database, managed_storage::BlobStore};
-use janus_server::modules::workspace_sync::interface::WorkspaceSyncInterface;
+use janus_server::platform::{events::EventStore, secret::SecretCipher};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -148,7 +148,9 @@ impl Fx {
             workspace.clone(),
             "owner-test".into(),
         )
-        .with_retry_sleeper(sleeper.clone() as std::sync::Arc<dyn janus_server::platform::sleeper::Sleeper>);
+        .with_retry_sleeper(
+            sleeper.clone() as std::sync::Arc<dyn janus_server::platform::sleeper::Sleeper>
+        );
 
         Ok(Self {
             _temp: temp,
@@ -197,7 +199,10 @@ async fn exhausted_transient_retries_park_waiting_for_model() -> anyhow::Result<
     let turn = fx.sessions.get_turn(session_id, turn_id).await?;
     assert_eq!(turn.status, "waiting_for_model");
     // 5 backoffs before giving up (initial + 5 retries => 5 sleeps).
-    assert!(fx.sleeper.waits.lock().unwrap().len() >= 1, "should have slept");
+    assert!(
+        fx.sleeper.waits.lock().unwrap().len() >= 1,
+        "should have slept"
+    );
     Ok(())
 }
 

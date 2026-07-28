@@ -1,0 +1,290 @@
+/* ================================================================
+   布局:Home 顶栏 / Settings 左栏
+   ================================================================ */
+.home-canvas,
+.settings-canvas {
+  min-height: 100vh;
+  background: var(--canvas);
+}
+
+.settings-canvas {
+  display: flex;
+  height: 100vh;
+  padding: var(--space-3);
+}
+
+.home-bar {
+  padding: var(--space-3) var(--space-3) 0;
+}
+
+.home-bar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 58px;
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 0 var(--space-3);
+}
+
+.home-bar-left {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.home-route {
+  max-width: 1120px;
+  margin: 0 auto;
+}
+
+/* Project IDE needs the full viewport: no home bar, fills the whole screen. */
+.home-route:has(.project-page--ide),
+.home-route--immersive {
+  display: flex;
+  max-width: none;
+  margin: 0;
+  height: 100vh;
+  min-height: 0;
+  padding: 0;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  width: fit-content;
+  color: var(--text);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  text-decoration: none;
+}
+
+.topbar-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.settings-link {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  padding: 0 var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+}
+
+.settings-link:hover,
+.settings-link:focus-visible {
+  color: var(--text);
+  background: var(--surface-muted);
+  box-shadow: none;
+  border-color: transparent;
+  outline: none;
+}
+
+/* --- Settings shell:左侧导航 + 右侧内容 --- */
+.settings-shell {
+  display: flex;
+  width: min(100%, 1024px);
+  min-height: 0;
+  height: 100%;
+  margin: 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.settings-rail {
+  display: flex;
+  width: 224px;
+  flex: 0 0 224px;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.settings-rail p {
+  margin: 0;
+  margin-top: var(--space-2);
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.settings-rail p:first-child {
+  margin-top: 0;
+}
+
+.settings-back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  padding: var(--space-2) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+}
+
+.settings-back:hover,
+.settings-back:focus-visible {
+  color: var(--text);
+  background: var(--surface-muted);
+  box-shadow: none;
+  outline: none;
+}
+
+.settings-rail > a {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+}
+
+.settings-rail > a:hover,
+.settings-rail > a:focus-visible {
+  color: var(--text);
+  background: var(--surface-muted);
+  box-shadow: none;
+  outline: none;
+}
+
+.settings-rail > a.active {
+  color: var(--text);
+  background: var(--accent);
+}
+
+.settings-content {
+  min-width: 0;
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-4);
+}
+
+.settings-route {
+  min-height: 0;
+}
+
+/* ================================================================
+   Inline route-loading marker — shown inside the routed area while a lazy
+   route's JS chunk resolves. NOT a full-viewport splash: the app chrome stays
+   visible, so loading a route never reads as the app restarting.
+   ================================================================ */
+.route-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  color: var(--text-muted);
+}
+
+.route-loading__spin {
+  animation: route-loading-spin 900ms linear infinite;
+}
+
+@keyframes route-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 820px) {
+  .home-bar {
+    padding: 0;
+  }
+
+  .home-bar-inner {
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-2);
+  }
+
+  .home-bar-left {
+    min-width: 0;
+  }
+
+  .home-bar-inner .topbar-actions {
+    gap: 0;
+  }
+
+  .settings-canvas {
+    padding: 0;
+  }
+
+  .settings-shell {
+    min-height: 100vh;
+    height: auto;
+    border-radius: 0;
+  }
+
+  .settings-rail {
+    width: 180px;
+    flex-basis: 180px;
+  }
+}
+
+@media (max-width: 900px) {
+  .home-route:has(.project-page--ide) {
+    height: auto;
+    min-height: calc(100vh - 74px);
+    padding: 0;
+  }
+}
+
+@media (max-width: 560px) {
+  .settings-shell {
+    flex-direction: column;
+  }
+
+  .settings-rail {
+    display: grid;
+    width: 100%;
+    flex: none;
+    grid-template-columns: auto repeat(3, minmax(0, 1fr));
+    padding: var(--space-2);
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .settings-rail p {
+    display: none;
+  }
+
+  .settings-rail > a {
+    justify-content: center;
+    padding: 0 var(--space-2);
+    font-size: var(--text-xs);
+    text-align: center;
+  }
+
+  .settings-back {
+    margin: 0;
+  }
+
+  .settings-content {
+    padding: var(--space-3);
+  }
+}

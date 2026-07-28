@@ -7,12 +7,13 @@ import Server from "lucide-solid/icons/server";
 import { For, Match, Switch } from "solid-js";
 import { ErrorBlock } from "../../components/ui/ErrorBlock";
 import { useSystemInfo } from "../../lib/queries";
+import "./system.css";
 
-export function SystemPage() {
+export function SystemStatus() {
   const system = useSystemInfo();
 
   return (
-    <section class="panel animate-panel-in" aria-labelledby="system-title">
+    <section class="panel" aria-labelledby="system-title">
       <div class="panel-heading">
         <h2 id="system-title">System</h2>
         <p>Deployment status and capabilities</p>
@@ -20,7 +21,7 @@ export function SystemPage() {
 
       <Switch>
         <Match when={system.isPending}>
-          <p class="files-tree-empty" role="status" aria-label="Loading...">
+          <p class="surface-note" role="status" aria-label="Loading...">
             Loading...
           </p>
         </Match>

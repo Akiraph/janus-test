@@ -14,7 +14,7 @@ use crate::platform::path::PathError;
 
 use super::paths::resolve_session_path;
 use super::registry::{is_forbidden_tool, is_registered};
-use super::types::{SupervisorError, ToolOutcome, ToolResultPart};
+use super::types::{CompletionSummary, SupervisorError, ToolOutcome, ToolResultPart, TurnWait};
 
 /// Hard image decode limits (SES-TOOL-READ-03 subset).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
@@ -45,7 +45,7 @@ pub async fn execute_tool(
             summary: json!({"error": "TOOL_NOT_ALLOWED", "name": name}),
             error_code: Some("TOOL_NOT_ALLOWED".into()),
             finish_summary: None,
-            wait_state: None,
+            wait: None,
         });
     }
 
@@ -74,7 +74,7 @@ pub async fn execute_tool(
             summary: json!({"error": "TOOL_NOT_ALLOWED"}),
             error_code: Some("TOOL_NOT_ALLOWED".into()),
             finish_summary: None,
-            wait_state: None,
+            wait: None,
         }),
     }
 }
@@ -134,7 +134,7 @@ async fn tool_list(repo: &Path, input: &Value) -> Result<ToolOutcome, Supervisor
         summary: json!({"count": entries.len()}),
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -151,7 +151,7 @@ fn fail_text(msg: &str, code: &str) -> ToolOutcome {
         summary: json!({"error": code, "detail": msg}),
         error_code: Some(code.into()),
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     }
 }
 
@@ -213,7 +213,7 @@ async fn tool_read(
         summary: json!({"path": raw, "kind": "text", "bytes": text.len()}),
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -437,7 +437,7 @@ async fn read_image(
         summary,
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -492,7 +492,7 @@ async fn tool_write(
         summary: json!({"path": path, "revision": rev.0}),
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -527,7 +527,7 @@ async fn tool_remove(
         summary: json!({"path": path, "revision": rev.0}),
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -551,7 +551,7 @@ async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
                 summary,
                 error_code: None,
                 finish_summary: None,
-                wait_state: None,
+                wait: None,
             })
         }
         Err(e) => Ok(fail_text(
@@ -564,24 +564,18 @@ async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
 fn tool_finish(input: &Value) -> Result<ToolOutcome, SupervisorError> {
     // Async Job-check variant is tool_finish_checked; this keeps the pure
     // summary path for callers that already verified no unfinished Jobs.
-    let summary_text = input
-        .get("summary")
-        .and_then(|s| s.as_str())
-        .unwrap_or("done");
-    let finish = json!({
-        "summary": summary_text,
-        "main_changes": input.get("main_changes").and_then(|v| v.as_str()).unwrap_or(""),
-        "risks": input.get("risks").and_then(|v| v.as_str()).unwrap_or(""),
-    });
+    let finish = CompletionSummary::from_tool_input(input);
+    let summary_text = finish.summary.clone();
+    let summary = serde_json::to_value(&finish)?;
     Ok(ToolOutcome {
         ok: true,
         parts: vec![ToolResultPart::Text {
             text: format!("finished: {summary_text}"),
         }],
-        summary: finish.clone(),
+        summary,
         error_code: None,
         finish_summary: Some(finish),
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -612,7 +606,7 @@ async fn tool_finish_checked(
             summary,
             error_code: None,
             finish_summary: None,
-            wait_state: Some("waiting_for_job".into()),
+            wait: Some(TurnWait::Job),
         });
     }
     tool_finish(input)
@@ -760,7 +754,7 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
             Some("COMMAND_FAILED".into())
         },
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -827,11 +821,14 @@ async fn tool_job(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, S
         summary,
         error_code: None,
         finish_summary: None,
-        wait_state: Some("waiting_for_job".into()),
+        wait: Some(TurnWait::Job),
     })
 }
 
-async fn tool_service(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
+async fn tool_service(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
     use crate::modules::runtime::interface::{
         ExecutionEnvironment, ExecutionSpec, NetworkPolicy, ServiceImpact, ServiceSpec,
         ValidatedCommand,
@@ -913,7 +910,7 @@ async fn tool_service(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcom
         summary,
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -922,17 +919,14 @@ async fn tool_delegate_cli(
     input: &Value,
 ) -> Result<ToolOutcome, SupervisorError> {
     use crate::modules::runtime::interface::{
-        DeploymentCapabilityProbe, DelegatedCliKind, ExecutionEnvironment, ExecutionSpec,
-        JobSpec, NetworkPolicy, RuntimeCapabilityId, ValidatedCommand,
+        DelegatedCliKind, DeploymentCapabilityProbe, ExecutionEnvironment, ExecutionSpec, JobSpec,
+        NetworkPolicy, RuntimeCapabilityId, ValidatedCommand,
     };
     use crate::platform::id::{CliSessionId, JobId};
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
-    let cli_raw = input
-        .get("cli")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let cli_raw = input.get("cli").and_then(|v| v.as_str()).unwrap_or("");
     let cli = match cli_raw {
         "claude_code" => DelegatedCliKind::ClaudeCode,
         "codex" => DelegatedCliKind::Codex,
@@ -968,13 +962,13 @@ async fn tool_delegate_cli(
         ));
     }
 
-    let cli_session_id = match input.get("cli_session_id").and_then(|v| v.as_str()) {
-        Some(raw) if !raw.is_empty() => Some(
-            CliSessionId::from_str(raw)
-                .map_err(|_| SupervisorError::Internal(anyhow::anyhow!("invalid cli_session_id")))?,
-        ),
-        _ => None,
-    };
+    let cli_session_id =
+        match input.get("cli_session_id").and_then(|v| v.as_str()) {
+            Some(raw) if !raw.is_empty() => Some(CliSessionId::from_str(raw).map_err(|_| {
+                SupervisorError::Internal(anyhow::anyhow!("invalid cli_session_id"))
+            })?),
+            _ => None,
+        };
 
     let runtime_proj = ensure_session_runtime(ctx).await?;
     let runtime = require_runtime(ctx)?;
@@ -1040,7 +1034,7 @@ async fn tool_delegate_cli(
         summary,
         error_code: None,
         finish_summary: None,
-        wait_state: Some("waiting_for_job".into()),
+        wait: Some(TurnWait::Job),
     })
 }
 
@@ -1087,7 +1081,7 @@ async fn tool_update_plan(
         summary,
         error_code: None,
         finish_summary: None,
-        wait_state: None,
+        wait: None,
     })
 }
 
@@ -1118,10 +1112,13 @@ async fn tool_ask_user(
     }
     let choices = input.get("choices").cloned().unwrap_or(json!([]));
     let default = input.get("default").cloned();
-    let expires_at = input.get("expires_in_ms").and_then(|v| v.as_u64()).map(|ms| {
-        let ts = SystemClock.now() + chrono::Duration::milliseconds(ms as i64);
-        format_utc(ts)
-    });
+    let expires_at = input
+        .get("expires_in_ms")
+        .and_then(|v| v.as_u64())
+        .map(|ms| {
+            let ts = SystemClock.now() + chrono::Duration::milliseconds(ms as i64);
+            format_utc(ts)
+        });
     let ask_id = AskId::new();
     let now = format_utc(SystemClock.now());
     sqlx::query(
@@ -1158,8 +1155,8 @@ async fn tool_ask_user(
         summary,
         error_code: None,
         finish_summary: None,
-        wait_state: if mode == "blocking" {
-            Some("waiting_for_ask".into())
+        wait: if mode == "blocking" {
+            Some(TurnWait::Ask)
         } else {
             None
         },

@@ -116,7 +116,10 @@ pub async fn create_terminal(
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid terminal size"))?;
     let working_directory = RelativeWorkingDirectory::new(&body.working_directory)
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid working directory"))?;
-    let ordinary = body.environment.map(|value| value.ordinary).unwrap_or_default();
+    let ordinary = body
+        .environment
+        .map(|value| value.ordinary)
+        .unwrap_or_default();
     let environment = ExecutionEnvironment::new(ordinary, Vec::new())
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid environment"))?;
     let runtime_id: RuntimeId = body
@@ -527,9 +530,7 @@ async fn send_problem(
 }
 
 fn base64_decode(value: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::STANDARD
-        .decode(value)
-        .ok()
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
 }
 
 #[allow(clippy::result_large_err)]

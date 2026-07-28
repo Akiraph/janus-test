@@ -1,4 +1,5 @@
 import type { JSX } from "solid-js";
+import "./badge.css";
 
 export type BadgeVariant = "neutral" | "success" | "warning" | "danger";
 

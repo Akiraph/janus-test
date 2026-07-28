@@ -106,7 +106,7 @@ export function ScmPanel(props: ScmPanelProps) {
       <Show
         when={status.data}
         fallback={
-          <Show when={status.isError} fallback={<p class="files-tree-empty">Loading...</p>}>
+          <Show when={status.isError} fallback={<p class="surface-note">Loading...</p>}>
             <ErrorBlock
               message={status.error instanceof Error ? status.error.message : "Git status failed"}
               retry={() => void status.refetch()}
@@ -248,7 +248,7 @@ export function ScmPanel(props: ScmPanelProps) {
               >
                 <Show
                   when={data().index.length > 0}
-                  fallback={<p class="files-tree-empty">No staged changes</p>}
+                  fallback={<p class="surface-note">No staged changes</p>}
                 >
                   <ul class="scm-path-list">
                     <For each={data().index}>
@@ -274,7 +274,7 @@ export function ScmPanel(props: ScmPanelProps) {
               >
                 <Show
                   when={changeRows().length > 0}
-                  fallback={<p class="files-tree-empty">No changes</p>}
+                  fallback={<p class="surface-note">No changes</p>}
                 >
                   <ul class="scm-path-list">
                     <For each={changeRows()}>

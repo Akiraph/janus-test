@@ -16,6 +16,7 @@ import { Select, type SelectOption } from "../../components/ui/Select";
 import type { EmbeddedModelInput, ProviderInput, ProviderView } from "../../lib/api";
 import { createProvider, deleteProvider, probeProvider, updateProvider } from "../../lib/api";
 import { useProviders } from "../../lib/queries";
+import "./models.css";
 
 type ProviderKind = ProviderInput["kind"];
 
@@ -49,7 +50,7 @@ function emptyModel(): ModelRow {
   };
 }
 
-export function ModelsPage() {
+export function ModelsSettings() {
   const providers = useProviders();
   const queryClient = useQueryClient();
   const notify = useNotifications().notify;
@@ -92,7 +93,7 @@ export function ModelsPage() {
   }
 
   return (
-    <div class="panel animate-panel-in">
+    <div class="panel">
       <section class="settings-group">
         <button
           class="settings-group-trigger"
@@ -115,7 +116,7 @@ export function ModelsPage() {
             <Show
               when={!providers.isPending}
               fallback={
-                <p class="files-tree-empty" role="status" aria-label="Loading...">
+                <p class="surface-note" role="status" aria-label="Loading...">
                   Loading...
                 </p>
               }

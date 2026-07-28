@@ -79,8 +79,8 @@ async fn finish_ok(axum::Json(_b): axum::Json<Value>) -> axum::response::Respons
 }
 
 async fn spawn_openai_fixture() -> anyhow::Result<SocketAddr> {
-    use axum::routing::post;
     use axum::Router;
+    use axum::routing::post;
     let app = Router::new().route("/v1/chat/completions", post(finish_ok));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -166,13 +166,15 @@ impl Fx {
                     display_name: "Fixture".into(),
                     base_url: format!("http://{openai_addr}/v1"),
                     api_key: Some("sk-test".into()),
-                    models: vec![janus_server::modules::models::interface::EmbeddedModelInput {
-                        display_name: "F".into(),
-                        upstream_model_id: "fixture".into(),
-                        supports_1m: false,
-                        supports_images: false,
-                        enabled: true,
-                    }],
+                    models: vec![
+                        janus_server::modules::models::interface::EmbeddedModelInput {
+                            display_name: "F".into(),
+                            upstream_model_id: "fixture".into(),
+                            supports_1m: false,
+                            supports_images: false,
+                            enabled: true,
+                        },
+                    ],
                     enabled: true,
                 },
             )
@@ -318,7 +320,10 @@ async fn terminal_lifecycle_round_trip_is_stable() -> anyhow::Result<()> {
     assert_eq!(closed.status(), 200);
     let closed_body: Value = closed.json().await?;
     assert!(
-        matches!(closed_body["data"]["status"].as_str(), Some("exited") | Some("closing")),
+        matches!(
+            closed_body["data"]["status"].as_str(),
+            Some("exited") | Some("closing")
+        ),
         "status after close: {:?}",
         closed_body["data"]["status"]
     );
@@ -388,7 +393,10 @@ async fn terminal_problems_are_stable_and_tokens_are_single_use() -> anyhow::Res
     assert_ne!(token, second_token, "tickets are unique");
 
     let projection = client
-        .get(format!("{}/api/v1/terminals?owner_kind=session&owner_id={}", fx.base, fx.session_id))
+        .get(format!(
+            "{}/api/v1/terminals?owner_kind=session&owner_id={}",
+            fx.base, fx.session_id
+        ))
         .send()
         .await?
         .json::<Value>()
@@ -399,7 +407,10 @@ async fn terminal_problems_are_stable_and_tokens_are_single_use() -> anyhow::Res
         !serialized.contains(&second_token),
         "second token leaked in list"
     );
-    assert!(!serialized.contains("token_hash"), "token hash leaked in list");
+    assert!(
+        !serialized.contains("token_hash"),
+        "token hash leaked in list"
+    );
 
     Ok(())
 }
@@ -439,7 +450,10 @@ async fn terminal_ticket_rejects_missing_origin() -> anyhow::Result<()> {
             .and_then(|v| v.to_str().ok()),
         Some("application/problem+json")
     );
-    assert_eq!(ticket.json::<Value>().await?["code"], "TERMINAL_TICKET_INVALID");
+    assert_eq!(
+        ticket.json::<Value>().await?["code"],
+        "TERMINAL_TICKET_INVALID"
+    );
 
     Ok(())
 }
@@ -454,7 +468,10 @@ async fn sessions_http_surface_and_version_guard_hold() -> anyhow::Result<()> {
     let client = Client::new();
 
     let list = client
-        .get(format!("{}/api/v1/projects/{}/sessions", fx.base, fx.project_id))
+        .get(format!(
+            "{}/api/v1/projects/{}/sessions",
+            fx.base, fx.project_id
+        ))
         .send()
         .await?;
     assert_eq!(list.status(), 200);
@@ -465,7 +482,10 @@ async fn sessions_http_surface_and_version_guard_hold() -> anyhow::Result<()> {
     );
 
     let created = client
-        .post(format!("{}/api/v1/projects/{}/sessions", fx.base, fx.project_id))
+        .post(format!(
+            "{}/api/v1/projects/{}/sessions",
+            fx.base, fx.project_id
+        ))
         .json(&json!({"title": "second"}))
         .send()
         .await?;
@@ -485,7 +505,10 @@ async fn sessions_http_surface_and_version_guard_hold() -> anyhow::Result<()> {
     // background supervisor turn is spawned and may fail without a model fixture,
     // but the HTTP response reflects the routing decision, not the model outcome.
     let posted = client
-        .post(format!("{}/api/v1/sessions/{}/messages", fx.base, fx.session_id))
+        .post(format!(
+            "{}/api/v1/sessions/{}/messages",
+            fx.base, fx.session_id
+        ))
         .json(&json!({
             "content": "hello",
             "expected_session_version": fx.session_version,
@@ -499,7 +522,10 @@ async fn sessions_http_surface_and_version_guard_hold() -> anyhow::Result<()> {
     // Stale version guard rejects the second post on that session with the
     // stable precondition Problem code.
     let stale = client
-        .post(format!("{}/api/v1/sessions/{}/messages", fx.base, fx.session_id))
+        .post(format!(
+            "{}/api/v1/sessions/{}/messages",
+            fx.base, fx.session_id
+        ))
         .json(&json!({
             "content": "again",
             "expected_session_version": fx.session_version,
@@ -528,13 +554,19 @@ async fn sessions_http_surface_and_version_guard_hold() -> anyhow::Result<()> {
     assert_eq!(timeline.status(), 200);
 
     let turn = client
-        .get(format!("{}/api/v1/sessions/{}/turns/{}", fx.base, fx.session_id, turn_id))
+        .get(format!(
+            "{}/api/v1/sessions/{}/turns/{}",
+            fx.base, fx.session_id, turn_id
+        ))
         .send()
         .await?;
     assert_eq!(turn.status(), 200);
 
     let diff = client
-        .get(format!("{}/api/v1/sessions/{}/diff", fx.base, fx.session_id))
+        .get(format!(
+            "{}/api/v1/sessions/{}/diff",
+            fx.base, fx.session_id
+        ))
         .send()
         .await?;
     assert_eq!(diff.status(), 200);
@@ -561,7 +593,9 @@ async fn timeline_pagination_and_cursor_validation_hold() -> anyhow::Result<()> 
     assert_eq!(first.status(), 200);
     let first_body: Value = first.json().await?;
     assert!(
-        first_body["data"]["items"].as_array().is_some_and(|v| v.is_empty()),
+        first_body["data"]["items"]
+            .as_array()
+            .is_some_and(|v| v.is_empty()),
         "fresh session timeline is empty"
     );
     assert_eq!(first_body["data"]["oldest_cursor"], Value::Null);
@@ -591,8 +625,6 @@ async fn timeline_pagination_and_cursor_validation_hold() -> anyhow::Result<()> 
 
     Ok(())
 }
-
-
 
 /// M4 event projection and SSE convergence: live POSTs surface as typed
 /// `janus` SSE frames whose `event_type` is the durable projection name and
@@ -628,7 +660,10 @@ async fn session_events_converge_on_the_sse_stream() -> anyhow::Result<()> {
     assert!(response.status().is_success());
 
     let created = client
-        .post(format!("{}/api/v1/projects/{}/sessions", fx.base, fx.project_id))
+        .post(format!(
+            "{}/api/v1/projects/{}/sessions",
+            fx.base, fx.project_id
+        ))
         .json(&json!({"title": "convergence-probe"}))
         .send()
         .await?;
@@ -676,7 +711,10 @@ async fn session_events_converge_on_the_sse_stream() -> anyhow::Result<()> {
         }
     })
     .await;
-    assert!(deadline.is_ok(), "timed out waiting for session.changed frame");
+    assert!(
+        deadline.is_ok(),
+        "timed out waiting for session.changed frame"
+    );
     assert!(saw_session_changed);
     Ok(())
 }

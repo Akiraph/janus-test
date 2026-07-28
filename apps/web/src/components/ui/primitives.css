@@ -1,0 +1,173 @@
+/* ================================================================
+   页面通用:panel / heading / 动画
+   ================================================================ */
+.panel {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.panel-heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.panel-heading h2 {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-lg);
+}
+
+.panel-heading p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-sm);
+}
+
+.record-list {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.record-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  transition: border-color var(--dur) var(--easing);
+}
+
+.record-card:hover {
+  border-color: var(--border-strong);
+}
+
+.record-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: var(--space-2);
+}
+
+.record-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.record-title h3 {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.record-copy > p {
+  overflow: hidden;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.record-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.record-chips span {
+  padding: 2px var(--space-2);
+  border-radius: var(--space-1);
+  color: var(--text-muted);
+  background: var(--surface-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* ================================================================
+   Dialog form(与 ui-dialog 配合)
+   ================================================================ */
+.dialog-form {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.dialog-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.dialog-form-grid > label,
+.dialog-form-grid > div {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.dialog-form-grid label,
+.dialog-form-grid .field-label {
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.dialog-form-grid .full-field {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: var(--space-2);
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.surface-note {
+  margin: 0;
+  padding: var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+@media (max-width: 560px) {
+  .record-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .record-actions {
+    justify-content: flex-end;
+  }
+
+  .dialog-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dialog-form-grid .full-field {
+    grid-column: auto;
+  }
+}

@@ -8,8 +8,9 @@ import { Button } from "../../components/ui/Button";
 import { useNotifications } from "../../components/ui/notifications";
 import { logout } from "../../lib/api";
 import { useMe } from "../../lib/queries";
+import "./security.css";
 
-export function SecurityPage() {
+export function SecuritySettings() {
   const me = useMe();
   const client = useQueryClient();
   const notify = useNotifications().notify;
@@ -21,7 +22,7 @@ export function SecurityPage() {
   }
 
   return (
-    <div class="panel animate-panel-in">
+    <div class="panel">
       <div class="panel-heading">
         <h2>Security</h2>
         <p>Local owner account</p>

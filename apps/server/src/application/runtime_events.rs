@@ -32,13 +32,12 @@ impl AppState {
         // Load the settled Job's controlling Turn (the Job row is terminal, so
         // its controlling_turn_id is the durable owner even after a handoff
         // transferred it).
-        let controlling: Option<String> = sqlx::query_scalar(
-            "SELECT controlling_turn_id FROM jobs WHERE id = ?",
-        )
-        .bind(job_id.to_string())
-        .fetch_optional(self.sessions().pool())
-        .await?
-        .flatten();
+        let controlling: Option<String> =
+            sqlx::query_scalar("SELECT controlling_turn_id FROM jobs WHERE id = ?")
+                .bind(job_id.to_string())
+                .fetch_optional(self.sessions().pool())
+                .await?
+                .flatten();
         let Some(turn_id_str) = controlling else {
             return Ok(None);
         };
@@ -73,12 +72,11 @@ impl AppState {
         }
 
         // Load the session id for the Turn (resume_turn + supervisor need it).
-        let session_id_str: String = sqlx::query_scalar(
-            "SELECT session_id FROM turns WHERE id = ?",
-        )
-        .bind(turn_id.to_string())
-        .fetch_one(self.sessions().pool())
-        .await?;
+        let session_id_str: String =
+            sqlx::query_scalar("SELECT session_id FROM turns WHERE id = ?")
+                .bind(turn_id.to_string())
+                .fetch_one(self.sessions().pool())
+                .await?;
         let session_id: SessionId = session_id_str
             .parse()
             .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid session_id")))?;
@@ -102,7 +100,12 @@ impl AppState {
 
         let version = self
             .sessions()
-            .resume_turn(session_id, turn_id, "waiting_for_job", json!({"kind": "supervisor"}))
+            .resume_turn(
+                session_id,
+                turn_id,
+                "waiting_for_job",
+                json!({"kind": "supervisor"}),
+            )
             .await?;
         let _ = version;
         Ok(Some(turn_id))

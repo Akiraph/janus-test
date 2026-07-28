@@ -4,13 +4,11 @@ mod support;
 
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
+use janus_server::modules::supervisor::tools::{ToolContext, execute_tool};
+use janus_server::platform::id::{JobId, LogStreamId, RuntimeId, SessionId, ToolCallId, TurnId};
 use janus_server::{
     AppState,
     config::{Config, RunMode},
-};
-use janus_server::modules::supervisor::tools::{ToolContext, execute_tool};
-use janus_server::platform::id::{
-    JobId, LogStreamId, RuntimeId, SessionId, ToolCallId, TurnId,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -101,7 +99,7 @@ async fn bash_tool_runs_sync_command() -> anyhow::Result<()> {
     )
     .await?;
     assert!(out.ok, "{:?}", out.summary);
-    assert!(out.wait_state.is_none());
+    assert!(out.wait.is_none());
     let text = match &out.parts[0] {
         janus_server::modules::supervisor::types::ToolResultPart::Text { text } => text.clone(),
         _ => String::new(),
@@ -152,7 +150,7 @@ async fn update_plan_and_ask_user_tools() -> anyhow::Result<()> {
     )
     .await?;
     assert!(ask.ok, "{:?}", ask.summary);
-    assert_eq!(ask.wait_state.as_deref(), Some("waiting_for_ask"));
+    assert_eq!(ask.wait.map(|wait| wait.status()), Some("waiting_for_ask"));
     assert!(ask.summary.get("ask_id").is_some());
     Ok(())
 }
@@ -231,11 +229,10 @@ async fn finish_defers_when_unfinished_jobs_exist() -> anyhow::Result<()> {
     };
     let out = execute_tool(&ctx, "finish", &json!({"summary": "done"})).await?;
     assert!(out.ok);
-    assert_eq!(out.wait_state.as_deref(), Some("waiting_for_job"));
+    assert_eq!(out.wait.map(|wait| wait.status()), Some("waiting_for_job"));
     assert!(out.finish_summary.is_none());
     Ok(())
 }
-
 
 #[tokio::test]
 async fn service_tool_starts_and_is_nonblocking() -> anyhow::Result<()> {
@@ -275,7 +272,7 @@ async fn service_tool_starts_and_is_nonblocking() -> anyhow::Result<()> {
     )
     .await?;
     assert!(out.ok, "{:?}", out.summary);
-    assert!(out.wait_state.is_none(), "service must not block the Turn");
+    assert!(out.wait.is_none(), "service must not block the Turn");
     let service_id = out.summary["service_id"].as_str().expect("service_id");
     // Stop so the test process does not leak a long-lived shell.
     let sid: janus_server::platform::id::ServiceId = service_id.parse()?;
@@ -324,7 +321,7 @@ async fn delegate_cli_rejects_missing_binary() -> anyhow::Result<()> {
     .await?;
     if out.ok {
         // Binary present: tool starts a Job and parks the Turn.
-        assert_eq!(out.wait_state.as_deref(), Some("waiting_for_job"));
+        assert_eq!(out.wait.map(|wait| wait.status()), Some("waiting_for_job"));
         assert!(out.summary.get("job_id").is_some());
         if let Some(job_id) = out.summary["job_id"].as_str() {
             let jid: JobId = job_id.parse()?;

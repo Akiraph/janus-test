@@ -12,8 +12,8 @@ use janus_server::{
     config::{Config, RunMode},
     modules::runtime::interface::{
         ExecutionEnvironment, ExecutorKind, LogCursor, NetworkPolicy, RelativeWorkingDirectory,
-        ResourceLimits, RuntimeError, RuntimeSpec, TerminalOwner, TerminalSignal, TerminalSize,
-        TerminalSpec, TerminalStatus, RuntimeStatus,
+        ResourceLimits, RuntimeError, RuntimeSpec, RuntimeStatus, TerminalOwner, TerminalSignal,
+        TerminalSize, TerminalSpec, TerminalStatus,
     },
     platform::id::{ProjectId, RuntimeId, SessionId, TerminalId},
 };
@@ -69,11 +69,7 @@ async fn boot_state() -> anyhow::Result<(TempDir, AppState, RuntimeId, SessionId
     Ok((temp, state, runtime_id, session_id))
 }
 
-fn terminal_spec(
-    id: TerminalId,
-    runtime_id: RuntimeId,
-    owner: TerminalOwner,
-) -> TerminalSpec {
+fn terminal_spec(id: TerminalId, runtime_id: RuntimeId, owner: TerminalOwner) -> TerminalSpec {
     TerminalSpec {
         id,
         runtime_id,
@@ -359,11 +355,7 @@ async fn project_owner_terminal_persists_and_lists() -> anyhow::Result<()> {
     let (_temp, state, runtime_id, _session_id) = boot_state().await?;
     let project_id = ProjectId::new();
     let terminal_id = TerminalId::new();
-    let spec = terminal_spec(
-        terminal_id,
-        runtime_id,
-        TerminalOwner::Project(project_id),
-    );
+    let spec = terminal_spec(terminal_id, runtime_id, TerminalOwner::Project(project_id));
     let _ = state.runtime().create_terminal(spec).await?;
     // Close the shell so the live handle is dropped before list.
     state

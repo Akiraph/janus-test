@@ -17,7 +17,9 @@ use crate::platform::clock::{Clock, SystemClock, format_utc};
 use crate::platform::events::NewEvent;
 use crate::platform::id::{AskId, CorrelationId, SessionId, ToolCallId, TurnId};
 
-use crate::modules::sessions::types::SessionsError;
+use crate::modules::sessions::types::{
+    MessageRoute, MessageRouteResult, SessionsError, TurnStatus,
+};
 
 /// Outcome of handling a freshly accepted message via the M4 state machine.
 pub struct HandledMessage {
@@ -27,6 +29,230 @@ pub struct HandledMessage {
 }
 
 impl AppState {
+    pub async fn post_session_message(
+        &self,
+        session_id: SessionId,
+        content: &str,
+        expected_version: &str,
+        actor: serde_json::Value,
+    ) -> Result<MessageRouteResult, SessionsError> {
+        let workspace_revision = self
+            .sessions()
+            .current_workspace_revision(session_id)
+            .await?;
+        let now = format_utc(SystemClock.now());
+        let mut tx = self.sessions().pool().begin().await?;
+        let command = self
+            .sessions()
+            .lock_session_command_in_tx(&mut *tx, session_id, expected_version, &now)
+            .await?;
+        let has_queued = self
+            .sessions()
+            .has_queued_turn_in_tx(&mut *tx, session_id)
+            .await?;
+        let active_status = match command.active_turn_id.as_deref() {
+            Some(turn_id) => self.sessions().turn_status_in_tx(&mut *tx, turn_id).await?,
+            None => None,
+        };
+        let route = match (command.active_turn_id.as_deref(), active_status, has_queued) {
+            (Some(_), Some(TurnStatus::WaitingForJob), _) => MessageRoute::HandedOff,
+            (Some(_), _, _) | (None, _, true) => MessageRoute::Queued,
+            (None, _, false) => MessageRoute::Started,
+        };
+        let predecessor = (route == MessageRoute::HandedOff)
+            .then_some(command.active_turn_id.as_deref())
+            .flatten();
+        let checkpoint_revision = matches!(route, MessageRoute::Started | MessageRoute::HandedOff)
+            .then_some(workspace_revision.as_str());
+        let created = self
+            .sessions()
+            .create_turn_input_in_tx(
+                &mut *tx,
+                session_id,
+                content,
+                &actor,
+                predecessor,
+                None,
+                checkpoint_revision,
+                &now,
+            )
+            .await?;
+
+        match route {
+            MessageRoute::Started => {
+                let activated = self
+                    .sessions()
+                    .activate_created_turn_in_tx(&mut *tx, session_id, &created.turn_id, &now)
+                    .await?;
+                if !activated {
+                    return Err(SessionsError::ActiveTurnExists);
+                }
+            }
+            MessageRoute::HandedOff => {
+                let predecessor = predecessor.ok_or(SessionsError::HandoffNotApplicable)?;
+                let handed_off = self
+                    .sessions()
+                    .begin_handoff_in_tx(&mut *tx, session_id, predecessor, &created.turn_id, &now)
+                    .await?;
+                if !handed_off {
+                    return Err(SessionsError::HandoffNotApplicable);
+                }
+                self.supervisor()
+                    .close_open_asks_in_tx(&mut *tx, predecessor, &now)
+                    .await
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+                sqlx::query(
+                    "UPDATE jobs SET controlling_turn_id = ? \
+                     WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
+                )
+                .bind(&created.turn_id)
+                .bind(predecessor)
+                .execute(&mut *tx)
+                .await?;
+                let activated = self
+                    .sessions()
+                    .activate_handoff_successor_in_tx(
+                        &mut *tx,
+                        session_id,
+                        predecessor,
+                        &created.turn_id,
+                        &now,
+                    )
+                    .await?;
+                if !activated {
+                    return Err(SessionsError::HandoffNotApplicable);
+                }
+            }
+            MessageRoute::Queued => {}
+            MessageRoute::AskAnswerSteer => {
+                unreachable!("ordinary messages cannot use Ask routing")
+            }
+        }
+        tx.commit().await?;
+
+        let result = MessageRouteResult {
+            route: route.as_str().to_owned(),
+            message_id: created.message_id.clone(),
+            turn_id: created.turn_id.clone(),
+            session_version: command.session_version.clone(),
+            handoff_from_turn_id: predecessor.map(str::to_owned),
+        };
+        self.publish_message_accepted(session_id, &created, &command, route, predecessor, actor)
+            .await;
+        Ok(result)
+    }
+
+    async fn publish_message_accepted(
+        &self,
+        session_id: SessionId,
+        created: &crate::modules::sessions::types::CreatedTurnInput,
+        command: &crate::modules::sessions::types::SessionCommandState,
+        route: MessageRoute,
+        predecessor: Option<&str>,
+        actor: serde_json::Value,
+    ) {
+        let correlation_id = CorrelationId::new().to_string();
+        if let Some(checkpoint_id) = &created.checkpoint_id {
+            let _ = self
+                .events()
+                .append(NewEvent {
+                    event_type: "checkpoint.created".into(),
+                    actor: actor.clone(),
+                    resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                    correlation_id: correlation_id.clone(),
+                    causation_id: None,
+                    payload: json!({
+                        "checkpoint_id": checkpoint_id,
+                        "session_id": session_id.to_string(),
+                        "kind": "pre_turn",
+                    }),
+                })
+                .await;
+        }
+        if let Some(predecessor) = predecessor {
+            let _ = self
+                .events()
+                .append(NewEvent {
+                    event_type: "turn.status_changed".into(),
+                    actor: json!({"kind": "supervisor"}),
+                    resource: Some(json!({"kind": "turn", "id": predecessor})),
+                    correlation_id: correlation_id.clone(),
+                    causation_id: None,
+                    payload: json!({
+                        "turn_id": predecessor,
+                        "to": "handed_off",
+                        "handoff_to_turn_id": created.turn_id,
+                    }),
+                })
+                .await;
+        }
+        let status = if route == MessageRoute::Queued {
+            "queued"
+        } else {
+            "running"
+        };
+        let _ = self
+            .events()
+            .append(NewEvent {
+                event_type: "turn.created".into(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "turn", "id": created.turn_id})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "turn_id": created.turn_id,
+                    "session_id": session_id.to_string(),
+                    "sequence": created.sequence,
+                    "status": status,
+                    "route": route.as_str(),
+                    "handoff_from_turn_id": predecessor,
+                }),
+            })
+            .await;
+        let _ = self
+            .events()
+            .append(NewEvent {
+                event_type: "timeline.item_created".into(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "timeline_item_id": created.timeline_item_id,
+                    "session_id": session_id.to_string(),
+                    "kind": "user_message",
+                    "display_order": created.display_order,
+                }),
+            })
+            .await;
+        let session_state = if route == MessageRoute::Queued {
+            command.state.as_str()
+        } else {
+            "active"
+        };
+        let active_turn_id = if route == MessageRoute::Queued {
+            command.active_turn_id.as_deref()
+        } else {
+            Some(created.turn_id.as_str())
+        };
+        let _ = self
+            .events()
+            .append(NewEvent {
+                event_type: "session.changed".into(),
+                actor,
+                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                correlation_id,
+                causation_id: None,
+                payload: json!({
+                    "session_id": session_id.to_string(),
+                    "state": session_state,
+                    "active_turn_id": active_turn_id,
+                    "version": command.session_version,
+                }),
+            })
+            .await;
+    }
+
     /// Route a just-accepted message: if it should take over an active
     /// `waiting_for_job` Turn via an atomic Handoff, perform that Handoff and
     /// return the successor Turn to execute; otherwise return the Turn
@@ -36,40 +262,51 @@ impl AppState {
         session_id: SessionId,
         result: crate::modules::sessions::types::MessageRouteResult,
         content: &str,
-        owner_id: &str,
+        _owner_id: &str,
     ) -> Result<HandledMessage, SessionsError> {
         let turn_id: TurnId = result
             .turn_id
             .parse()
             .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid turn id")))?;
-        if !result.awaiting_handoff {
+        if result.route != "handed_off" {
             // started -> execute; queued -> nothing to run now.
             if result.route == "started" {
-                return Ok(HandledMessage { run_turn: Some(turn_id) });
+                return Ok(HandledMessage {
+                    run_turn: Some(turn_id),
+                });
             }
             return Ok(HandledMessage { run_turn: None });
         }
         // Handoff: promote the queued Turn to the successor of the active
         // waiting_for_job Turn, transactionally closing the predecessor's Asks
         // and transferring its unfinished finite Jobs.
-        let active: Option<String> = sqlx::query_scalar("SELECT active_turn_id FROM sessions WHERE id = ?")
-            .bind(session_id.to_string())
-            .fetch_optional(self.sessions().pool())
-            .await?
-            .flatten();
+        let active: Option<String> =
+            sqlx::query_scalar("SELECT active_turn_id FROM sessions WHERE id = ?")
+                .bind(session_id.to_string())
+                .fetch_optional(self.sessions().pool())
+                .await?
+                .flatten();
         let Some(predecessor_str) = active else {
             // No active Turn anymore (concurrency) — just promote the queued Turn.
             let _ = self.sessions().promote_oldest_queued(session_id).await?;
-            return Ok(HandledMessage { run_turn: self.sessions().active_turn_status(session_id).await?.map(|(t, _)| t) });
+            return Ok(HandledMessage {
+                run_turn: self
+                    .sessions()
+                    .active_turn_status(session_id)
+                    .await?
+                    .map(|(t, _)| t),
+            });
         };
         let predecessor: TurnId = predecessor_str
             .parse()
             .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid active_turn_id")))?;
 
-        let supervisor = self.supervisor_for_owner(owner_id);
+        let supervisor = self.supervisor().clone();
         self.handoff_message_internal(session_id, predecessor, turn_id, content, &supervisor)
             .await?;
-        Ok(HandledMessage { run_turn: Some(turn_id) })
+        Ok(HandledMessage {
+            run_turn: Some(turn_id),
+        })
     }
 
     /// Atomically hand a `waiting_for_job` Turn off to a queued successor Turn:
@@ -190,7 +427,7 @@ impl AppState {
         expires_at: Option<&str>,
     ) -> Result<(AskId, String, String), SessionsError> {
         let ask_id = AskId::new();
-        let supervisor = self.supervisor_for_owner(owner_id);
+        let supervisor = self.supervisor().clone();
         let now = format_utc(SystemClock.now());
         let mut tx = self.sessions().pool().begin().await?;
         supervisor
@@ -216,7 +453,12 @@ impl AppState {
             let _ = owner_id;
             let v = self
                 .sessions()
-                .pause_turn_for(session_id, turn_id, "waiting_for_ask", json!({"kind": "supervisor"}))
+                .pause_turn_for(
+                    session_id,
+                    turn_id,
+                    "waiting_for_ask",
+                    json!({"kind": "supervisor"}),
+                )
                 .await?;
             ("waiting_for_ask".to_string(), v)
         } else {
@@ -259,7 +501,7 @@ impl AppState {
         answer: &serde_json::Value,
         actor: serde_json::Value,
     ) -> Result<(TurnId, String, String), SessionsError> {
-        let supervisor = self.supervisor_for_owner(owner_id);
+        let supervisor = self.supervisor().clone();
         let now = format_utc(SystemClock.now());
 
         // Look up the Ask's Turn + session (best-effort if it still exists).
@@ -328,7 +570,7 @@ impl AppState {
     /// resuming the controlling Turn if it is still `waiting_for_ask`. Called by
     /// a periodic sweeper (and at startup). Stale notifications are harmless.
     pub async fn expire_asks(&self, owner_id: &str) -> Result<u64, SessionsError> {
-        let supervisor = self.supervisor_for_owner(owner_id);
+        let supervisor = self.supervisor().clone();
         let now = format_utc(SystemClock.now());
         let expired = supervisor
             .expire_open_asks(&now)
@@ -340,13 +582,12 @@ impl AppState {
                 continue;
             };
             // Find the session for this turn.
-            let session_id_str: Option<String> = sqlx::query_scalar(
-                "SELECT session_id FROM turns WHERE id = ?",
-            )
-            .bind(turn_id_str)
-            .fetch_optional(self.sessions().pool())
-            .await?
-            .flatten();
+            let session_id_str: Option<String> =
+                sqlx::query_scalar("SELECT session_id FROM turns WHERE id = ?")
+                    .bind(turn_id_str)
+                    .fetch_optional(self.sessions().pool())
+                    .await?
+                    .flatten();
             let Some(session_id_str) = session_id_str else {
                 continue;
             };
@@ -356,7 +597,12 @@ impl AppState {
             // Resume only if still waiting for the Ask.
             let _ = self
                 .sessions()
-                .resume_turn(session_id, turn_id, "waiting_for_ask", json!({"kind": "supervisor"}))
+                .resume_turn(
+                    session_id,
+                    turn_id,
+                    "waiting_for_ask",
+                    json!({"kind": "supervisor"}),
+                )
                 .await;
             count += 1;
         }
@@ -385,7 +631,7 @@ impl AppState {
         // cannot resume it after settlement.
         let now = format_utc(SystemClock.now());
         let mut tx = self.sessions().pool().begin().await?;
-        let supervisor = self.supervisor_for_owner("owner-bootstrap");
+        let supervisor = self.supervisor().clone();
         supervisor
             .close_open_asks_in_tx(&mut *tx, &turn_id.to_string(), &now)
             .await
@@ -398,4 +644,3 @@ impl AppState {
             .await
     }
 }
-

@@ -279,7 +279,8 @@ async fn diff_summary_clean_session_reports_no_modifications() -> anyhow::Result
         .await?;
     let summary = fx.sync.diff_summary(session_id).await?;
     assert_eq!(
-        summary.modified, 0,
+        summary.modified,
+        0,
         "clean session must show 0 modified, got {}: {:?}",
         summary.modified,
         summary.paths.iter().map(|p| &p.path).collect::<Vec<_>>()

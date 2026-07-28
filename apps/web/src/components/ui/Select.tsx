@@ -1,6 +1,7 @@
 import ChevronDown from "lucide-solid/icons/chevron-down";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import "./fields.css";
 
 export interface SelectOption {
   readonly value: string;

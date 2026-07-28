@@ -21,8 +21,8 @@ export function ScmGraphList(props: ScmGraphListProps) {
 
   return (
     <section class="scm-graph-list" aria-label="Source control commit graph">
-      <Show when={!log.isPending} fallback={<p class="files-tree-empty">Loading...</p>}>
-        <Show when={entries().length > 0} fallback={<p class="files-tree-empty">No commits yet</p>}>
+      <Show when={!log.isPending} fallback={<p class="surface-note">Loading...</p>}>
+        <Show when={entries().length > 0} fallback={<p class="surface-note">No commits yet</p>}>
           <ol class="scm-graph-rows">
             <For each={entries()}>
               {(commit, index) => {

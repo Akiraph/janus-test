@@ -203,10 +203,16 @@ async fn tst_ses_03_single_active_turn() -> anyhow::Result<()> {
         .force_complete_turn_for_test(session_id, turn_id)
         .await?;
     let promoted = fx.sessions.promote_oldest_queued(session_id).await?;
-    assert_eq!(promoted.map(|t| t.to_string()), Some(second.turn_id.clone()));
+    assert_eq!(
+        promoted.map(|t| t.to_string()),
+        Some(second.turn_id.clone())
+    );
 
     let session = fx.sessions.get_session(session_id).await?;
-    assert_eq!(session.active_turn_id.as_deref(), Some(second.turn_id.as_str()));
+    assert_eq!(
+        session.active_turn_id.as_deref(),
+        Some(second.turn_id.as_str())
+    );
     let promoted_turn = fx
         .sessions
         .get_turn(session_id, TurnId::from_str(&second.turn_id)?)

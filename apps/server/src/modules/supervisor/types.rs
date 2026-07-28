@@ -79,8 +79,89 @@ pub struct ToolOutcome {
     pub summary: serde_json::Value,
     pub error_code: Option<String>,
     /// When set, the Turn should complete with this summary.
-    pub finish_summary: Option<serde_json::Value>,
-    /// When set, the Turn should pause in this status after the tool returns
-    /// (`waiting_for_job` / `waiting_for_ask`). Stage 5 runtime tools use this.
-    pub wait_state: Option<String>,
+    pub finish_summary: Option<CompletionSummary>,
+    pub wait: Option<TurnWait>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionSummary {
+    pub summary: String,
+    pub main_changes: Vec<String>,
+    pub validation_performed: Vec<String>,
+    pub validation_not_performed: Vec<String>,
+    pub remaining_risks: Vec<String>,
+}
+
+impl CompletionSummary {
+    pub fn from_tool_input(input: &serde_json::Value) -> Self {
+        Self {
+            summary: input
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("done")
+                .to_owned(),
+            main_changes: string_items(input.get("main_changes")),
+            validation_performed: string_items(input.get("validation_performed")),
+            validation_not_performed: string_items(input.get("validation_not_performed")),
+            remaining_risks: string_items(
+                input.get("remaining_risks").or_else(|| input.get("risks")),
+            ),
+        }
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        Self {
+            summary: if text.is_empty() {
+                "The model stopped without a structured completion summary.".to_owned()
+            } else {
+                text.to_owned()
+            },
+            main_changes: Vec::new(),
+            validation_performed: Vec::new(),
+            validation_not_performed: vec![
+                "No validation was reported in the text-only completion.".to_owned(),
+            ],
+            remaining_risks: vec![
+                "Structured completion details were not provided by the model.".to_owned(),
+            ],
+        }
+    }
+}
+
+fn string_items(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+            vec![value.to_owned()]
+        }
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWait {
+    Job,
+    Ask,
+}
+
+impl TurnWait {
+    pub const fn status(self) -> &'static str {
+        match self {
+            Self::Job => "waiting_for_job",
+            Self::Ask => "waiting_for_ask",
+        }
+    }
+
+    pub const fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Ask, _) | (_, Self::Ask) => Self::Ask,
+            _ => Self::Job,
+        }
+    }
 }

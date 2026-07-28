@@ -1,3 +1,5 @@
+import "./skeleton.css";
+
 interface SkeletonProps {
   compact?: boolean;
   class?: string;

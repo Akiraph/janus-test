@@ -1,4 +1,5 @@
 import type { JSX } from "solid-js";
+import "./button.css";
 
 export type ButtonVariant = "primary" | "outline" | "ghost" | "destructive";
 export type ButtonSize = "sm" | "md";

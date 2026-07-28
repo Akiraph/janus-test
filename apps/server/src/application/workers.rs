@@ -126,7 +126,8 @@ async fn dispatch(state: &AppState, kind: &str, payload: &Value) -> anyhow::Resu
             }
         },
         KIND_DELETE_PROJECT => {
-            match crate::application::lifecycle::delete_project_with_runtime(state, project_id).await
+            match crate::application::lifecycle::delete_project_with_runtime(state, project_id)
+                .await
             {
                 Ok(()) => {
                     record_operation_success(state, kind, project_id, payload).await;

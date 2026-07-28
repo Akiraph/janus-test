@@ -108,7 +108,12 @@ async fn main() -> anyhow::Result<()> {
             command: EventsCommand::Follow { after, count },
         } => follow_events(&client, &cli.base_url, after, count).await,
         Command::Events {
-            command: EventsCommand::Range { after, until, limit },
+            command:
+                EventsCommand::Range {
+                    after,
+                    until,
+                    limit,
+                },
         } => events_range(&client, &cli.base_url, after, until, limit).await,
         Command::Projects { command } => match command {
             ProjectsCommand::List => projects_list(&client, &cli.base_url).await,
@@ -133,9 +138,7 @@ async fn main() -> anyhow::Result<()> {
                 owner_kind,
                 owner_id,
             } => terminal_list(&client, &cli.base_url, owner_kind, owner_id).await,
-            TerminalCommand::Ticket { id } => {
-                terminal_ticket(&client, &cli.base_url, &id).await
-            }
+            TerminalCommand::Ticket { id } => terminal_ticket(&client, &cli.base_url, &id).await,
             TerminalCommand::Scrollback { id, after, limit } => {
                 terminal_scrollback(&client, &cli.base_url, &id, after, limit).await
             }
@@ -145,9 +148,7 @@ async fn main() -> anyhow::Result<()> {
             TerminalCommand::Signal { id, signal } => {
                 terminal_signal(&client, &cli.base_url, &id, &signal).await
             }
-            TerminalCommand::Close { id } => {
-                terminal_close(&client, &cli.base_url, &id).await
-            }
+            TerminalCommand::Close { id } => terminal_close(&client, &cli.base_url, &id).await,
         },
         Command::Sessions { command } => match command {
             SessionsCommand::List { project_id } => {
@@ -162,14 +163,16 @@ async fn main() -> anyhow::Result<()> {
                 id,
                 content,
                 expected_session_version,
-            } => sessions_post_message(
-                &client,
-                &cli.base_url,
-                &id,
-                &content,
-                &expected_session_version,
-            )
-            .await,
+            } => {
+                sessions_post_message(
+                    &client,
+                    &cli.base_url,
+                    &id,
+                    &content,
+                    &expected_session_version,
+                )
+                .await
+            }
             SessionsCommand::Timeline {
                 id,
                 before,
@@ -363,7 +366,10 @@ async fn terminal_list(
 ) -> anyhow::Result<()> {
     let response = client
         .get(url(base_url, "/api/v1/terminals"))
-        .query(&[("owner_kind", owner_kind.as_str()), ("owner_id", owner_id.as_str())])
+        .query(&[
+            ("owner_kind", owner_kind.as_str()),
+            ("owner_id", owner_id.as_str()),
+        ])
         .send()
         .await?;
     print_response(response).await
@@ -564,7 +570,10 @@ async fn events_range(
 
 async fn sessions_list(client: &Client, base_url: &str, project_id: &str) -> anyhow::Result<()> {
     let response = client
-        .get(url(base_url, &format!("/api/v1/projects/{project_id}/sessions")))
+        .get(url(
+            base_url,
+            &format!("/api/v1/projects/{project_id}/sessions"),
+        ))
         .send()
         .await?;
     print_response(response).await
@@ -578,7 +587,10 @@ async fn sessions_create(
 ) -> anyhow::Result<()> {
     let body = serde_json::json!({ "title": title });
     let response = client
-        .post(url(base_url, &format!("/api/v1/projects/{project_id}/sessions")))
+        .post(url(
+            base_url,
+            &format!("/api/v1/projects/{project_id}/sessions"),
+        ))
         .json(&body)
         .send()
         .await?;
@@ -636,8 +648,7 @@ async fn sessions_timeline(
     after: Option<String>,
     limit: i64,
 ) -> anyhow::Result<()> {
-    let mut request =
-        client.get(url(base_url, &format!("/api/v1/sessions/{id}/timeline")));
+    let mut request = client.get(url(base_url, &format!("/api/v1/sessions/{id}/timeline")));
     if let Some(cursor) = &before {
         request = request.query(&[("before", cursor.as_str())]);
     }

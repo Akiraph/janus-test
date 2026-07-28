@@ -21,11 +21,11 @@ use janus_server::modules::models::interface::{
 };
 use janus_server::modules::sessions::interface::SessionsInterface;
 use janus_server::modules::supervisor::interface::SupervisorInterface;
+use janus_server::modules::workspace_sync::interface::WorkspaceSyncInterface;
 use janus_server::platform::id::{ProjectId, SessionId, TurnId};
 use janus_server::platform::sleeper::FakeSleeper;
-use janus_server::platform::{events::EventStore, secret::SecretCipher};
 use janus_server::platform::{database::Database, managed_storage::BlobStore};
-use janus_server::modules::workspace_sync::interface::WorkspaceSyncInterface;
+use janus_server::platform::{events::EventStore, secret::SecretCipher};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -141,7 +141,7 @@ impl Fx {
             "owner-test".into(),
         )
         .with_retry_sleeper(
-            sleeper.clone() as std::sync::Arc<dyn janus_server::platform::sleeper::Sleeper>,
+            sleeper.clone() as std::sync::Arc<dyn janus_server::platform::sleeper::Sleeper>
         );
 
         Ok(Self {

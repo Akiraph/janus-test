@@ -1,0 +1,90 @@
+* {
+  box-sizing: border-box;
+}
+
+/* Default page scrollbars: square, ultra-thin, no arrow buttons — same square
+   thumb language as the IDE side panels so every list surface reads as one
+   system. The `*` selector keeps this consistent across Settings/Models pages
+   and any future overflow surfaces without per-container overrides. */
+@supports selector(::-webkit-scrollbar) {
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: hsl(210 16% 78%);
+    border: 0;
+    border-radius: 0;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: hsl(210 16% 64%);
+  }
+  /* Strip the increment/decrement arrow buttons from every Chromium surface. */
+  *::-webkit-scrollbar-button,
+  *::-webkit-scrollbar-button:start,
+  *::-webkit-scrollbar-button:end,
+  *::-webkit-scrollbar-corner {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(210 16% 78%) transparent;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--canvas);
+}
+
+button,
+a {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+  border-color: var(--border-strong);
+  border-radius: var(--radius-sm);
+}
+
+h1,
+h2,
+p {
+  overflow-wrap: anywhere;
+}
+
+h1 {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+h2 {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

@@ -9,10 +9,11 @@ import type { JSX } from "solid-js";
 import { Show, Suspense } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
 import { type TabItem, Tabs } from "../components/ui/Tabs";
-import { LoginPage, SetupPage } from "../features/auth/AuthPage";
 import { IdeShellScaffold } from "../features/projects/workspace/IdeShellScaffold";
 import { useBootstrap, useMe } from "../lib/queries";
 import { useEventStream } from "../lib/useEventStream";
+import { LoginPage, SetupPage } from "../pages/AuthPages";
+import "./app.css";
 
 const MODE_TABS: TabItem[] = [
   { value: "code", label: "Code" },

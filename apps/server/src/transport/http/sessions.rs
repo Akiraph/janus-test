@@ -173,8 +173,7 @@ pub async fn post_message(
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
     let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
     let data = state
-        .sessions()
-        .post_message(
+        .post_session_message(
             session_id,
             &body.content,
             &body.expected_session_version,
@@ -182,23 +181,14 @@ pub async fn post_message(
         )
         .await
         .map_err(sessions_problem)?;
-
-    // Route the message through the M4 state machine: started -> execute the
-    // Turn now; queued behind an active Turn -> nothing to run (promoted later);
-    // awaiting_handoff (active Turn is `waiting_for_job`) -> perform the atomic
-    // Handoff in `application::session_flow` and execute the successor Turn.
-    let content = body.content.clone();
-    let owner_id = auth.owner_id.clone();
-    let outcome = state
-        .clone()
-        .handle_message(session_id, data.clone(), &content, &owner_id)
-        .await
-        .map_err(sessions_problem)?;
-    if let Some(run_turn) = outcome.run_turn {
-        let supervisor = state.supervisor_for_owner(&owner_id);
+    if matches!(data.route.as_str(), "started" | "handed_off") {
+        let run_turn: TurnId = data
+            .turn_id
+            .parse()
+            .map_err(|_| Problem::from_code(codes::INTERNAL_ERROR, "invalid accepted Turn id"))?;
+        let supervisor = state.supervisor().clone();
         let sess_state = state.clone();
         let sess_session_id = session_id;
-        let sess_owner_id = owner_id.clone();
         tokio::spawn(async move {
             if let Err(error) = supervisor.execute_turn(run_turn).await {
                 tracing::error!(%error, turn_id = %run_turn, "execute_turn failed");
@@ -214,7 +204,7 @@ pub async fn post_message(
                 .ok()
                 .flatten()
             {
-                let supervisor = sess_state.supervisor_for_owner(&sess_owner_id);
+                let supervisor = sess_state.supervisor().clone();
                 if let Err(error) = supervisor.execute_turn(next).await {
                     tracing::error!(%error, turn_id = %next, "promoted execute_turn failed");
                 }

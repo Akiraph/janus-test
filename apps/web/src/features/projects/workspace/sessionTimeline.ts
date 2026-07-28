@@ -132,9 +132,7 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
         "model",
       ),
       status,
-      detail: text(
-        summary.detail ?? summary.error ?? projection.detail ?? projection.message,
-      ),
+      detail: text(summary.detail ?? summary.error ?? projection.detail ?? projection.message),
       attempt: displayValue(summary.attempt_number ?? projection.attempt_number),
       warning:
         item.kind === "model_warning" ||
@@ -270,8 +268,6 @@ function displayValue(value: unknown): string | null {
 
 function stringList(value: unknown): string[] {
   return Array.isArray(value)
-    ? value
-        .map((choice) => (typeof choice === "string" ? choice : String(choice)))
-        .filter(Boolean)
+    ? value.map((choice) => (typeof choice === "string" ? choice : String(choice))).filter(Boolean)
     : [];
 }

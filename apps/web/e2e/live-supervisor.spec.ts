@@ -24,6 +24,10 @@ test("a browser message completes through the live supervisor", async ({ page })
   await expect(sessionRow).toBeVisible({ timeout: 15_000 });
   await sessionRow.click();
 
+  await expect(
+    page.getByRole("tablist", { name: "Session views" }).getByRole("tab", { name: "Terminal" }),
+  ).toHaveCount(0);
+
   const composer = page.getByPlaceholder(/Send a message/i);
   await expect(composer).toBeVisible();
   await composer.fill("Complete this through the live supervisor");
@@ -45,4 +49,29 @@ test("a browser message completes through the live supervisor", async ({ page })
       expect.objectContaining({ kind: "assistant_message" }),
     ]),
   );
+});
+
+test("mobile workspace switches between navigation and the active Session", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`/projects/${live.projectId}`, { waitUntil: "domcontentloaded" });
+
+  const sessionRow = page.getByRole("button", { name: live.sessionTitle, exact: true });
+  await expect(sessionRow).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".ide-main")).toBeHidden();
+  await sessionRow.click();
+
+  const composer = page.getByPlaceholder(/Send a message/i);
+  await expect(composer).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Workspace activity" })).toBeHidden();
+
+  await page.screenshot({ path: testInfo.outputPath("live-session-mobile.png"), fullPage: true });
+
+  await page.getByRole("button", { name: "Open workspace navigation" }).click();
+  await expect(sessionRow).toBeVisible();
+  await expect(page.locator(".ide-main")).toBeHidden();
+
+  await sessionRow.click();
+  await expect(composer).toBeVisible();
 });

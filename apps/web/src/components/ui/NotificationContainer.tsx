@@ -6,6 +6,7 @@ import XCircle from "lucide-solid/icons/x-circle";
 import { For } from "solid-js";
 import { Portal } from "solid-js/web";
 import type { NotificationVariant } from "./notifications";
+import "./notifications.css";
 import { useNotifications } from "./notifications";
 
 const ICONS: Record<NotificationVariant, typeof Info> = {

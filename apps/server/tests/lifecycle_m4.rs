@@ -238,13 +238,7 @@ async fn delete_session_cancels_job_and_recovery_does_not_replay() -> anyhow::Re
         );
         assert_ne!(job.status, JobStatus::Queued);
     }
-    assert!(
-        state
-            .runtime()
-            .current_runtime(session_id)
-            .await?
-            .is_none()
-    );
+    assert!(state.runtime().current_runtime(session_id).await?.is_none());
 
     Ok(())
 }

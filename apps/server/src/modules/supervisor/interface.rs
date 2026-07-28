@@ -1,28 +1,40 @@
 //! Turn execution loop (M3 Stage 4).
 
-use serde_json::{Value, json};
-use sqlx::Row;
-
 use crate::modules::models::interface::ModelsInterface;
 use crate::modules::models::stream_types::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent, ToolSpec,
 };
+use crate::modules::sessions::interface::SessionsInterface;
+use crate::modules::sessions::types::{ExecutionTurn, TurnStatus};
 use crate::modules::workspace_sync::interface::WorkspaceSyncInterface;
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     events::{EventStore, NewEvent},
-    id::{CorrelationId, MessageId, RoundId, SessionId, TimelineItemId, ToolCallId, TurnId},
+    id::{CorrelationId, RoundId, SessionId, ToolCallId, TurnId},
     sleeper::{Sleeper, SystemSleeper},
 };
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use super::context::SYSTEM_PROMPT;
 use super::registry::{SCHEMA_VERSION, registry};
-use super::retry::{FaultClass, MAX_ATTEMPTS_PER_CANDIDATE, classify, RetryDecision};
+use super::retry::{FaultClass, MAX_ATTEMPTS_PER_CANDIDATE, RetryDecision, classify};
 use super::tools::{ToolContext, execute_tool};
-use super::types::{SupervisorError, ToolResultPart};
+use super::types::{CompletionSummary, SupervisorError, ToolOutcome, ToolResultPart, TurnWait};
 
 const MAX_ROUNDS: usize = 12;
+
+#[derive(Clone)]
+struct AcceptedToolCall {
+    id: ToolCallId,
+    ordinal: i64,
+    request: CompletedToolCall,
+}
+
+struct ExecutedToolCall {
+    outcome: ToolOutcome,
+    message: ChatMessage,
+}
 
 #[derive(Clone)]
 pub struct SupervisorInterface {
@@ -30,10 +42,9 @@ pub struct SupervisorInterface {
     events: EventStore,
     models: ModelsInterface,
     workspace: WorkspaceSyncInterface,
+    sessions: SessionsInterface,
     runtime: Option<crate::modules::runtime::interface::RuntimeInterface>,
     retry_sleeper: std::sync::Arc<dyn Sleeper>,
-    /// Owner id used to resolve provider credentials (Phase 1 single owner).
-    owner_id: String,
 }
 
 impl SupervisorInterface {
@@ -42,16 +53,16 @@ impl SupervisorInterface {
         events: EventStore,
         models: ModelsInterface,
         workspace: WorkspaceSyncInterface,
-        owner_id: String,
+        sessions: SessionsInterface,
     ) -> Self {
         Self {
             pool,
             events,
             models,
             workspace,
+            sessions,
             runtime: None,
             retry_sleeper: std::sync::Arc::new(SystemSleeper),
-            owner_id,
         }
     }
 
@@ -74,7 +85,7 @@ impl SupervisorInterface {
     /// Execute a running Turn until finish tool, model stop without tools, or failure.
     pub async fn execute_turn(&self, turn_id: TurnId) -> Result<(), SupervisorError> {
         let turn = self.load_turn(turn_id).await?;
-        if turn.status != "running" {
+        if turn.status != TurnStatus::Running || !turn.active {
             return Ok(()); // idempotent
         }
         let session_id: SessionId = turn
@@ -82,9 +93,17 @@ impl SupervisorInterface {
             .parse()
             .map_err(|_| SupervisorError::SessionNotFound)?;
 
-        let (provider_id, upstream_model_id) = self.resolve_model(&turn.session_id).await?;
+        let (provider_id, upstream_model_id) = match self.resolve_model(&turn).await {
+            Ok(model) => model,
+            Err(SupervisorError::ModelNotConfigured) => {
+                self.enter_waiting_for_model(session_id, turn_id, "model is not configured")
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
 
-        let mut chat: Vec<ChatMessage> = self.load_chat_history(session_id).await?;
+        let (mut chat, mut input_cursor) = self.load_chat_history(session_id, turn_id).await?;
         // Ensure system prefix once.
         if !chat
             .first()
@@ -98,6 +117,7 @@ impl SupervisorInterface {
                         text: SYSTEM_PROMPT.into(),
                     }],
                     tool_call_id: None,
+                    tool_calls: Vec::new(),
                 },
             );
         }
@@ -113,50 +133,60 @@ impl SupervisorInterface {
 
         let actor = json!({"kind": "supervisor"});
         let mut finished = false;
-        let mut finish_summary: Option<Value> = None;
-        let mut total_in: i64 = 0;
-        let mut total_out: i64 = 0;
+        let mut finish_summary: Option<CompletionSummary> = None;
 
-        for round_seq in 1..=MAX_ROUNDS {
-            // Honor Cancel mid-loop: if the Turn has been moved to `canceling`
-            // by sessions, stop without starting a new Round. Final settlement
-            // (`canceled` vs `interrupted`) is the application/runtime's job.
-            let current_status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM turns WHERE id = ?")
-                    .bind(turn_id.to_string())
-                    .fetch_optional(&self.pool)
-                    .await?;
-            if current_status.as_deref() == Some("canceling") {
+        let last_round_sequence: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM rounds WHERE turn_id = ?")
+                .bind(turn_id.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+        if last_round_sequence >= MAX_ROUNDS as i64 {
+            self.fail_turn(session_id, turn_id, "max rounds exceeded")
+                .await?;
+            return Ok(());
+        }
+
+        for round_seq in (last_round_sequence + 1)..=MAX_ROUNDS as i64 {
+            if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
                 return Ok(());
             }
 
-            // Inject Steers that arrived since the last Round boundary. Steer
-            // messages are ordinary user messages with body_json.steer = true;
-            // they become visible here and only here (design: next safe Round).
-            let steers = self.drain_pending_steers(session_id, turn_id, &chat).await?;
-            chat.extend(steers);
+            let (turn_inputs, next_cursor) =
+                self.load_turn_inputs_after(turn_id, input_cursor).await?;
+            chat.extend(turn_inputs);
+            input_cursor = next_cursor;
 
             let round_id = RoundId::new();
             let now = format_utc(SystemClock.now());
             let version = format!("v_{}", RoundId::new());
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO rounds \
                  (id, turn_id, sequence, context_version, status, candidate_snapshot_json, \
                   final_attempt_id, output_summary_json, input_tokens, output_tokens, \
                   stop_reason, version, created_at, updated_at) \
-                 VALUES (?, ?, ?, '1', 'running', NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?)",
+                 SELECT ?, ?, ?, '1', 'running', NULL, NULL, NULL, 0, 0, NULL, ?, ?, ? \
+                 WHERE EXISTS(SELECT 1 FROM turns AS turn \
+                              JOIN sessions AS session ON session.id = turn.session_id \
+                              WHERE turn.id = ? AND turn.session_id = ? \
+                                AND turn.status = 'running' \
+                                AND session.active_turn_id = turn.id)",
             )
             .bind(round_id.to_string())
             .bind(turn_id.to_string())
-            .bind(round_seq as i64)
+            .bind(round_seq)
             .bind(&version)
             .bind(&now)
             .bind(&now)
+            .bind(turn_id.to_string())
+            .bind(session_id.to_string())
             .execute(&self.pool)
             .await?;
+            if inserted.rows_affected() != 1 {
+                return Ok(());
+            }
 
             let req = ModelRequest {
-                owner_id: self.owner_id.clone(),
+                owner_id: turn.owner_id.clone(),
                 provider_id: provider_id.clone(),
                 upstream_model_id: upstream_model_id.clone(),
                 messages: chat.clone(),
@@ -168,6 +198,9 @@ impl SupervisorInterface {
             };
 
             let events = self.try_round_stream(req).await?;
+            if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
+                return Ok(());
+            }
             // Emit provisional deltas as public events (best-effort).
             for ev in &events {
                 if let ModelStreamEvent::Delta {
@@ -229,7 +262,8 @@ impl SupervisorInterface {
                         _ => None,
                     })
                     .unwrap_or_else(|| "stream failed".into());
-                self.fail_round(&round_id, &detail).await?;
+                self.fail_round(session_id, turn_id, &round_id, &detail)
+                    .await?;
                 let decision = classify_failed(&events).expect("Failed event present");
                 if decision.class == FaultClass::Transient {
                     self.enter_waiting_for_model(session_id, turn_id, &detail)
@@ -240,101 +274,71 @@ impl SupervisorInterface {
                 return Ok(());
             };
 
-            total_in += usage.input_tokens as i64;
-            total_out += usage.output_tokens as i64;
-            self.succeed_round(
-                &round_id,
-                &attempt_id,
-                usage.input_tokens as i64,
-                usage.output_tokens as i64,
-                stop_reason.as_deref(),
-                &text,
-            )
-            .await?;
+            let Some(accepted_calls) = self
+                .accept_round_response(
+                    session_id,
+                    turn_id,
+                    &round_id,
+                    &attempt_id,
+                    usage.input_tokens as i64,
+                    usage.output_tokens as i64,
+                    stop_reason.as_deref(),
+                    &text,
+                    &tool_calls,
+                    &actor,
+                )
+                .await?
+            else {
+                return Ok(());
+            };
 
-            // Commit assistant message + timeline (formal, replaces provisional).
-            if !text.is_empty() {
-                self.append_assistant_message(session_id, turn_id, &text, &actor)
-                    .await?;
+            if !text.is_empty() || !tool_calls.is_empty() {
                 chat.push(ChatMessage {
                     role: ChatRole::Assistant,
                     parts: vec![ContentPart::Text { text: text.clone() }],
                     tool_call_id: None,
+                    tool_calls: tool_calls.clone(),
                 });
             }
 
             if tool_calls.is_empty() {
                 // Model stopped without tools — complete turn with text as summary.
-                finish_summary = Some(json!({
-                    "summary": if text.is_empty() { "completed without tools" } else { &text },
-                    "main_changes": "",
-                    "risks": "",
-                }));
+                finish_summary = Some(CompletionSummary::from_text(&text));
                 finished = true;
                 break;
             }
 
             // Execute tools in order; abort tools if any prior stream had failed (already handled).
             let mut round_tool_messages: Vec<ChatMessage> = Vec::new();
-            let mut wait_state: Option<String> = None;
-            for (ord, tc) in tool_calls.iter().enumerate() {
-                let outcome = self
-                    .run_one_tool(session_id, turn_id, &round_id, ord as i64, tc, &actor)
-                    .await?;
+            let mut wait: Option<TurnWait> = None;
+            for accepted_call in &accepted_calls {
+                if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
+                    return Ok(());
+                }
+                let Some(executed) = self
+                    .run_one_tool(session_id, turn_id, accepted_call, &actor)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let ExecutedToolCall { outcome, message } = executed;
                 if let Some(fs) = outcome.finish_summary {
                     finish_summary = Some(fs);
                     finished = true;
                 }
-                if let Some(ws) = outcome.wait_state {
-                    wait_state = Some(ws);
-                }
-                // Feed tool result text/json back (images as content parts, no Base64 in history text).
-                let mut parts = Vec::new();
-                for p in outcome.parts {
-                    match p {
-                        ToolResultPart::Text { text } => {
-                            parts.push(ContentPart::Text { text });
-                        }
-                        ToolResultPart::Json { value } => {
-                            parts.push(ContentPart::Text {
-                                text: value.to_string(),
-                            });
-                        }
-                        ToolResultPart::Image {
-                            mime,
-                            bytes,
-                            width,
-                            height,
-                            ..
-                        } => {
-                            parts.push(ContentPart::Image {
-                                mime,
-                                bytes,
-                                width: Some(width),
-                                height: Some(height),
-                            });
-                        }
-                    }
-                }
-                if parts.is_empty() {
-                    parts.push(ContentPart::Text {
-                        text: outcome.summary.to_string(),
+                if let Some(next_wait) = outcome.wait {
+                    wait = Some(match wait {
+                        Some(current) => current.combine(next_wait),
+                        None => next_wait,
                     });
                 }
-                round_tool_messages.push(ChatMessage {
-                    role: ChatRole::Tool,
-                    parts,
-                    tool_call_id: Some(tc.id.clone()),
-                });
-                if finished || wait_state.is_some() {
-                    break;
-                }
+                round_tool_messages.push(message);
             }
             chat.extend(round_tool_messages);
-            if let Some(ws) = wait_state {
+            if let Some(wait) = wait {
                 // Park the Turn (waiting_for_job / waiting_for_ask). Resume is
                 // driven by application::runtime_events / answer_ask.
-                self.park_turn(session_id, turn_id, &ws).await?;
+                self.park_turn(session_id, turn_id, wait).await?;
                 return Ok(());
             }
             if finished {
@@ -346,9 +350,7 @@ impl SupervisorInterface {
             self.complete_turn(
                 session_id,
                 turn_id,
-                finish_summary.unwrap_or(json!({"summary": "done"})),
-                total_in,
-                total_out,
+                finish_summary.unwrap_or_else(|| CompletionSummary::from_text("")),
             )
             .await?;
         } else {
@@ -359,12 +361,6 @@ impl SupervisorInterface {
     }
 }
 
-struct TurnRow {
-    session_id: String,
-    project_id: String,
-    status: String,
-}
-
 /// Inspect the streamed events and return a `RetryDecision` only if the stream
 /// ended in `Failed` (no `Completed`). Used both by `try_round_stream`'s inner
 /// loop and by the Round-level posture: a `Transient` final failure parks the
@@ -372,7 +368,9 @@ struct TurnRow {
 fn classify_failed(events: &[ModelStreamEvent]) -> Option<RetryDecision> {
     let failed = events.iter().rev().find_map(|e| match e {
         ModelStreamEvent::Failed {
-            code, detail, attempt_id: _,
+            code,
+            detail,
+            attempt_id: _,
         } => Some((code.clone(), detail.clone())),
         _ => None,
     })?;
@@ -386,33 +384,103 @@ fn classify_failed(events: &[ModelStreamEvent]) -> Option<RetryDecision> {
     Some(classify(&failed.0, &failed.1, prior))
 }
 
-impl SupervisorInterface {
-    async fn load_turn(&self, turn_id: TurnId) -> Result<TurnRow, SupervisorError> {
-        let row = sqlx::query(
-            "SELECT t.session_id, t.status, s.project_id \
-             FROM turns t JOIN sessions s ON s.id = t.session_id WHERE t.id = ?",
-        )
-        .bind(turn_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SupervisorError::TurnNotFound)?;
-        Ok(TurnRow {
-            session_id: row.try_get("session_id")?,
-            project_id: row.try_get("project_id")?,
-            status: row.try_get("status")?,
+fn message_text(body: &Value) -> String {
+    body.get("parts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
         })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn tool_result_message(outcome: &ToolOutcome, provider_call_id: &str) -> (ChatMessage, Value) {
+    let mut model_parts = Vec::new();
+    let mut durable_parts = Vec::new();
+    for part in &outcome.parts {
+        match part {
+            ToolResultPart::Text { text } => {
+                model_parts.push(ContentPart::Text { text: text.clone() });
+                durable_parts.push(json!({"type": "text", "text": text}));
+            }
+            ToolResultPart::Json { value } => {
+                let text = value.to_string();
+                model_parts.push(ContentPart::Text { text: text.clone() });
+                durable_parts.push(json!({"type": "text", "text": text}));
+            }
+            ToolResultPart::Image {
+                mime,
+                bytes,
+                width,
+                height,
+                path,
+                content_revision,
+                derived,
+                content_hash,
+            } => {
+                model_parts.push(ContentPart::Image {
+                    mime: mime.clone(),
+                    bytes: bytes.clone(),
+                    width: Some(*width),
+                    height: Some(*height),
+                });
+                durable_parts.push(json!({
+                    "type": "image_reference",
+                    "mime": mime,
+                    "path": path,
+                    "content_revision": content_revision,
+                    "derived": derived,
+                    "content_hash": content_hash,
+                    "width": width,
+                    "height": height,
+                }));
+                durable_parts.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "[image result: {path}, {mime}, {width}x{height}, hash={content_hash}]"
+                    ),
+                }));
+            }
+        }
+    }
+    if model_parts.is_empty() {
+        let text = outcome.summary.to_string();
+        model_parts.push(ContentPart::Text { text: text.clone() });
+        durable_parts.push(json!({"type": "text", "text": text}));
+    }
+    (
+        ChatMessage {
+            role: ChatRole::Tool,
+            parts: model_parts,
+            tool_call_id: Some(provider_call_id.to_owned()),
+            tool_calls: Vec::new(),
+        },
+        Value::Array(durable_parts),
+    )
+}
+
+impl SupervisorInterface {
+    async fn load_turn(&self, turn_id: TurnId) -> Result<ExecutionTurn, SupervisorError> {
+        match self.sessions.execution_turn(turn_id).await {
+            Ok(turn) => Ok(turn),
+            Err(crate::modules::sessions::types::SessionsError::NotFound) => {
+                Err(SupervisorError::TurnNotFound)
+            }
+            Err(error) => Err(SupervisorError::Sessions(error)),
+        }
     }
 
-    async fn resolve_model(&self, session_id: &str) -> Result<(String, String), SupervisorError> {
+    async fn resolve_model(
+        &self,
+        turn: &ExecutionTurn,
+    ) -> Result<(String, String), SupervisorError> {
         // Prefer session.next_model_ref JSON {provider_id, upstream_model_id};
         // else first enabled model on any enabled provider for owner.
-        let next: Option<String> =
-            sqlx::query_scalar("SELECT next_model_ref FROM sessions WHERE id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .flatten();
-        if let Some(raw) = next
+        if let Some(raw) = turn.next_model_ref.as_deref()
             && let Ok(v) = serde_json::from_str::<Value>(&raw)
             && let (Some(p), Some(m)) = (
                 v.get("provider_id").and_then(|x| x.as_str()),
@@ -421,7 +489,7 @@ impl SupervisorInterface {
         {
             return Ok((p.to_owned(), m.to_owned()));
         }
-        let providers = self.models.providers(&self.owner_id).await?;
+        let providers = self.models.providers(&turn.owner_id).await?;
         for p in providers {
             if !p.enabled {
                 continue;
@@ -436,112 +504,81 @@ impl SupervisorInterface {
     async fn load_chat_history(
         &self,
         session_id: SessionId,
-    ) -> Result<Vec<ChatMessage>, SupervisorError> {
-        let rows = sqlx::query(
-            "SELECT kind, body_json FROM messages \
-             WHERE session_id = ? AND status = 'active' ORDER BY created_at ASC",
-        )
-        .bind(session_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
+        turn_id: TurnId,
+    ) -> Result<(Vec<ChatMessage>, i64), SupervisorError> {
+        let rows = self.sessions.context_messages(session_id, turn_id).await?;
         let mut out = Vec::new();
+        let mut input_cursor = 0;
+        let current_turn_id = turn_id.to_string();
         for row in rows {
-            let kind: String = row.try_get("kind")?;
-            let body_json: String = row.try_get("body_json")?;
-            let body: Value = serde_json::from_str(&body_json).unwrap_or(json!({}));
-            let text = body
-                .get("parts")
-                .and_then(|p| p.as_array())
-                .and_then(|arr| {
-                    arr.iter().find_map(|part| {
-                        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            part.get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|s| s.to_owned())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_default();
-            let role = match kind.as_str() {
+            let role = match row.kind.as_str() {
                 "user" => ChatRole::User,
                 "assistant" => ChatRole::Assistant,
                 "system" => ChatRole::System,
+                "tool_result_ref" => ChatRole::Tool,
                 _ => continue,
             };
+            if row.turn_id.as_deref() == Some(current_turn_id.as_str()) && row.kind == "user" {
+                input_cursor = input_cursor.max(row.timeline_sequence);
+            }
+            let tool_call_id = row
+                .body
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let tool_calls = row
+                .body
+                .get("tool_calls")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default();
             out.push(ChatMessage {
                 role,
-                parts: vec![ContentPart::Text { text }],
-                tool_call_id: None,
+                parts: vec![ContentPart::Text {
+                    text: message_text(&row.body),
+                }],
+                tool_call_id,
+                tool_calls,
             });
         }
-        Ok(out)
+        Ok((out, input_cursor))
     }
 
-    /// Pull Steer messages for this Turn that are not yet reflected in `chat`.
-    /// Steer is recorded by sessions as a user message with `body_json.steer =
-    /// true`; it becomes visible at the next safe Round boundary (here).
-    async fn drain_pending_steers(
+    async fn load_turn_inputs_after(
         &self,
-        session_id: SessionId,
         turn_id: TurnId,
-        chat: &[ChatMessage],
-    ) -> Result<Vec<ChatMessage>, SupervisorError> {
-        let rows = sqlx::query(
-            "SELECT body_json FROM messages \
-             WHERE session_id = ? AND turn_id = ? AND status = 'active' AND kind = 'user' \
-             ORDER BY created_at ASC",
-        )
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        // Count how many user messages are already in chat so we only inject
-        // the ones that arrived after the last Round (including Steers).
-        let already = chat
-            .iter()
-            .filter(|m| matches!(m.role, ChatRole::User))
-            .count();
+        input_cursor: i64,
+    ) -> Result<(Vec<ChatMessage>, i64), SupervisorError> {
+        let rows = self
+            .sessions
+            .turn_inputs_after(turn_id, input_cursor)
+            .await?;
         let mut out = Vec::new();
-        for (idx, row) in rows.into_iter().enumerate() {
-            if idx < already {
-                continue;
-            }
-            let body_json: String = row.try_get("body_json")?;
-            let body: Value = serde_json::from_str(&body_json).unwrap_or(json!({}));
-            let text = body
-                .get("parts")
-                .and_then(|p| p.as_array())
-                .and_then(|arr| {
-                    arr.iter().find_map(|part| {
-                        if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            part.get("text")
-                                .and_then(|t| t.as_str())
-                                .map(|s| s.to_owned())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_default();
+        let mut next_cursor = input_cursor;
+        for row in rows {
+            next_cursor = next_cursor.max(row.timeline_sequence);
+            let text = message_text(&row.body);
             if text.is_empty() {
                 continue;
             }
-            // Prefix Steers so the model can tell them from the original request.
-            let is_steer = body.get("steer").and_then(|v| v.as_bool()).unwrap_or(false);
-            let text = if is_steer {
-                format!("[steer] {text}")
-            } else {
-                text
+            let input_kind = row
+                .body
+                .get("turn_input")
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str);
+            let text = match input_kind {
+                Some("steer") => format!("[steer] {text}"),
+                Some("ask_answer") => format!("[ask answer] {text}"),
+                _ => text,
             };
             out.push(ChatMessage {
                 role: ChatRole::User,
                 parts: vec![ContentPart::Text { text }],
                 tool_call_id: None,
+                tool_calls: Vec::new(),
             });
         }
-        Ok(out)
+        Ok((out, next_cursor))
     }
 
     /// Run one Round's model stream with the M4 retry policy applied to a
@@ -602,28 +639,22 @@ impl SupervisorInterface {
     ) -> Result<(), SupervisorError> {
         let now = format_utc(SystemClock.now());
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE turns SET status = 'waiting_for_model', completion_reason = ?, \
-             completion_summary_json = ?, updated_at = ? \
-             WHERE id = ? AND status IN ('running', 'waiting_for_model')",
-        )
-        .bind(reason)
-        .bind(json!({"waiting_for_model": reason}).to_string())
-        .bind(&now)
-        .bind(turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        // Session version advances so clients re-read the Turn projection, but
-        // the active slot stays held — the Turn is paused, not terminal.
-        sqlx::query(
-            "UPDATE sessions SET version = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(format!("v_{}", SessionId::new()))
-        .bind(&now)
-        .bind(session_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        let transition = self
+            .sessions
+            .transition_active_turn_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                TurnStatus::Running,
+                TurnStatus::WaitingForModel,
+                Some(reason),
+                &now,
+            )
+            .await?;
         tx.commit().await?;
+        let Some(transition) = transition else {
+            return Ok(());
+        };
         let _ = self
             .events
             .append(NewEvent {
@@ -634,8 +665,10 @@ impl SupervisorInterface {
                 causation_id: None,
                 payload: json!({
                     "turn_id": turn_id.to_string(),
-                    "to": "waiting_for_model",
+                    "from": transition.from_status.as_str(),
+                    "to": transition.to_status.as_str(),
                     "reason": reason,
+                    "session_version": transition.session_version,
                 }),
             })
             .await;
@@ -647,10 +680,10 @@ impl SupervisorInterface {
     /// next Round via `resolve_model`. Idempotent if the Turn is already running.
     pub async fn retry_model(&self, turn_id: TurnId) -> Result<(), SupervisorError> {
         let turn = self.load_turn(turn_id).await?;
-        if turn.status == "running" {
-            return self.execute_turn(turn_id).await;
+        if turn.status == TurnStatus::Running {
+            return Ok(());
         }
-        if turn.status != "waiting_for_model" {
+        if turn.status != TurnStatus::WaitingForModel {
             return Ok(());
         }
         let session_id: SessionId = turn
@@ -659,25 +692,22 @@ impl SupervisorInterface {
             .map_err(|_| SupervisorError::SessionNotFound)?;
         let now = format_utc(SystemClock.now());
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE turns SET status = 'running', updated_at = ? \
-             WHERE id = ? AND status = 'waiting_for_model'",
-        )
-        .bind(&now)
-        .bind(turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            tx.commit().await?;
-            return Ok(());
-        }
-        sqlx::query("UPDATE sessions SET version = ?, updated_at = ? WHERE id = ?")
-            .bind(format!("v_{}", SessionId::new()))
-            .bind(&now)
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
+        let transition = self
+            .sessions
+            .transition_active_turn_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                TurnStatus::WaitingForModel,
+                TurnStatus::Running,
+                None,
+                &now,
+            )
             .await?;
         tx.commit().await?;
+        let Some(transition) = transition else {
+            return Ok(());
+        };
         let _ = self
             .events
             .append(NewEvent {
@@ -688,28 +718,40 @@ impl SupervisorInterface {
                 causation_id: None,
                 payload: json!({
                     "turn_id": turn_id.to_string(),
-                    "from": "waiting_for_model",
-                    "to": "running",
+                    "from": transition.from_status.as_str(),
+                    "to": transition.to_status.as_str(),
                     "route": "retry_model",
+                    "session_version": transition.session_version,
                 }),
             })
             .await;
         self.execute_turn(turn_id).await
     }
 
-    async fn succeed_round(
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_round_response(
         &self,
+        session_id: SessionId,
+        turn_id: TurnId,
         round_id: &RoundId,
         attempt_id: &str,
         input_tokens: i64,
         output_tokens: i64,
         stop_reason: Option<&str>,
         text: &str,
-    ) -> Result<(), SupervisorError> {
+        tool_calls: &[CompletedToolCall],
+        actor: &Value,
+    ) -> Result<Option<Vec<AcceptedToolCall>>, SupervisorError> {
         let now = format_utc(SystemClock.now());
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let accepted = sqlx::query(
             "UPDATE rounds SET status = 'succeeded', final_attempt_id = ?, input_tokens = ?, \
-             output_tokens = ?, stop_reason = ?, output_summary_json = ?, updated_at = ? WHERE id = ?",
+             output_tokens = ?, stop_reason = ?, output_summary_json = ?, updated_at = ? \
+             WHERE id = ? AND status = 'running' \
+               AND EXISTS(SELECT 1 FROM turns AS turn \
+                          JOIN sessions AS session ON session.id = turn.session_id \
+                          WHERE turn.id = ? AND turn.session_id = ? AND turn.status = 'running' \
+                            AND session.active_turn_id = turn.id)",
         )
         .bind(attempt_id)
         .bind(input_tokens)
@@ -718,15 +760,65 @@ impl SupervisorInterface {
         .bind(json!({"text": text}).to_string())
         .bind(&now)
         .bind(round_id.to_string())
-        .execute(&self.pool)
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
+        .execute(&mut *tx)
         .await?;
+        if accepted.rows_affected() != 1 {
+            return Ok(None);
+        }
+
+        let declared_calls = serde_json::to_value(tool_calls)?;
+        let (_, timeline_item_id, _) = self
+            .sessions
+            .append_assistant_message_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                text,
+                &declared_calls,
+                actor,
+                &now,
+            )
+            .await?;
+        let mut persisted_calls = Vec::with_capacity(tool_calls.len());
+        for (ordinal, request) in tool_calls.iter().enumerate() {
+            let id = ToolCallId::new();
+            let input = serde_json::from_str::<Value>(&request.arguments_json)
+                .unwrap_or_else(|_| json!({}));
+            sqlx::query(
+                "INSERT INTO tool_calls \
+                 (id, round_id, ord, tool_name, schema_version, input_json, result_summary_json, \
+                  status, actor_json, error_code, provider_call_id, started_at, ended_at, version) \
+                 VALUES (?, ?, ?, ?, ?, ?, NULL, 'requested', ?, NULL, ?, NULL, NULL, ?)",
+            )
+            .bind(id.to_string())
+            .bind(round_id.to_string())
+            .bind(ordinal as i64)
+            .bind(&request.name)
+            .bind(SCHEMA_VERSION)
+            .bind(input.to_string())
+            .bind(actor.to_string())
+            .bind(&request.id)
+            .bind(format!("v_{}", ToolCallId::new()))
+            .execute(&mut *tx)
+            .await?;
+            persisted_calls.push(AcceptedToolCall {
+                id,
+                ordinal: ordinal as i64,
+                request: request.clone(),
+            });
+        }
+        tx.commit().await?;
+
+        let correlation_id = CorrelationId::new().to_string();
         let _ = self
             .events
             .append(NewEvent {
                 event_type: "round.changed".into(),
                 actor: json!({"kind": "supervisor"}),
                 resource: Some(json!({"kind": "round", "id": round_id.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
+                correlation_id: correlation_id.clone(),
                 causation_id: None,
                 payload: json!({
                     "round_id": round_id.to_string(),
@@ -736,21 +828,72 @@ impl SupervisorInterface {
                 }),
             })
             .await;
-        Ok(())
+        if let Some(timeline_item_id) = timeline_item_id {
+            let _ = self
+                .events
+                .append(NewEvent {
+                    event_type: "timeline.item_created".into(),
+                    actor: actor.clone(),
+                    resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                    correlation_id: correlation_id.clone(),
+                    causation_id: None,
+                    payload: json!({
+                        "timeline_item_id": timeline_item_id,
+                        "kind": "assistant_message",
+                    }),
+                })
+                .await;
+        }
+        for call in &persisted_calls {
+            let _ = self
+                .events
+                .append(NewEvent {
+                    event_type: "tool_call.created".into(),
+                    actor: actor.clone(),
+                    resource: Some(json!({"kind": "tool_call", "id": call.id.to_string()})),
+                    correlation_id: correlation_id.clone(),
+                    causation_id: None,
+                    payload: json!({
+                        "tool_call_id": call.id.to_string(),
+                        "provider_call_id": call.request.id,
+                        "tool_name": call.request.name,
+                        "status": "requested",
+                        "ordinal": call.ordinal,
+                    }),
+                })
+                .await;
+        }
+        Ok(Some(persisted_calls))
     }
 
-    async fn fail_round(&self, round_id: &RoundId, detail: &str) -> Result<(), SupervisorError> {
+    async fn fail_round(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        round_id: &RoundId,
+        detail: &str,
+    ) -> Result<(), SupervisorError> {
         let now = format_utc(SystemClock.now());
-        sqlx::query(
+        let changed = sqlx::query(
             "UPDATE rounds SET status = 'failed', stop_reason = ?, output_summary_json = ?, \
-             updated_at = ? WHERE id = ?",
+              updated_at = ? WHERE id = ? AND status = 'running' \
+              AND EXISTS(SELECT 1 FROM turns AS turn \
+                         JOIN sessions AS session ON session.id = turn.session_id \
+                         WHERE turn.id = ? AND turn.session_id = ? \
+                           AND turn.status = 'running' \
+                           AND session.active_turn_id = turn.id)",
         )
         .bind("error")
         .bind(json!({"error": detail}).to_string())
         .bind(&now)
         .bind(round_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
         .execute(&self.pool)
         .await?;
+        if changed.rows_affected() != 1 {
+            return Ok(());
+        }
         let _ = self
             .events
             .append(NewEvent {
@@ -769,196 +912,126 @@ impl SupervisorInterface {
         Ok(())
     }
 
-    async fn append_assistant_message(
-        &self,
-        session_id: SessionId,
-        turn_id: TurnId,
-        text: &str,
-        actor: &Value,
-    ) -> Result<(), SupervisorError> {
-        let message_id = MessageId::new();
-        let timeline_id = TimelineItemId::new();
-        let now = format_utc(SystemClock.now());
-        let next_order: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(display_order), 0) + 1 FROM timeline_items WHERE session_id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        let body = json!({"parts": [{"type": "text", "text": text}]});
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'assistant', ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(body.to_string())
-        .bind(next_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-        let projection = json!({
-            "kind": "assistant_message",
-            "message_id": message_id.to_string(),
-            "text": text,
-        });
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'assistant_message', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(message_id.to_string())
-        .bind(next_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-        let _ = self
-            .events
-            .append(NewEvent {
-                event_type: "timeline.item_created".into(),
-                actor: actor.clone(),
-                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
-                causation_id: None,
-                payload: json!({
-                    "timeline_item_id": timeline_id.to_string(),
-                    "kind": "assistant_message",
-                }),
-            })
-            .await;
-        Ok(())
-    }
-
     async fn run_one_tool(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        round_id: &RoundId,
-        ord: i64,
-        tc: &CompletedToolCall,
+        accepted: &AcceptedToolCall,
         actor: &Value,
-    ) -> Result<super::types::ToolOutcome, SupervisorError> {
-        let tool_call_id = ToolCallId::new();
+    ) -> Result<Option<ExecutedToolCall>, SupervisorError> {
         let now = format_utc(SystemClock.now());
-        let input: Value = serde_json::from_str(&tc.arguments_json).unwrap_or(json!({}));
-        sqlx::query(
-            "INSERT INTO tool_calls \
-             (id, round_id, ord, tool_name, schema_version, input_json, result_summary_json, \
-              status, actor_json, error_code, started_at, ended_at, version) \
-             VALUES (?, ?, ?, ?, ?, ?, NULL, 'running', ?, NULL, ?, NULL, ?)",
+        let input: Value =
+            serde_json::from_str(&accepted.request.arguments_json).unwrap_or_else(|_| json!({}));
+        let started = sqlx::query(
+            "UPDATE tool_calls SET status = 'running', started_at = ?, version = ? \
+             WHERE id = ? AND status = 'requested' \
+               AND EXISTS(SELECT 1 FROM turns AS turn \
+                          JOIN sessions AS session ON session.id = turn.session_id \
+                          WHERE turn.id = ? AND turn.session_id = ? AND turn.status = 'running' \
+                            AND session.active_turn_id = turn.id)",
         )
-        .bind(tool_call_id.to_string())
-        .bind(round_id.to_string())
-        .bind(ord)
-        .bind(&tc.name)
-        .bind(SCHEMA_VERSION)
-        .bind(input.to_string())
-        .bind(actor.to_string())
         .bind(&now)
         .bind(format!("v_{}", ToolCallId::new()))
+        .bind(accepted.id.to_string())
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
         .execute(&self.pool)
         .await?;
-        let _ = self
-            .events
-            .append(NewEvent {
-                event_type: "tool_call.created".into(),
-                actor: actor.clone(),
-                resource: Some(json!({"kind": "tool_call", "id": tool_call_id.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
-                causation_id: None,
-                payload: json!({
-                    "tool_call_id": tool_call_id.to_string(),
-                    "tool_name": tc.name,
-                    "status": "running",
-                }),
-            })
-            .await;
+        if started.rows_affected() != 1 {
+            return Ok(None);
+        }
 
         let ctx = ToolContext {
             session_id,
             turn_id,
-            tool_call_id,
+            tool_call_id: accepted.id,
             workspace: &self.workspace,
             runtime: self.runtime.as_ref(),
             pool: &self.pool,
             actor: actor.clone(),
         };
-        let outcome = execute_tool(&ctx, &tc.name, &input).await?;
+        let outcome = match execute_tool(&ctx, &accepted.request.name, &input).await {
+            Ok(outcome) => outcome,
+            Err(error @ SupervisorError::Storage(_))
+            | Err(error @ SupervisorError::Serde(_))
+            | Err(error @ SupervisorError::Internal(_)) => return Err(error),
+            Err(error) => super::types::ToolOutcome {
+                ok: false,
+                parts: vec![ToolResultPart::Text {
+                    text: error.to_string(),
+                }],
+                summary: json!({
+                    "ok": false,
+                    "error": error.to_string(),
+                }),
+                error_code: Some("TOOL_EXECUTION_FAILED".into()),
+                finish_summary: None,
+                wait: None,
+            },
+        };
+        let (message, durable_parts) = tool_result_message(&outcome, &accepted.request.id);
         let ended = format_utc(SystemClock.now());
-        let status = if outcome.ok { "succeeded" } else { "failed" };
-        sqlx::query(
+        let status = if !outcome.ok {
+            "failed"
+        } else if outcome.wait.is_some() {
+            "waiting"
+        } else {
+            "succeeded"
+        };
+        let ended_at = (status != "waiting").then_some(ended.as_str());
+        let mut tx = self.pool.begin().await?;
+        let finalized = sqlx::query(
             "UPDATE tool_calls SET status = ?, result_summary_json = ?, error_code = ?, \
-             ended_at = ? WHERE id = ?",
+              ended_at = ?, version = ? WHERE id = ? AND status = 'running'",
         )
         .bind(status)
         .bind(outcome.summary.to_string())
         .bind(&outcome.error_code)
-        .bind(&ended)
-        .bind(tool_call_id.to_string())
-        .execute(&self.pool)
+        .bind(ended_at)
+        .bind(format!("v_{}", ToolCallId::new()))
+        .bind(accepted.id.to_string())
+        .execute(&mut *tx)
         .await?;
-
-        let timeline_id = TimelineItemId::new();
-        let next_order: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(display_order), 0) + 1 FROM timeline_items WHERE session_id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        let projection = json!({
-            "kind": "tool_call",
-            "tool_call_id": tool_call_id.to_string(),
-            "tool_name": tc.name,
-            "status": status,
-            "summary": outcome.summary,
-        });
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'tool_call', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(tool_call_id.to_string())
-        .bind(next_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(&ended)
-        .bind(&ended)
-        .execute(&self.pool)
-        .await?;
+        if finalized.rows_affected() != 1 {
+            return Ok(None);
+        }
+        let (_, timeline_item_id, _) = self
+            .sessions
+            .append_tool_result_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                &accepted.id.to_string(),
+                &accepted.request.id,
+                &accepted.request.name,
+                status,
+                &outcome.summary,
+                &durable_parts,
+                actor,
+                &ended,
+            )
+            .await?;
+        tx.commit().await?;
 
         let _ = self
             .events
             .append(NewEvent {
                 event_type: "tool_call.changed".into(),
                 actor: actor.clone(),
-                resource: Some(json!({"kind": "tool_call", "id": tool_call_id.to_string()})),
+                resource: Some(json!({"kind": "tool_call", "id": accepted.id.to_string()})),
                 correlation_id: CorrelationId::new().to_string(),
                 causation_id: None,
                 payload: json!({
-                    "tool_call_id": tool_call_id.to_string(),
-                    "tool_name": tc.name,
+                    "tool_call_id": accepted.id.to_string(),
+                    "provider_call_id": accepted.request.id,
+                    "tool_name": accepted.request.name,
                     "status": status,
                     "summary": outcome.summary,
+                    "timeline_item_id": timeline_item_id,
                 }),
             })
             .await;
-        Ok(outcome)
+        Ok(Some(ExecutedToolCall { outcome, message }))
     }
 
     /// Park a running Turn into a `waiting_for_*` status without releasing the
@@ -967,24 +1040,30 @@ impl SupervisorInterface {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        wait_state: &str,
+        wait: TurnWait,
     ) -> Result<(), SupervisorError> {
         let now = format_utc(SystemClock.now());
-        sqlx::query(
-            "UPDATE turns SET status = ?, updated_at = ? \
-             WHERE id = ? AND status = 'running'",
-        )
-        .bind(wait_state)
-        .bind(&now)
-        .bind(turn_id.to_string())
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("UPDATE sessions SET version = ?, updated_at = ? WHERE id = ?")
-            .bind(format!("v_{}", SessionId::new()))
-            .bind(&now)
-            .bind(session_id.to_string())
-            .execute(&self.pool)
+        let to_status = match wait {
+            TurnWait::Job => TurnStatus::WaitingForJob,
+            TurnWait::Ask => TurnStatus::WaitingForAsk,
+        };
+        let mut tx = self.pool.begin().await?;
+        let transition = self
+            .sessions
+            .transition_active_turn_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                TurnStatus::Running,
+                to_status,
+                None,
+                &now,
+            )
             .await?;
+        tx.commit().await?;
+        let Some(transition) = transition else {
+            return Ok(());
+        };
         let _ = self
             .events
             .append(NewEvent {
@@ -995,8 +1074,9 @@ impl SupervisorInterface {
                 causation_id: None,
                 payload: json!({
                     "turn_id": turn_id.to_string(),
-                    "from": "running",
-                    "to": wait_state,
+                    "from": transition.from_status.as_str(),
+                    "to": transition.to_status.as_str(),
+                    "session_version": transition.session_version,
                 }),
             })
             .await;
@@ -1007,35 +1087,61 @@ impl SupervisorInterface {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-        summary: Value,
-        input_tokens: i64,
-        output_tokens: i64,
+        summary: CompletionSummary,
     ) -> Result<(), SupervisorError> {
         let now = format_utc(SystemClock.now());
+        let summary_value = serde_json::to_value(&summary)?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE turns SET status = 'completed', completion_summary_json = ?, \
-             completion_reason = 'finish', input_tokens = ?, output_tokens = ?, \
-             updated_at = ? WHERE id = ?",
+        let unfinished_calls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(1) FROM tool_calls AS call \
+             JOIN rounds AS round ON round.id = call.round_id \
+             WHERE round.turn_id = ? AND call.status IN ('requested', 'running', 'waiting')",
         )
-        .bind(summary.to_string())
-        .bind(input_tokens)
-        .bind(output_tokens)
-        .bind(&now)
         .bind(turn_id.to_string())
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE sessions SET state = 'ready', active_turn_id = NULL, updated_at = ?, \
-             version = ?, last_activity_at = ? WHERE id = ?",
+        let unfinished_jobs = match &self.runtime {
+            Some(runtime) => runtime
+                .has_unfinished_jobs_in_tx(&mut *tx, turn_id)
+                .await
+                .map_err(|error| {
+                    SupervisorError::Internal(anyhow::anyhow!(
+                        "inspect unfinished Jobs before Turn completion: {error}"
+                    ))
+                })?,
+            None => false,
+        };
+        if unfinished_calls > 0 || unfinished_jobs {
+            return Err(SupervisorError::Internal(anyhow::anyhow!(
+                "Turn completion attempted with unfinished finite work"
+            )));
+        }
+        let (input_tokens, output_tokens): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
+             FROM rounds WHERE turn_id = ? AND status = 'succeeded'",
         )
-        .bind(&now)
-        .bind(format!("v_{}", SessionId::new()))
-        .bind(&now)
-        .bind(session_id.to_string())
-        .execute(&mut *tx)
+        .bind(turn_id.to_string())
+        .fetch_one(&mut *tx)
         .await?;
+        let transition = self
+            .sessions
+            .settle_active_turn_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                TurnStatus::Running,
+                TurnStatus::Completed,
+                Some("finish"),
+                Some(&summary_value),
+                Some(input_tokens),
+                Some(output_tokens),
+                &now,
+            )
+            .await?;
         tx.commit().await?;
+        let Some(transition) = transition else {
+            return Ok(());
+        };
         let _ = self
             .events
             .append(NewEvent {
@@ -1046,9 +1152,12 @@ impl SupervisorInterface {
                 causation_id: None,
                 payload: json!({
                     "turn_id": turn_id.to_string(),
-                    "from": "running",
-                    "to": "completed",
-                    "summary": summary,
+                    "from": transition.from_status.as_str(),
+                    "to": transition.to_status.as_str(),
+                    "summary": summary_value,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "session_version": transition.session_version,
                 }),
             })
             .await;
@@ -1063,26 +1172,26 @@ impl SupervisorInterface {
     ) -> Result<(), SupervisorError> {
         let now = format_utc(SystemClock.now());
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE turns SET status = 'failed', completion_reason = ?, \
-             completion_summary_json = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(reason)
-        .bind(json!({"error": reason}).to_string())
-        .bind(&now)
-        .bind(turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE sessions SET state = 'ready', active_turn_id = NULL, updated_at = ?, \
-             version = ? WHERE id = ?",
-        )
-        .bind(&now)
-        .bind(format!("v_{}", SessionId::new()))
-        .bind(session_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        let summary = json!({"error": reason});
+        let transition = self
+            .sessions
+            .settle_active_turn_in_tx(
+                &mut *tx,
+                session_id,
+                turn_id,
+                TurnStatus::Running,
+                TurnStatus::Failed,
+                Some(reason),
+                Some(&summary),
+                None,
+                None,
+                &now,
+            )
+            .await?;
         tx.commit().await?;
+        let Some(transition) = transition else {
+            return Ok(());
+        };
         let _ = self
             .events
             .append(NewEvent {
@@ -1093,9 +1202,10 @@ impl SupervisorInterface {
                 causation_id: None,
                 payload: json!({
                     "turn_id": turn_id.to_string(),
-                    "from": "running",
-                    "to": "failed",
+                    "from": transition.from_status.as_str(),
+                    "to": transition.to_status.as_str(),
                     "reason": reason,
+                    "session_version": transition.session_version,
                 }),
             })
             .await;
@@ -1241,7 +1351,11 @@ impl SupervisorInterface {
             let id: String = row.try_get("id")?;
             let turn_id: String = row.try_get("turn_id")?;
             let default: String = row.try_get(2)?;
-            let default = if default.is_empty() { None } else { Some(default) };
+            let default = if default.is_empty() {
+                None
+            } else {
+                Some(default)
+            };
             sqlx::query(
                 "UPDATE asks SET status = 'expired', answer_json = COALESCE(answer_json, ?), \
                  updated_at = ? WHERE id = ? AND status = 'open'",

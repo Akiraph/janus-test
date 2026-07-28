@@ -1,0 +1,24 @@
+/* --- EmptyState --- */
+.ui-empty {
+  display: grid;
+  flex: 1;
+  min-height: 360px;
+  place-content: center;
+  justify-items: center;
+  gap: var(--space-3);
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.ui-empty h2 {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.ui-empty p {
+  max-width: 448px;
+  margin: 0;
+  font-size: var(--text-sm);
+}

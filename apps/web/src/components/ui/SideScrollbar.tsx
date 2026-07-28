@@ -1,4 +1,5 @@
 import { createEffect, createSignal, on, onCleanup, Show } from "solid-js";
+import "./side-scrollbar.css";
 
 /**
  * SideScrollbar

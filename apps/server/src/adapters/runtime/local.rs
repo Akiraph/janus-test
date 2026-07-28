@@ -253,9 +253,7 @@ impl LocalExecutor {
         scrollback_stream_id: LogStreamId,
     ) -> Result<ManagedProcess, RuntimeError> {
         let runtime = self.runtime(spec.runtime_id).await?;
-        let working_directory = runtime
-            .workspace_root
-            .join(spec.working_directory.as_str());
+        let working_directory = runtime.workspace_root.join(spec.working_directory.as_str());
         let canonical_workspace = tokio::fs::canonicalize(&runtime.workspace_root)
             .await
             .map_err(|_| RuntimeError::RuntimeUnavailable)?;
@@ -640,7 +638,9 @@ impl RuntimeExecutor for LocalExecutor {
                 .send(ProcessCommand::Stdin(input, sent))
                 .await
                 .map_err(|_| RuntimeError::TerminalNotWritable(id))?;
-            received.await.map_err(|_| RuntimeError::TerminalNotWritable(id))?
+            received
+                .await
+                .map_err(|_| RuntimeError::TerminalNotWritable(id))?
         })
     }
 

@@ -86,7 +86,7 @@ impl AppState {
             events.clone(),
             models.clone(),
             workspace_sync.clone(),
-            "owner-bootstrap".into(),
+            sessions.clone(),
         )
         .with_runtime(runtime.clone());
         if let Err(error) = supervisor.recover_running_on_startup().await {
@@ -189,19 +189,6 @@ impl AppState {
 
     pub fn supervisor(&self) -> &SupervisorInterface {
         &self.inner.supervisor
-    }
-
-    /// Build a request-scoped supervisor bound to the authenticated owner id
-    /// (provider credentials / model selection).
-    pub fn supervisor_for_owner(&self, owner_id: &str) -> SupervisorInterface {
-        SupervisorInterface::new(
-            self.inner.database.pool().clone(),
-            self.inner.events.clone(),
-            self.inner.models.clone(),
-            self.inner.workspace_sync.clone(),
-            owner_id.to_owned(),
-        )
-        .with_runtime(self.inner.runtime.clone())
     }
 }
 

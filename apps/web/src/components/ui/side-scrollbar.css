@@ -1,0 +1,33 @@
+/* The track is an invisible grab strip pinned to the right edge; the thumb is
+   the only thing painted. Square (no border-radius), 3px wide, soft grey that
+   darkens on hover/drag. */
+.side-scroll-track {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 10px;
+  display: flex;
+  justify-content: flex-end;
+  z-index: 5;
+  pointer-events: auto;
+}
+
+.side-scroll-thumb {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 3px;
+  border-radius: 0;
+  background: hsl(210 16% 70% / 80%);
+  cursor: default;
+  transition: background var(--dur-fast) var(--easing);
+}
+
+.side-scroll-thumb--active {
+  background: hsl(210 16% 56%);
+}
+
+.side-scroll-track:hover .side-scroll-thumb {
+  background: hsl(210 16% 56%);
+}

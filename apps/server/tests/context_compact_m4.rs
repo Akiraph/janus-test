@@ -77,17 +77,12 @@ async fn schedule_compact_records_immutable_summary() -> anyhow::Result<()> {
     )
     .await?;
     let summary = json!({"done": "refactored auth module", "open": []});
-    let id = schedule_compact(
-        &pool,
-        sid,
-        Some("tl-first"),
-        "tl-last",
-        summary.clone(),
-    )
-    .await?;
+    let id = schedule_compact(&pool, sid, Some("tl-first"), "tl-last", summary.clone()).await?;
     assert!(!id.is_empty());
 
-    let latest = latest_compact_summary(&pool, sid).await?.expect("summary recorded");
+    let latest = latest_compact_summary(&pool, sid)
+        .await?
+        .expect("summary recorded");
     assert_eq!(latest.0, summary);
     assert_eq!(latest.1, "tl-last");
 
@@ -102,14 +97,15 @@ async fn schedule_compact_records_immutable_summary() -> anyhow::Result<()> {
     )
     .await?;
     assert_ne!(id, id2);
-    let all: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM compact_summaries WHERE session_id = ?",
-    )
-    .bind(sid.to_string())
-    .fetch_one(&pool)
-    .await?;
+    let all: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM compact_summaries WHERE session_id = ?")
+            .bind(sid.to_string())
+            .fetch_one(&pool)
+            .await?;
     assert_eq!(all, 2);
-    let latest = latest_compact_summary(&pool, sid).await?.expect("summary recorded");
+    let latest = latest_compact_summary(&pool, sid)
+        .await?
+        .expect("summary recorded");
     assert_eq!(latest.1, "tl-last-2");
     Ok(())
 }

@@ -240,17 +240,19 @@ fn openapi_contains_every_public_route() {
     .map(str::to_owned)
     .collect();
 
-    let document = janus_server::transport::http::openapi().to_json().expect("OpenAPI serializes");
+    let document = janus_server::transport::http::openapi()
+        .to_json()
+        .expect("OpenAPI serializes");
     let value: serde_json::Value = serde_json::from_str(&document).expect("OpenAPI parses");
     let paths = value
         .get("paths")
         .and_then(|node| node.as_object())
         .expect("OpenAPI has a paths object");
-    let actual: std::collections::BTreeSet<String> =
-        paths.keys().cloned().collect();
+    let actual: std::collections::BTreeSet<String> = paths.keys().cloned().collect();
 
     assert_eq!(
-        actual, expected,
+        actual,
+        expected,
         "router/OpenAPI route set diverged — missing from OpenAPI: {:?}, orphan in OpenAPI: {:?}",
         expected.difference(&actual).collect::<Vec<_>>(),
         actual.difference(&expected).collect::<Vec<_>>(),
@@ -262,9 +264,6 @@ fn openapi_contains_every_public_route() {
         let has_operation = ["get", "post", "put", "patch", "delete", "head", "options"]
             .into_iter()
             .any(|method| node.get(method).is_some());
-        assert!(
-            has_operation,
-            "OpenAPI path {route} declares no operation"
-        );
+        assert!(has_operation, "OpenAPI path {route} declares no operation");
     }
 }

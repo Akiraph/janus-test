@@ -1,0 +1,62 @@
+/* ================================================================
+   Security:account rows
+   ================================================================ */
+.account-rows {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.account-row {
+  display: flex;
+  min-height: 56px;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.account-row > div,
+.account-label-with-icon > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.account-row strong {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.account-row span:not(.ui-badge) {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.account-label-with-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.account-label-with-icon > svg {
+  flex: none;
+  color: var(--text-muted);
+}
+
+.account-row .account-value {
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 560px) {
+  .account-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

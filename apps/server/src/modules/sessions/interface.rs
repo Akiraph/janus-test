@@ -17,15 +17,15 @@ use crate::platform::{
 };
 
 use super::types::{
-    CancelResult, MessageRoute, MessageRouteResult, QueuedTurnSummary,
-    SessionSummary, SessionsError, SteerResult, TimelineItemView, TimelinePage, TurnSummary,
+    CancelResult, MessageRoute, MessageRouteResult, QueuedTurnSummary, SessionSummary,
+    SessionsError, SteerResult, TimelineItemView, TimelinePage, TurnSummary,
 };
 
 #[derive(Clone)]
 pub struct SessionsInterface {
-    pool: SqlitePool,
-    events: EventStore,
-    workspace_sync: WorkspaceSyncInterface,
+    pub(super) pool: SqlitePool,
+    pub(super) events: EventStore,
+    pub(super) workspace_sync: WorkspaceSyncInterface,
 }
 
 impl SessionsInterface {
@@ -308,12 +308,11 @@ impl SessionsInterface {
             let active: Option<String> = current.active_turn_id.clone();
             match active {
                 Some(turn_id_str) => {
-                    let st: Option<String> = sqlx::query_scalar(
-                        "SELECT status FROM turns WHERE id = ?",
-                    )
-                    .bind(&turn_id_str)
-                    .fetch_optional(&self.pool)
-                    .await?;
+                    let st: Option<String> =
+                        sqlx::query_scalar("SELECT status FROM turns WHERE id = ?")
+                            .bind(&turn_id_str)
+                            .fetch_optional(&self.pool)
+                            .await?;
                     st.as_deref() == Some("waiting_for_job")
                 }
                 None => false,
@@ -502,7 +501,7 @@ impl SessionsInterface {
                 message_id: message_id.to_string(),
                 turn_id: turn_id.to_string(),
                 session_version,
-                awaiting_handoff,
+                handoff_from_turn_id: None,
             });
         }
 
@@ -584,7 +583,7 @@ impl SessionsInterface {
             message_id: message_id.to_string(),
             turn_id: turn_id.to_string(),
             session_version,
-            awaiting_handoff,
+            handoff_from_turn_id: None,
         })
     }
 
@@ -1113,22 +1112,18 @@ impl SessionsInterface {
         successor_turn_id: TurnId,
     ) -> Result<(), SessionsError> {
         let now = format_utc(SystemClock.now());
-        sqlx::query(
-            "UPDATE turns SET handoff_to_turn_id = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(successor_turn_id.to_string())
-        .bind(&now)
-        .bind(predecessor_turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE turns SET handoff_from_turn_id = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(predecessor_turn_id.to_string())
-        .bind(&now)
-        .bind(successor_turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE turns SET handoff_to_turn_id = ?, updated_at = ? WHERE id = ?")
+            .bind(successor_turn_id.to_string())
+            .bind(&now)
+            .bind(predecessor_turn_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE turns SET handoff_from_turn_id = ?, updated_at = ? WHERE id = ?")
+            .bind(predecessor_turn_id.to_string())
+            .bind(&now)
+            .bind(successor_turn_id.to_string())
+            .execute(&mut *tx)
+            .await?;
         Ok(())
     }
 

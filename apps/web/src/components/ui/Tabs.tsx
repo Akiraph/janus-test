@@ -1,4 +1,5 @@
 import { createMemo, createSignal, For } from "solid-js";
+import "./tabs.css";
 
 export interface TabItem {
   value: string;

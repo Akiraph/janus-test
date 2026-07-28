@@ -1,0 +1,37 @@
+/* --- Badge --- */
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: fit-content;
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--space-1);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.ui-badge[data-variant="neutral"] {
+  color: var(--text-muted);
+  background: var(--surface-muted);
+}
+
+.ui-badge[data-variant="success"] {
+  border-color: hsl(150 50% 40% / 25%);
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.ui-badge[data-variant="warning"] {
+  border-color: hsl(36 82% 45% / 30%);
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+
+.ui-badge[data-variant="danger"] {
+  border-color: var(--danger-border);
+  color: var(--danger);
+  background: var(--danger-soft);
+}

@@ -20,15 +20,8 @@ import {
 } from "../../../lib/api";
 import { useIsMobile } from "../../../lib/viewport";
 
-export type TerminalOwnerKind = "project" | "session";
-
 interface TerminalPanelProps {
-  /** Project id always known for Main Terminal; Session Terminal also needs session id. */
   projectId: () => string | undefined;
-  ownerKind: TerminalOwnerKind;
-  ownerId: () => string | undefined;
-  /** Session Terminal shows a direct-write warning. */
-  warnAgentCopy?: boolean;
   /** When false the panel is hidden (e.g. activity view not selected). */
   active?: () => boolean;
   /** Optional title override for the sidebar header. */
@@ -75,9 +68,9 @@ export function TerminalPanel(props: TerminalPanelProps) {
   let dataDisposable: { dispose: () => void } | undefined;
 
   const owner = (): TerminalOwnerInput | undefined => {
-    const id = props.ownerId();
+    const id = props.projectId();
     if (!id) return undefined;
-    return props.ownerKind === "project" ? { kind: "project", id } : { kind: "session", id };
+    return { kind: "project", id };
   };
 
   function invalidateList() {
@@ -317,8 +310,8 @@ export function TerminalPanel(props: TerminalPanelProps) {
   });
 
   createEffect(() => {
-    // Re-bootstrap when the owner identity changes (project/session switch).
-    const id = props.ownerId();
+    // Re-bootstrap when the project identity changes.
+    const id = props.projectId();
     const active = props.active?.() ?? true;
     if (!id || !active || isMobile()) return;
     if (status() === "idle") {
@@ -341,7 +334,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
   });
 
   return (
-    <div class="terminal-panel" data-owner-kind={props.ownerKind}>
+    <div class="terminal-panel" data-owner-kind="project">
       <div class="ide-sidebar-header terminal-panel__header">
         <span>{props.title ?? "Terminal"}</span>
         <div class="terminal-panel__actions">
@@ -387,20 +380,13 @@ export function TerminalPanel(props: TerminalPanelProps) {
         </div>
       </div>
 
-      <Show when={props.warnAgentCopy}>
-        <p class="terminal-panel__warning" role="note">
-          Session Terminal writes directly to the Agent workspace copy. Changes mark the Session
-          dirty and may require a revision refresh before Apply/Sync.
-        </p>
-      </Show>
-
       <Show
         when={!isMobile()}
         fallback={
           <EmptyState
             icon={TerminalSquare}
             title="Terminal unavailable on this screen"
-            description="Interactive Terminal is desktop-only. Use Job, Service, Ask, Steer, and Cancel controls in the Session document on small screens."
+            description="Main Terminal is available on desktop screens."
             class="terminal-placeholder"
           />
         }

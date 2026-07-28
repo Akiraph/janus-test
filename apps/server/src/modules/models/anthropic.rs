@@ -29,7 +29,7 @@ pub fn build_messages_body(req: &ModelRequest) -> Value {
                 } else {
                     "assistant"
                 };
-                let content: Vec<Value> = msg
+                let mut content: Vec<Value> = msg
                     .parts
                     .iter()
                     .map(|p| match p {
@@ -47,26 +47,45 @@ pub fn build_messages_body(req: &ModelRequest) -> Value {
                         }
                     })
                     .collect();
+                content.extend(msg.tool_calls.iter().map(|call| {
+                    let input = serde_json::from_str::<Value>(&call.arguments_json)
+                        .unwrap_or_else(|_| json!({}));
+                    json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": input,
+                    })
+                }));
                 messages.push(json!({"role": role, "content": content}));
             }
             ChatRole::Tool => {
                 // Tool results as user content blocks in Anthropic Messages.
-                let text = msg
+                let content: Vec<Value> = msg
                     .parts
                     .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        _ => None,
+                    .map(|part| match part {
+                        ContentPart::Text { text } => json!({
+                            "type": "text",
+                            "text": text,
+                        }),
+                        ContentPart::Image { mime, bytes, .. } => json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": B64.encode(bytes),
+                            }
+                        }),
                     })
-                    .collect::<Vec<_>>()
-                    .join("");
+                    .collect();
                 let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
                 messages.push(json!({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
-                        "content": text,
+                        "content": content,
                     }]
                 }));
             }

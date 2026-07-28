@@ -8,7 +8,7 @@ import { EmptyState } from "../../../components/ui/EmptyState";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
 import { useNotifications } from "../../../components/ui/notifications";
 import { getFileContentText, getFileMeta, saveFileText } from "../../../lib/api";
-import type { FileTab } from "../ProjectPage";
+import type { FileDocument } from "./workspaceState";
 
 /**
  * Controlled single-file editor. The ProjectPage owns the tab store; this
@@ -19,8 +19,8 @@ import type { FileTab } from "../ProjectPage";
 interface FileEditorProps {
   projectId: () => string | undefined;
   mainRevision: () => string | null;
-  tab: () => FileTab;
-  onPatch: (mutator: (tab: FileTab) => void) => void;
+  tab: () => FileDocument;
+  onPatch: (mutator: (tab: FileDocument) => void) => void;
   onSaved: (projectId: string) => void | Promise<void>;
 }
 
@@ -123,7 +123,7 @@ export function FileEditor(props: FileEditorProps) {
     <div class="ide-editor-surface">
       <Show
         when={props.tab().meta || !props.tab().loading}
-        fallback={<p class="files-tree-empty">Loading…</p>}
+        fallback={<p class="surface-note">Loading…</p>}
       >
         <div class="files-editor-toolbar">
           <div>

@@ -31,10 +31,7 @@ pub async fn delete_session_with_runtime(
 /// Project cascade: for every non-deleting Session under the Project, stop its
 /// Runtime resources and drop the Session, then hand the Project row + Main
 /// workspace removal to `ProjectsInterface::run_delete`.
-pub async fn delete_project_with_runtime(
-    state: &AppState,
-    project_id: &str,
-) -> anyhow::Result<()> {
+pub async fn delete_project_with_runtime(state: &AppState, project_id: &str) -> anyhow::Result<()> {
     let project: ProjectId = project_id
         .parse()
         .map_err(|error| anyhow::anyhow!("project id: {error}"))?;
@@ -167,6 +164,9 @@ pub async fn graceful_shutdown(state: &AppState, deadline: Duration) {
         }
     };
     if tokio::time::timeout(deadline, shutdown).await.is_err() {
-        warn!(?deadline, "graceful shutdown deadline exceeded; exiting anyway");
+        warn!(
+            ?deadline,
+            "graceful shutdown deadline exceeded; exiting anyway"
+        );
     }
 }

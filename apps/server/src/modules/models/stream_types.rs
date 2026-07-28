@@ -38,6 +38,8 @@ pub struct ChatMessage {
     pub parts: Vec<ContentPart>,
     /// Optional tool call id when role is Tool.
     pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<CompletedToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

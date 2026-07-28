@@ -2,8 +2,8 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import { type Component, lazy, Show, Suspense } from "solid-js";
 
 /**
- * Dynamically load the Terminal panel only when the Terminal activity (or Session
- * Terminal sub-tab) is actually opened. Keeps @xterm out of the initial bundle.
+ * Dynamically load the Terminal panel only when the Project Terminal activity is
+ * opened. Keeps @xterm out of the initial bundle.
  */
 const LazyTerminalInner = lazy(() =>
   import("./TerminalPanel").then((m) => ({ default: m.TerminalPanel })),

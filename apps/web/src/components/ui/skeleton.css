@@ -1,0 +1,22 @@
+.ui-skeleton {
+  height: 96px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--surface-muted), var(--surface), var(--surface-muted));
+  background-size: 200% 100%;
+  animation: skeleton 1.4s ease-in-out infinite;
+}
+
+.ui-skeleton--compact {
+  height: 42px;
+}
+
+/* --- ErrorBlock --- */
+
+@keyframes skeleton {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}

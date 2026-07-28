@@ -1,25 +1,24 @@
 use std::{path::Path, sync::Arc};
 
 use serde_json::json;
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 use super::{
     interface::{
         CapabilityScope, DeploymentCapabilityProbe, EffectiveCapabilityConfig, ExecutionResult,
-        ExecutionSpec, ExecutorKind, ExitSummary, JobProjection, JobSpec,
-        JobStatus, LogChannel, LogCursor, LogRange, LogStreamProjection, ProcessCompletion,
-        ResourceLimits, ResourceUsage, RuntimeCapabilityEvaluator, RuntimeError, RuntimeExecutor,
-        RuntimeProjection, RuntimeSpec, RuntimeStatus, ServiceHealth, ServiceImpact,
-        ServiceProjection, ServiceSpec, ServiceStatus, TerminalOwner, TerminalProjection,
-        TerminalSignal, TerminalSize, TerminalSpec, TerminalStatus, TerminalTicket,
-        TerminalTicketRequest,
+        ExecutionSpec, ExecutorKind, ExitSummary, JobProjection, JobSpec, JobStatus, LogChannel,
+        LogCursor, LogRange, LogStreamProjection, ProcessCompletion, ResourceLimits, ResourceUsage,
+        RuntimeCapabilityEvaluator, RuntimeError, RuntimeExecutor, RuntimeProjection, RuntimeSpec,
+        RuntimeStatus, ServiceHealth, ServiceImpact, ServiceProjection, ServiceSpec, ServiceStatus,
+        TerminalOwner, TerminalProjection, TerminalSignal, TerminalSize, TerminalSpec,
+        TerminalStatus, TerminalTicket, TerminalTicketRequest,
     },
     log_store::{LogRetention, LogStore},
 };
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     events::{EventStore, NewEvent},
-    id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
+    id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId, TurnId},
     secret::{purpose_hash, random_token},
 };
 
@@ -140,6 +139,22 @@ impl RuntimeInterface {
     /// Subscribe to durable Job terminal-state notifications.
     pub fn subscribe_job_settled(&self) -> tokio::sync::broadcast::Receiver<JobId> {
         self.job_settled_tx.subscribe()
+    }
+
+    pub async fn has_unfinished_jobs_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        turn_id: TurnId,
+    ) -> Result<bool, RuntimeError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(1) FROM jobs \
+             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
+        )
+        .bind(turn_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage_error)?;
+        Ok(count > 0)
     }
 
     pub async fn ensure_runtime(
@@ -552,7 +567,10 @@ impl RuntimeInterface {
         let runtime_nonce = self.runtime_nonce(spec.runtime_id).await?;
         let scrollback = self
             .logs
-            .create(super::interface::LogOwnerKind::Terminal, &spec.id.to_string())
+            .create(
+                super::interface::LogOwnerKind::Terminal,
+                &spec.id.to_string(),
+            )
             .await?;
         let now = format_utc(SystemClock.now());
         let (owner_kind, owner_id) = terminal_owner_parts(spec.owner);
@@ -599,7 +617,8 @@ impl RuntimeInterface {
                 let terminal_id = terminal.id;
                 let nonce = runtime_nonce;
                 tokio::spawn(async move {
-                    if let Ok(completion) = this.executor.await_terminal_exit(terminal_id, &nonce).await
+                    if let Ok(completion) =
+                        this.executor.await_terminal_exit(terminal_id, &nonce).await
                     {
                         let _ = this.finalize_terminal(terminal_id, completion).await;
                     }
@@ -736,7 +755,9 @@ impl RuntimeInterface {
         if changed == 0 {
             return Err(RuntimeError::TerminalTicketInvalid);
         }
-        row.terminal_id.parse().map_err(|_| RuntimeError::TerminalTicketInvalid)
+        row.terminal_id
+            .parse()
+            .map_err(|_| RuntimeError::TerminalTicketInvalid)
     }
 
     pub async fn write_terminal_input(
@@ -864,7 +885,11 @@ impl RuntimeInterface {
         let _ = self
             .logs
             .close(
-                self.terminal_row(id).await?.scrollback_stream_id.parse().map_err(storage_error)?,
+                self.terminal_row(id)
+                    .await?
+                    .scrollback_stream_id
+                    .parse()
+                    .map_err(storage_error)?,
             )
             .await;
         Ok(())
@@ -1247,12 +1272,8 @@ fn terminal_owner_parts(owner: TerminalOwner) -> (&'static str, String) {
 
 fn parse_terminal_owner(kind: &str, id: &str) -> Result<TerminalOwner, RuntimeError> {
     match kind {
-        "project" => Ok(TerminalOwner::Project(
-            id.parse().map_err(storage_error)?,
-        )),
-        "session" => Ok(TerminalOwner::Session(
-            id.parse().map_err(storage_error)?,
-        )),
+        "project" => Ok(TerminalOwner::Project(id.parse().map_err(storage_error)?)),
+        "session" => Ok(TerminalOwner::Session(id.parse().map_err(storage_error)?)),
         _ => Err(RuntimeError::RuntimeUnavailable),
     }
 }

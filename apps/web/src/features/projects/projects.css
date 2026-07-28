@@ -1,0 +1,71 @@
+/* ================================================================
+   Workspace:Projects
+   ================================================================ */
+.projects {
+  padding: var(--space-5) var(--space-4);
+}
+
+.projects-heading h1 {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+
+.projects-heading p {
+  margin: var(--space-1) 0 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.projects-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.project-card .record-title h3 a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.project-card .record-title h3 a:hover {
+  text-decoration: underline;
+}
+
+.project-repo {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.operation-card {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius);
+  background: var(--warning-soft);
+}
+
+.operation-card h3 {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.operation-card p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.operation-meta {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+@media (max-width: 560px) {
+  .projects-heading-row {
+    flex-direction: column;
+  }
+}

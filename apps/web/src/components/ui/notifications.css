@@ -1,0 +1,100 @@
+/* --- Notifications:右下角,可堆叠,自动消失 --- */
+.ui-notifications {
+  position: fixed;
+  z-index: 60;
+  bottom: var(--space-4);
+  right: var(--space-4);
+  display: grid;
+  gap: var(--space-2);
+  width: min(100% - 32px, 380px);
+  pointer-events: none;
+}
+
+.ui-notification {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 52px;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-lg);
+  pointer-events: auto;
+  animation: notification-in var(--dur) var(--easing) both;
+}
+
+.ui-notification[data-variant="info"] svg {
+  color: var(--text-faint);
+}
+
+.ui-notification__icon {
+  flex: none;
+}
+
+.ui-notification[data-variant="success"] {
+  border-color: hsl(150 50% 40% / 30%);
+  background: var(--success-soft);
+}
+
+.ui-notification[data-variant="success"] svg {
+  color: var(--success);
+}
+
+.ui-notification[data-variant="warning"] {
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+}
+
+.ui-notification[data-variant="warning"] svg {
+  color: var(--warning);
+}
+
+.ui-notification[data-variant="danger"] {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+}
+
+.ui-notification[data-variant="danger"] svg {
+  color: var(--danger);
+}
+
+.ui-notification-message {
+  flex: 1;
+  align-self: center;
+  font-size: var(--text-sm);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ui-notification-close {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    background var(--dur) var(--easing),
+    color var(--dur) var(--easing);
+}
+
+.ui-notification-close:hover {
+  color: var(--text);
+  background: var(--surface-muted);
+}
+
+@keyframes notification-in {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}

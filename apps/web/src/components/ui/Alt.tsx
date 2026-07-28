@@ -1,5 +1,6 @@
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import "./alt.css";
 
 interface AltProps {
   /** Custom bubble content shown on hover/focus. */

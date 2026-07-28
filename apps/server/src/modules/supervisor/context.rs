@@ -24,7 +24,7 @@ pub const SYSTEM_PREFIX_VERSION: &str = "sys-1";
 /// Bytes of the durable system prefix prepended to every Turn's first Round.
 pub(crate) const SYSTEM_PROMPT: &str = "You are the Janus Supervisor coding agent. \
 You may only use registered tools on the Session workspace. \
-Call finish(summary) when the user request is complete. \
+Call finish with the completion summary, main changes, performed and unperformed validation, and remaining risks when the user request is complete. \
 Do not attempt Apply, Sync, Git write, or Main workspace access.";
 
 /// Record one `context_versions` row for a Session/Turn and return its id.

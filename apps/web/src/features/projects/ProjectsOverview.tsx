@@ -22,6 +22,7 @@ import {
   retryProject,
 } from "../../lib/api";
 import { useGithubCredentials, useProjects } from "../../lib/queries";
+import "./projects.css";
 
 const ACCESS_OPTIONS: readonly SelectOption[] = [
   { value: "public_https", label: "Public HTTPS" },
@@ -54,7 +55,7 @@ function problemMessage(problem: unknown): string {
   return record.detail ?? record.title ?? record.code ?? "Operation failed";
 }
 
-export function ProjectsPage() {
+export function ProjectsOverview() {
   const projects = useProjects();
   const queryClient = useQueryClient();
   const notify = useNotifications().notify;
@@ -165,7 +166,7 @@ export function ProjectsPage() {
   }
 
   return (
-    <section class="projects route-enter" aria-labelledby="workspace-title">
+    <section class="projects" aria-labelledby="workspace-title">
       <div class="projects-heading projects-heading-row">
         <div>
           <h1 id="workspace-title">Projects</h1>
@@ -197,7 +198,7 @@ export function ProjectsPage() {
       <Show
         when={!projects.isPending}
         fallback={
-          <p class="files-tree-empty" role="status" aria-label="Loading...">
+          <p class="surface-note" role="status" aria-label="Loading...">
             Loading...
           </p>
         }
