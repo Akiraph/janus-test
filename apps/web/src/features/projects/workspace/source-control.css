@@ -1,0 +1,380 @@
+.scm-panel {
+  --graph-accent: hsl(201 74% 45%);
+}
+
+.git-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.git-commit-message {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.scm-path-meta {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.scm-panel .scm-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-height: 0;
+  padding: var(--space-2);
+}
+
+.scm-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.scm-ahead-behind {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+}
+
+.scm-commit {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.scm-commit-message {
+  min-height: 64px;
+  resize: vertical;
+  font-size: var(--text-sm);
+}
+
+.scm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.scm-section {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.scm-section-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 24px;
+  padding: var(--space-1) 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  line-height: 1;
+  text-align: left;
+  cursor: pointer;
+}
+
+.scm-section-header > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+}
+
+.scm-section-chevron {
+  display: inline-flex;
+  flex: none;
+  width: 14px;
+  height: 14px;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  line-height: 0;
+  transform: rotate(0deg);
+  transform-origin: center;
+  transition: transform var(--dur) var(--easing);
+}
+
+.scm-section-chevron--open {
+  transform: rotate(90deg);
+}
+
+/* Collapsible section body: max-height 0→60vh transition. Unlike
+   grid-template-rows 0fr→1fr (which only interpolates on the newest engines
+   with interpolate-size), max-height animates smoothly on every browser, so
+   the height slide is always visible. overflow:hidden clips the content while
+   collapsed, and opacity fades on the same duration so the chevron turn,
+   fade, and slide read as one motion. */
+.scm-section-body {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition:
+    max-height var(--dur) var(--easing),
+    opacity var(--dur) var(--easing);
+}
+
+.scm-section-body--open {
+  /* 60vh comfortably covers a tall Changes/Graph list; content shorter than
+     this still animates, content taller scrolls inside .scm-body. */
+  max-height: 60vh;
+  opacity: 1;
+}
+/* The Graph section is the long tail of the SCM panel: a 50-entry commit list
+   should render in full (the panel body scrolls), not be clipped to ~8 visible
+   rows by the 60vh cap + overflow:hidden that suits the short Staged/Changes
+   lists. Lift the cap so every returned commit is reachable by scrolling the
+   panel body. */
+.scm-section-body--graph.scm-section-body--open {
+  max-height: none;
+}
+
+.scm-section-body-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.scm-path-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scm-path-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 3px var(--space-1);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.scm-path-item:hover {
+  background: var(--surface-muted);
+}
+
+.scm-path-open {
+  display: block;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.scm-path-name {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.scm-path-name > span:first-child,
+.scm-path-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scm-path-dir {
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+}
+
+.scm-letter {
+  flex: none;
+  width: 1.1em;
+  color: var(--warning);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  text-align: right;
+}
+
+.scm-letter--u {
+  color: var(--success);
+}
+
+.scm-letter--m {
+  color: var(--warning);
+}
+
+.scm-graph-section {
+  margin-top: var(--space-2);
+  width: 100%;
+  min-width: 0;
+}
+
+.scm-graph-list {
+  min-height: 0;
+  width: 100%;
+  min-width: 0;
+}
+
+.scm-graph-rows {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.scm-graph-rows > li {
+  display: block;
+  width: 100%;
+}
+
+.scm-graph-row {
+  display: flex;
+  box-sizing: border-box;
+  width: 100%;
+  align-items: stretch;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.scm-graph-row:hover {
+  background: var(--surface-muted);
+}
+
+.scm-graph-row--selected {
+  background: var(--accent-soft, var(--surface-muted));
+}
+
+/* Simple single-lane rail: continuous vertical line + one dot per row.
+   Line spans full row height so consecutive rows join without gaps. */
+.scm-graph-rail {
+  position: relative;
+  display: block;
+  flex: none;
+  align-self: stretch;
+  width: 14px;
+  /* Stretch with the row; absolute children paint the continuous line. */
+  min-height: 100%;
+}
+
+.scm-graph-rail::before {
+  content: "";
+  position: absolute;
+  /* Extend slightly past the row edges so rounded row gaps don't break the line. */
+  top: -1px;
+  bottom: -1px;
+  left: 50%;
+  width: 1.5px;
+  transform: translateX(-50%);
+  background: var(--graph-accent, hsl(210 55% 52%));
+  opacity: 0.75;
+}
+
+.scm-graph-rail--first::before {
+  top: 50%;
+  bottom: -1px;
+}
+
+.scm-graph-rail--last::before {
+  top: -1px;
+  bottom: 50%;
+}
+
+.scm-graph-rail--first.scm-graph-rail--last::before {
+  display: none;
+}
+
+.scm-graph-dot {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  box-sizing: border-box;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--graph-accent, hsl(210 55% 52%));
+  border: 1.5px solid var(--graph-accent, hsl(210 55% 52%));
+  transform: translate(-50%, -50%);
+}
+
+.scm-graph-dot--hollow {
+  background: var(--surface);
+  border-width: 2px;
+}
+
+.scm-graph-content {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1px;
+  overflow: hidden;
+  padding: 6px 0;
+}
+
+.scm-graph-message-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.scm-graph-message {
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scm-graph-ref {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--canvas);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.scm-graph-meta {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.scm-graph-meta code {
+  color: var(--graph-accent);
+  flex: none;
+}
+
+@media (max-width: 560px) {
+  .git-actions {
+    margin-left: 0;
+  }
+}

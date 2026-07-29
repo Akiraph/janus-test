@@ -121,6 +121,36 @@ test("Main Terminal runs in the Project workspace through CLI and WebSocket", as
   }
 });
 
+test("Project files keep drafts across real SCM navigation and close cleanly", async ({
+  page,
+}, testInfo) => {
+  await page.goto(`/projects/${live.projectId}`, { waitUntil: "domcontentloaded" });
+
+  await page.getByRole("button", { name: "Explorer", exact: true }).click();
+  const readme = page.getByRole("button", { name: "README.md", exact: true });
+  await expect(readme).toBeVisible({ timeout: 15_000 });
+  await readme.click();
+
+  const editor = page.getByRole("textbox", { name: "File content README.md" });
+  await expect(editor).toHaveValue("# Live fixture\n");
+  await editor.fill("unsaved live draft");
+
+  await page.getByRole("button", { name: "Source Control", exact: true }).click();
+  await expect(page.locator(".scm-graph-row").first()).toContainText("fixture", {
+    timeout: 15_000,
+  });
+  await page.screenshot({
+    path: testInfo.outputPath("live-workspace-desktop.png"),
+    fullPage: true,
+  });
+
+  await page.getByRole("button", { name: "Explorer", exact: true }).click();
+  await expect(editor).toHaveValue("unsaved live draft");
+  await page.getByRole("button", { name: "Close README.md" }).click();
+  await expect(editor).toHaveCount(0);
+  await expect(page.locator(".ide-tab")).toHaveCount(0);
+});
+
 test("mobile workspace switches between navigation and the active Session", async ({
   page,
 }, testInfo) => {

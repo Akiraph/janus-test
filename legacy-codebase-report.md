@@ -59,19 +59,19 @@ Overall         ░░░░░░░░░░  --   -   Pending
 | --- | ---: | ---: | ---: |
 | Critical | 0 | 0 | 0 |
 | High | 38 | 37 | 1 |
-| Medium | 33 | 33 | 0 |
+| Medium | 35 | 35 | 0 |
 | Low | 7 | 7 | 0 |
 | Info | 0 | 0 | 0 |
-| **Total** | 78 | 77 | 1 |
+| **Total** | 80 | 79 | 1 |
 
 Rejected candidates remain in the decision record but are excluded from the counts.
 
 ## Executive summary
 
-- Current runnable state: Typecheck, lint, build, and nine compiled-server browser/CLI scenarios pass on this host; mocked suites remain baseline evidence only until their useful assertions move to live coverage.
-- Main conclusion: The generic message/Turn/SSE path works, but the Session UI still exposes unfinished command concepts while concentrating query, command, projection, layout, and secondary-view responsibilities in one component and one global stylesheet.
-- Highest-priority findings: Keep the live workflow as a gate, then remove transport/UI mismatches and establish one typed timeline boundary before visual cleanup.
-- Next smallest action: Refactor the Session projection and component boundaries while preserving the now-proven live path.
+- Current runnable state: Typecheck, lint, build, and ten compiled-server browser/CLI scenarios pass on this host; two mocked suites remain temporary non-acceptance coverage.
+- Main conclusion: The live Session, Project Terminal, file, SCM, Ask, Job, Handoff, Cancel, and restart paths work; remaining UI risk is concentrated in unfinished command exposure and environment-specific provider behavior.
+- Highest-priority findings: Keep the live workflow as the gate, finish supported Session command ownership, and retire remaining mock-only assertions as equivalent live scenarios land.
+- Next smallest action: Connect supported Ask/Cancel/Steer commands through the typed Web API boundary without re-expanding `SessionTabView`.
 
 ## System map
 
@@ -141,18 +141,33 @@ Execution-replacement WIP evidence: `cargo check -p janus-server --tests`, `carg
 
 Both snapshots use the tracked-file inventory helper and physical lines. The increase in the Turn runner replaces duplicated Ask/Job coordination; the batch removes 205 production lines overall without changing schema or public HTTP contracts.
 
+### Workspace retirement baseline
+
+This additive Before snapshot was frozen before the workspace stylesheet and browser-test retirement slice.
+
+| Measure | Before | Evidence |
+| --- | ---: | --- |
+| `workspace.css` | 1891 lines | Physical lines before the first slice edit. |
+| Workspace CSS classes without a production source consumer | 58 | Exact class-token search across Web TypeScript/TSX; four occur only in the obsolete mocked Graph probe. |
+| Zero-production-consumer commit graph projection | 84 production + 45 test lines | `commitGraph.ts` is imported only by `commitGraph.test.ts`; the rendered SCM owner is `ScmGraphList`. |
+| Mocked/diagnostic browser files selected for retirement | 3 files / 462 lines | `probe-tabs.spec.ts`, `project-graph.spec.ts`, and `diag-save.spec.ts`. |
+| Frontend first-party production | 80 files / 11743 lines | Tracked TS/TSX/CSS excluding generated API and colocated tests. |
+| Frontend tests | 8 files / 1970 lines | Tracked `e2e` and colocated test/spec TypeScript. |
+
+After the retirement slice, frontend production is 82 files / 11055 lines and tests are 4 files / 1489 lines. The workspace feature CSS is 1284 lines across four owner files instead of 1891 lines in one file; its largest file is 562 lines.
+
 Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-project-tab/sessions-tab-desktop.png` and `apps/web/test-results/sessions-mobile-session-opens-as-project-tab/sessions-tab-mobile.png`. The mobile image directly records F-010; both images record F-011 and the unfinished-control presentation already covered by F-002/F-003.
 
 ## Before/after comparison
 
 | Measure | Before (frozen) | After | Delta | Interpretation |
 | --- | --- | --- | --- | --- |
-| First-party production physical LOC | 11501 in 43 files | Pending | Pending | Same path/name classification and physical-line count. |
-| Largest relevant file/symbol | `styles.css`: 4251 lines | Pending | Pending | Size is a navigation signal; the finding also requires mixed ownership evidence. |
-| Tests / static checks | typecheck/build pass; lint exit 0 with 3 warnings; mocked Playwright 2/2 | Pending | Pending | Same commands and environment. |
-| Confirmed findings fixed/open | 0 fixed / 7 open | Pending | Pending | Rejected candidates excluded. |
-| Documented functional standards | Product, UX, Session/Supervisor, HTTP, roadmap, M4 design | Pending | Pending | Update only verified conflicts. |
-| User-visible/contract behavior | Mocked Session UI only proven | Pending | Pending | Live path remains to be reproduced. |
+| First-party production physical LOC | 11501 in 43 files | 11055 in 82 files | -446 lines / +39 focused files | Same path/name classification and physical-line count; files increased through prior boundary extraction while the current slice removed 688 lines. |
+| Largest relevant file/symbol | `styles.css`: 4251 lines | `api.ts`: 817 lines; largest stylesheet: `workspace.css` at 562 | -3689 stylesheet lines | The former global owner was replaced by base, component, and feature owners. |
+| Tests / static checks | typecheck/build pass; lint exit 0 with 3 warnings; mocked Playwright 2/2 | typecheck/lint/build pass; compiled live Playwright 10/10 | Real server, SQLite, Git, CLI, browser, WebSocket, and process evidence replaces the primary mock-only gate. |
+| Confirmed findings fixed/open | 0 fixed / 7 open | 35 fixed / 45 open | +35 fixed; ledger scope expanded | Rejected candidates remain excluded. |
+| Documented functional standards | Product, UX, Session/Supervisor, HTTP, roadmap, M4 design | Same authorities plus repository/frontend ownership rules | Confirmed rules only | Unconfirmed runtime behavior remains in the ledger, not formal guidance. |
+| User-visible/contract behavior | Mocked Session UI only proven | Ten live scenarios plus inspected desktop/mobile screenshots | Primary flow and recovery controls exercised | The affected user's exact provider/configuration failure remains unjudgeable. |
 
 ## Root-cause clusters
 
@@ -170,7 +185,7 @@ Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-p
 | F-003 | High | Confirmed | Open | Documented M4 Session controls are omitted or rendered as non-actionable state because public transport is missing. | M4 design and `docs/03-session-and-supervisor.md` require Ask answer, Steer, Cancel, Handoff, model recovery, Job/Service controls, and Context/Compact; Stage 9 notes and current UI explicitly omit or fake several because routes are absent. | Long-running or waiting Turns cannot be controlled from the primary Web UI as specified. | Inventory the current backend interfaces and expose the smallest cohesive typed command set needed by the documented workflow; do not add per-condition UI patches. |
 | F-004 | Medium | Confirmed | Open | The Session work surface mixes unrelated responsibilities and repeatedly interprets raw projections. | `SessionTabView.tsx` is 594 lines and owns four queries, submission, textarea sizing, auto-scroll, tabs, timeline decoding, diff normalization/rendering, context, terminal composition, and raw `unknown` casts also used by `SessionCards.tsx`. | Changes spread across unrelated render/state concerns and timeline contract drift can be handled differently by each consumer. | Establish one projection decoder/view-model owner and extract only stateful or substantial feature responsibilities. |
 | F-005 | Medium | Confirmed | Fixed | One 4251-line stylesheet owns global tokens and unrelated feature/page styling. | `apps/web/src/styles.css`; selector ownership spans app shell, auth, projects, workspace, Session, SCM, Terminal, models, system, and responsive behavior. | Token cleanup and feature changes require navigating and validating unrelated regions; duplicate semantic decisions are easy to introduce. | Inventory tokens/selectors, consolidate semantics, and move complete selector groups to stable feature owners. |
-| F-006 | Medium | Confirmed | Open | Current browser coverage mixes a real workflow gate with local HTTP simulations that can pass against a disconnected or contract-inaccurate server. | Before: `apps/web/e2e/sessions.spec.ts`, `workspace.spec.ts`, `probe-tabs.spec.ts`, and `project-graph.spec.ts` fulfill application HTTP routes inside Playwright; the Session suite passed while Vite logged repeated `ECONNREFUSED`. Partial repair: `e2e/live-supervisor.spec.ts` and `e2e/support/liveJanus.ts` start a compiled server, real temporary SQLite/Git/workspace state, and a protocol-level provider fixture. | Mock-owned response shapes cannot establish that the shipped browser/server/database/runtime composition works and can preserve obsolete contracts during refactoring. | Move each still-valuable workflow, responsive, and accessibility assertion to compiled-server coverage through public HTTP/SSE/WebSocket and `janus-test`, then delete the superseded mocked and local-only tests; do not delete first and leave a coverage gap. |
+| F-006 | Medium | Confirmed | Open | Current browser coverage still includes local HTTP simulations that can pass against a disconnected or contract-inaccurate server. | Before: four Playwright suites fulfilled application routes and the Session suite passed while Vite logged `ECONNREFUSED`. After: the compiled-server suite covers ten live scenarios; obsolete probe/graph tests were deleted after file/SCM behavior moved live, while `sessions.spec.ts` and `workspace.spec.ts` remain mock-owned. | Remaining mock-owned response shapes are not acceptance evidence and can still preserve obsolete contracts. | Move each still-valuable responsive/accessibility assertion to compiled-server coverage, then delete the remaining mocked suites without leaving a behavior gap. |
 | F-007 | Low | Confirmed | Fixed | Frontend guidance requires reduced-motion checks even though the project intentionally avoids costly animation and does not maintain two motion modes. | `src/AGENTS.md` and `.trellis/spec/frontend/quality-guidelines.md`; explicit user decision in this task. | Future changes are asked to maintain unsupported duplicate behavior and may add unnecessary branches. | Replace the rule with a single low-cost motion/performance constraint and keep accessibility requirements unrelated to motion. |
 | F-008 | Medium | Confirmed | Open | Session Terminal remains a supported backend/API owner even though the product decision explicitly excludes it. | The Web Session tab has been removed, but `TerminalOwnerInput::Session`, `TerminalOwner::Session`, Session deletion cleanup, three Runtime tests, the generated contract, CLI help, and product/API docs still preserve the capability. | The unsupported path continues to enlarge the public contract, Runtime domain vocabulary, lifecycle coordination, generated client, tests, and documentation after its only UI consumer was retired. | Remove Session-owned creation/listing and domain branches while retaining Project Terminal and generic Runtime process/log/ticket behavior; keep historical rows recoverable until their Session is deleted rather than inventing a data conversion. |
 | F-009 | Low | Confirmed | Fixed | Global CSS relies on two `!important` visibility overrides and has a descending-specificity status rule. | Baseline Biome warnings at `styles.css:1101`, `styles.css:3809/3870`, and `styles.css:4239`. | Hidden-state and status styling depend on fragile cascade ordering and block a warning-clean quality gate. | Make hidden-state ownership explicit and order/scope status selectors without specificity reversal. |
@@ -244,6 +259,8 @@ Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-p
 | F-077 | Medium | Confirmed | Fixed | Ask and Job recovery maintained separate copies of the same cross-owner Tool result projection and event transaction. | Before: `application/session_flow.rs::record_ask_tool_call_settlement_in_tx` and `application/turn_execution.rs::record_job_result_in_tx` both parsed the source Turn, replaced the Sessions-owned Tool result projection, and appended matching events. After: both use `TurnRunner::record_tool_result_in_tx`, and persisted blocker inspection also has one runner command. | Tool result attribution and wake-up state can no longer drift between Ask and Job recovery. | Keep resource-specific Supervisor settlement before the runner projection and schedule only after the shared Unit of Work commits. |
 | F-078 | Low | Confirmed | Fixed | The Supervisor retry delay kept a trait object, injection method, boxed future, `FakeSleeper`, and unused metadata solely for tests that no longer exist. | Before: full-repository search found `with_retry_sleeper`, `FakeSleeper`, `RetryDecision.code`, and `retry_after_ms` only at their definitions. After: Supervisor calls Tokio directly, the sleeper module is deleted, and warnings-denied all-target Clippy passes. | The retry path has one fewer file, allocation/dispatch seam, and public test-only configuration path. | Keep real retry behavior behind the Supervisor loop unless a production clock/scheduler contract creates a genuine replacement need. |
 | F-079 | Low | Confirmed | Fixed | Module Interfaces retained zero-consumer query and Log Store wrappers after their workflows moved to guarded commands and owner-specific paths. | Before: Sessions queue queries/projection and four Runtime Log Store forwards were definition-only across production, routes, CLI, tests, and docs. After: all seven symbols are absent; documented `patch_session` and future compaction code remain. | Module navigation now presents only retained workflow entry points without deleting declared future behavior. | Preserve queue behavior through transaction-scoped activation commands and Terminal behavior through `create_terminal`, executor logging, and `terminal_scrollback`. |
+| F-080 | Medium | Confirmed | Fixed | Retired Project Files/Git/Graph surfaces remained in workspace CSS and a test-only graph projection remained in production source. | Before: `workspace.css` had 1891 lines and 58 exact class tokens absent from production TS/TSX; `.graph-*` rendered nowhere and `commitGraph.ts` was test-only. After: zero such selectors or projection references remain, and the retained CSS is split by Workspace, Files, SCM, and Sessions ownership. | Maintainers no longer navigate or preserve UI paths that cannot render. | Keep retired private selectors out unless a production owner and live behavior require them. |
+| F-081 | Medium | Confirmed | Fixed | A diagnostic Playwright file could mutate a hard-coded Project file, had no assertions, and could report success before exercising Save or Git. | Before: `diag-save.spec.ts` prepended a timestamped marker and never restored it. After: the file is deleted; the isolated live fixture opens a real temporary-repository file, keeps an unsaved draft, exercises SCM, and closes the tab without persisting it. | The default suite no longer risks developer data or false-green diagnostic output. | Keep mutable file scenarios inside disposable repositories with explicit assertions. |
 
 ## Pending user decisions
 
@@ -278,7 +295,7 @@ Migration state is deliberately short because Janus is single-node and startup h
 | Finding | Before evidence | Change | After evidence / verification | Result |
 | --- | --- | --- | --- | --- |
 | F-001 | User report plus no representative live browser evidence | Added the F-006 live integration fixture and exercised the generic path without changing its behavior. | `bun run test:e2e:live`: 1/1 pass; exact affected-environment cause remains unjudgeable. | Investigated; open as environment-specific Suspected finding. |
-| F-006 | Mocked Session tests passed despite unexpected failed requests. | Added a real server, temporary repository, deterministic SSE provider, and browser workflow test; user then set compiled real-environment tests as the acceptance standard. | `bun run test:e2e:live`: 1/1 pass through durable timeline convergence and Session `ready`; control, responsive, and secondary workflows are not yet migrated. | Partial repair; remains open until equivalent live coverage replaces the mock suites. |
+| F-006 | Mocked Session tests passed despite unexpected failed requests. | Added a compiled server, temporary Git/SQLite/data root, deterministic SSE provider, public CLI, and browser suite; moved file-tab/SCM behavior live before deleting obsolete probe/graph coverage. | `bun run test:e2e:live`: 10/10; `sessions.spec.ts` and `workspace.spec.ts` remain mock-owned. | Partial repair; live acceptance is established, but the remaining mock suites still need value-by-value retirement. |
 | F-008 | Session UI exposed a Terminal tab, responsive branch, owner props, and Session-specific warning copy. | Removed the Session composition path and narrowed the retained Terminal panel interface to Project ownership; moved the absence assertion to the compiled-server browser workflow. | TypeScript passes; batched live/browser verification is pending with the larger UI replacement. | Implemented; remains open until batch verification and documentation closure. |
 | F-005 | One global file owned 58 tokens, primitives, app chrome, every feature, and mixed responsive rules. | Replaced it with 45 global tokens, 90 lines of base rules, component-owned styles, App chrome CSS, and feature-owned Auth/Models/Projects/workspace/Security/System/Session CSS; feature-only graph color moved out of globals and the cross-feature `files-tree-empty` dependency became shared `surface-note`. | TypeScript, warning-free Biome, production build, and compiled-server desktop/mobile tests pass after both the ownership and token/component slices. | Fixed. |
 | F-009 | Hidden-state and Session spinner ordering produced three baseline CSS warnings. | Removed the unnecessary `!important`, restored cascade order, and placed the shared spinner rule before the active-state refinement. | `bun run lint` passes with no warning. | Fixed. |
@@ -309,6 +326,8 @@ Migration state is deliberately short because Janus is single-node and startup h
 | F-077 | Ask and Job wake paths duplicated Tool result projection, events, and persisted blocker inspection. | Moved both resources through one Turn runner coordinator while keeping owner settlement in Supervisor and state projection in Sessions. | Warnings-denied Clippy and the full 9/9 compiled live suite pass, including Ask answer/expiry, Job resume, Handoff, Cancel, and restart. | Fixed. |
 | F-078 | Retry timing retained a zero-consumer fake/injection abstraction and unused decision metadata. | Replaced it with direct Tokio delay and deleted the sleeper file, setter, trait object, fake, and unused fields. | Repository reference search is empty; warnings-denied all-target Clippy passes. | Fixed. |
 | F-079 | Sessions and Runtime exposed seven definition-only query/log wrapper symbols. | Removed only the proven zero-consumer methods/type and made retained implementation modules private where no test imports remain. | Reference search is empty; architecture check and all 9 live scenarios pass. | Fixed. |
+| F-080 | Workspace CSS retained 58 no-production-consumer class selectors and a test-only graph projection. | Removed the retired rules/projection/tests, split retained styles into Workspace, Files, SCM, and Sessions owners, and consolidated three spinner animations into one UI primitive. | Workspace feature CSS: 1891 to 1284 lines; largest owner: 562 lines; TypeScript, Biome, build, live 10/10, and desktop/mobile screenshot inspection pass. | Fixed. |
+| F-081 | A hard-coded diagnostic browser test could mutate developer data and pass without assertions. | Deleted it after adding a disposable real-Git browser scenario that keeps its edit as an unsaved draft. | The live file/SCM scenario passes and the temporary fixture is removed during teardown. | Fixed. |
 
 ## Documentation feedback
 
@@ -318,7 +337,7 @@ Migration state is deliberately short because Janus is single-node and startup h
 
 ## Remaining risk and uninspected areas
 
-- Deferred/accepted/open findings retain their individual ledger dispositions; this slice closes F-077 through F-079 only.
+- Deferred/accepted/open findings retain their individual ledger dispositions; this slice closes F-080 and F-081 while narrowing F-006.
 - Checks not run and why: The affected user's exact provider/configuration failure has not been reproduced; Stage 7 is excluded by host capability.
 - Currently unjudgeable: Real low-end device performance, production provider behavior, and Linux container behavior; none will be reported as verified without evidence.
 - Uninspected areas: Non-workspace pages remain in the declared UI scope for token/semantic consistency, but detailed issue enumeration follows the code-size and workflow priority order.

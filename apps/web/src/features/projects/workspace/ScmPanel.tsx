@@ -20,6 +20,7 @@ import {
 } from "../../../lib/api";
 import { useGitStatus } from "../../../lib/queries";
 import { ScmGraphList } from "./ScmGraphList";
+import "./source-control.css";
 import { basename } from "./utils";
 
 interface ScmPanelProps {
@@ -304,7 +305,7 @@ export function ScmPanel(props: ScmPanelProps) {
                       {(path) => (
                         <div class="git-conflict-path">
                           <strong>{path.path}</strong>
-                          <span class="files-editor-meta">{path.kind}</span>
+                          <span class="scm-path-meta">{path.kind}</span>
                           <div class="git-actions">
                             <For each={["main", "remote", "delete", "edited_text"] as const}>
                               {(choice) => (
@@ -431,7 +432,7 @@ function ScmSection(props: {
           <ChevronRight size={14} />
         </span>
         <span>
-          {props.title} <span class="files-editor-meta">({props.count})</span>
+          {props.title} <span class="scm-path-meta">({props.count})</span>
         </span>
       </button>
       <div

@@ -99,7 +99,7 @@ export function SessionComposer(props: SessionComposerProps) {
           aria-label={submitting() ? `${actionLabel()} in progress` : actionLabel()}
         >
           <Show when={submitting()} fallback={<Send size={16} />}>
-            <Loader2 size={16} class="sessions-panel__spin" />
+            <Loader2 size={16} class="ui-spinner" />
           </Show>
         </Button>
       </div>

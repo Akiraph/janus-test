@@ -26,7 +26,7 @@ const MODE_TABS: TabItem[] = [
 function RouteLoading() {
   return (
     <div class="route-loading" role="status" aria-label="Loading">
-      <Loader2 size={20} class="route-loading__spin" />
+      <Loader2 size={20} class="ui-spinner" />
     </div>
   );
 }

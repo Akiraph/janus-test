@@ -153,6 +153,16 @@
   color: var(--text-muted);
 }
 
+.ui-spinner {
+  animation: ui-spin 900ms linear infinite;
+}
+
+@keyframes ui-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @media (max-width: 560px) {
   .record-card {
     align-items: stretch;

@@ -12,6 +12,7 @@ import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../../lib/api";
 import { createSession, deleteSession, getSession, waitForOperation } from "../../../lib/api";
 import { useSessions } from "../../../lib/queries";
+import "./sessions-panel.css";
 
 interface SessionsPanelProps {
   projectId: () => string | undefined;
@@ -94,7 +95,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
           onClick={() => void onCreate()}
         >
           <Show when={creating()} fallback={<Plus size={14} />}>
-            <Loader2 size={14} class="sessions-panel__spin" />
+            <Loader2 size={14} class="ui-spinner" />
           </Show>
         </button>
       </div>
@@ -161,7 +162,7 @@ function SessionRow(props: {
         <Alt content={status.label} class="alt-bubble">
           <span class="sessions-panel__status" aria-hidden="true">
             <Show when={status.spinning} fallback={status.icon}>
-              <Loader2 size={14} class="sessions-panel__spin" />
+              <Loader2 size={14} class="ui-spinner" />
             </Show>
           </span>
         </Alt>
@@ -181,7 +182,7 @@ function SessionRow(props: {
         }}
       >
         <Show when={props.deleting()} fallback={<Trash2 size={14} />}>
-          <Loader2 size={14} class="sessions-panel__spin" />
+          <Loader2 size={14} class="ui-spinner" />
         </Show>
       </button>
     </div>

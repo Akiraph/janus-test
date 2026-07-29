@@ -68,7 +68,7 @@ export function SessionConversation(props: SessionConversationProps) {
                   role="status"
                   aria-label="Loading conversation"
                 >
-                  <Loader2 size={16} class="sessions-panel__spin" />
+                  <Loader2 size={16} class="ui-spinner" />
                 </div>
               </Show>
             }

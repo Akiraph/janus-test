@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -105,7 +105,9 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
     runGit(["init", "-b", "main", workRepo]);
     runGit(["-C", workRepo, "config", "user.email", "ui-e2e@example.invalid"]);
     runGit(["-C", workRepo, "config", "user.name", "Janus UI E2E"]);
-    runGit(["-C", workRepo, "commit", "--allow-empty", "-m", "fixture"]);
+    await writeFile(join(workRepo, "README.md"), "# Live fixture\n", "utf8");
+    runGit(["-C", workRepo, "add", "README.md"]);
+    runGit(["-C", workRepo, "commit", "-m", "fixture"]);
     runGit(["clone", "--bare", workRepo, bareRepo]);
 
     const executable = resolve(

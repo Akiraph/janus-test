@@ -1,0 +1,185 @@
+.files-editor-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.files-editor-toolbar strong {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+.files-editor-meta {
+  margin: var(--space-1) 0 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.files-textarea {
+  width: 100%;
+  min-height: 420px;
+  padding: var(--space-3);
+  border: 0;
+  resize: vertical;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+}
+
+.files-textarea:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 1px var(--accent-strong);
+}
+
+.ide-tree {
+  flex: 1;
+  min-height: 0;
+  /* No top padding — first row sits flush under the Explorer header. */
+  padding: 0;
+}
+
+.ide-tree-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ide-tree-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 26px;
+  padding: 0 var(--space-2);
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  line-height: 26px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ide-tree-item:hover {
+  background: var(--surface-muted);
+}
+
+.ide-tree-item--active {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.ide-tree-item--dir {
+  color: var(--text);
+}
+
+.ide-tree-chevron {
+  display: inline-flex;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  line-height: 0;
+  transform: rotate(0deg);
+  transform-origin: center;
+  transition: transform var(--dur-fast) var(--easing);
+}
+
+.ide-tree-chevron--open {
+  transform: rotate(90deg);
+}
+
+.ide-tree-icon {
+  display: block;
+  flex: none;
+  color: var(--text-muted);
+}
+
+/* Fixed-width slot so the directory chevron (> / v) and the file glyph share
+   the same left edge — and so the label text always starts at the same x,
+   regardless of whether the slot holds a 12px chevron or a 14px file glyph.
+   Left-aligning the contents (rather than centering) pins every icon to the
+   slot's left; the fixed 16px width then locks the label's start position. */
+.ide-tree-icon-slot {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-start;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  line-height: 0;
+}
+
+.ide-tree-label {
+  overflow: hidden;
+  line-height: 26px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-tree-children {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  interpolate-size: allow-keywords;
+  transition:
+    grid-template-rows var(--dur) var(--easing),
+    opacity var(--dur) var(--easing);
+}
+
+.ide-tree-children--open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.ide-tree-children-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ide-tree-loading {
+  padding: 0 var(--space-2);
+  color: var(--text-faint);
+  font-size: var(--text-xs);
+  line-height: 26px;
+}
+
+.ide-tree-retry {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.ide-editor-surface {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ide-textarea {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+  resize: none;
+}
+
+@media (max-width: 900px) {
+  .files-textarea {
+    min-height: 280px;
+  }
+}

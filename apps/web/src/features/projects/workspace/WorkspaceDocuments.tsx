@@ -101,7 +101,7 @@ export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
             <Suspense
               fallback={
                 <div class="ide-shell-scaffold-loading" role="status" aria-label="Loading">
-                  <Loader2 size={22} class="ide-shell-scaffold-loading__spin" />
+                  <Loader2 size={22} class="ui-spinner" />
                 </div>
               }
             >

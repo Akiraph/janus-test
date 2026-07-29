@@ -9,6 +9,7 @@ import { ErrorBlock } from "../../../components/ui/ErrorBlock";
 import { useNotifications } from "../../../components/ui/notifications";
 import { getFileContentText, getFileMeta, saveFileText } from "../../../lib/api";
 import type { FileDocument } from "./workspaceState";
+import "./files.css";
 
 /**
  * Controlled single-file editor. The ProjectPage owns the tab store; this

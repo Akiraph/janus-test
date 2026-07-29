@@ -58,7 +58,7 @@ export function IdeShellScaffold() {
         <main class="ide-main">
           <div class="ide-main-surface">
             <div class="ide-shell-scaffold-loading" role="status" aria-label="Loading workspace">
-              <Loader2 size={22} class="ide-shell-scaffold-loading__spin" />
+              <Loader2 size={22} class="ui-spinner" />
             </div>
           </div>
         </main>

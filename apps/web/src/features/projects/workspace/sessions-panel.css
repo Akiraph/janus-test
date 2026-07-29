@@ -1,0 +1,157 @@
+/* ---- Sessions (M3, IDE-aligned) ---- */
+.sessions-panel__new {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.sessions-panel__new:hover:not(:disabled) {
+  background: var(--surface-2, rgba(255, 255, 255, 0.06));
+  color: var(--text);
+}
+.sessions-panel__new:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.sessions-panel__scroll {
+  flex: 1;
+  min-height: 0;
+}
+.sessions-panel__list {
+  height: 100%;
+  overflow: auto;
+  padding: var(--space-2);
+}
+.sessions-panel__items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* Row mirrors the legacy panel: rounded, pl-2 / pr-1, group-hover reveals the
+   trailing action. Selected state is a soft blue fill (info-soft) — no inset
+   border accent. */
+.sessions-panel__item {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-1) 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: default;
+  font: inherit;
+  transition: background-color var(--dur-fast) var(--easing);
+}
+.sessions-panel__item:hover {
+  background: var(--surface-muted);
+}
+.sessions-panel__item--active {
+  background: var(--accent);
+  color: var(--text);
+}
+/* Status dot: fixed-width slot so titles line up across rows regardless of
+   whether the icon is a glyph or a spinner. */
+.sessions-panel__status {
+  display: inline-flex;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+}
+/* The Alt tooltip wraps the status icon in an extra <span class="alt-trigger">.
+   In the row's flex layout that wrapper must not claim more main-axis space
+   than the icon itself — otherwise it pushes the title far to the right. Pin
+   it to the icon slot and keep it from growing or shrinking. */
+.sessions-panel__select .alt-trigger {
+  flex: none;
+  width: 16px;
+  min-width: 0;
+}
+.sessions-panel__item--active .sessions-panel__status {
+  color: var(--success);
+}
+
+/* The list row's selectable area — fills the space between the status dot and
+   the trailing action. Owns the status dot + title together, so clicking either
+   opens the session. */
+.sessions-panel__select {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.sessions-panel__title {
+  min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Trailing action — invisible until hover/focus so the panel reads as a quiet
+   list, then reveals on row hover (legacy affordance). */
+.sessions-panel__action {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--easing),
+    background-color var(--dur-fast) var(--easing),
+    color var(--dur-fast) var(--easing);
+}
+.sessions-panel__item:hover .sessions-panel__action,
+.sessions-panel__item:focus-within .sessions-panel__action,
+.sessions-panel__action:focus-visible {
+  opacity: 1;
+}
+.sessions-panel__action:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.sessions-panel__action:disabled {
+  opacity: 0.4;
+  cursor: progress;
+}
+.sessions-panel__item--active .sessions-panel__status .ui-spinner {
+  color: var(--warning);
+}
+.sessions-panel__hint,
+.sessions-panel__error {
+  padding: var(--space-2) var(--space-3);
+}
+.sessions-panel__empty {
+  padding: var(--space-3);
+}

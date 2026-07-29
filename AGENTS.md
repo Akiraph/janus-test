@@ -9,6 +9,7 @@
 
 ## Architecture
 
+- Frontend ownership uses `styles/` for global tokens/base, `components/` for reusable primitives, `features/` for complete business UI/styles, and `pages/` for route composition and macro layout.
 - The backend is one Rust server crate containing seven domain Modules: identity, models, projects, sessions, supervisor, runtime, and workspace-sync.
 - Each Module exposes only `interface.rs`, includes a short `README.md` and `module.toml`, and does not import another Module's private implementation.
 - Cross-module workflows belong in `application/`; shared persistence, IDs, clock, events, and secrets belong in `platform/`; external implementations belong in `adapters/`; HTTP/SSE belongs in `transport/`.

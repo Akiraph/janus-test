@@ -201,16 +201,6 @@
   color: var(--text-muted);
 }
 
-.route-loading__spin {
-  animation: route-loading-spin 900ms linear infinite;
-}
-
-@keyframes route-loading-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
 @media (max-width: 820px) {
   .home-bar {
     padding: 0;

@@ -369,7 +369,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
         </Show>
         <Show when={status() === "loading" || status() === "connecting"}>
           <div class="terminal-panel__loading" role="status" aria-label="Opening terminal">
-            <Loader2 size={16} class="sessions-panel__spin" />
+            <Loader2 size={16} class="ui-spinner" />
             <span>Opening terminal…</span>
           </div>
         </Show>

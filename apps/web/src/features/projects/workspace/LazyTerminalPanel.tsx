@@ -14,7 +14,7 @@ export const LazyTerminalPanel: Component<Parameters<typeof LazyTerminalInner>[0
     <Suspense
       fallback={
         <div class="terminal-panel__loading" role="status" aria-label="Loading terminal">
-          <Loader2 size={16} class="sessions-panel__spin" />
+          <Loader2 size={16} class="ui-spinner" />
           <span>Loading terminal…</span>
         </div>
       }

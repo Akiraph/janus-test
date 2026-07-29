@@ -6,6 +6,7 @@ import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { FileTreeView } from "../../../lib/api";
 import { listFileTree } from "../../../lib/api";
 import { basename, sortTreeEntries } from "./utils";
+import "./files.css";
 
 interface FileTreePanelProps {
   projectId: () => string | undefined;
