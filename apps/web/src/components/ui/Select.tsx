@@ -12,6 +12,7 @@ interface SelectProps {
   value: string;
   options: readonly SelectOption[];
   onChange: (value: string) => void;
+  disabled?: boolean;
   "aria-label"?: string;
   class?: string;
 }
@@ -66,6 +67,7 @@ export function Select(props: SelectProps) {
   };
 
   const openList = () => {
+    if (props.disabled) return;
     position();
     setOpen(true);
   };
@@ -132,6 +134,7 @@ export function Select(props: SelectProps) {
         aria-haspopup="listbox"
         aria-expanded={open()}
         aria-label={props["aria-label"]}
+        disabled={props.disabled}
         onPointerDown={(event) => {
           // Primary button only; ignore right-click / pen barrel.
           if (event.button !== 0) return;

@@ -5,17 +5,20 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use utoipa::ToSchema;
 
 use crate::{
     AppState,
+    application::session_flow::PostSessionMessage,
     modules::sessions::interface::{
-        CancelResult, MessageRouteResult, SessionSummary, SessionsError, SteerResult, TimelinePage,
+        AttachmentView, CancelResult, MAX_ATTACHMENT_BYTES, MessageRouteResult,
+        SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage,
         TurnSummary,
     },
     platform::{
-        id::{AskId, CorrelationId, ProjectId, SessionId, TurnId},
+        id::{AskId, AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
+        managed_storage::BlobReference,
         operations::OperationView,
     },
     transport::http::{
@@ -43,6 +46,24 @@ pub struct CreateSessionRequest {
 pub struct PostMessageRequest {
     pub content: String,
     pub expected_session_version: String,
+    #[serde(default)]
+    pub attachment_ids: Vec<AttachmentId>,
+    #[serde(default, deserialize_with = "deserialize_model_preference")]
+    pub model_preference: Option<Option<SessionModelPreference>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UploadAttachmentQuery {
+    pub name: String,
+}
+
+fn deserialize_model_preference<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<SessionModelPreference>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<SessionModelPreference>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -173,6 +194,39 @@ pub async fn get_session(
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{id}/context",
+    params(("id" = String, Path)),
+    responses((status = 200, body = DataResponse<Option<crate::modules::supervisor::interface::ContextUsageView>>), (status = 404, body = Problem))
+)]
+pub async fn session_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<
+    Json<DataResponse<Option<crate::modules::supervisor::interface::ContextUsageView>>>,
+    Problem,
+> {
+    let _auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    state
+        .sessions()
+        .get_session(session_id)
+        .await
+        .map_err(sessions_problem)?;
+    let data = state
+        .supervisor()
+        .latest_context_usage(session_id)
+        .await
+        .map_err(|_| {
+            Problem::from_code(codes::INTERNAL_ERROR, "context usage could not be read")
+        })?;
+    Ok(Json(DataResponse { data }))
+}
+
+#[utoipa::path(
     delete,
     path = "/api/v1/sessions/{id}",
     params(("id" = String, Path)),
@@ -235,13 +289,18 @@ pub async fn post_message(
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
     let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
     let data = state
-        .post_session_message(
-            &auth.owner_id,
+        .post_session_message(PostSessionMessage {
+            owner_id: &auth.owner_id,
             session_id,
-            &body.content,
-            &body.expected_session_version,
+            content: &body.content,
+            expected_version: &body.expected_session_version,
+            model_preference: body
+                .model_preference
+                .as_ref()
+                .map(|preference| preference.as_ref()),
+            attachment_ids: &body.attachment_ids,
             actor,
-        )
+        })
         .await
         .map_err(sessions_problem)?;
     if matches!(data.route.as_str(), "started" | "handed_off") {
@@ -253,6 +312,129 @@ pub async fn post_message(
     }
 
     Ok(Json(DataResponse { data }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/attachments",
+    params(("id" = String, Path), ("name" = String, Query)),
+    responses((status = 201, body = DataResponse<AttachmentView>), (status = 404, body = Problem), (status = 413, body = Problem), (status = 422, body = Problem))
+)]
+pub async fn upload_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<UploadAttachmentQuery>,
+    RawBody(body): RawBody,
+) -> Result<(StatusCode, Json<DataResponse<AttachmentView>>), Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let name = query.name.trim();
+    if name.is_empty()
+        || name.len() > 255
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(Problem::from_code(
+            codes::VALIDATION_FAILED,
+            "attachment name is invalid",
+        ));
+    }
+    if body.is_empty() {
+        return Err(Problem::from_code(
+            codes::VALIDATION_FAILED,
+            "attachment is empty",
+        ));
+    }
+    if body.len() as u64 > MAX_ATTACHMENT_BYTES {
+        return Err(Problem::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PAYLOAD_TOO_LARGE",
+            "Attachment too large",
+            format!("an attachment may contain at most {MAX_ATTACHMENT_BYTES} bytes"),
+        ));
+    }
+    let mime = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or("application/octet-stream");
+    let upload_id = crate::platform::id::UploadId::new();
+    let attachment_id = AttachmentId::new();
+    let reference = BlobReference::new(
+        "sessions",
+        "attachment",
+        &attachment_id.to_string(),
+        "content",
+    );
+    let blob_sha = state
+        .blobs()
+        .write(body.as_ref(), reference.clone())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "store attachment bytes");
+            Problem::from_code(codes::INTERNAL_ERROR, "attachment could not be stored")
+        })?;
+    let attachment = match state
+        .sessions()
+        .create_upload_attachment(
+            &auth.owner_id,
+            session_id,
+            upload_id,
+            attachment_id,
+            name,
+            mime,
+            body.len() as u64,
+            blob_sha.as_str(),
+        )
+        .await
+    {
+        Ok(attachment) => attachment,
+        Err(error) => {
+            let _ = state.blobs().drop_reference(&reference).await;
+            return Err(sessions_problem(error));
+        }
+    };
+    Ok((StatusCode::CREATED, Json(DataResponse { data: attachment })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/sessions/{id}/attachments/{attachment_id}",
+    params(("id" = String, Path), ("attachment_id" = String, Path)),
+    responses((status = 204), (status = 404, body = Problem), (status = 422, body = Problem))
+)]
+pub async fn delete_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, attachment_id)): Path<(String, String)>,
+) -> Result<StatusCode, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let attachment_id: AttachmentId = attachment_id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid attachment id"))?;
+    state
+        .sessions()
+        .delete_draft_attachment(&auth.owner_id, session_id, attachment_id)
+        .await
+        .map_err(sessions_problem)?;
+    let reference = BlobReference::new(
+        "sessions",
+        "attachment",
+        &attachment_id.to_string(),
+        "content",
+    );
+    if let Err(error) = state.blobs().drop_reference(&reference).await {
+        tracing::warn!(%error, %attachment_id, "drop deleted attachment reference");
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -522,6 +704,12 @@ fn sessions_problem(error: SessionsError) -> Problem {
         }
         SessionsError::ModelNotConfigured => {
             Problem::from_code(codes::MODEL_NOT_CONFIGURED, error.to_string())
+        }
+        SessionsError::InvalidModelPreference => {
+            Problem::from_code(codes::VALIDATION_FAILED, error.to_string())
+        }
+        SessionsError::Validation(_) => {
+            Problem::from_code(codes::VALIDATION_FAILED, error.to_string())
         }
         other => Problem::from_code(codes::INTERNAL_ERROR, other.to_string()),
     }

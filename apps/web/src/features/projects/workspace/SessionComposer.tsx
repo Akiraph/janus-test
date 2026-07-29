@@ -1,8 +1,19 @@
 import Loader2 from "lucide-solid/icons/loader-2";
+import Paperclip from "lucide-solid/icons/paperclip";
 import Send from "lucide-solid/icons/send";
-import { createSignal, Show } from "solid-js";
+import X from "lucide-solid/icons/x";
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
 import { Button } from "../../../components/ui/Button";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { Select, type SelectOption } from "../../../components/ui/Select";
+import type {
+  AttachmentView,
+  ContextUsageView,
+  ProviderView,
+  PublicLimits,
+  ReasoningEffort,
+  SessionModelPreference,
+} from "../../../lib/api";
 
 export interface SessionMessageReceipt {
   route: string;
@@ -11,17 +22,91 @@ export interface SessionMessageReceipt {
 interface SessionComposerProps {
   delivery: "send" | "queue";
   disabled?: boolean;
-  onSubmit: (content: string) => Promise<SessionMessageReceipt>;
+  contextUsage: ContextUsageView | null;
+  limits: PublicLimits | undefined;
+  modelPreference: SessionModelPreference | null;
+  providers: readonly ProviderView[];
+  sessionId: string;
+  onSubmit: (
+    content: string,
+    modelPreference: SessionModelPreference | null,
+    attachmentIds: readonly string[],
+  ) => Promise<SessionMessageReceipt>;
+  onUploadAttachment: (sessionId: string, file: File) => Promise<AttachmentView>;
+  onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
 }
+
+const DEFAULT_MODEL = "";
+const REASONING_OPTIONS: readonly SelectOption[] = [
+  { value: "none", label: "No reasoning" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Maximum" },
+];
 
 export function SessionComposer(props: SessionComposerProps) {
   const [draft, setDraft] = createSignal("");
   const [submitting, setSubmitting] = createSignal(false);
   const [error, setError] = createSignal("");
   const [receipt, setReceipt] = createSignal<SessionMessageReceipt | null>(null);
+  const [modelValue, setModelValue] = createSignal(DEFAULT_MODEL);
+  const [reasoningEffort, setReasoningEffort] = createSignal<ReasoningEffort>("none");
+  const [attachments, setAttachments] = createSignal<AttachmentView[]>([]);
+  const [uploading, setUploading] = createSignal(false);
   let textarea: HTMLTextAreaElement | undefined;
+  let fileInput: HTMLInputElement | undefined;
+  let attachmentSessionId = props.sessionId;
 
-  const canSubmit = () => !props.disabled && !submitting() && Boolean(draft().trim());
+  const availableModels = createMemo(() =>
+    props.providers
+      .filter((provider) => provider.enabled)
+      .flatMap((provider) =>
+        provider.models
+          .filter((model) => model.enabled)
+          .map((model) => ({
+            value: modelKey(provider.id, model.upstream_model_id),
+            label: `${model.display_name} / ${provider.display_name}`,
+            providerId: provider.id,
+            providerKind: provider.kind,
+            upstreamModelId: model.upstream_model_id,
+          })),
+      ),
+  );
+  const modelOptions = createMemo<readonly SelectOption[]>(() => [
+    { value: DEFAULT_MODEL, label: "Project default" },
+    ...availableModels(),
+  ]);
+  const selectedModel = createMemo(() =>
+    availableModels().find((model) => model.value === modelValue()),
+  );
+  const supportsReasoning = createMemo(() => selectedModel()?.providerKind !== "anthropic");
+
+  createEffect(() => {
+    const preference = props.modelPreference;
+    setModelValue(
+      preference ? modelKey(preference.provider_id, preference.upstream_model_id) : DEFAULT_MODEL,
+    );
+    setReasoningEffort(preference?.reasoning_effort ?? "none");
+  });
+
+  createEffect(() => {
+    const sessionId = props.sessionId;
+    if (sessionId === attachmentSessionId) return;
+    const stale = attachments();
+    setAttachments([]);
+    for (const attachment of stale) {
+      void props.onDeleteAttachment(attachmentSessionId, attachment.id);
+    }
+    attachmentSessionId = sessionId;
+  });
+
+  const canSubmit = () =>
+    !props.disabled &&
+    !submitting() &&
+    !uploading() &&
+    (Boolean(draft().trim()) || attachments().length > 0);
   const actionLabel = () => (props.delivery === "queue" ? "Queue message" : "Send message");
 
   function resize() {
@@ -32,14 +117,19 @@ export function SessionComposer(props: SessionComposerProps) {
 
   async function submit() {
     const content = draft().trim();
-    if (!content || !canSubmit()) return;
+    if (!canSubmit()) return;
 
     setSubmitting(true);
     setError("");
     setReceipt(null);
     try {
-      const result = await props.onSubmit(content);
+      const result = await props.onSubmit(
+        content,
+        selectedPreference(),
+        attachments().map((attachment) => attachment.id),
+      );
       setDraft("");
+      setAttachments([]);
       setReceipt(result);
       if (textarea) textarea.style.height = "auto";
     } catch (cause) {
@@ -48,6 +138,66 @@ export function SessionComposer(props: SessionComposerProps) {
       setSubmitting(false);
     }
   }
+
+  async function addFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    const maxAttachments = props.limits?.max_attachments ?? 20;
+    const maxFileBytes = props.limits?.max_file_bytes ?? 20 * 1024 * 1024;
+    const selected = Array.from(files).slice(0, Math.max(0, maxAttachments - attachments().length));
+    if (selected.length < files.length) {
+      setError(`A message supports at most ${maxAttachments} attachments`);
+    }
+    setUploading(true);
+    setReceipt(null);
+    try {
+      for (const file of selected) {
+        if (file.size > maxFileBytes) {
+          setError(`${file.name} exceeds the ${formatBytes(maxFileBytes)} attachment limit`);
+          continue;
+        }
+        try {
+          const attachment = await props.onUploadAttachment(props.sessionId, file);
+          setAttachments((current) => [...current, attachment]);
+        } catch (cause) {
+          setError(cause instanceof Error ? cause.message : `${file.name} could not be uploaded`);
+        }
+      }
+    } finally {
+      setUploading(false);
+      if (fileInput) fileInput.value = "";
+    }
+  }
+
+  async function removeAttachment(attachment: AttachmentView) {
+    try {
+      await props.onDeleteAttachment(props.sessionId, attachment.id);
+      setAttachments((current) => current.filter((value) => value.id !== attachment.id));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Attachment could not be removed");
+    }
+  }
+
+  function selectedPreference(): SessionModelPreference | null {
+    const model = selectedModel();
+    if (!model) return null;
+    return {
+      provider_id: model.providerId,
+      upstream_model_id: model.upstreamModelId,
+      reasoning_effort: supportsReasoning() ? reasoningEffort() : "none",
+    };
+  }
+
+  const contextLabel = () => {
+    const usage = props.contextUsage;
+    if (!usage || usage.context_limit <= 0) return "--";
+    return `${Math.min(999, Math.round((usage.estimated_input_tokens / usage.context_limit) * 100))}%`;
+  };
+
+  const contextTitle = () => {
+    const usage = props.contextUsage;
+    if (!usage) return "Context usage is not available yet";
+    return `${usage.estimated_input_tokens.toLocaleString()} of ${usage.context_limit.toLocaleString()} context tokens used`;
+  };
 
   return (
     <form
@@ -64,6 +214,26 @@ export function SessionComposer(props: SessionComposerProps) {
         <p class="session-composer__status" role="status">
           Message queued
         </p>
+      </Show>
+      <Show when={attachments().length > 0}>
+        <div class="session-composer__attachments">
+          <For each={attachments()}>
+            {(attachment) => (
+              <span class="session-composer__attachment">
+                <span title={attachment.name}>{attachment.name}</span>
+                <small>{formatBytes(attachment.byte_size)}</small>
+                <button
+                  type="button"
+                  aria-label={`Remove ${attachment.name}`}
+                  disabled={submitting()}
+                  onClick={() => void removeAttachment(attachment)}
+                >
+                  <X size={12} />
+                </button>
+              </span>
+            )}
+          </For>
+        </div>
       </Show>
       <textarea
         ref={(element) => {
@@ -87,9 +257,65 @@ export function SessionComposer(props: SessionComposerProps) {
         }}
       />
       <div class="session-composer__bar">
-        <span class="session-composer__delivery">
-          {props.delivery === "queue" ? "Next turn" : "Current session"}
-        </span>
+        <div class="session-composer__controls">
+          <input
+            ref={fileInput}
+            class="session-composer__file-input"
+            type="file"
+            multiple
+            onChange={(event) => void addFiles(event.currentTarget.files)}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            iconOnly
+            disabled={
+              submitting() ||
+              uploading() ||
+              Boolean(props.disabled) ||
+              attachments().length >= (props.limits?.max_attachments ?? 20)
+            }
+            aria-label={uploading() ? "Uploading attachment" : "Add attachment"}
+            onClick={() => fileInput?.click()}
+          >
+            <Show when={uploading()} fallback={<Paperclip size={15} />}>
+              <Loader2 size={15} class="ui-spinner" />
+            </Show>
+          </Button>
+          <Select
+            class="session-composer__model"
+            aria-label="Model"
+            value={modelValue()}
+            options={modelOptions()}
+            disabled={submitting() || Boolean(props.disabled)}
+            onChange={(value) => {
+              setModelValue(value);
+              if (
+                availableModels().find((model) => model.value === value)?.providerKind ===
+                "anthropic"
+              ) {
+                setReasoningEffort("none");
+              }
+            }}
+          />
+          <Select
+            class="session-composer__reasoning"
+            aria-label="Reasoning effort"
+            value={reasoningEffort()}
+            options={REASONING_OPTIONS}
+            disabled={
+              submitting() || Boolean(props.disabled) || !selectedModel() || !supportsReasoning()
+            }
+            onChange={(value) => setReasoningEffort(value as ReasoningEffort)}
+          />
+          <span class="session-composer__context" title={contextTitle()}>
+            {contextLabel()}
+          </span>
+          <span class="session-composer__delivery">
+            {props.delivery === "queue" ? "Next turn" : "Current session"}
+          </span>
+        </div>
         <Button
           type="submit"
           variant="primary"
@@ -105,4 +331,14 @@ export function SessionComposer(props: SessionComposerProps) {
       </div>
     </form>
   );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function modelKey(providerId: string, upstreamModelId: string): string {
+  return `${providerId}\u0000${upstreamModelId}`;
 }

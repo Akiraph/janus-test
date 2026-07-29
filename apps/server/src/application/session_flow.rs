@@ -13,15 +13,16 @@ use std::collections::HashMap;
 use serde_json::json;
 
 use crate::AppState;
-use crate::application::turn_execution::ToolResultRecord;
+use crate::application::turn_execution::{ToolResultRecord, TurnExecutionError};
 use crate::modules::runtime::interface::JobStatus;
 use crate::modules::sessions::interface::{
-    CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionsError, TurnStatus,
+    CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionModelPreference,
+    SessionsError, TurnStatus,
 };
 use crate::modules::supervisor::interface::{AskAnswerDisposition, AskClosure, SupervisorError};
 use crate::platform::clock::{Clock, SystemClock, format_utc};
 use crate::platform::events::NewEvent;
-use crate::platform::id::{AskId, CorrelationId, ProjectId, SessionId, TurnId};
+use crate::platform::id::{AskId, AttachmentId, CorrelationId, ProjectId, SessionId, TurnId};
 use crate::platform::unit_of_work::UnitOfWorkTransaction;
 
 struct SessionInput<'a> {
@@ -30,20 +31,37 @@ struct SessionInput<'a> {
     content: &'a str,
     expected_version: &'a str,
     actor: serde_json::Value,
+    model_preference: Option<Option<&'a SessionModelPreference>>,
+    attachment_ids: &'a [AttachmentId],
     source_ask_id: Option<&'a str>,
     workspace_revision: &'a str,
     now: &'a str,
 }
 
+pub struct PostSessionMessage<'a> {
+    pub owner_id: &'a str,
+    pub session_id: SessionId,
+    pub content: &'a str,
+    pub expected_version: &'a str,
+    pub model_preference: Option<Option<&'a SessionModelPreference>>,
+    pub attachment_ids: &'a [AttachmentId],
+    pub actor: serde_json::Value,
+}
+
 impl AppState {
     pub async fn post_session_message(
         &self,
-        owner_id: &str,
-        session_id: SessionId,
-        content: &str,
-        expected_version: &str,
-        actor: serde_json::Value,
+        input: PostSessionMessage<'_>,
     ) -> Result<MessageRouteResult, SessionsError> {
+        let PostSessionMessage {
+            owner_id,
+            session_id,
+            content,
+            expected_version,
+            model_preference,
+            attachment_ids,
+            actor,
+        } = input;
         let workspace_revision = self
             .sessions()
             .current_workspace_revision(session_id)
@@ -59,6 +77,8 @@ impl AppState {
                     content,
                     expected_version,
                     actor,
+                    model_preference,
+                    attachment_ids,
                     source_ask_id: None,
                     workspace_revision: &workspace_revision,
                     now: &now,
@@ -80,13 +100,21 @@ impl AppState {
             content,
             expected_version,
             actor,
+            model_preference,
+            attachment_ids,
             source_ask_id,
             workspace_revision,
             now,
         } = input;
         let command = self
             .sessions()
-            .lock_session_command_in_tx(work.connection(), session_id, expected_version, now)
+            .lock_session_command_in_tx(
+                work.connection(),
+                session_id,
+                expected_version,
+                model_preference,
+                now,
+            )
             .await?;
         let has_queued = self
             .sessions()
@@ -110,24 +138,27 @@ impl AppState {
             .flatten();
         let checkpoint_revision = matches!(route, MessageRoute::Started | MessageRoute::HandedOff)
             .then_some(workspace_revision);
-        let model_snapshot = if route == MessageRoute::Queued {
-            None
-        } else {
-            let project_id = command.project_id.parse::<ProjectId>().map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!("invalid Project id: {error}"))
+        let project_id = command.project_id.parse::<ProjectId>().map_err(|error| {
+            SessionsError::Internal(anyhow::anyhow!("invalid Project id: {error}"))
+        })?;
+        let preference = command
+            .next_model_ref
+            .as_deref()
+            .map(serde_json::from_str::<SessionModelPreference>)
+            .transpose()?;
+        let model_snapshot = self
+            .turn_runner()
+            .resolve_model_snapshot_in_tx(
+                work.connection(),
+                project_id,
+                Some(owner_id),
+                preference.as_ref(),
+            )
+            .await
+            .map_err(|error| match error {
+                TurnExecutionError::InvalidModelPreference => SessionsError::InvalidModelPreference,
+                other => SessionsError::Internal(anyhow::anyhow!("resolve Turn model: {other}")),
             })?;
-            self.turn_runner()
-                .resolve_model_snapshot_in_tx(
-                    work.connection(),
-                    project_id,
-                    Some(owner_id),
-                    command.next_model_ref.as_deref(),
-                )
-                .await
-                .map_err(|error| {
-                    SessionsError::Internal(anyhow::anyhow!("resolve Turn model: {error}"))
-                })?
-        };
         let created = self
             .sessions()
             .create_turn_input_in_tx(
@@ -137,6 +168,8 @@ impl AppState {
                 &actor,
                 predecessor,
                 source_ask_id,
+                attachment_ids,
+                model_snapshot.as_ref(),
                 checkpoint_revision,
                 now,
             )
@@ -451,6 +484,8 @@ impl AppState {
                             content: &answer_text,
                             expected_version: &outcome.session_version,
                             actor: actor.clone(),
+                            model_preference: None,
+                            attachment_ids: &[],
                             source_ask_id: Some(&source_ask_id),
                             workspace_revision: &workspace_revision,
                             now: &now,

@@ -4,14 +4,15 @@ use sqlx::{Row, SqliteConnection};
 use crate::modules::workspace_sync::interface::WorkspaceHandle;
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
-    id::{CheckpointId, MessageId, SessionId, TimelineItemId, TurnId},
+    id::{AttachmentId, CheckpointId, MessageId, SessionId, TimelineItemId, TurnId},
 };
 
 use super::interface::SessionsInterface;
 use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, ContextMessage, CreatedTurnInput, ExecutionTurn,
-    QueuedTurnCandidate, RecordAskAnswer, RecordedTurnInput, RecoveredTurn, SessionCommandState,
-    SessionsError, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus, TurnTransition,
+    MAX_ATTACHMENTS, MAX_MESSAGE_BYTES, QueuedTurnCandidate, RecordAskAnswer, RecordedTurnInput,
+    RecoveredTurn, SessionCommandState, SessionModelPreference, SessionsError, TurnBlockerOutcome,
+    TurnBlockers, TurnModelSnapshot, TurnStatus, TurnTransition,
 };
 
 const TURN_IS_RUNNABLE_SQL: &str = "SELECT EXISTS( \
@@ -28,6 +29,13 @@ struct ActiveTurnTransition<'a> {
     to_status: TurnStatus,
     reason: Option<&'a str>,
     now: &'a str,
+}
+
+struct MessageAttachment {
+    id: AttachmentId,
+    name: String,
+    mime: String,
+    byte_size: u64,
 }
 
 impl SessionsInterface {
@@ -315,6 +323,7 @@ impl SessionsInterface {
         tx: &mut SqliteConnection,
         session_id: SessionId,
         expected_version: &str,
+        model_preference: Option<Option<&SessionModelPreference>>,
         now: &str,
     ) -> Result<SessionCommandState, SessionsError> {
         let row = sqlx::query(
@@ -337,17 +346,38 @@ impl SessionsInterface {
             });
         }
         let session_version = format!("v_{}", SessionId::new());
-        let updated = sqlx::query(
-            "UPDATE sessions SET version = ?, updated_at = ?, last_activity_at = ? \
-             WHERE id = ? AND version = ? AND state != 'deleting'",
-        )
-        .bind(&session_version)
-        .bind(now)
-        .bind(now)
-        .bind(session_id.to_string())
-        .bind(expected_version)
-        .execute(&mut *tx)
-        .await?;
+        let stored_next_model_ref: Option<String> = row.try_get("next_model_ref")?;
+        let next_model_ref = match model_preference {
+            Some(Some(preference)) => Some(serde_json::to_string(preference)?),
+            Some(None) => None,
+            None => stored_next_model_ref,
+        };
+        let updated = if model_preference.is_some() {
+            sqlx::query(
+                "UPDATE sessions SET next_model_ref = ?, version = ?, updated_at = ?, \
+                 last_activity_at = ? WHERE id = ? AND version = ? AND state != 'deleting'",
+            )
+            .bind(&next_model_ref)
+            .bind(&session_version)
+            .bind(now)
+            .bind(now)
+            .bind(session_id.to_string())
+            .bind(expected_version)
+            .execute(&mut *tx)
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE sessions SET version = ?, updated_at = ?, last_activity_at = ? \
+                 WHERE id = ? AND version = ? AND state != 'deleting'",
+            )
+            .bind(&session_version)
+            .bind(now)
+            .bind(now)
+            .bind(session_id.to_string())
+            .bind(expected_version)
+            .execute(&mut *tx)
+            .await?
+        };
         if updated.rows_affected() != 1 {
             let current =
                 sqlx::query_scalar::<_, String>("SELECT version FROM sessions WHERE id = ?")
@@ -364,7 +394,7 @@ impl SessionsInterface {
             project_id: row.try_get("project_id")?,
             state,
             workspace_handle: row.try_get("workspace_handle")?,
-            next_model_ref: row.try_get("next_model_ref")?,
+            next_model_ref,
             active_turn_id: row.try_get("active_turn_id")?,
             session_version,
         })
@@ -411,9 +441,61 @@ impl SessionsInterface {
         actor: &Value,
         predecessor_turn_id: Option<&str>,
         source_ask_id: Option<&str>,
+        attachment_ids: &[AttachmentId],
+        model_snapshot: Option<&TurnModelSnapshot>,
         checkpoint_revision: Option<&str>,
         now: &str,
     ) -> Result<CreatedTurnInput, SessionsError> {
+        if content.trim().is_empty() && attachment_ids.is_empty() {
+            return Err(SessionsError::Validation(
+                "message content or an attachment is required".into(),
+            ));
+        }
+        if attachment_ids.len() > usize::from(MAX_ATTACHMENTS) {
+            return Err(SessionsError::Validation(format!(
+                "a message supports at most {MAX_ATTACHMENTS} attachments"
+            )));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        let mut attachments = Vec::with_capacity(attachment_ids.len());
+        let mut message_bytes =
+            u64::try_from(content.len()).map_err(|error| SessionsError::Internal(error.into()))?;
+        for attachment_id in attachment_ids {
+            if !unique.insert(attachment_id.to_string()) {
+                return Err(SessionsError::Validation(
+                    "attachment ids must be unique".into(),
+                ));
+            }
+            let row: Option<(String, String, i64)> = sqlx::query_as(
+                "SELECT name, mime, byte_size FROM attachments \
+                 WHERE id = ? AND session_id = ? AND lifecycle IN ('draft', 'attached')",
+            )
+            .bind(attachment_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some((name, mime, byte_size)) = row else {
+                return Err(SessionsError::Validation(
+                    "attachment is missing or belongs to another session".into(),
+                ));
+            };
+            let byte_size =
+                u64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?;
+            message_bytes = message_bytes
+                .checked_add(byte_size)
+                .ok_or_else(|| SessionsError::Validation("message is too large".into()))?;
+            attachments.push(MessageAttachment {
+                id: *attachment_id,
+                name,
+                mime,
+                byte_size,
+            });
+        }
+        if message_bytes > MAX_MESSAGE_BYTES {
+            return Err(SessionsError::Validation(format!(
+                "message content and attachments exceed {MAX_MESSAGE_BYTES} bytes"
+            )));
+        }
         let next_sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM turns WHERE session_id = ?",
         )
@@ -424,6 +506,7 @@ impl SessionsInterface {
         let turn_id = TurnId::new();
         let message_id = MessageId::new();
         let timeline_item_id = TimelineItemId::new();
+        let model_snapshot_json = serde_json::to_string(&model_snapshot)?;
         sqlx::query(
             "INSERT INTO turns \
              (id, session_id, sequence, status, input_message_id, model_snapshot_json, \
@@ -436,7 +519,7 @@ impl SessionsInterface {
         .bind(session_id.to_string())
         .bind(next_sequence)
         .bind(message_id.to_string())
-        .bind("null")
+        .bind(model_snapshot_json)
         .bind(predecessor_turn_id)
         .bind(predecessor_turn_id)
         .bind(format!("v_{}", TurnId::new()))
@@ -445,7 +528,20 @@ impl SessionsInterface {
         .execute(&mut *tx)
         .await?;
 
-        let mut body = json!({"parts": [{"type": "text", "text": content}]});
+        let mut parts = Vec::with_capacity(attachments.len() + 1);
+        if !content.is_empty() {
+            parts.push(json!({"type": "text", "text": content}));
+        }
+        parts.extend(attachments.iter().map(|attachment| {
+            json!({
+                "type": "attachment_reference",
+                "attachment_id": attachment.id.to_string(),
+                "name": attachment.name,
+                "mime": attachment.mime,
+                "byte_size": attachment.byte_size,
+            })
+        }));
+        let mut body = json!({"parts": parts});
         if let Some(source_ask_id) = source_ask_id {
             body["turn_input"] = json!({"kind": "ask_answer", "source_ask_id": source_ask_id});
         }
@@ -466,11 +562,37 @@ impl SessionsInterface {
         .execute(&mut *tx)
         .await?;
 
+        for (ordinal, attachment) in attachments.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO message_attachments (message_id, attachment_id, ord) \
+                 VALUES (?, ?, ?)",
+            )
+            .bind(message_id.to_string())
+            .bind(attachment.id.to_string())
+            .bind(i64::try_from(ordinal).map_err(|error| SessionsError::Internal(error.into()))?)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE attachments SET lifecycle = 'attached', version = ? \
+                 WHERE id = ? AND lifecycle = 'draft'",
+            )
+            .bind(format!("v_{}", AttachmentId::new()))
+            .bind(attachment.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
+
         let mut projection = json!({
             "kind": "user_message",
             "message_id": message_id.to_string(),
             "turn_id": turn_id.to_string(),
             "text": content,
+            "attachments": attachments.iter().map(|attachment| json!({
+                "id": attachment.id.to_string(),
+                "name": attachment.name,
+                "mime": attachment.mime,
+                "byte_size": attachment.byte_size,
+            })).collect::<Vec<_>>(),
         });
         if let Some(source_ask_id) = source_ask_id {
             projection["source_ask_id"] = json!(source_ask_id);
@@ -1382,7 +1504,7 @@ impl SessionsInterface {
         session_id: SessionId,
     ) -> Result<Option<QueuedTurnCandidate>, SessionsError> {
         let row = sqlx::query(
-            "SELECT next_turn.id, next_turn.session_id, session.project_id, session.next_model_ref \
+            "SELECT next_turn.id, next_turn.session_id, next_turn.model_snapshot_json \
              FROM turns AS terminal_turn \
              JOIN sessions AS session ON session.id = terminal_turn.session_id \
              JOIN turns AS next_turn ON next_turn.session_id = terminal_turn.session_id \
@@ -1408,11 +1530,9 @@ impl SessionsInterface {
                     .try_get::<String, _>("session_id")?
                     .parse::<SessionId>()
                     .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
-                project_id: row
-                    .try_get::<String, _>("project_id")?
-                    .parse::<crate::platform::id::ProjectId>()
-                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
-                next_model_ref: row.try_get("next_model_ref")?,
+                model_snapshot: TurnModelSnapshot::parse(
+                    &row.try_get::<String, _>("model_snapshot_json")?,
+                )?,
             })
         })
         .transpose()

@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::modules::workspace_sync::interface::WorkspaceSyncError;
-use crate::platform::id::{AskId, ProjectId, SessionId, TurnId};
+use crate::platform::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId};
+
+pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+pub const MAX_MESSAGE_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENTS: u16 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionsError {
@@ -34,6 +38,10 @@ pub enum SessionsError {
     TimelineCursorInvalid,
     #[error("model is not configured")]
     ModelNotConfigured,
+    #[error("the selected model or reasoning effort is not available")]
+    InvalidModelPreference,
+    #[error("validation failed: {0}")]
+    Validation(String),
     #[error("workspace error: {0}")]
     Workspace(#[from] WorkspaceSyncError),
     #[error("storage error: {0}")]
@@ -195,10 +203,65 @@ pub struct SessionSummary {
     pub workspace_revision: Option<String>,
     pub source_main_revision_id: String,
     pub active_turn_id: Option<String>,
+    pub model_preference: Option<SessionModelPreference>,
     pub version: String,
     pub created_at: String,
     pub updated_at: String,
     pub last_activity_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionModelPreference {
+    pub provider_id: String,
+    pub upstream_model_id: String,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AttachmentView {
+    pub id: String,
+    pub session_id: String,
+    pub name: String,
+    pub mime: String,
+    pub byte_size: u64,
+    pub lifecycle: String,
+    pub version: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachmentResource {
+    pub id: AttachmentId,
+    pub name: String,
+    pub mime: String,
+    pub byte_size: u64,
+    pub blob_sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -356,8 +419,7 @@ pub struct SessionCommandState {
 pub struct QueuedTurnCandidate {
     pub turn_id: TurnId,
     pub session_id: SessionId,
-    pub project_id: ProjectId,
-    pub next_model_ref: Option<String>,
+    pub model_snapshot: Option<TurnModelSnapshot>,
 }
 
 #[derive(Debug, Clone)]

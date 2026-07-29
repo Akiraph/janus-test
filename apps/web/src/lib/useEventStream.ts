@@ -106,6 +106,9 @@ export function useEventStream() {
         void queryClient.invalidateQueries({ queryKey: ["session-timeline", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["session-diff", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["turn", sessionId] });
+        if (type === "context.changed") {
+          void queryClient.invalidateQueries({ queryKey: ["session-context", sessionId] });
+        }
       }
       // Project session lists are keyed by project id when known.
       const projectId = (payload as { project_id?: string }).project_id;

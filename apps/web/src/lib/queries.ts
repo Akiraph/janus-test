@@ -5,6 +5,7 @@ import {
   getProject,
   getProviders,
   getSession,
+  getSessionContext,
   getSessionDiff,
   getSessionTimeline,
   getSystemInfo,
@@ -120,6 +121,17 @@ export function useSession(sessionId: () => string | undefined) {
         const state = query.state.data?.state;
         return state === "active" ? 1500 : false;
       },
+    };
+  });
+}
+
+export function useSessionContext(sessionId: () => string | undefined) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["session-context", id],
+      queryFn: () => getSessionContext(id as string),
+      enabled: Boolean(id),
     };
   });
 }

@@ -272,8 +272,9 @@ async function startProvider(): Promise<{
       requestCount += 1;
       let latestUser = "";
       let hasToolResult = false;
+      let payload: unknown;
       try {
-        const payload = JSON.parse(requestBody);
+        payload = JSON.parse(requestBody);
         latestUser = latestUserContent(payload);
         hasToolResult = hasToolResultAfterLatestUser(payload);
       } catch {
@@ -282,8 +283,30 @@ async function startProvider(): Promise<{
       }
 
       const callId = `fixture_call_${requestCount}`;
+      const calledTools = toolNamesAfterLatestUser(payload);
       let stream = FINISH_STREAM;
-      if (latestUser.includes("[fixture:ask-expire]")) {
+      if (latestUser.includes("[fixture:attachments]")) {
+        const attachmentIds = uuids(latestUser);
+        if (!calledTools.includes("attachment.list")) {
+          stream = toolStream(callId, "attachment.list", {});
+        } else if (!calledTools.includes("attachment.read") && attachmentIds[0]) {
+          stream = toolStream(callId, "attachment.read", {
+            attachment_id: attachmentIds[0],
+          });
+        } else if (!calledTools.includes("attachment.save") && attachmentIds[1]) {
+          stream = toolStream(callId, "attachment.save", {
+            attachment_id: attachmentIds[1],
+            path: "assets/logo.bin",
+          });
+        }
+      } else if (latestUser.includes("[fixture:attachment-reuse]")) {
+        const attachmentId = uuids(latestToolContent(payload))[0];
+        if (!calledTools.includes("attachment.list")) {
+          stream = toolStream(callId, "attachment.list", {});
+        } else if (!calledTools.includes("attachment.read") && attachmentId) {
+          stream = toolStream(callId, "attachment.read", { attachment_id: attachmentId });
+        }
+      } else if (latestUser.includes("[fixture:ask-expire]")) {
         stream = toolStream(callId, "ask_user", {
           prompt: "Use the fixture default",
           mode: "best_effort",
@@ -375,6 +398,58 @@ function hasToolResultAfterLatestUser(payload: unknown): boolean {
       (message) =>
         typeof message === "object" && message !== null && Reflect.get(message, "role") === "tool",
     );
+}
+
+function toolNamesAfterLatestUser(payload: unknown): string[] {
+  if (typeof payload !== "object" || payload === null) return [];
+  const messages = Reflect.get(payload, "messages");
+  if (!Array.isArray(messages)) return [];
+  let latestUser = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message: unknown = messages[index];
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      Reflect.get(message, "role") === "user"
+    ) {
+      latestUser = index;
+      break;
+    }
+  }
+  const names: string[] = [];
+  for (const message of messages.slice(latestUser + 1)) {
+    if (typeof message !== "object" || message === null) continue;
+    const calls = Reflect.get(message, "tool_calls");
+    if (!Array.isArray(calls)) continue;
+    for (const call of calls) {
+      if (typeof call !== "object" || call === null) continue;
+      const fn = Reflect.get(call, "function");
+      if (typeof fn !== "object" || fn === null) continue;
+      const name = Reflect.get(fn, "name");
+      if (typeof name === "string") names.push(name);
+    }
+  }
+  return names;
+}
+
+function latestToolContent(payload: unknown): string {
+  if (typeof payload !== "object" || payload === null) return "";
+  const messages = Reflect.get(payload, "messages");
+  if (!Array.isArray(messages)) return "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (typeof message !== "object" || message === null) continue;
+    if (Reflect.get(message, "role") !== "tool") continue;
+    const content = Reflect.get(message, "content");
+    return typeof content === "string" ? content : JSON.stringify(content);
+  }
+  return "";
+}
+
+function uuids(value: string): string[] {
+  return [...value.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)]
+    .map((match) => match[0])
+    .filter((id, index, values) => values.indexOf(id) === index);
 }
 
 function fixtureSleepCommand(seconds: number): string {

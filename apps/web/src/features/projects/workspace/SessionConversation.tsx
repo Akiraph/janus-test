@@ -4,6 +4,13 @@ import { createEffect, For, Show } from "solid-js";
 import { Badge } from "../../../components/ui/Badge";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import type {
+  AttachmentView,
+  ContextUsageView,
+  ProviderView,
+  PublicLimits,
+  SessionModelPreference,
+} from "../../../lib/api";
 import { AskCard, JobCard, ModelCard, PlanCard, ServiceCard } from "./SessionCards";
 import { SessionComposer, type SessionMessageReceipt } from "./SessionComposer";
 import type { SessionTimelineItem } from "./sessionTimeline";
@@ -14,8 +21,19 @@ interface SessionConversationProps {
   error: string | null;
   delivery: "send" | "queue";
   composerDisabled?: boolean;
+  contextUsage: ContextUsageView | null;
+  limits: PublicLimits | undefined;
+  modelPreference: SessionModelPreference | null;
+  providers: readonly ProviderView[];
+  sessionId: string;
   onRetry: () => void;
-  onSubmit: (content: string) => Promise<SessionMessageReceipt>;
+  onSubmit: (
+    content: string,
+    modelPreference: SessionModelPreference | null,
+    attachmentIds: readonly string[],
+  ) => Promise<SessionMessageReceipt>;
+  onUploadAttachment: (sessionId: string, file: File) => Promise<AttachmentView>;
+  onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
   onAnswer?: (askId: string, answer: string) => Promise<void>;
 }
 
@@ -90,7 +108,14 @@ export function SessionConversation(props: SessionConversationProps) {
       <SessionComposer
         delivery={props.delivery}
         disabled={props.composerDisabled ?? false}
+        contextUsage={props.contextUsage}
+        limits={props.limits}
+        modelPreference={props.modelPreference}
+        providers={props.providers}
+        sessionId={props.sessionId}
         onSubmit={props.onSubmit}
+        onUploadAttachment={props.onUploadAttachment}
+        onDeleteAttachment={props.onDeleteAttachment}
       />
     </section>
   );
@@ -104,7 +129,18 @@ function SessionTimelineEntry(props: {
     case "user":
       return (
         <div class="session-message session-message--user">
-          <div class="session-message__bubble">{props.item.text}</div>
+          <div class="session-message__user-content">
+            <Show when={props.item.text}>
+              <div class="session-message__bubble">{props.item.text}</div>
+            </Show>
+            <For each={props.item.attachments}>
+              {(attachment) => (
+                <span class="session-message__attachment" title={attachment.mime}>
+                  {attachment.name}
+                </span>
+              )}
+            </For>
+          </div>
         </div>
       );
     case "assistant":

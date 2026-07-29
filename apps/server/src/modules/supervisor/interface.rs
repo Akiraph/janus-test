@@ -14,15 +14,18 @@ use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     events::{EventStore, NewEvent},
     id::{AskId, AttemptId, CorrelationId, JobId, RoundId, SessionId, ToolCallId, TurnId},
+    managed_storage::BlobStore,
     unit_of_work::UnitOfWork,
 };
+use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{SqliteConnection, SqlitePool};
+use utoipa::ToSchema;
 
 use super::context::SYSTEM_PROMPT;
 use super::registry::{SCHEMA_VERSION, registry};
 use super::retry::{FaultClass, MAX_ATTEMPTS_PER_CANDIDATE, RetryDecision, classify};
-use super::tools::{ToolContext, execute_tool};
+use super::tools::{ToolContext, execute_tool, read_attachment_bytes, supported_image_mime};
 pub use super::types::{
     AskAnswer, AskAnswerDisposition, AskClosure, AskMode, AskRequest, AskStatus, CompletionSummary,
     ExpiredAsk, SupervisorError, ToolCallSettlement, ToolCallStatus, ToolExecutionDisposition,
@@ -30,6 +33,14 @@ pub use super::types::{
 };
 
 const MAX_ROUNDS: usize = 12;
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ContextUsageView {
+    pub estimated_input_tokens: i64,
+    pub context_limit: i64,
+    pub compact_status: String,
+    pub created_at: String,
+}
 
 #[derive(Clone)]
 struct AcceptedToolCall {
@@ -52,6 +63,7 @@ pub struct SupervisorInterface {
     projects: ProjectsInterface,
     workspace: WorkspaceSyncInterface,
     sessions: SessionsInterface,
+    blobs: BlobStore,
     runtime: Option<crate::modules::runtime::interface::RuntimeInterface>,
 }
 
@@ -63,6 +75,7 @@ impl SupervisorInterface {
         projects: ProjectsInterface,
         workspace: WorkspaceSyncInterface,
         sessions: SessionsInterface,
+        blobs: BlobStore,
     ) -> Self {
         let unit_of_work = UnitOfWork::new(pool.clone(), events.clone());
         Self {
@@ -73,6 +86,7 @@ impl SupervisorInterface {
             projects,
             workspace,
             sessions,
+            blobs,
             runtime: None,
         }
     }
@@ -85,6 +99,29 @@ impl SupervisorInterface {
     ) -> Self {
         self.runtime = Some(runtime);
         self
+    }
+
+    pub async fn latest_context_usage(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ContextUsageView>, SupervisorError> {
+        let row: Option<(i64, i64, String, String)> = sqlx::query_as(
+            "SELECT estimated_input_tokens, context_limit, compact_status, created_at \
+             FROM context_versions WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(estimated_input_tokens, context_limit, compact_status, created_at)| {
+                ContextUsageView {
+                    estimated_input_tokens,
+                    context_limit,
+                    compact_status,
+                    created_at,
+                }
+            },
+        ))
     }
 
     /// Execute a running Turn until finish tool, model stop without tools, or failure.
@@ -107,7 +144,9 @@ impl SupervisorInterface {
         let provider_id = model_snapshot.provider_id.clone();
         let upstream_model_id = model_snapshot.upstream_model_id.clone();
 
-        let (mut chat, mut input_cursor) = self.load_chat_history(session_id, turn_id).await?;
+        let (mut chat, mut input_cursor) = self
+            .load_chat_history(session_id, turn_id, model_snapshot.supports_images)
+            .await?;
         // Ensure system prefix once.
         if !chat
             .first()
@@ -155,8 +194,14 @@ impl SupervisorInterface {
                 return Ok(TurnExecutionOutcome::default());
             }
 
-            let (turn_inputs, next_cursor) =
-                self.load_turn_inputs_after(turn_id, input_cursor).await?;
+            let (turn_inputs, next_cursor) = self
+                .load_turn_inputs_after(
+                    session_id,
+                    turn_id,
+                    input_cursor,
+                    model_snapshot.supports_images,
+                )
+                .await?;
             chat.extend(turn_inputs);
             input_cursor = next_cursor;
 
@@ -211,6 +256,7 @@ impl SupervisorInterface {
                 owner_id: owner_id.clone(),
                 provider_id: provider_id.clone(),
                 upstream_model_id: upstream_model_id.clone(),
+                parameters: model_snapshot.parameters.clone(),
                 messages: chat.clone(),
                 tools: tools.clone(),
                 round_id: Some(round_id.to_string()),
@@ -424,20 +470,6 @@ fn classify_failed(events: &[ModelStreamEvent]) -> Option<RetryDecision> {
     Some(classify(&failed.0, &failed.1, prior))
 }
 
-fn message_text(body: &Value) -> String {
-    body.get("parts")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|part| {
-            (part.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| part.get("text").and_then(Value::as_str))
-                .flatten()
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
 fn tool_result_message(outcome: &ToolOutcome, provider_call_id: &str) -> (ChatMessage, Value) {
     let mut model_parts = Vec::new();
     let mut durable_parts = Vec::new();
@@ -518,6 +550,7 @@ impl SupervisorInterface {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
+        supports_images: bool,
     ) -> Result<(Vec<ChatMessage>, i64), SupervisorError> {
         let rows = self.sessions.context_messages(session_id, turn_id).await?;
         let mut out = Vec::new();
@@ -545,11 +578,14 @@ impl SupervisorInterface {
                 .cloned()
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default();
+            let include_images = supports_images
+                && row.turn_id.as_deref() == Some(current_turn_id.as_str())
+                && row.kind == "user";
             out.push(ChatMessage {
                 role,
-                parts: vec![ContentPart::Text {
-                    text: message_text(&row.body),
-                }],
+                parts: self
+                    .message_parts(session_id, &row.body, include_images)
+                    .await?,
                 tool_call_id,
                 tool_calls,
             });
@@ -559,8 +595,10 @@ impl SupervisorInterface {
 
     async fn load_turn_inputs_after(
         &self,
+        session_id: SessionId,
         turn_id: TurnId,
         input_cursor: i64,
+        supports_images: bool,
     ) -> Result<(Vec<ChatMessage>, i64), SupervisorError> {
         let rows = self
             .sessions
@@ -570,8 +608,10 @@ impl SupervisorInterface {
         let mut next_cursor = input_cursor;
         for row in rows {
             next_cursor = next_cursor.max(row.timeline_sequence);
-            let text = message_text(&row.body);
-            if text.is_empty() {
+            let mut parts = self
+                .message_parts(session_id, &row.body, supports_images)
+                .await?;
+            if parts.is_empty() {
                 continue;
             }
             let input_kind = row
@@ -579,19 +619,104 @@ impl SupervisorInterface {
                 .get("turn_input")
                 .and_then(|value| value.get("kind"))
                 .and_then(Value::as_str);
-            let text = match input_kind {
-                Some("steer") => format!("[steer] {text}"),
-                Some("ask_answer") => format!("[ask answer] {text}"),
-                _ => text,
+            let prefix = match input_kind {
+                Some("steer") => Some("[steer] "),
+                Some("ask_answer") => Some("[ask answer] "),
+                _ => None,
             };
+            if let Some(prefix) = prefix {
+                if let Some(ContentPart::Text { text }) = parts
+                    .iter_mut()
+                    .find(|part| matches!(part, ContentPart::Text { .. }))
+                {
+                    text.insert_str(0, prefix);
+                } else {
+                    parts.insert(
+                        0,
+                        ContentPart::Text {
+                            text: prefix.trim_end().to_owned(),
+                        },
+                    );
+                }
+            }
             out.push(ChatMessage {
                 role: ChatRole::User,
-                parts: vec![ContentPart::Text { text }],
+                parts,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
             });
         }
         Ok((out, next_cursor))
+    }
+
+    async fn message_parts(
+        &self,
+        session_id: SessionId,
+        body: &Value,
+        include_images: bool,
+    ) -> Result<Vec<ContentPart>, SupervisorError> {
+        let mut parts = Vec::new();
+        for part in body
+            .get("parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = part.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        parts.push(ContentPart::Text {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+                Some("attachment_reference") => {
+                    let attachment_id = part
+                        .get("attachment_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow::anyhow!("attachment reference is missing its id"))?
+                        .parse()
+                        .map_err(|error| anyhow::anyhow!("invalid attachment id: {error}"))?;
+                    let attachment = self
+                        .sessions
+                        .get_attachment(session_id, attachment_id)
+                        .await?;
+                    let metadata = json!({
+                        "id": attachment.id.to_string(),
+                        "name": attachment.name,
+                        "mime": attachment.mime,
+                        "byte_size": attachment.byte_size,
+                    });
+                    parts.push(ContentPart::Text {
+                        text: format!(
+                            "[Session attachment {metadata}. Use attachment.read or attachment.save with this id.]"
+                        ),
+                    });
+                    if include_images && attachment.blob_sha.is_some() {
+                        let bytes = read_attachment_bytes(&self.blobs, &attachment)
+                            .await?
+                            .ok_or_else(|| {
+                                SupervisorError::Internal(anyhow::anyhow!(
+                                    "attachment {} content is unavailable",
+                                    attachment.id
+                                ))
+                            })?;
+                        if let Some(mime) = supported_image_mime(&bytes) {
+                            parts.push(ContentPart::Image {
+                                mime: mime.to_owned(),
+                                bytes,
+                                width: None,
+                                height: None,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(parts)
     }
 
     /// Run one Round's model stream with the M4 retry policy applied to a
@@ -1040,6 +1165,8 @@ impl SupervisorInterface {
             turn_id,
             tool_call_id: accepted.id,
             workspace: &self.workspace,
+            sessions: &self.sessions,
+            blobs: &self.blobs,
             runtime: self.runtime.as_ref(),
             pool: &self.pool,
             actor: actor.clone(),

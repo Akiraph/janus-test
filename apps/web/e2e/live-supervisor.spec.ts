@@ -96,6 +96,55 @@ test("a browser message completes through the live supervisor", async ({ page })
   );
 });
 
+test("Session attachments remain reusable and can become workspace files", async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(90_000);
+  await page.goto(`/projects/${live.projectId}?view=sessions`, {
+    waitUntil: "domcontentloaded",
+  });
+  await page.getByRole("button", { name: live.sessionTitle, exact: true }).click();
+
+  await page.locator('input[type="file"]').setInputFiles([
+    {
+      name: "session.log",
+      mimeType: "text/plain",
+      buffer: Buffer.from("attachment log survives later turns\n", "utf8"),
+    },
+    {
+      name: "logo.bin",
+      mimeType: "application/vnd.janus.asset",
+      buffer: Buffer.from([0, 1, 2, 127, 128, 255]),
+    },
+  ]);
+  await expect(page.getByText("session.log", { exact: true })).toBeVisible();
+  await expect(page.getByText("logo.bin", { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("attachments-desktop.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: testInfo.outputPath("attachments-mobile.png"), fullPage: true });
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  const composer = page.getByPlaceholder(/Send a message/i);
+  await composer.fill("[fixture:attachments] Inspect the log and save the binary asset");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await waitFor(
+    () => readTimeline(),
+    (timeline) => JSON.stringify(timeline).includes('"tool_name":"attachment.save"'),
+    "attachment save tool",
+    30_000,
+  );
+
+  const diff = await live.request(`/api/v1/sessions/${live.sessionId}/diff`);
+  expect(JSON.stringify(diff)).toContain("assets/logo.bin");
+
+  const reused = postMessage("[fixture:attachment-reuse] Read a previous Session attachment");
+  await waitForTurn(reused.turn_id, "completed", 30_000);
+  const attachmentReads = JSON.stringify(await readTimeline()).match(
+    /"tool_name":"attachment\.read"/g,
+  );
+  expect(attachmentReads?.length).toBeGreaterThanOrEqual(2);
+});
+
 test("Main Terminal runs in the Project workspace through CLI and WebSocket", async ({ page }) => {
   test.setTimeout(60_000);
   const created = live.cli<DataResponse<LiveTerminal>>(["terminal", "create", live.projectId]);

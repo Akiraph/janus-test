@@ -236,6 +236,21 @@ impl ModelsInterface {
         rows.into_iter().map(model_view).collect()
     }
 
+    pub async fn provider_kind_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        provider_id: &str,
+    ) -> Result<ProviderKind, ModelsError> {
+        let kind = sqlx::query_scalar::<_, String>(
+            "SELECT kind FROM model_providers WHERE id = ? AND enabled = 1",
+        )
+        .bind(provider_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ModelsError::ProviderNotFound)?;
+        parse_kind(&kind)
+    }
+
     pub async fn resolve_for_turn_in_tx(
         &self,
         tx: &mut SqliteConnection,

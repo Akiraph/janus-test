@@ -788,6 +788,54 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/sessions/{id}/attachments": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["upload_attachment"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/attachments/{attachment_id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post?: never;
+    delete: operations["delete_attachment"];
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/context": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["session_context"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/sessions/{id}/diff": {
     parameters: {
       query?: never;
@@ -1073,6 +1121,19 @@ export interface components {
     AnswerAskRequest: {
       answer: unknown;
     };
+    /** Format: uuid */
+    AttachmentId: string;
+    AttachmentView: {
+      /** Format: int64 */
+      byte_size: number;
+      created_at: string;
+      id: string;
+      lifecycle: string;
+      mime: string;
+      name: string;
+      session_id: string;
+      version: string;
+    };
     /** @enum {string} */
     AuthenticationMode: "passkey" | "development";
     BootstrapData: {
@@ -1121,6 +1182,14 @@ export interface components {
       ceremony_id: string;
       public_key: unknown;
     };
+    ContextUsageView: {
+      compact_status: string;
+      /** Format: int64 */
+      context_limit: number;
+      created_at: string;
+      /** Format: int64 */
+      estimated_input_tokens: number;
+    };
     CreateGithubCredentialInput: {
       github_host: string;
       name: string;
@@ -1144,6 +1213,19 @@ export interface components {
       /** Format: int32 */
       http_status?: number | null;
       status: string;
+    };
+    DataResponse_AttachmentView: {
+      data: {
+        /** Format: int64 */
+        byte_size: number;
+        created_at: string;
+        id: string;
+        lifecycle: string;
+        mime: string;
+        name: string;
+        session_id: string;
+        version: string;
+      };
     };
     DataResponse_CancelResult: {
       /**
@@ -1260,6 +1342,16 @@ export interface components {
         version: string;
       };
     };
+    DataResponse_Option_ContextUsageView: {
+      data: null | {
+        compact_status: string;
+        /** Format: int64 */
+        context_limit: number;
+        created_at: string;
+        /** Format: int64 */
+        estimated_input_tokens: number;
+      };
+    };
     DataResponse_OwnerView: {
       data: {
         authentication_mode: components["schemas"]["AuthenticationMode"];
@@ -1329,6 +1421,7 @@ export interface components {
         id: string;
         kind: string;
         last_activity_at: string;
+        model_preference?: null | components["schemas"]["SessionModelPreference"];
         project_id: string;
         source_main_revision_id: string;
         state: string;
@@ -1498,6 +1591,7 @@ export interface components {
         id: string;
         kind: string;
         last_activity_at: string;
+        model_preference?: null | components["schemas"]["SessionModelPreference"];
         project_id: string;
         source_main_revision_id: string;
         state: string;
@@ -1763,8 +1857,10 @@ export interface components {
       name: string;
     };
     PostMessageRequest: {
+      attachment_ids?: components["schemas"]["AttachmentId"][];
       content: string;
       expected_session_version: string;
+      model_preference?: null | components["schemas"]["SessionModelPreference"];
     };
     ProbeResult: {
       detail: string;
@@ -1839,6 +1935,8 @@ export interface components {
       schema_version: number;
       status: string;
     };
+    /** @enum {string} */
+    ReasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | "max";
     RecoveryExchangeRequest: {
       code: string;
     };
@@ -1915,12 +2013,18 @@ export interface components {
       expected_main_revision?: string | null;
       path: string;
     };
+    SessionModelPreference: {
+      provider_id: string;
+      reasoning_effort?: components["schemas"]["ReasoningEffort"];
+      upstream_model_id: string;
+    };
     SessionSummary: {
       active_turn_id?: string | null;
       created_at: string;
       id: string;
       kind: string;
       last_activity_at: string;
+      model_preference?: null | components["schemas"]["SessionModelPreference"];
       project_id: string;
       source_main_revision_id: string;
       state: string;
@@ -4455,6 +4559,118 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  upload_attachment: {
+    parameters: {
+      query: {
+        name: string;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_AttachmentView"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  delete_attachment: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+        attachment_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  session_context: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Option_ContextUsageView"];
         };
       };
       404: {

@@ -9,6 +9,7 @@ use crate::{
     config::RunMode,
     modules::identity::interface::InitializationState,
     modules::runtime::interface::{DeploymentCapabilityProbe, RuntimeCapabilityEvaluator},
+    modules::sessions::interface::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES},
     transport::http::{
         dto::{
             BootstrapData, BootstrapResponse, BootstrapState, DatabaseInfo, EventInfo,
@@ -94,9 +95,9 @@ pub async fn bootstrap(
                 webauthn_rp_name: state.config().webauthn_rp_name.clone(),
                 version: env!("CARGO_PKG_VERSION"),
                 limits: PublicLimits {
-                    max_file_bytes: 20 * 1024 * 1024,
-                    max_message_bytes: 25 * 1024 * 1024,
-                    max_attachments: 20,
+                    max_file_bytes: MAX_ATTACHMENT_BYTES,
+                    max_message_bytes: MAX_MESSAGE_BYTES,
+                    max_attachments: MAX_ATTACHMENTS,
                 },
             },
         }),

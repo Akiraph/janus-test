@@ -14,7 +14,7 @@ use janus_server::modules::models::stream_types::{
     ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
 };
 use janus_server::platform::{database::Database, events::EventStore, secret::SecretCipher};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -174,6 +174,7 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
             owner_id: owner.clone(),
             provider_id: provider.id.clone(),
             upstream_model_id: "fixture-model".into(),
+            parameters: json!({}),
             messages: vec![user_msg("hi")],
             tools: vec![],
             round_id: Some("round-1".into()),
@@ -196,7 +197,6 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
         })
         .collect();
     assert_eq!(text_deltas, ["Hel", "lo"]);
-
     match events.last() {
         Some(ModelStreamEvent::Completed {
             text,
@@ -259,6 +259,7 @@ async fn anthropic_messages_stream() -> anyhow::Result<()> {
             owner_id: owner.clone(),
             provider_id: provider.id,
             upstream_model_id: "claude-fixture".into(),
+            parameters: json!({}),
             messages: vec![user_msg("yo")],
             tools: vec![],
             round_id: Some("round-a".into()),
@@ -312,6 +313,7 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
             owner_id: owner.clone(),
             provider_id: provider.id,
             upstream_model_id: "x".into(),
+            parameters: json!({}),
             messages: vec![user_msg("nope")],
             tools: vec![],
             round_id: Some("r".into()),

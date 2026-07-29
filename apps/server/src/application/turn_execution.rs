@@ -5,12 +5,14 @@ use std::{
 
 use tracing::{debug, error, warn};
 
-use crate::modules::models::interface::{ModelPreference, ModelsError, ModelsInterface};
+use crate::modules::models::interface::{
+    ModelPreference, ModelsError, ModelsInterface, ProviderKind,
+};
 use crate::modules::projects::interface::{ProjectsError, ProjectsInterface};
 use crate::modules::runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
 use crate::modules::sessions::interface::{
-    SessionsError, SessionsInterface, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot,
-    TurnStatus,
+    ReasoningEffort, SessionModelPreference, SessionsError, SessionsInterface, TurnBlockerOutcome,
+    TurnBlockers, TurnModelSnapshot, TurnStatus,
 };
 use crate::modules::supervisor::interface::{
     SupervisorError, SupervisorInterface, ToolCallSettlement, TurnWait,
@@ -165,30 +167,14 @@ impl TurnRunner {
         tx: &mut sqlx::SqliteConnection,
         project_id: crate::platform::id::ProjectId,
         expected_owner_id: Option<&str>,
-        next_model_ref: Option<&str>,
+        preference: Option<&SessionModelPreference>,
     ) -> Result<Option<TurnModelSnapshot>, TurnExecutionError> {
         let project = self.projects.model_preference_in_tx(tx, project_id).await?;
         if expected_owner_id.is_some_and(|owner_id| owner_id != project.owner_id) {
             return Err(ProjectsError::NotFound.into());
         }
-        let configured = next_model_ref
-            .map(serde_json::from_str::<serde_json::Value>)
-            .transpose()
-            .map_err(|_| TurnExecutionError::InvalidModelPreference)?;
-        let (provider_id, upstream_model_id) = match configured.as_ref() {
-            Some(configured) => {
-                let provider_id = configured
-                    .get("provider_id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or(TurnExecutionError::InvalidModelPreference)?;
-                let upstream_model_id = configured
-                    .get("upstream_model_id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or(TurnExecutionError::InvalidModelPreference)?;
-                (Some(provider_id), Some(upstream_model_id))
-            }
-            None => (None, None),
-        };
+        let provider_id = preference.map(|value| value.provider_id.as_str());
+        let upstream_model_id = preference.map(|value| value.upstream_model_id.as_str());
         let model = self
             .models
             .resolve_for_turn_in_tx(
@@ -201,7 +187,34 @@ impl TurnRunner {
                 },
             )
             .await?;
-        Ok(model.map(|model| TurnModelSnapshot {
+        if preference.is_some() && model.is_none() {
+            return Err(TurnExecutionError::InvalidModelPreference);
+        }
+        let Some(model) = model else {
+            return Ok(None);
+        };
+        let mut parameters = model.parameters;
+        if let Some(preference) = preference {
+            let map = parameters
+                .as_object_mut()
+                .ok_or(TurnExecutionError::InvalidModelPreference)?;
+            if preference.reasoning_effort == ReasoningEffort::None {
+                map.remove("reasoning_effort");
+            } else {
+                let kind = self
+                    .models
+                    .provider_kind_in_tx(tx, &model.provider_id)
+                    .await?;
+                if kind == ProviderKind::Anthropic {
+                    return Err(TurnExecutionError::InvalidModelPreference);
+                }
+                map.insert(
+                    "reasoning_effort".into(),
+                    serde_json::Value::String(preference.reasoning_effort.as_str().to_owned()),
+                );
+            }
+        }
+        Ok(Some(TurnModelSnapshot {
             model_id: model.model_id,
             provider_id: model.provider_id,
             display_name: model.display_name,
@@ -209,7 +222,7 @@ impl TurnRunner {
             context_limit: model.context_limit,
             supports_images: model.supports_images,
             supports_tools: model.supports_tools,
-            parameters: model.parameters,
+            parameters,
         }))
     }
 
@@ -229,20 +242,12 @@ impl TurnRunner {
             work.rollback().await?;
             return Ok(None);
         };
-        let model_snapshot = self
-            .resolve_model_snapshot_in_tx(
-                work.connection(),
-                candidate.project_id,
-                None,
-                candidate.next_model_ref.as_deref(),
-            )
-            .await?;
         let session_version = self
             .sessions
             .activate_queued_turn_in_tx(
                 work.connection(),
                 &candidate,
-                model_snapshot.as_ref(),
+                candidate.model_snapshot.as_ref(),
                 &workspace_revision,
                 &now,
             )
@@ -265,7 +270,10 @@ impl TurnRunner {
                 "from": TurnStatus::Queued.as_str(),
                 "to": TurnStatus::Running.as_str(),
                 "route": "queued_start",
-                "model_id": model_snapshot.as_ref().map(|model| model.model_id.as_str()),
+                "model_id": candidate
+                    .model_snapshot
+                    .as_ref()
+                    .map(|model| model.model_id.as_str()),
                 "session_version": session_version,
             }),
         })

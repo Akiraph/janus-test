@@ -3184,6 +3184,165 @@
         }
       }
     },
+    "/api/v1/sessions/{id}/attachments": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "upload_attachment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_AttachmentView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/attachments/{attachment_id}": {
+      "delete": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "delete_attachment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/context": {
+      "get": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "session_context",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Option_ContextUsageView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sessions/{id}/diff": {
       "get": {
         "tags": [
@@ -3990,6 +4149,51 @@
           "answer": {}
         }
       },
+      "AttachmentId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "AttachmentView": {
+        "type": "object",
+        "required": [
+          "id",
+          "session_id",
+          "name",
+          "mime",
+          "byte_size",
+          "lifecycle",
+          "version",
+          "created_at"
+        ],
+        "properties": {
+          "byte_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "lifecycle": {
+            "type": "string"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
       "AuthenticationMode": {
         "type": "string",
         "enum": [
@@ -4137,6 +4341,31 @@
           "public_key": {}
         }
       },
+      "ContextUsageView": {
+        "type": "object",
+        "required": [
+          "estimated_input_tokens",
+          "context_limit",
+          "compact_status",
+          "created_at"
+        ],
+        "properties": {
+          "compact_status": {
+            "type": "string"
+          },
+          "context_limit": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "estimated_input_tokens": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "CreateGithubCredentialInput": {
         "type": "object",
         "required": [
@@ -4232,6 +4461,55 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "DataResponse_AttachmentView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "session_id",
+              "name",
+              "mime",
+              "byte_size",
+              "lifecycle",
+              "version",
+              "created_at"
+            ],
+            "properties": {
+              "byte_size": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "lifecycle": {
+                "type": "string"
+              },
+              "mime": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
           }
         }
       },
@@ -4683,6 +4961,46 @@
           }
         }
       },
+      "DataResponse_Option_ContextUsageView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "estimated_input_tokens",
+                  "context_limit",
+                  "compact_status",
+                  "created_at"
+                ],
+                "properties": {
+                  "compact_status": {
+                    "type": "string"
+                  },
+                  "context_limit": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "created_at": {
+                    "type": "string"
+                  },
+                  "estimated_input_tokens": {
+                    "type": "integer",
+                    "format": "int64"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
       "DataResponse_OwnerView": {
         "type": "object",
         "required": [
@@ -4978,6 +5296,16 @@
               },
               "last_activity_at": {
                 "type": "string"
+              },
+              "model_preference": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SessionModelPreference"
+                  }
+                ]
               },
               "project_id": {
                 "type": "string"
@@ -5672,6 +6000,16 @@
                 },
                 "last_activity_at": {
                   "type": "string"
+                },
+                "model_preference": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionModelPreference"
+                    }
+                  ]
                 },
                 "project_id": {
                   "type": "string"
@@ -6677,11 +7015,27 @@
           "expected_session_version"
         ],
         "properties": {
+          "attachment_ids": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentId"
+            }
+          },
           "content": {
             "type": "string"
           },
           "expected_session_version": {
             "type": "string"
+          },
+          "model_preference": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SessionModelPreference"
+              }
+            ]
           }
         }
       },
@@ -6980,6 +7334,17 @@
           }
         }
       },
+      "ReasoningEffort": {
+        "type": "string",
+        "enum": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
       "RecoveryExchangeRequest": {
         "type": "object",
         "required": [
@@ -7259,6 +7624,24 @@
           }
         }
       },
+      "SessionModelPreference": {
+        "type": "object",
+        "required": [
+          "provider_id",
+          "upstream_model_id"
+        ],
+        "properties": {
+          "provider_id": {
+            "type": "string"
+          },
+          "reasoning_effort": {
+            "$ref": "#/components/schemas/ReasoningEffort"
+          },
+          "upstream_model_id": {
+            "type": "string"
+          }
+        }
+      },
       "SessionSummary": {
         "type": "object",
         "required": [
@@ -7291,6 +7674,16 @@
           },
           "last_activity_at": {
             "type": "string"
+          },
+          "model_preference": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SessionModelPreference"
+              }
+            ]
           },
           "project_id": {
             "type": "string"

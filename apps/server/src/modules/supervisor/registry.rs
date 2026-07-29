@@ -77,6 +77,38 @@ pub fn registry() -> Vec<ToolSpecEntry> {
             }),
         },
         ToolSpecEntry {
+            name: "attachment.list",
+            description: "List files the user has made available to this Session, including reusable IDs and metadata.",
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolSpecEntry {
+            name: "attachment.read",
+            description: "Read a Session attachment by ID. Returns bounded UTF-8 text, a supported image, or binary metadata.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string"}
+                },
+                "required": ["attachment_id"]
+            }),
+        },
+        ToolSpecEntry {
+            name: "attachment.save",
+            description: "Save a Session attachment by ID to a Session-relative workspace path so it can be used by the project.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "required": ["attachment_id", "path"]
+            }),
+        },
+        ToolSpecEntry {
             name: "finish",
             description: "Complete the Turn with a structured summary.",
             parameters: json!({

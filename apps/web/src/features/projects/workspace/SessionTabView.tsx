@@ -1,8 +1,20 @@
 import { createEffect, createMemo, createSignal } from "solid-js";
 import { Badge, type BadgeVariant } from "../../../components/ui/Badge";
 import { type TabItem, Tabs } from "../../../components/ui/Tabs";
-import { postSessionMessage } from "../../../lib/api";
-import { useSession, useSessionDiff, useSessionTimeline } from "../../../lib/queries";
+import {
+  deleteSessionAttachment,
+  postSessionMessage,
+  type SessionModelPreference,
+  uploadSessionAttachment,
+} from "../../../lib/api";
+import {
+  useBootstrap,
+  useProviders,
+  useSession,
+  useSessionContext,
+  useSessionDiff,
+  useSessionTimeline,
+} from "../../../lib/queries";
 import { SessionConversation } from "./SessionConversation";
 import { SessionDiffView } from "./SessionDiffView";
 import { decodeSessionDiff } from "./sessionDiff";
@@ -20,7 +32,10 @@ interface SessionTabViewProps {
 
 export function SessionTabView(props: SessionTabViewProps) {
   const session = useSession(props.sessionId);
+  const bootstrap = useBootstrap();
   const timeline = useSessionTimeline(props.sessionId);
+  const context = useSessionContext(props.sessionId);
+  const providers = useProviders();
   const diff = useSessionDiff(props.sessionId, () => props.subView() === "diff");
   const [acceptedVersion, setAcceptedVersion] = createSignal("");
 
@@ -52,13 +67,19 @@ export function SessionTabView(props: SessionTabViewProps) {
     if (title) props.onTitle?.(title);
   });
 
-  async function sendMessage(content: string) {
+  async function sendMessage(
+    content: string,
+    modelPreference: SessionModelPreference | null,
+    attachmentIds: readonly string[],
+  ) {
     const version = acceptedVersion() || session.data?.version;
     if (!version) throw new Error("Session is not ready");
 
     const result = await postSessionMessage(props.sessionId(), {
       content,
       expected_session_version: version,
+      model_preference: modelPreference,
+      attachment_ids: [...attachmentIds],
     });
     setAcceptedVersion(result.session_version);
     void session.refetch();
@@ -97,11 +118,18 @@ export function SessionTabView(props: SessionTabViewProps) {
           error={conversationError()}
           delivery={active() ? "queue" : "send"}
           composerDisabled={!canMessage()}
+          contextUsage={context.data ?? null}
+          limits={bootstrap.data?.data.limits}
+          modelPreference={session.data?.model_preference ?? null}
+          providers={providers.data ?? []}
+          sessionId={props.sessionId()}
           onRetry={() => {
             void session.refetch();
             void timeline.refetch();
           }}
           onSubmit={sendMessage}
+          onUploadAttachment={uploadSessionAttachment}
+          onDeleteAttachment={deleteSessionAttachment}
         />
       </div>
 

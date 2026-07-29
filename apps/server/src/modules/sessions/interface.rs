@@ -13,16 +13,18 @@ use crate::modules::workspace_sync::interface::{WorkspaceHandle, WorkspaceSyncIn
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     events::{EventStore, NewEvent},
-    id::{CorrelationId, ProjectId, SessionId, TurnId},
+    id::{AttachmentId, CorrelationId, ProjectId, SessionId, TurnId, UploadId},
     unit_of_work::UnitOfWork,
 };
 
 pub use super::types::{
-    ActiveTurnOutcome, AppendAssistantMessage, AskAnswerResult, AskSummary, CancelResult,
-    ContextMessage, CreatedTurnInput, ExecutionTurn, MessageRoute, MessageRouteResult,
-    QueuedTurnCandidate, RecordAskAnswer, RecordedTurnInput, RecoveredTurn, SessionCommandState,
-    SessionSummary, SessionsError, SteerResult, TerminalSettlement, TimelineItemView, TimelinePage,
-    TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
+    ActiveTurnOutcome, AppendAssistantMessage, AskAnswerResult, AskSummary, AttachmentResource,
+    AttachmentView, CancelResult, ContextMessage, CreatedTurnInput, ExecutionTurn,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES, MessageRoute, MessageRouteResult,
+    QueuedTurnCandidate, ReasoningEffort, RecordAskAnswer, RecordedTurnInput, RecoveredTurn,
+    SessionCommandState, SessionModelPreference, SessionSummary, SessionsError, SteerResult,
+    TerminalSettlement, TimelineItemView, TimelinePage, TurnBlockerOutcome, TurnBlockers,
+    TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
 };
 
 #[derive(Clone)]
@@ -128,7 +130,7 @@ impl SessionsInterface {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query(
             "SELECT id, project_id, kind, title, state, workspace_handle, \
-                    active_turn_id, source_main_revision_id, version, \
+                    active_turn_id, next_model_ref, source_main_revision_id, version, \
                     created_at, updated_at, last_activity_at \
              FROM sessions \
              WHERE project_id = ? AND state != 'deleting' \
@@ -170,7 +172,7 @@ impl SessionsInterface {
     ) -> Result<SessionSummary, SessionsError> {
         let row = sqlx::query(
             "SELECT id, project_id, kind, title, state, workspace_handle, \
-                    active_turn_id, source_main_revision_id, version, \
+                    active_turn_id, next_model_ref, source_main_revision_id, version, \
                     created_at, updated_at, last_activity_at \
              FROM sessions WHERE id = ?",
         )
@@ -179,6 +181,150 @@ impl SessionsInterface {
         .await?
         .ok_or(SessionsError::NotFound)?;
         self.row_to_summary(row).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_upload_attachment(
+        &self,
+        owner_id: &str,
+        session_id: SessionId,
+        upload_id: UploadId,
+        attachment_id: AttachmentId,
+        name: &str,
+        mime: &str,
+        byte_size: u64,
+        blob_sha: &str,
+    ) -> Result<AttachmentView, SessionsError> {
+        let available: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sessions AS session \
+             JOIN projects AS project ON project.id = session.project_id \
+             WHERE session.id = ? AND project.owner_id = ? AND session.state != 'deleting')",
+        )
+        .bind(session_id.to_string())
+        .bind(owner_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if available != 1 {
+            return Err(SessionsError::NotFound);
+        }
+        let now = format_utc(SystemClock.now());
+        let version = format!("v_{attachment_id}");
+        let mut work = self.unit_of_work.begin().await?;
+        sqlx::query(
+            "INSERT INTO uploads \
+             (id, owner_id, original_name, mime, byte_size, blob_sha, scan_status, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?)",
+        )
+        .bind(upload_id.to_string())
+        .bind(owner_id)
+        .bind(name)
+        .bind(mime)
+        .bind(i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?)
+        .bind(blob_sha)
+        .bind(&now)
+        .execute(work.connection())
+        .await?;
+        sqlx::query(
+            "INSERT INTO attachments \
+             (id, session_id, source_kind, upload_id, name, mime, byte_size, blob_sha, \
+              lifecycle, version, created_at) \
+             VALUES (?, ?, 'upload', ?, ?, ?, ?, ?, 'draft', ?, ?)",
+        )
+        .bind(attachment_id.to_string())
+        .bind(session_id.to_string())
+        .bind(upload_id.to_string())
+        .bind(name)
+        .bind(mime)
+        .bind(i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?)
+        .bind(blob_sha)
+        .bind(&version)
+        .bind(&now)
+        .execute(work.connection())
+        .await?;
+        work.commit().await?;
+        Ok(AttachmentView {
+            id: attachment_id.to_string(),
+            session_id: session_id.to_string(),
+            name: name.to_owned(),
+            mime: mime.to_owned(),
+            byte_size,
+            lifecycle: "draft".into(),
+            version,
+            created_at: now,
+        })
+    }
+
+    pub async fn delete_draft_attachment(
+        &self,
+        owner_id: &str,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+    ) -> Result<String, SessionsError> {
+        let mut work = self.unit_of_work.begin().await?;
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT attachment.blob_sha, attachment.upload_id FROM attachments AS attachment \
+             JOIN sessions AS session ON session.id = attachment.session_id \
+             JOIN projects AS project ON project.id = session.project_id \
+             WHERE attachment.id = ? AND attachment.session_id = ? AND project.owner_id = ? \
+               AND attachment.lifecycle = 'draft' \
+               AND NOT EXISTS (SELECT 1 FROM message_attachments AS message_attachment \
+                               WHERE message_attachment.attachment_id = attachment.id)",
+        )
+        .bind(attachment_id.to_string())
+        .bind(session_id.to_string())
+        .bind(owner_id)
+        .fetch_optional(work.connection())
+        .await?;
+        let Some((blob_sha, upload_id)) = row else {
+            work.rollback().await?;
+            return Err(SessionsError::Validation(
+                "attachment is missing or is already referenced by a message".into(),
+            ));
+        };
+        sqlx::query("DELETE FROM attachments WHERE id = ?")
+            .bind(attachment_id.to_string())
+            .execute(work.connection())
+            .await?;
+        if let Some(upload_id) = upload_id {
+            sqlx::query("DELETE FROM uploads WHERE id = ?")
+                .bind(upload_id)
+                .execute(work.connection())
+                .await?;
+        }
+        work.commit().await?;
+        Ok(blob_sha)
+    }
+
+    pub async fn list_attachments(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<AttachmentResource>, SessionsError> {
+        let rows = sqlx::query(
+            "SELECT id, name, mime, byte_size, blob_sha FROM attachments \
+             WHERE session_id = ? AND lifecycle = 'attached' \
+             ORDER BY created_at, id",
+        )
+        .bind(session_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(attachment_resource).collect()
+    }
+
+    pub async fn get_attachment(
+        &self,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+    ) -> Result<AttachmentResource, SessionsError> {
+        let row = sqlx::query(
+            "SELECT id, name, mime, byte_size, blob_sha FROM attachments \
+             WHERE id = ? AND session_id = ? AND lifecycle = 'attached'",
+        )
+        .bind(attachment_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(SessionsError::NotFound)?;
+        attachment_resource(row)
     }
 
     pub async fn patch_session(
@@ -626,6 +772,10 @@ impl SessionsInterface {
             workspace_revision,
             source_main_revision_id: row.try_get("source_main_revision_id")?,
             active_turn_id: row.try_get("active_turn_id")?,
+            model_preference: row
+                .try_get::<Option<String>, _>("next_model_ref")?
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()?,
             version: row.try_get("version")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -648,5 +798,21 @@ fn timeline_row(row: sqlx::sqlite::SqliteRow) -> Result<TimelineItemView, Sessio
         status: row.try_get("status")?,
         version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,
+    })
+}
+
+fn attachment_resource(row: sqlx::sqlite::SqliteRow) -> Result<AttachmentResource, SessionsError> {
+    let id = row
+        .try_get::<String, _>("id")?
+        .parse::<AttachmentId>()
+        .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+    let byte_size = u64::try_from(row.try_get::<i64, _>("byte_size")?)
+        .map_err(|error| SessionsError::Internal(error.into()))?;
+    Ok(AttachmentResource {
+        id,
+        name: row.try_get("name")?,
+        mime: row.try_get("mime")?,
+        byte_size,
+        blob_sha: row.try_get("blob_sha")?,
     })
 }

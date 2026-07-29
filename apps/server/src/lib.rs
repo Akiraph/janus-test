@@ -92,6 +92,7 @@ impl AppState {
             projects.clone(),
             workspace_sync.clone(),
             sessions.clone(),
+            blobs.clone(),
         )
         .with_runtime(runtime.clone());
         application::lifecycle::recover_execution_state(

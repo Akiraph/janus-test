@@ -28,6 +28,11 @@ export type SaveTextInput = components["schemas"]["SaveTextInput"];
 export type RepositoryInput = components["schemas"]["RepositoryInput"];
 export type RepoAccess = components["schemas"]["RepoAccess"];
 export type SessionSummary = components["schemas"]["SessionSummary"];
+export type SessionModelPreference = components["schemas"]["SessionModelPreference"];
+export type ReasoningEffort = components["schemas"]["ReasoningEffort"];
+export type ContextUsageView = components["schemas"]["ContextUsageView"];
+export type AttachmentView = components["schemas"]["AttachmentView"];
+export type PublicLimits = components["schemas"]["PublicLimits"];
 export type MessageRouteResult = components["schemas"]["MessageRouteResult"];
 export type TimelinePage = components["schemas"]["TimelinePage"];
 export type TimelineItemView = components["schemas"]["TimelineItemView"];
@@ -286,6 +291,38 @@ export async function postSessionMessage(
     await requestJson<{ data: MessageRouteResult }>(
       `/api/v1/sessions/${id}/messages`,
       { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function uploadSessionAttachment(id: string, file: File): Promise<AttachmentView> {
+  const query = new URLSearchParams({ name: file.name });
+  const response = await fetch(`/api/v1/sessions/${id}/attachments?${query}`, {
+    method: "POST",
+    headers: requestHeaders({ "Content-Type": file.type || "application/octet-stream" }),
+    credentials: "include",
+    body: file,
+  });
+  if (!response.ok) throw await toApiError(response);
+  const value: unknown = await response.json();
+  if (!hasData(value)) throw new ApiError(502, "Janus returned an incompatible response");
+  return value.data as AttachmentView;
+}
+
+export async function deleteSessionAttachment(id: string, attachmentId: string): Promise<void> {
+  await requestJson(
+    `/api/v1/sessions/${id}/attachments/${attachmentId}`,
+    { method: "DELETE" },
+    () => true,
+  );
+}
+
+export async function getSessionContext(id: string): Promise<ContextUsageView | null> {
+  return (
+    await requestJson<{ data: ContextUsageView | null }>(
+      `/api/v1/sessions/${id}/context`,
+      { method: "GET" },
       isDataResponse,
     )
   ).data;
@@ -734,11 +771,7 @@ function requestInit(
   body?: string | object,
   extraHeaders?: Record<string, string>,
 ): RequestInit {
-  const headers = new Headers({ "X-Request-Id": crypto.randomUUID(), Accept: "application/json" });
-  if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
-  if (extraHeaders) {
-    for (const [key, value] of Object.entries(extraHeaders)) headers.set(key, value);
-  }
+  const headers = requestHeaders(extraHeaders);
   if (body !== undefined) {
     headers.set("Content-Type", "application/json");
     body = typeof body === "string" ? body : JSON.stringify(body);
@@ -746,6 +779,15 @@ function requestInit(
   const result: RequestInit = { method, headers, credentials: "include" };
   if (body !== undefined) result.body = body as BodyInit;
   return result;
+}
+
+function requestHeaders(extraHeaders?: Record<string, string>): Headers {
+  const headers = new Headers({ "X-Request-Id": crypto.randomUUID(), Accept: "application/json" });
+  if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  if (extraHeaders) {
+    for (const [key, value] of Object.entries(extraHeaders)) headers.set(key, value);
+  }
+  return headers;
 }
 
 async function requestJson<T>(
@@ -771,7 +813,7 @@ async function toApiError(response: Response): Promise<ApiError> {
   );
 }
 
-function hasData(value: unknown): boolean {
+function hasData(value: unknown): value is { data: unknown } {
   return isRecord(value) && "data" in value;
 }
 const isDataResponse = hasData;

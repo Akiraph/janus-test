@@ -15,8 +15,15 @@ export interface TimelinePlanStep {
   status: string | null;
 }
 
+export interface TimelineAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  byteSize: number;
+}
+
 export type SessionTimelineItem =
-  | (TimelineItemBase & { type: "user"; text: string })
+  | (TimelineItemBase & { type: "user"; text: string; attachments: TimelineAttachment[] })
   | (TimelineItemBase & { type: "assistant"; text: string })
   | (TimelineItemBase & { type: "steer"; text: string })
   | (TimelineItemBase & {
@@ -85,7 +92,12 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
 
   switch (item.kind) {
     case "user_message":
-      return { ...base, type: "user", text: text(projection.text) };
+      return {
+        ...base,
+        type: "user",
+        text: text(projection.text),
+        attachments: decodeAttachments(projection.attachments),
+      };
     case "assistant_message":
       return { ...base, type: "assistant", text: text(projection.text) };
     case "steer":
@@ -231,6 +243,24 @@ function decodePlanSteps(value: unknown): TimelinePlanStep[] {
       text: text(step.text ?? step.title ?? step.label, text(value, JSON.stringify(value))),
       status: optionalText(step.status),
     };
+  });
+}
+
+function decodeAttachments(value: unknown): TimelineAttachment[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((value) => {
+    const attachment = asRecord(value);
+    const id = text(attachment.id);
+    const name = text(attachment.name);
+    if (!id || !name) return [];
+    return [
+      {
+        id,
+        name,
+        mime: text(attachment.mime, "application/octet-stream"),
+        byteSize: typeof attachment.byte_size === "number" ? attachment.byte_size : 0,
+      },
+    ];
   });
 }
 

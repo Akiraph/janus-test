@@ -15,6 +15,14 @@ pub fn build_chat_body(req: &ModelRequest) -> Value {
         "stream": true,
         "messages": messages,
     });
+    if let Some(reasoning_effort) = req
+        .parameters
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .filter(|value| *value != "none")
+    {
+        body["reasoning_effort"] = json!(reasoning_effort);
+    }
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools

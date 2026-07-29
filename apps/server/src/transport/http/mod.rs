@@ -14,7 +14,7 @@ mod terminal;
 
 use axum::{
     Router, middleware,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use utoipa::OpenApi;
 
@@ -48,7 +48,8 @@ pub use problem::Problem;
         git::git_update, git::list_update_conflicts, git::get_update_conflict, git::resolve_update_conflict,
         operations::get_operation,
         sessions::list_sessions, sessions::create_session, sessions::get_session,
-        sessions::delete_session, sessions::post_message, sessions::timeline,
+        sessions::delete_session, sessions::post_message, sessions::upload_attachment,
+        sessions::delete_attachment, sessions::session_context, sessions::timeline,
         sessions::get_turn, sessions::session_diff, sessions::steer, sessions::cancel_turn,
         sessions::answer_ask, sessions::retry_model,
         terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
@@ -130,6 +131,10 @@ pub use problem::Problem;
         crate::modules::sessions::interface::TimelineItemView,
         crate::modules::sessions::interface::CancelResult,
         crate::modules::sessions::interface::SteerResult,
+        crate::modules::sessions::interface::SessionModelPreference,
+        crate::modules::sessions::interface::ReasoningEffort,
+        crate::modules::sessions::interface::AttachmentView,
+        crate::modules::supervisor::interface::ContextUsageView,
         sessions::CreateSessionRequest,
         sessions::PostMessageRequest,
         sessions::SteerRequest,
@@ -299,7 +304,19 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/messages",
             post(sessions::post_message),
         )
+        .route(
+            "/api/v1/sessions/{id}/attachments",
+            post(sessions::upload_attachment),
+        )
+        .route(
+            "/api/v1/sessions/{id}/attachments/{attachment_id}",
+            delete(sessions::delete_attachment),
+        )
         .route("/api/v1/sessions/{id}/steer", post(sessions::steer))
+        .route(
+            "/api/v1/sessions/{id}/context",
+            get(sessions::session_context),
+        )
         .route("/api/v1/sessions/{id}/timeline", get(sessions::timeline))
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}",

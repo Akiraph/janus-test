@@ -54,6 +54,7 @@ pub struct ModelRequest {
     pub owner_id: String,
     pub provider_id: String,
     pub upstream_model_id: String,
+    pub parameters: serde_json::Value,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolSpec>,
     /// Correlation for attempt ledger (optional for pure stream tests).

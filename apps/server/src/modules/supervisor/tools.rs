@@ -6,10 +6,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::adapters::git::{GitRunner, SystemGit};
+use crate::modules::sessions::interface::{AttachmentResource, SessionsInterface};
 use crate::modules::workspace_sync::interface::{
     FileMutation, WorkspaceHandle, WorkspaceSyncInterface,
 };
-use crate::platform::id::{AskId, SessionId, ToolCallId, TurnId};
+use crate::platform::id::{AskId, AttachmentId, SessionId, ToolCallId, TurnId};
+use crate::platform::managed_storage::BlobStore;
 use crate::platform::path::PathError;
 
 use super::paths::resolve_session_path;
@@ -23,12 +25,15 @@ use super::types::{
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_EDGE_PX: u32 = 32_768;
 const MAX_PIXELS: u64 = 100_000_000;
+const MAX_ATTACHMENT_TEXT_BYTES: usize = 256 * 1024;
 
 pub struct ToolContext<'a> {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub tool_call_id: ToolCallId,
     pub workspace: &'a WorkspaceSyncInterface,
+    pub sessions: &'a SessionsInterface,
+    pub blobs: &'a BlobStore,
     pub runtime: Option<&'a crate::modules::runtime::interface::RuntimeInterface>,
     pub pool: &'a sqlx::SqlitePool,
     pub actor: Value,
@@ -62,6 +67,9 @@ pub async fn execute_tool(
         "fs.patch" => tool_write(ctx, &handle, input, true).await,
         "fs.remove" => tool_remove(ctx, &handle, input).await,
         "git.inspect" => tool_git_status(&repo).await,
+        "attachment.list" => tool_attachment_list(ctx).await,
+        "attachment.read" => tool_attachment_read(ctx, input).await,
+        "attachment.save" => tool_attachment_save(ctx, &handle, input).await,
         "finish" => tool_finish_checked(ctx, input).await,
         "bash" => tool_bash(ctx, input).await,
         "job" => tool_job(ctx, input).await,
@@ -239,6 +247,21 @@ fn sniff_image(bytes: &[u8]) -> Option<ImageKind> {
     None
 }
 
+pub(super) fn supported_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let kind = sniff_image(bytes)?;
+    if matches!(kind, ImageKind::Gif) && gif_is_animated(bytes) {
+        return None;
+    }
+    let (width, height) = probe_dimensions(bytes, kind).ok()?;
+    if width == 0 || height == 0 || width > MAX_EDGE_PX || height > MAX_EDGE_PX {
+        return None;
+    }
+    ((width as u64).saturating_mul(height as u64) <= MAX_PIXELS).then(|| mime_of(kind))
+}
+
 fn mime_of(kind: ImageKind) -> &'static str {
     match kind {
         ImageKind::Png => "image/png",
@@ -374,6 +397,21 @@ async fn read_image(
     handle: &WorkspaceHandle,
     ctx: &ToolContext<'_>,
 ) -> Result<ToolOutcome, SupervisorError> {
+    let revision = ctx
+        .workspace
+        .current_revision(handle)
+        .await
+        .ok()
+        .map(|r| r.0);
+    image_outcome(path, bytes, kind, revision)
+}
+
+fn image_outcome(
+    path: &str,
+    bytes: &[u8],
+    kind: ImageKind,
+    revision: Option<String>,
+) -> Result<ToolOutcome, SupervisorError> {
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
         return Ok(fail_text("image exceeds 50MiB", "IMAGE_TOO_LARGE"));
     }
@@ -395,13 +433,6 @@ async fn read_image(
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let content_hash = hex::encode(hasher.finalize());
-    let revision = ctx
-        .workspace
-        .current_revision(handle)
-        .await
-        .ok()
-        .map(|r| r.0);
-
     // Summary never includes Base64 — only references.
     let summary = json!({
         "path": path,
@@ -557,6 +588,188 @@ async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
             "TOOL_PATH_INVALID",
         )),
     }
+}
+
+async fn tool_attachment_list(ctx: &ToolContext<'_>) -> Result<ToolOutcome, SupervisorError> {
+    let attachments = ctx.sessions.list_attachments(ctx.session_id).await?;
+    let items = attachments
+        .iter()
+        .map(|attachment| {
+            json!({
+                "id": attachment.id.to_string(),
+                "name": attachment.name,
+                "mime": attachment.mime,
+                "byte_size": attachment.byte_size,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(ToolOutcome {
+        disposition: ToolExecutionDisposition::Succeeded,
+        parts: vec![ToolResultPart::Json {
+            value: json!({"attachments": items}),
+        }],
+        summary: json!({"count": attachments.len()}),
+        error_code: None,
+        finish_summary: None,
+        wait: None,
+    })
+}
+
+async fn tool_attachment_read(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    let Some(attachment) = find_attachment(ctx, input).await? else {
+        return Ok(fail_text(
+            "attachment not found",
+            "TOOL_ATTACHMENT_NOT_FOUND",
+        ));
+    };
+    let Some(bytes) = read_attachment_bytes(ctx.blobs, &attachment).await? else {
+        return Ok(fail_text(
+            "attachment content is not available",
+            "TOOL_ATTACHMENT_UNAVAILABLE",
+        ));
+    };
+
+    if let Some(kind) = sniff_image(&bytes) {
+        let label = format!("attachment:{}/{}", attachment.id, attachment.name);
+        return image_outcome(&label, &bytes, kind, None);
+    }
+
+    if let Ok(text) = std::str::from_utf8(&bytes)
+        && !text.contains('\0')
+    {
+        let mut end = text.len().min(MAX_ATTACHMENT_TEXT_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = end < text.len();
+        return Ok(ToolOutcome {
+            disposition: ToolExecutionDisposition::Succeeded,
+            parts: vec![ToolResultPart::Text {
+                text: text[..end].to_owned(),
+            }],
+            summary: json!({
+                "attachment_id": attachment.id.to_string(),
+                "name": attachment.name,
+                "mime": attachment.mime,
+                "byte_size": attachment.byte_size,
+                "kind": "text",
+                "returned_bytes": end,
+                "truncated": truncated,
+            }),
+            error_code: None,
+            finish_summary: None,
+            wait: None,
+        });
+    }
+
+    let metadata = json!({
+        "attachment_id": attachment.id.to_string(),
+        "name": attachment.name,
+        "mime": attachment.mime,
+        "byte_size": attachment.byte_size,
+        "kind": "binary",
+        "next_action": "Use attachment.save with this attachment_id and a Session-relative path.",
+    });
+    Ok(ToolOutcome {
+        disposition: ToolExecutionDisposition::Succeeded,
+        parts: vec![ToolResultPart::Json {
+            value: metadata.clone(),
+        }],
+        summary: metadata,
+        error_code: None,
+        finish_summary: None,
+        wait: None,
+    })
+}
+
+async fn tool_attachment_save(
+    ctx: &ToolContext<'_>,
+    handle: &WorkspaceHandle,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    let Some(attachment) = find_attachment(ctx, input).await? else {
+        return Ok(fail_text(
+            "attachment not found",
+            "TOOL_ATTACHMENT_NOT_FOUND",
+        ));
+    };
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or(SupervisorError::ToolPathInvalid)?;
+    let _ = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+        .map_err(|_| SupervisorError::ToolPathInvalid)?;
+    let Some(bytes) = read_attachment_bytes(ctx.blobs, &attachment).await? else {
+        return Ok(fail_text(
+            "attachment content is not available",
+            "TOOL_ATTACHMENT_UNAVAILABLE",
+        ));
+    };
+    let revision = ctx
+        .workspace
+        .apply_file_mutation(
+            handle,
+            FileMutation::Write {
+                path: path.to_owned(),
+                content: bytes,
+            },
+            None,
+            "tool.attachment.save",
+            ctx.actor.clone(),
+        )
+        .await?;
+    Ok(ToolOutcome {
+        disposition: ToolExecutionDisposition::Succeeded,
+        parts: vec![ToolResultPart::Text {
+            text: format!("saved attachment {} to {path}", attachment.id),
+        }],
+        summary: json!({
+            "attachment_id": attachment.id.to_string(),
+            "path": path,
+            "revision": revision.0,
+        }),
+        error_code: None,
+        finish_summary: None,
+        wait: None,
+    })
+}
+
+async fn find_attachment(
+    ctx: &ToolContext<'_>,
+    input: &Value,
+) -> Result<Option<AttachmentResource>, SupervisorError> {
+    let Some(id) = input
+        .get("attachment_id")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<AttachmentId>().ok())
+    else {
+        return Ok(None);
+    };
+    match ctx.sessions.get_attachment(ctx.session_id, id).await {
+        Ok(attachment) => Ok(Some(attachment)),
+        Err(crate::modules::sessions::interface::SessionsError::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) async fn read_attachment_bytes(
+    blobs: &BlobStore,
+    attachment: &AttachmentResource,
+) -> Result<Option<Vec<u8>>, SupervisorError> {
+    let Some(blob_sha) = attachment.blob_sha.as_deref() else {
+        return Ok(None);
+    };
+    let bytes = blobs.read(blob_sha).await?;
+    if bytes.len() as u64 != attachment.byte_size {
+        return Err(SupervisorError::Internal(anyhow::anyhow!(
+            "attachment {} byte length does not match its stored metadata",
+            attachment.id
+        )));
+    }
+    Ok(Some(bytes))
 }
 
 fn tool_finish(input: &Value) -> Result<ToolOutcome, SupervisorError> {
