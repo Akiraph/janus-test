@@ -176,6 +176,33 @@ test("mobile workspace switches between navigation and the active Session", asyn
   await expect(composer).toBeVisible();
 });
 
+test("live deployment pages remain usable on mobile", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+  await expect(page.getByText("Live project", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
+
+  await page.goto("/settings", { waitUntil: "domcontentloaded" });
+  const navigation = page.getByRole("navigation", { name: "Settings navigation" });
+  await expect(navigation).toBeVisible();
+  expect((await navigation.boundingBox())?.height).toBeLessThan(80);
+  const provider = page.locator(".provider-card").filter({ hasText: "Live fixture" });
+  await expect(provider).toContainText("Fixture model");
+  await expect(page.getByRole("button", { name: /^Models/ })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("live-settings-mobile.png"), fullPage: true });
+
+  await page.goto("/system", { waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("heading", { name: "System", level: 2 })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Capabilities" })).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+    ),
+  ).toBe(false);
+});
+
 test("blocking Ask answers once and duplicate delivery is idempotent", async () => {
   test.setTimeout(60_000);
   const routed = postMessage("[fixture:ask] Ask before finishing");
