@@ -395,17 +395,6 @@ pub struct AppendAssistantMessage<'a> {
     pub now: &'a str,
 }
 
-/// A queued Turn awaiting promotion (projection used by Session UI queue view).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct QueuedTurnSummary {
-    pub turn_id: String,
-    pub session_id: String,
-    pub sequence: i64,
-    pub message_id: Option<String>,
-    pub source: String,
-    pub created_at: String,
-}
-
 /// Result of cancelling a Turn (Stage 4 state machine: `running ->
 /// canceling -> canceled|interrupted`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

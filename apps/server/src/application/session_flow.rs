@@ -13,14 +13,12 @@ use std::collections::HashMap;
 use serde_json::json;
 
 use crate::AppState;
+use crate::application::turn_execution::ToolResultRecord;
 use crate::modules::runtime::interface::JobStatus;
 use crate::modules::sessions::interface::{
-    CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionsError,
-    TurnBlockerOutcome, TurnBlockers, TurnStatus,
+    CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionsError, TurnStatus,
 };
-use crate::modules::supervisor::interface::{
-    AskAnswerDisposition, AskClosure, SupervisorError, ToolCallSettlement,
-};
+use crate::modules::supervisor::interface::{AskAnswerDisposition, AskClosure, SupervisorError};
 use crate::platform::clock::{Clock, SystemClock, format_utc};
 use crate::platform::events::NewEvent;
 use crate::platform::id::{AskId, CorrelationId, ProjectId, SessionId, TurnId};
@@ -366,19 +364,30 @@ impl AppState {
                 error => SessionsError::Internal(anyhow::anyhow!("answer Ask: {error}")),
             })?;
         let outcome = self
-            .reconcile_turn_blockers_in_tx(work.connection(), answered.turn_id, &now)
-            .await?;
+            .turn_runner()
+            .inspect_and_reconcile_turn_blockers_in_tx(work.connection(), answered.turn_id, &now)
+            .await
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("reconcile Ask blockers: {error}"))
+            })?;
         let correlation_id = CorrelationId::new().to_string();
         if let Some(settlement) = &answered.tool_call {
-            self.record_ask_tool_call_settlement_in_tx(
-                &mut work,
-                outcome.session_id,
-                settlement,
-                &actor,
-                &correlation_id,
-                &now,
-            )
-            .await?;
+            self.turn_runner()
+                .record_tool_result_in_tx(
+                    &mut work,
+                    ToolResultRecord {
+                        session_id: outcome.session_id,
+                        settlement,
+                        actor: &actor,
+                        correlation_id: &correlation_id,
+                        job_id: None,
+                        now: &now,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    SessionsError::Internal(anyhow::anyhow!("record Ask Tool result: {error}"))
+                })?;
         }
         let accepted_by_original = answered.disposition == AskAnswerDisposition::Accepted
             && outcome.active
@@ -587,23 +596,38 @@ impl AppState {
         let mut schedule = Vec::new();
         for (turn_id, asks) in by_turn {
             let outcome = self
-                .reconcile_turn_blockers_in_tx(work.connection(), turn_id, &now)
-                .await?;
+                .turn_runner()
+                .inspect_and_reconcile_turn_blockers_in_tx(work.connection(), turn_id, &now)
+                .await
+                .map_err(|error| {
+                    SessionsError::Internal(anyhow::anyhow!(
+                        "reconcile expired Ask blockers: {error}"
+                    ))
+                })?;
             let original_can_consume = outcome.active
                 && matches!(
                     outcome.status,
                     TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
                 );
             for ask in asks {
-                self.record_ask_tool_call_settlement_in_tx(
-                    &mut work,
-                    outcome.session_id,
-                    &ask.tool_call,
-                    &actor,
-                    &correlation_id,
-                    &now,
-                )
-                .await?;
+                self.turn_runner()
+                    .record_tool_result_in_tx(
+                        &mut work,
+                        ToolResultRecord {
+                            session_id: outcome.session_id,
+                            settlement: &ask.tool_call,
+                            actor: &actor,
+                            correlation_id: &correlation_id,
+                            job_id: None,
+                            now: &now,
+                        },
+                    )
+                    .await
+                    .map_err(|error| {
+                        SessionsError::Internal(anyhow::anyhow!(
+                            "record expired Ask Tool result: {error}"
+                        ))
+                    })?;
                 work.append_event(NewEvent {
                     event_type: "ask.changed".into(),
                     actor: actor.clone(),
@@ -675,103 +699,6 @@ impl AppState {
         Ok(expired.len() as u64)
     }
 
-    async fn record_ask_tool_call_settlement_in_tx(
-        &self,
-        work: &mut UnitOfWorkTransaction<'_>,
-        session_id: SessionId,
-        settlement: &ToolCallSettlement,
-        actor: &serde_json::Value,
-        correlation_id: &str,
-        now: &str,
-    ) -> Result<(), SessionsError> {
-        let source_turn_id = settlement
-            .source_turn_id
-            .parse::<TurnId>()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid source Turn id")))?;
-        let timeline_item_id = self
-            .sessions()
-            .replace_tool_result_in_tx(
-                work.connection(),
-                session_id,
-                source_turn_id,
-                &settlement.tool_call_id,
-                &settlement.provider_call_id,
-                &settlement.tool_name,
-                settlement.status.as_str(),
-                &settlement.summary,
-                &settlement.model_parts,
-                now,
-            )
-            .await?;
-        work.append_event(NewEvent {
-            event_type: "tool_call.changed".into(),
-            actor: actor.clone(),
-            resource: Some(json!({
-                "kind": "tool_call",
-                "id": settlement.tool_call_id,
-            })),
-            correlation_id: correlation_id.to_owned(),
-            causation_id: None,
-            payload: json!({
-                "tool_call_id": settlement.tool_call_id,
-                "provider_call_id": settlement.provider_call_id,
-                "tool_name": settlement.tool_name,
-                "status": settlement.status.as_str(),
-                "summary": settlement.summary,
-                "timeline_item_id": timeline_item_id,
-            }),
-        })
-        .await
-        .map_err(SessionsError::Internal)?;
-        work.append_event(NewEvent {
-            event_type: "timeline.item_updated".into(),
-            actor: actor.clone(),
-            resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
-            correlation_id: correlation_id.to_owned(),
-            causation_id: None,
-            payload: json!({
-                "timeline_item_id": timeline_item_id,
-                "tool_call_id": settlement.tool_call_id,
-            }),
-        })
-        .await
-        .map_err(SessionsError::Internal)?;
-        Ok(())
-    }
-
-    async fn reconcile_turn_blockers_in_tx(
-        &self,
-        tx: &mut sqlx::SqliteConnection,
-        turn_id: TurnId,
-        now: &str,
-    ) -> Result<TurnBlockerOutcome, SessionsError> {
-        let open_ask = self
-            .supervisor()
-            .has_open_asks_in_tx(tx, turn_id)
-            .await
-            .map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!("inspect Ask blockers: {error}"))
-            })?;
-        let unfinished_job = self
-            .runtime()
-            .has_unfinished_jobs_in_tx(tx, turn_id)
-            .await
-            .map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!("inspect Job blockers: {error}"))
-            })?;
-        self.sessions()
-            .reconcile_turn_blockers_in_tx(
-                tx,
-                turn_id,
-                TurnBlockers {
-                    open_ask,
-                    unfinished_job,
-                },
-                now,
-            )
-            .await
-    }
-
     fn blocker_transition_event(
         turn_id: TurnId,
         transition: &crate::modules::sessions::interface::TurnTransition,
@@ -801,7 +728,7 @@ impl AppState {
     ///   process is gone (queue stays paused).
     ///
     /// Sessions owns the Turn state write via `settle_cancel_in_tx`.
-    pub async fn settle_cancel(
+    async fn settle_cancel(
         &self,
         session_id: SessionId,
         turn_id: TurnId,

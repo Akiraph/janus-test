@@ -13,6 +13,7 @@
 - Each Module exposes only `interface.rs`, includes a short `README.md` and `module.toml`, and does not import another Module's private implementation.
 - Cross-module workflows belong in `application/`; shared persistence, IDs, clock, events, and secrets belong in `platform/`; external implementations belong in `adapters/`; HTTP/SSE belongs in `transport/`.
 - Cross-module writes use short Unit of Work transactions through owner-provided commands; external file, process, Provider, and network work stays outside those transactions.
+- Turn execution, wake-up, Tool result projection, and blocker reconciliation use the application Turn runner; Ask, Job, retry, and Cancel paths must not coordinate them independently.
 - Do not introduce a central ports crate, generic repository abstraction, global event bus, or service locator.
 
 ## Product scope

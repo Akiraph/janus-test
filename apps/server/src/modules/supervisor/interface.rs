@@ -14,7 +14,6 @@ use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     events::{EventStore, NewEvent},
     id::{AskId, AttemptId, CorrelationId, JobId, RoundId, SessionId, ToolCallId, TurnId},
-    sleeper::{Sleeper, SystemSleeper},
     unit_of_work::UnitOfWork,
 };
 use serde_json::{Value, json};
@@ -54,7 +53,6 @@ pub struct SupervisorInterface {
     workspace: WorkspaceSyncInterface,
     sessions: SessionsInterface,
     runtime: Option<crate::modules::runtime::interface::RuntimeInterface>,
-    retry_sleeper: std::sync::Arc<dyn Sleeper>,
 }
 
 impl SupervisorInterface {
@@ -76,14 +74,7 @@ impl SupervisorInterface {
             workspace,
             sessions,
             runtime: None,
-            retry_sleeper: std::sync::Arc::new(SystemSleeper),
         }
-    }
-
-    /// Inject a sleeper for the retry/cooldown loop (tests use `FakeSleeper`).
-    pub fn with_retry_sleeper(mut self, sleeper: std::sync::Arc<dyn Sleeper>) -> Self {
-        self.retry_sleeper = sleeper;
-        self
     }
 
     /// Bind a Runtime interface so Stage-5 tools (bash/job/service/delegate_cli)
@@ -631,7 +622,7 @@ impl SupervisorInterface {
                     match d.class {
                         FaultClass::Transient => {
                             if attempt + 1 < MAX_ATTEMPTS_PER_CANDIDATE {
-                                self.retry_sleeper.sleep(d.retry_after).await;
+                                tokio::time::sleep(d.retry_after).await;
                                 continue;
                             }
                             // Out of retries — bubble the Failed up so the

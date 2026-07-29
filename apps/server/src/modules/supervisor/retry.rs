@@ -32,18 +32,10 @@ pub struct RetryDecision {
     pub class: FaultClass,
     /// Suggested delay before the next attempt of this candidate.
     pub retry_after: Duration,
-    /// Stable code surfaced to the durable projection.
-    pub code: String,
 }
 
 /// Caps the in-Round retry loop: initial attempt plus 5 retries.
 pub const MAX_ATTEMPTS_PER_CANDIDATE: usize = 6;
-
-impl RetryDecision {
-    pub fn retry_after_ms(&self) -> u64 {
-        self.retry_after.as_millis() as u64
-    }
-}
 
 /// Classify a provider fault. `attempt` is 0-indexed within the current
 /// candidate (0 = first failure of the first attempt). Transient faults use an
@@ -75,7 +67,6 @@ pub fn classify(code: &str, detail: &str, attempt: usize) -> RetryDecision {
     RetryDecision {
         class,
         retry_after: backoff,
-        code: code.to_owned(),
     }
 }
 

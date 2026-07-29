@@ -59,10 +59,10 @@ Overall         ░░░░░░░░░░  --   -   Pending
 | --- | ---: | ---: | ---: |
 | Critical | 0 | 0 | 0 |
 | High | 38 | 37 | 1 |
-| Medium | 32 | 32 | 0 |
-| Low | 5 | 5 | 0 |
+| Medium | 33 | 33 | 0 |
+| Low | 7 | 7 | 0 |
 | Info | 0 | 0 | 0 |
-| **Total** | 75 | 74 | 1 |
+| **Total** | 78 | 77 | 1 |
 
 Rejected candidates remain in the decision record but are excluded from the counts.
 
@@ -128,6 +128,18 @@ The same CSS contains 58 unique custom-property declarations, 592 heuristic rule
 Post-baseline evidence: `bun run test:e2e:live` passes 9/9 with a temporary Git repository, local deterministic SSE provider, compiled server and test CLI, real SQLite/Runtime processes, browser submission, Project Terminal WebSocket/Bash, Ask answer/expiry, Job resume, Handoff, Cancel, and retained-data-root restart. These tests were added after the frozen Before snapshot, so they are recorded as repair evidence rather than rewritten into the baseline.
 
 Execution-replacement WIP evidence: `cargo check -p janus-server --tests`, `cargo clippy -p janus-server --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `cargo xtask check architecture` pass after the retired direct Session suites and zero-production-consumer Interfaces were removed. The architecture gate now validates imports, dependency cycles, migration owners, persistent-table inventory, and production SQL table ownership.
+
+### Post-checkpoint execution simplification
+
+| Measure | Before (`24e7557`) | After | Delta |
+| --- | ---: | ---: | ---: |
+| First-party production source | 183 files / 46966 lines | 182 files / 46761 lines | -1 file / -205 lines |
+| `application/session_flow.rs` | 1017 | 944 | -73 |
+| `modules/runtime/service.rs` | 1869 | 1825 | -44 |
+| `modules/sessions/interface.rs` | 708 | 652 | -56 |
+| `application/turn_execution.rs` | 525 | 570 | +45 for the single shared coordinator |
+
+Both snapshots use the tracked-file inventory helper and physical lines. The increase in the Turn runner replaces duplicated Ask/Job coordination; the batch removes 205 production lines overall without changing schema or public HTTP contracts.
 
 Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-project-tab/sessions-tab-desktop.png` and `apps/web/test-results/sessions-mobile-session-opens-as-project-tab/sessions-tab-mobile.png`. The mobile image directly records F-010; both images record F-011 and the unfinished-control presentation already covered by F-002/F-003.
 
@@ -229,6 +241,9 @@ Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-p
 | F-074 | High | Confirmed | Fixed | Main Terminal has no authoritative Project Runtime or Main Workspace binding. | `TerminalPanel` cannot create the first Project Terminal because the public request requires a pre-existing `runtime_id`; when it reuses one, every Runtime is Session-owned and `LocalRuntimeExecutor::start_terminal_internal` resolves the working directory under that Session Runtime's workspace root. `TerminalOwner::Project` changes only Terminal metadata. | The advertised Main Terminal is initially unusable and, when a Session Runtime happens to exist, commands labeled as Project/Main can execute against the wrong Session copy. | Model Project and Session Runtime scope explicitly, let the Project Terminal command resolve and ensure a Project-scoped Runtime against the Main Workspace, and verify the working directory through the compiled public CLI/WebSocket path before enabling the UI surface. |
 | F-075 | High | Confirmed | Fixed | Windows Terminal shell discovery and its integration tests both mistake Git Bash outside `PATH` for an unavailable dependency. | This host has Git at `C:\Program Files\Git\cmd\git.exe` and Bash at `C:\Program Files\Git\bin\bash.exe`; `which_bash` searched only `PATH`, while all four `runtime_terminal` tests called a second PATH-only probe and returned `Ok(())` when it failed. The reported 4/4 run completed in 0.01 seconds without executing a shell. | Main Terminal failed on a normal Git for Windows installation, and the test suite reported success while exercising none of its process, input, scrollback, ticket, signal, or recovery behavior. | Runtime shell discovery now resolves Git for Windows' bundled Bash through `git --exec-path` when `PATH` misses; the tests no longer skip and execute real processes. |
 | F-076 | Medium | Confirmed | Fixed | The development Web UI cannot upgrade a Main Terminal WebSocket through Vite. | The compiled server and CLI create a running Project Terminal, but the browser remains in `connecting`; the captured accessibility tree shows `Main Terminal connecting`. `vite.config.ts` proxies `/api` as HTTP only, while `terminalConnectUrl` targets the Vite origin and therefore requires WebSocket proxying. | Main Terminal appears open but never accepts input in the normal development and compiled-server Playwright environment; failed scenarios can also leave a real Bash process holding the temporary Project workspace. | Enable WebSocket forwarding on the existing `/api` proxy and make the live scenario close its Terminal in a `finally` path, then prove `pwd` resolves to the Project rather than Session workspace. |
+| F-077 | Medium | Confirmed | Fixed | Ask and Job recovery maintained separate copies of the same cross-owner Tool result projection and event transaction. | Before: `application/session_flow.rs::record_ask_tool_call_settlement_in_tx` and `application/turn_execution.rs::record_job_result_in_tx` both parsed the source Turn, replaced the Sessions-owned Tool result projection, and appended matching events. After: both use `TurnRunner::record_tool_result_in_tx`, and persisted blocker inspection also has one runner command. | Tool result attribution and wake-up state can no longer drift between Ask and Job recovery. | Keep resource-specific Supervisor settlement before the runner projection and schedule only after the shared Unit of Work commits. |
+| F-078 | Low | Confirmed | Fixed | The Supervisor retry delay kept a trait object, injection method, boxed future, `FakeSleeper`, and unused metadata solely for tests that no longer exist. | Before: full-repository search found `with_retry_sleeper`, `FakeSleeper`, `RetryDecision.code`, and `retry_after_ms` only at their definitions. After: Supervisor calls Tokio directly, the sleeper module is deleted, and warnings-denied all-target Clippy passes. | The retry path has one fewer file, allocation/dispatch seam, and public test-only configuration path. | Keep real retry behavior behind the Supervisor loop unless a production clock/scheduler contract creates a genuine replacement need. |
+| F-079 | Low | Confirmed | Fixed | Module Interfaces retained zero-consumer query and Log Store wrappers after their workflows moved to guarded commands and owner-specific paths. | Before: Sessions queue queries/projection and four Runtime Log Store forwards were definition-only across production, routes, CLI, tests, and docs. After: all seven symbols are absent; documented `patch_session` and future compaction code remain. | Module navigation now presents only retained workflow entry points without deleting declared future behavior. | Preserve queue behavior through transaction-scoped activation commands and Terminal behavior through `create_terminal`, executor logging, and `terminal_scrollback`. |
 
 ## Pending user decisions
 
@@ -291,6 +306,9 @@ Migration state is deliberately short because Janus is single-node and startup h
 | F-075 | Git Bash existed at `C:\Program Files\Git\bin\bash.exe`, but production and tests searched only `PATH`; four tests returned success in 0.01 seconds without starting Bash. | Added Git-for-Windows discovery through `git --exec-path` and removed every success-on-missing-Bash branch from the Terminal integration suite. | `cargo test -p janus-server --test runtime_terminal -- --nocapture` executes all four real-process cases and passes 4/4 in 2.40 seconds. | Fixed. |
 | F-074 | Project Terminal creation depended on a caller-supplied Session Runtime and could target the Session Workspace. | Added typed Project/Session `RuntimeScope`, migrated existing rows as Session-scoped, moved Project Terminal creation into application orchestration, and removed public `runtime_id` input. | Real schema 14 migration preserves Runtime Job/Terminal references and passes `foreign_key_check`; the compiled CLI/browser/WebSocket/Bash scenario runs `pwd` in a path containing the Project ID and not the Session ID. | Fixed. |
 | F-076 | Vite forwarded Terminal HTTP requests but not the WebSocket upgrade, leaving the UI in `connecting`. | Enabled WebSocket forwarding on the existing `/api` proxy and guaranteed CLI Terminal close in the live scenario's `finally` path. | Playwright records `101 Switching Protocols`; the Terminal command succeeds and the full compiled live suite passes 9/9 without retaining the Bash workspace lock. | Fixed. |
+| F-077 | Ask and Job wake paths duplicated Tool result projection, events, and persisted blocker inspection. | Moved both resources through one Turn runner coordinator while keeping owner settlement in Supervisor and state projection in Sessions. | Warnings-denied Clippy and the full 9/9 compiled live suite pass, including Ask answer/expiry, Job resume, Handoff, Cancel, and restart. | Fixed. |
+| F-078 | Retry timing retained a zero-consumer fake/injection abstraction and unused decision metadata. | Replaced it with direct Tokio delay and deleted the sleeper file, setter, trait object, fake, and unused fields. | Repository reference search is empty; warnings-denied all-target Clippy passes. | Fixed. |
+| F-079 | Sessions and Runtime exposed seven definition-only query/log wrapper symbols. | Removed only the proven zero-consumer methods/type and made retained implementation modules private where no test imports remain. | Reference search is empty; architecture check and all 9 live scenarios pass. | Fixed. |
 
 ## Documentation feedback
 
@@ -300,7 +318,7 @@ Migration state is deliberately short because Janus is single-node and startup h
 
 ## Remaining risk and uninspected areas
 
-- Deferred/accepted/open findings: F-001 through F-016 remain open.
+- Deferred/accepted/open findings retain their individual ledger dispositions; this slice closes F-077 through F-079 only.
 - Checks not run and why: The affected user's exact provider/configuration failure has not been reproduced; Stage 7 is excluded by host capability.
 - Currently unjudgeable: Real low-end device performance, production provider behavior, and Linux container behavior; none will be reported as verified without evidence.
 - Uninspected areas: Non-workspace pages remain in the declared UI scope for token/semantic consistency, but detailed issue enumeration follows the code-size and workflow priority order.

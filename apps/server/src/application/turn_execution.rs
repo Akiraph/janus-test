@@ -9,11 +9,14 @@ use crate::modules::models::interface::{ModelPreference, ModelsError, ModelsInte
 use crate::modules::projects::interface::{ProjectsError, ProjectsInterface};
 use crate::modules::runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
 use crate::modules::sessions::interface::{
-    SessionsError, SessionsInterface, TurnBlockers, TurnModelSnapshot, TurnStatus,
+    SessionsError, SessionsInterface, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot,
+    TurnStatus,
 };
-use crate::modules::supervisor::interface::{SupervisorError, SupervisorInterface, TurnWait};
+use crate::modules::supervisor::interface::{
+    SupervisorError, SupervisorInterface, ToolCallSettlement, TurnWait,
+};
 use crate::platform::events::NewEvent;
-use crate::platform::id::{CorrelationId, JobId, TurnId};
+use crate::platform::id::{CorrelationId, JobId, SessionId, TurnId};
 use crate::platform::unit_of_work::{UnitOfWork, UnitOfWorkTransaction};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +48,15 @@ pub struct TurnRunner {
     runtime: RuntimeInterface,
     unit_of_work: UnitOfWork,
     active_turns: Arc<Mutex<HashSet<TurnId>>>,
+}
+
+pub(crate) struct ToolResultRecord<'a> {
+    pub(crate) session_id: SessionId,
+    pub(crate) settlement: &'a ToolCallSettlement,
+    pub(crate) actor: &'a serde_json::Value,
+    pub(crate) correlation_id: &'a str,
+    pub(crate) job_id: Option<&'a JobId>,
+    pub(crate) now: &'a str,
 }
 
 impl TurnRunner {
@@ -346,6 +358,28 @@ impl TurnRunner {
         Ok(target_status == TurnStatus::Running)
     }
 
+    pub(crate) async fn inspect_and_reconcile_turn_blockers_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        turn_id: TurnId,
+        now: &str,
+    ) -> Result<TurnBlockerOutcome, TurnExecutionError> {
+        let open_ask = self.supervisor.has_open_asks_in_tx(tx, turn_id).await?;
+        let unfinished_job = self.runtime.has_unfinished_jobs_in_tx(tx, turn_id).await?;
+        Ok(self
+            .sessions
+            .reconcile_turn_blockers_in_tx(
+                tx,
+                turn_id,
+                TurnBlockers {
+                    open_ask,
+                    unfinished_job,
+                },
+                now,
+            )
+            .await?)
+    }
+
     pub async fn settle_job(&self, job_id: JobId) -> Result<Option<TurnId>, TurnExecutionError> {
         let job = self.runtime.job(job_id).await?;
         if !job.status.is_terminal() {
@@ -357,23 +391,10 @@ impl TurnRunner {
             work.rollback().await?;
             return Ok(None);
         }
-        let open_ask = self
-            .supervisor
-            .has_open_asks_in_tx(work.connection(), job.controlling_turn_id)
-            .await?;
-        let unfinished_job = self
-            .runtime
-            .has_unfinished_jobs_in_tx(work.connection(), job.controlling_turn_id)
-            .await?;
         let blocker_outcome = self
-            .sessions
-            .reconcile_turn_blockers_in_tx(
+            .inspect_and_reconcile_turn_blockers_in_tx(
                 work.connection(),
                 job.controlling_turn_id,
-                TurnBlockers {
-                    open_ask,
-                    unfinished_job,
-                },
                 &now,
             )
             .await?;
@@ -439,6 +460,29 @@ impl TurnRunner {
         else {
             return Ok(false);
         };
+        let correlation_id = CorrelationId::new().to_string();
+        let actor = serde_json::json!({"kind": "runtime"});
+        self.record_tool_result_in_tx(
+            work,
+            ToolResultRecord {
+                session_id: job.session_id,
+                settlement: &settlement,
+                actor: &actor,
+                correlation_id: &correlation_id,
+                job_id: Some(&job.id),
+                now,
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn record_tool_result_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        record: ToolResultRecord<'_>,
+    ) -> Result<(), TurnExecutionError> {
+        let settlement = record.settlement;
         let source_turn_id: TurnId = settlement
             .source_turn_id
             .parse()
@@ -447,7 +491,7 @@ impl TurnRunner {
             .sessions
             .replace_tool_result_in_tx(
                 work.connection(),
-                job.session_id,
+                record.session_id,
                 source_turn_id,
                 &settlement.tool_call_id,
                 &settlement.provider_call_id,
@@ -455,47 +499,48 @@ impl TurnRunner {
                 settlement.status.as_str(),
                 &settlement.summary,
                 &settlement.model_parts,
-                now,
+                record.now,
             )
             .await?;
-        let correlation_id = CorrelationId::new().to_string();
-        let actor = serde_json::json!({"kind": "runtime"});
+        let mut payload = serde_json::json!({
+            "tool_call_id": settlement.tool_call_id,
+            "provider_call_id": settlement.provider_call_id,
+            "tool_name": settlement.tool_name,
+            "status": settlement.status.as_str(),
+            "summary": settlement.summary,
+            "timeline_item_id": timeline_item_id,
+        });
+        if let Some(job_id) = record.job_id {
+            payload["job_id"] = serde_json::Value::String(job_id.to_string());
+        }
         work.append_event(NewEvent {
             event_type: "tool_call.changed".into(),
-            actor: actor.clone(),
+            actor: record.actor.clone(),
             resource: Some(serde_json::json!({
                 "kind": "tool_call",
                 "id": settlement.tool_call_id,
             })),
-            correlation_id: correlation_id.clone(),
+            correlation_id: record.correlation_id.to_owned(),
             causation_id: None,
-            payload: serde_json::json!({
-                "tool_call_id": settlement.tool_call_id,
-                "provider_call_id": settlement.provider_call_id,
-                "tool_name": settlement.tool_name,
-                "status": settlement.status.as_str(),
-                "summary": settlement.summary,
-                "timeline_item_id": timeline_item_id,
-                "job_id": job.id.to_string(),
-            }),
+            payload,
         })
         .await?;
         work.append_event(NewEvent {
             event_type: "timeline.item_updated".into(),
-            actor,
+            actor: record.actor.clone(),
             resource: Some(serde_json::json!({
                 "kind": "session",
-                "id": job.session_id.to_string(),
+                "id": record.session_id.to_string(),
             })),
-            correlation_id,
+            correlation_id: record.correlation_id.to_owned(),
             causation_id: None,
             payload: serde_json::json!({
                 "timeline_item_id": timeline_item_id,
-                "tool_call_id": job.initiated_by_tool_call_id.to_string(),
+                "tool_call_id": settlement.tool_call_id,
             }),
         })
         .await?;
-        Ok(true)
+        Ok(())
     }
 
     pub async fn reconcile_waiting_jobs(&self) -> Result<u64, TurnExecutionError> {

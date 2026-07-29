@@ -1,7 +1,7 @@
 pub mod context;
 pub mod interface;
-pub mod paths;
-pub mod registry;
-pub mod retry;
-pub mod tools;
-pub mod types;
+mod paths;
+mod registry;
+mod retry;
+mod tools;
+mod types;

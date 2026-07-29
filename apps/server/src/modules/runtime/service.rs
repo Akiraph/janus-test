@@ -6,14 +6,14 @@ use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use super::{
     interface::{
         DeploymentCapabilityProbe, EffectiveCapabilityConfig, ExecutionResult, ExecutionSpec,
-        ExecutorKind, ExitSummary, JobProjection, JobSpec, JobStatus, LogChannel, LogCursor,
-        LogRange, LogStreamProjection, ProcessCompletion, ResourceLimits, ResourceUsage,
-        RuntimeCapabilityEvaluator, RuntimeError, RuntimeExecutor, RuntimeProjection, RuntimeScope,
-        RuntimeSpec, RuntimeStatus, ServiceHealth, ServiceImpact, ServiceProjection, ServiceSpec,
-        ServiceStatus, TerminalProjection, TerminalSignal, TerminalSize, TerminalSpec,
-        TerminalStatus, TerminalTicket, TerminalTicketRequest,
+        ExecutorKind, ExitSummary, JobProjection, JobSpec, JobStatus, LogCursor, LogRange,
+        ProcessCompletion, ResourceLimits, ResourceUsage, RuntimeCapabilityEvaluator, RuntimeError,
+        RuntimeExecutor, RuntimeProjection, RuntimeScope, RuntimeSpec, RuntimeStatus,
+        ServiceHealth, ServiceImpact, ServiceProjection, ServiceSpec, ServiceStatus,
+        TerminalProjection, TerminalSignal, TerminalSize, TerminalSpec, TerminalStatus,
+        TerminalTicket, TerminalTicketRequest,
     },
-    log_store::{LogRetention, LogStore},
+    log_store::LogStore,
 };
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
@@ -797,41 +797,6 @@ impl RuntimeInterface {
         self.logs.read(id, after, limit_bytes).await
     }
 
-    pub async fn log_projection(
-        &self,
-        id: LogStreamId,
-    ) -> Result<LogStreamProjection, RuntimeError> {
-        self.logs.projection(id).await
-    }
-
-    pub async fn create_terminal_log_stream(
-        &self,
-        owner_id: &str,
-    ) -> Result<LogStreamProjection, RuntimeError> {
-        let stream = self
-            .logs
-            .create(super::interface::LogOwnerKind::Terminal, owner_id)
-            .await?;
-        Ok(stream)
-    }
-
-    pub async fn append_terminal_output(
-        &self,
-        id: LogStreamId,
-        input: &[u8],
-        secret_values: &[&str],
-    ) -> Result<LogStreamProjection, RuntimeError> {
-        self.logs
-            .append(
-                id,
-                LogChannel::Stdout,
-                input,
-                secret_values,
-                LogRetention::TERMINAL,
-            )
-            .await
-    }
-
     pub async fn create_terminal(
         &self,
         spec: TerminalSpec,
@@ -1107,15 +1072,6 @@ impl RuntimeInterface {
         let row = self.terminal_row(id).await?;
         let stream_id: LogStreamId = row.scrollback_stream_id.parse().map_err(storage_error)?;
         self.logs.read(stream_id, after, limit_bytes).await
-    }
-
-    pub async fn terminal_scrollback_projection(
-        &self,
-        id: TerminalId,
-    ) -> Result<LogStreamProjection, RuntimeError> {
-        let row = self.terminal_row(id).await?;
-        let stream_id: LogStreamId = row.scrollback_stream_id.parse().map_err(storage_error)?;
-        self.logs.projection(stream_id).await
     }
 
     async fn finalize_terminal(

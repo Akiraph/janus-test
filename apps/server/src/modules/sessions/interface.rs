@@ -20,10 +20,9 @@ use crate::platform::{
 pub use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, AskAnswerResult, AskSummary, CancelResult,
     ContextMessage, CreatedTurnInput, ExecutionTurn, MessageRoute, MessageRouteResult,
-    QueuedTurnCandidate, QueuedTurnSummary, RecordAskAnswer, RecordedTurnInput, RecoveredTurn,
-    SessionCommandState, SessionSummary, SessionsError, SteerResult, TerminalSettlement,
-    TimelineItemView, TimelinePage, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot,
-    TurnStatus, TurnSummary, TurnTransition,
+    QueuedTurnCandidate, RecordAskAnswer, RecordedTurnInput, RecoveredTurn, SessionCommandState,
+    SessionSummary, SessionsError, SteerResult, TerminalSettlement, TimelineItemView, TimelinePage,
+    TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
 };
 
 #[derive(Clone)]
@@ -342,61 +341,6 @@ impl SessionsInterface {
     // ----------------------------------------------------------------------
     // M4 Session Control State Machine primitives
     // ----------------------------------------------------------------------
-
-    /// Return the current active Turn's status (one of the active statuses or a
-    /// terminal status), or `None` if the Session is idle. Used by the HTTP layer
-    /// and `application::session_flow` to route a new message (started vs queued vs
-    /// handoff) and by the worker to decide whether a waiting Turn is actionable.
-    pub async fn active_turn_status(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<(TurnId, String)>, SessionsError> {
-        let session = self.get_session(session_id).await?;
-        let Some(turn_id) = session.active_turn_id else {
-            return Ok(None);
-        };
-        let turn_id: TurnId = turn_id
-            .parse()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid active_turn_id")))?;
-        let row = sqlx::query("SELECT status FROM turns WHERE id = ?")
-            .bind(turn_id.to_string())
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(SessionsError::NotFound)?;
-        Ok(Some((turn_id, row.try_get::<String, _>("status")?)))
-    }
-
-    /// List queued Turns in sequence order (FIFO). Includes orphaned start/head
-    /// of queue. `source` is inferred from `predecessor_turn_id` presence: turns
-    /// carrying a predecessor originate from a Handoff; otherwise from an
-    /// ordinary `post_message`.
-    pub async fn list_queued_turns(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<QueuedTurnSummary>, SessionsError> {
-        let rows = sqlx::query(
-            "SELECT id, session_id, sequence, input_message_id, \
-                    CASE WHEN predecessor_turn_id IS NULL THEN 'message' ELSE 'handoff' END AS source, \
-                    predecessor_turn_id, created_at \
-             FROM turns WHERE session_id = ? AND status = 'queued' \
-             ORDER BY sequence ASC",
-        )
-        .bind(session_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| {
-                Ok(QueuedTurnSummary {
-                    turn_id: r.try_get("id")?,
-                    session_id: r.try_get("session_id")?,
-                    sequence: r.try_get("sequence")?,
-                    message_id: r.try_get("input_message_id")?,
-                    source: r.try_get("source")?,
-                    created_at: r.try_get("created_at")?,
-                })
-            })
-            .collect()
-    }
 
     /// Steer: bind a user message to the active interactive Turn so it becomes
     /// visible at the next safe Round boundary. Accepted while the Turn is
