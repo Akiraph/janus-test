@@ -196,12 +196,9 @@ impl SessionsInterface {
         blob_sha: &str,
     ) -> Result<AttachmentView, SessionsError> {
         let available: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sessions AS session \
-             JOIN projects AS project ON project.id = session.project_id \
-             WHERE session.id = ? AND project.owner_id = ? AND session.state != 'deleting')",
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ? AND state != 'deleting')",
         )
         .bind(session_id.to_string())
-        .bind(owner_id)
         .fetch_one(&self.pool)
         .await?;
         if available != 1 {
@@ -256,23 +253,19 @@ impl SessionsInterface {
 
     pub async fn delete_draft_attachment(
         &self,
-        owner_id: &str,
         session_id: SessionId,
         attachment_id: AttachmentId,
     ) -> Result<String, SessionsError> {
         let mut work = self.unit_of_work.begin().await?;
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT attachment.blob_sha, attachment.upload_id FROM attachments AS attachment \
-             JOIN sessions AS session ON session.id = attachment.session_id \
-             JOIN projects AS project ON project.id = session.project_id \
-             WHERE attachment.id = ? AND attachment.session_id = ? AND project.owner_id = ? \
+             WHERE attachment.id = ? AND attachment.session_id = ? \
                AND attachment.lifecycle = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM message_attachments AS message_attachment \
                                WHERE message_attachment.attachment_id = attachment.id)",
         )
         .bind(attachment_id.to_string())
         .bind(session_id.to_string())
-        .bind(owner_id)
         .fetch_optional(work.connection())
         .await?;
         let Some((blob_sha, upload_id)) = row else {

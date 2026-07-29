@@ -413,7 +413,7 @@ pub async fn delete_attachment(
     headers: HeaderMap,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let _auth = authenticate(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -422,7 +422,7 @@ pub async fn delete_attachment(
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid attachment id"))?;
     state
         .sessions()
-        .delete_draft_attachment(&auth.owner_id, session_id, attachment_id)
+        .delete_draft_attachment(session_id, attachment_id)
         .await
         .map_err(sessions_problem)?;
     let reference = BlobReference::new(
