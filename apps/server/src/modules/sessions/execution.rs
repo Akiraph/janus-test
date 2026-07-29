@@ -9,38 +9,64 @@ use crate::platform::{
 
 use super::interface::SessionsInterface;
 use super::types::{
-    ContextMessage, CreatedTurnInput, ExecutionTurn, SessionCommandState, SessionsError,
-    TurnStatus, TurnTransition,
+    ActiveTurnOutcome, AppendAssistantMessage, ContextMessage, CreatedTurnInput, ExecutionTurn,
+    QueuedTurnCandidate, RecordAskAnswer, RecordedTurnInput, RecoveredTurn, SessionCommandState,
+    SessionsError, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus, TurnTransition,
 };
+
+const TURN_IS_RUNNABLE_SQL: &str = "SELECT EXISTS( \
+        SELECT 1 FROM turns AS turn \
+        JOIN sessions AS session ON session.id = turn.session_id \
+        WHERE turn.id = ? AND turn.session_id = ? AND turn.status = 'running' \
+          AND session.active_turn_id = turn.id \
+     )";
+
+struct ActiveTurnTransition<'a> {
+    session_id: SessionId,
+    turn_id: TurnId,
+    from_status: TurnStatus,
+    to_status: TurnStatus,
+    reason: Option<&'a str>,
+    now: &'a str,
+}
 
 impl SessionsInterface {
     pub async fn execution_turn(&self, turn_id: TurnId) -> Result<ExecutionTurn, SessionsError> {
         let row = sqlx::query(
-            "SELECT turn.id, turn.session_id, session.project_id, project.owner_id, \
-                    turn.status, turn.sequence, session.active_turn_id, session.next_model_ref \
+            "SELECT turn.id, turn.session_id, session.project_id, \
+                    turn.status, turn.sequence, turn.model_snapshot_json, session.active_turn_id \
              FROM turns AS turn \
              JOIN sessions AS session ON session.id = turn.session_id \
-             JOIN projects AS project ON project.id = session.project_id \
              WHERE turn.id = ?",
         )
         .bind(turn_id.to_string())
         .fetch_optional(&self.pool)
         .await?
         .ok_or(SessionsError::NotFound)?;
-        let id: String = row.try_get("id")?;
+        let id: TurnId = row
+            .try_get::<String, _>("id")?
+            .parse::<TurnId>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
         let active_turn_id: Option<String> = row.try_get("active_turn_id")?;
+        let active = active_turn_id.as_deref() == Some(id.to_string().as_str());
         let status: String = row.try_get("status")?;
+        let model_snapshot_json: String = row.try_get("model_snapshot_json")?;
         Ok(ExecutionTurn {
-            active: active_turn_id.as_deref() == Some(id.as_str()),
+            active,
             id,
-            session_id: row.try_get("session_id")?,
-            project_id: row.try_get("project_id")?,
-            owner_id: row.try_get("owner_id")?,
+            session_id: row
+                .try_get::<String, _>("session_id")?
+                .parse::<SessionId>()
+                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+            project_id: row
+                .try_get::<String, _>("project_id")?
+                .parse::<crate::platform::id::ProjectId>()
+                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
             status: status
                 .parse()
                 .map_err(|error: String| SessionsError::Internal(anyhow::anyhow!(error)))?,
             sequence: row.try_get("sequence")?,
-            next_model_ref: row.try_get("next_model_ref")?,
+            model_snapshot: TurnModelSnapshot::parse(&model_snapshot_json)?,
         })
     }
 
@@ -49,19 +75,163 @@ impl SessionsInterface {
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Result<bool, SessionsError> {
-        let runnable: i64 = sqlx::query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM turns AS turn \
-                JOIN sessions AS session ON session.id = turn.session_id \
-                WHERE turn.id = ? AND turn.session_id = ? AND turn.status = 'running' \
-                  AND session.active_turn_id = turn.id \
-             )",
+        let runnable: i64 = sqlx::query_scalar(TURN_IS_RUNNABLE_SQL)
+            .bind(turn_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(runnable == 1)
+    }
+
+    pub async fn turn_is_runnable_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<bool, SessionsError> {
+        let runnable: i64 = sqlx::query_scalar(TURN_IS_RUNNABLE_SQL)
+            .bind(turn_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        Ok(runnable == 1)
+    }
+
+    pub async fn reconcile_turn_blockers_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        turn_id: TurnId,
+        blockers: TurnBlockers,
+        now: &str,
+    ) -> Result<TurnBlockerOutcome, SessionsError> {
+        let row = sqlx::query(
+            "SELECT turn.session_id, turn.status, session.active_turn_id, session.version \
+             FROM turns AS turn \
+             JOIN sessions AS session ON session.id = turn.session_id \
+             WHERE turn.id = ?",
         )
         .bind(turn_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(SessionsError::NotFound)?;
+        let session_id = row
+            .try_get::<String, _>("session_id")?
+            .parse::<SessionId>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        let current_status = row
+            .try_get::<String, _>("status")?
+            .parse::<TurnStatus>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        let active_turn_id: Option<String> = row.try_get("active_turn_id")?;
+        let active = active_turn_id.as_deref() == Some(turn_id.to_string().as_str());
+        let current_session_version: String = row.try_get("version")?;
+        let can_reconcile = active
+            && matches!(
+                current_status,
+                TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
+            );
+        let target_status = blockers.status();
+        if !can_reconcile || current_status == target_status {
+            return Ok(TurnBlockerOutcome {
+                session_id,
+                status: current_status,
+                active,
+                session_version: current_session_version,
+                transition: None,
+            });
+        }
+        let transition = self
+            .transition_active_turn_in_tx(
+                tx,
+                ActiveTurnTransition {
+                    session_id,
+                    turn_id,
+                    from_status: current_status,
+                    to_status: target_status,
+                    reason: None,
+                    now,
+                },
+            )
+            .await?;
+        let session_version = transition
+            .as_ref()
+            .map(|transition| transition.session_version.clone())
+            .unwrap_or(current_session_version);
+        Ok(TurnBlockerOutcome {
+            session_id,
+            status: transition
+                .as_ref()
+                .map_or(current_status, |transition| transition.to_status),
+            active,
+            session_version,
+            transition,
+        })
+    }
+
+    pub(crate) async fn interrupt_active_turns_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        now: &str,
+    ) -> Result<Vec<RecoveredTurn>, SessionsError> {
+        let rows = sqlx::query(
+            "SELECT id, session_id, status FROM turns \
+             WHERE status IN ('running', 'waiting_for_job', 'waiting_for_ask', \
+                              'waiting_for_model', 'canceling') \
+             ORDER BY session_id, sequence",
+        )
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(runnable == 1)
+        let mut recovered = Vec::with_capacity(rows.len());
+        for row in rows {
+            let turn_id = row
+                .try_get::<String, _>("id")?
+                .parse::<TurnId>()
+                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+            let session_id = row
+                .try_get::<String, _>("session_id")?
+                .parse::<SessionId>()
+                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+            let from_status = row
+                .try_get::<String, _>("status")?
+                .parse::<TurnStatus>()
+                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+            let turn_version = format!("v_{}", TurnId::new());
+            let changed = sqlx::query(
+                "UPDATE turns SET status = 'interrupted', \
+                        completion_reason = 'control_plane_restart', version = ?, updated_at = ? \
+                 WHERE id = ? AND status = ?",
+            )
+            .bind(&turn_version)
+            .bind(now)
+            .bind(turn_id.to_string())
+            .bind(from_status.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if changed.rows_affected() != 1 {
+                continue;
+            }
+            let next_session_version = format!("v_{}", SessionId::new());
+            let released = sqlx::query(
+                "UPDATE sessions SET state = 'ready', active_turn_id = NULL, version = ?, \
+                        updated_at = ?, last_activity_at = ? \
+                 WHERE id = ? AND active_turn_id = ?",
+            )
+            .bind(&next_session_version)
+            .bind(now)
+            .bind(now)
+            .bind(session_id.to_string())
+            .bind(turn_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            recovered.push(RecoveredTurn {
+                turn_id,
+                session_id,
+                from_status,
+                turn_version,
+                session_version: (released.rows_affected() == 1).then_some(next_session_version),
+            });
+        }
+        Ok(recovered)
     }
 
     pub async fn context_messages(
@@ -148,7 +318,7 @@ impl SessionsInterface {
         now: &str,
     ) -> Result<SessionCommandState, SessionsError> {
         let row = sqlx::query(
-            "SELECT project_id, state, workspace_handle, active_turn_id, version \
+            "SELECT project_id, state, workspace_handle, next_model_ref, active_turn_id, version \
              FROM sessions WHERE id = ?",
         )
         .bind(session_id.to_string())
@@ -194,6 +364,7 @@ impl SessionsInterface {
             project_id: row.try_get("project_id")?,
             state,
             workspace_handle: row.try_get("workspace_handle")?,
+            next_model_ref: row.try_get("next_model_ref")?,
             active_turn_id: row.try_get("active_turn_id")?,
             session_version,
         })
@@ -265,7 +436,7 @@ impl SessionsInterface {
         .bind(session_id.to_string())
         .bind(next_sequence)
         .bind(message_id.to_string())
-        .bind(json!({"provider_id": null, "upstream_model_id": null}).to_string())
+        .bind("null")
         .bind(predecessor_turn_id)
         .bind(predecessor_turn_id)
         .bind(format!("v_{}", TurnId::new()))
@@ -349,17 +520,218 @@ impl SessionsInterface {
         })
     }
 
+    pub async fn record_ask_answer_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        input: RecordAskAnswer<'_>,
+    ) -> Result<RecordedTurnInput, SessionsError> {
+        let RecordAskAnswer {
+            session_id,
+            turn_id,
+            ask_id,
+            answer,
+            actor,
+            now,
+        } = input;
+        let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
+        let message_id = MessageId::new();
+        let timeline_item_id = TimelineItemId::new();
+        let text = answer
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| answer.to_string());
+        let body = json!({
+            "parts": [{"type": "text", "text": text}],
+            "turn_input": {"kind": "ask_answer", "source_ask_id": ask_id.to_string()},
+        });
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, session_id, turn_id, actor_json, kind, body_json, status, \
+              timeline_sequence, version, created_at) \
+             VALUES (?, ?, ?, ?, 'user', ?, 'active', ?, ?, ?)",
+        )
+        .bind(message_id.to_string())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(actor.to_string())
+        .bind(body.to_string())
+        .bind(display_order)
+        .bind(format!("v_{}", MessageId::new()))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let projection = json!({
+            "kind": "user_message",
+            "message_id": message_id.to_string(),
+            "turn_id": turn_id.to_string(),
+            "text": text,
+            "source_ask_id": ask_id.to_string(),
+        });
+        sqlx::query(
+            "INSERT INTO timeline_items \
+             (id, session_id, turn_id, kind, source_resource_id, display_order, \
+              projection_json, status, version, created_at, updated_at) \
+             VALUES (?, ?, ?, 'user_message', ?, ?, ?, 'active', ?, ?, ?)",
+        )
+        .bind(timeline_item_id.to_string())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(message_id.to_string())
+        .bind(display_order)
+        .bind(projection.to_string())
+        .bind(format!("v_{}", TimelineItemId::new()))
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        Ok(RecordedTurnInput {
+            message_id: message_id.to_string(),
+            timeline_item_id: timeline_item_id.to_string(),
+            display_order,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_steer_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        expected_turn_id: Option<TurnId>,
+        content: &str,
+        expected_version: &str,
+        actor: &Value,
+        source_ask_id: Option<&str>,
+        now: &str,
+    ) -> Result<(super::types::SteerResult, String), SessionsError> {
+        let row = sqlx::query(
+            "SELECT session.state, session.active_turn_id, session.version, turn.status \
+             FROM sessions AS session \
+             LEFT JOIN turns AS turn ON turn.id = session.active_turn_id \
+             WHERE session.id = ?",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(SessionsError::NotFound)?;
+        if row.try_get::<String, _>("state")? == "deleting" {
+            return Err(SessionsError::SessionDeleting);
+        }
+        let current_version: String = row.try_get("version")?;
+        if current_version != expected_version {
+            return Err(SessionsError::VersionMismatch {
+                expected: expected_version.to_owned(),
+                current: current_version,
+            });
+        }
+        let active_turn_id = row
+            .try_get::<Option<String>, _>("active_turn_id")?
+            .ok_or(SessionsError::TurnNotInteractive)?
+            .parse::<TurnId>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        if expected_turn_id.is_some_and(|expected| expected != active_turn_id) {
+            return Err(SessionsError::TurnNotInteractive);
+        }
+        let status = row
+            .try_get::<Option<String>, _>("status")?
+            .ok_or(SessionsError::TurnNotInteractive)?
+            .parse::<TurnStatus>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        if !status.is_interactive() {
+            return Err(SessionsError::TurnNotInteractive);
+        }
+
+        let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
+        let message_id = MessageId::new();
+        let timeline_item_id = TimelineItemId::new();
+        let mut body = json!({"parts": [{"type": "text", "text": content}], "steer": true});
+        if let Some(source_ask_id) = source_ask_id {
+            body["turn_input"] = json!({"kind": "ask_answer", "source_ask_id": source_ask_id});
+        }
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, session_id, turn_id, actor_json, kind, body_json, status, \
+              timeline_sequence, version, created_at) \
+             VALUES (?, ?, ?, ?, 'user', ?, 'active', ?, ?, ?)",
+        )
+        .bind(message_id.to_string())
+        .bind(session_id.to_string())
+        .bind(active_turn_id.to_string())
+        .bind(actor.to_string())
+        .bind(body.to_string())
+        .bind(display_order)
+        .bind(format!("v_{}", MessageId::new()))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        let mut projection = json!({
+            "kind": "steer",
+            "message_id": message_id.to_string(),
+            "turn_id": active_turn_id.to_string(),
+            "text": content,
+        });
+        if let Some(source_ask_id) = source_ask_id {
+            projection["source_ask_id"] = json!(source_ask_id);
+        }
+        sqlx::query(
+            "INSERT INTO timeline_items \
+             (id, session_id, turn_id, kind, source_resource_id, display_order, \
+              projection_json, status, version, created_at, updated_at) \
+             VALUES (?, ?, ?, 'steer', ?, ?, ?, 'active', ?, ?, ?)",
+        )
+        .bind(timeline_item_id.to_string())
+        .bind(session_id.to_string())
+        .bind(active_turn_id.to_string())
+        .bind(message_id.to_string())
+        .bind(display_order)
+        .bind(projection.to_string())
+        .bind(format!("v_{}", TimelineItemId::new()))
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        let session_version = format!("v_{}", SessionId::new());
+        let changed = sqlx::query(
+            "UPDATE sessions SET version = ?, updated_at = ? \
+             WHERE id = ? AND version = ? AND active_turn_id = ?",
+        )
+        .bind(&session_version)
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(expected_version)
+        .bind(active_turn_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(SessionsError::Internal(anyhow::anyhow!(
+                "Session changed while recording Steer"
+            )));
+        }
+        Ok((
+            super::types::SteerResult {
+                turn_id: active_turn_id.to_string(),
+                message_id: message_id.to_string(),
+                session_version,
+            },
+            timeline_item_id.to_string(),
+        ))
+    }
+
     pub async fn activate_created_turn_in_tx(
         &self,
         tx: &mut SqliteConnection,
         session_id: SessionId,
         turn_id: &str,
+        model_snapshot: Option<&TurnModelSnapshot>,
         now: &str,
     ) -> Result<bool, SessionsError> {
+        let model_snapshot_json = serde_json::to_string(&model_snapshot)?;
         let promoted = sqlx::query(
-            "UPDATE turns SET status = 'running', updated_at = ? \
+            "UPDATE turns SET status = 'running', model_snapshot_json = ?, updated_at = ? \
              WHERE id = ? AND session_id = ? AND status = 'queued'",
         )
+        .bind(model_snapshot_json)
         .bind(now)
         .bind(turn_id)
         .bind(session_id.to_string())
@@ -411,13 +783,16 @@ impl SessionsInterface {
         session_id: SessionId,
         predecessor_turn_id: &str,
         successor_turn_id: &str,
+        model_snapshot: Option<&TurnModelSnapshot>,
         now: &str,
     ) -> Result<bool, SessionsError> {
+        let model_snapshot_json = serde_json::to_string(&model_snapshot)?;
         let promoted = sqlx::query(
-            "UPDATE turns SET status = 'running', updated_at = ? \
+            "UPDATE turns SET status = 'running', model_snapshot_json = ?, updated_at = ? \
              WHERE id = ? AND session_id = ? AND status = 'queued' \
                AND predecessor_turn_id = ?",
         )
+        .bind(model_snapshot_json)
         .bind(now)
         .bind(successor_turn_id)
         .bind(session_id.to_string())
@@ -440,82 +815,19 @@ impl SessionsInterface {
         Ok(claimed.rows_affected() == 1)
     }
 
-    pub async fn append_turn_input_in_tx(
-        &self,
-        tx: &mut SqliteConnection,
-        session_id: SessionId,
-        turn_id: TurnId,
-        content: &str,
-        input_kind: &str,
-        source_ask_id: Option<&str>,
-        actor: &Value,
-        now: &str,
-    ) -> Result<(String, String, i64), SessionsError> {
-        let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
-        let message_id = MessageId::new();
-        let timeline_item_id = TimelineItemId::new();
-        let body = json!({
-            "parts": [{"type": "text", "text": content}],
-            "turn_input": {"kind": input_kind, "source_ask_id": source_ask_id},
-        });
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'user', ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(body.to_string())
-        .bind(display_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        let projection = json!({
-            "kind": input_kind,
-            "message_id": message_id.to_string(),
-            "turn_id": turn_id.to_string(),
-            "text": content,
-            "source_ask_id": source_ask_id,
-        });
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_item_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(input_kind)
-        .bind(message_id.to_string())
-        .bind(display_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        Ok((
-            message_id.to_string(),
-            timeline_item_id.to_string(),
-            display_order,
-        ))
-    }
-
     pub async fn append_assistant_message_in_tx(
         &self,
         tx: &mut SqliteConnection,
-        session_id: SessionId,
-        turn_id: TurnId,
-        text: &str,
-        tool_calls: &Value,
-        actor: &Value,
-        now: &str,
+        input: AppendAssistantMessage<'_>,
     ) -> Result<(String, Option<String>, i64), SessionsError> {
+        let AppendAssistantMessage {
+            session_id,
+            turn_id,
+            text,
+            tool_calls,
+            actor,
+            now,
+        } = input;
         let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
         let message_id = MessageId::new();
         let body = json!({
@@ -644,16 +956,134 @@ impl SessionsInterface {
         ))
     }
 
-    pub async fn transition_active_turn_in_tx(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_tool_result_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        source_turn_id: TurnId,
+        tool_call_id: &str,
+        provider_call_id: &str,
+        tool_name: &str,
+        status: &str,
+        summary: &Value,
+        model_parts: &Value,
+        now: &str,
+    ) -> Result<String, SessionsError> {
+        let projection = json!({
+            "kind": "tool_call",
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "status": status,
+            "summary": summary,
+        });
+        let timeline_item_id: Option<String> = sqlx::query_scalar(
+            "UPDATE timeline_items SET projection_json = ?, version = ?, updated_at = ? \
+             WHERE session_id = ? AND turn_id = ? AND kind = 'tool_call' \
+               AND source_resource_id = ? AND status = 'active' \
+             RETURNING id",
+        )
+        .bind(projection.to_string())
+        .bind(format!("v_{}", TimelineItemId::new()))
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(source_turn_id.to_string())
+        .bind(tool_call_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let timeline_item_id = timeline_item_id.ok_or_else(|| {
+            SessionsError::Internal(anyhow::anyhow!("Tool Call timeline projection is missing"))
+        })?;
+
+        let message = json!({
+            "parts": model_parts,
+            "tool_call_id": provider_call_id,
+            "resource_tool_call_id": tool_call_id,
+        });
+        let updated = sqlx::query(
+            "UPDATE messages SET body_json = ?, version = ? \
+             WHERE session_id = ? AND turn_id = ? AND kind = 'tool_result_ref' \
+               AND status = 'active' \
+               AND json_extract(body_json, '$.resource_tool_call_id') = ?",
+        )
+        .bind(message.to_string())
+        .bind(format!("v_{}", MessageId::new()))
+        .bind(session_id.to_string())
+        .bind(source_turn_id.to_string())
+        .bind(tool_call_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(SessionsError::Internal(anyhow::anyhow!(
+                "Tool Call protocol result is missing or duplicated"
+            )));
+        }
+        Ok(timeline_item_id)
+    }
+
+    pub async fn wait_for_model_in_tx(
         &self,
         tx: &mut SqliteConnection,
         session_id: SessionId,
         turn_id: TurnId,
-        from_status: TurnStatus,
-        to_status: TurnStatus,
-        reason: Option<&str>,
+        reason: &str,
         now: &str,
     ) -> Result<Option<TurnTransition>, SessionsError> {
+        self.transition_active_turn_in_tx(
+            tx,
+            ActiveTurnTransition {
+                session_id,
+                turn_id,
+                from_status: TurnStatus::Running,
+                to_status: TurnStatus::WaitingForModel,
+                reason: Some(reason),
+                now,
+            },
+        )
+        .await
+    }
+
+    pub async fn retry_waiting_model_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        turn_id: TurnId,
+        now: &str,
+    ) -> Result<Option<TurnTransition>, SessionsError> {
+        self.transition_active_turn_in_tx(
+            tx,
+            ActiveTurnTransition {
+                session_id,
+                turn_id,
+                from_status: TurnStatus::WaitingForModel,
+                to_status: TurnStatus::Running,
+                reason: None,
+                now,
+            },
+        )
+        .await
+    }
+
+    async fn transition_active_turn_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        transition: ActiveTurnTransition<'_>,
+    ) -> Result<Option<TurnTransition>, SessionsError> {
+        let ActiveTurnTransition {
+            session_id,
+            turn_id,
+            from_status,
+            to_status,
+            reason,
+            now,
+        } = transition;
+        if !from_status.can_transition_to(to_status) {
+            return Err(SessionsError::Internal(anyhow::anyhow!(
+                "invalid active Turn transition: {} -> {}",
+                from_status.as_str(),
+                to_status.as_str()
+            )));
+        }
         let changed = sqlx::query(
             "UPDATE turns SET status = ?, completion_reason = COALESCE(?, completion_reason), \
                     updated_at = ? \
@@ -696,60 +1126,94 @@ impl SessionsInterface {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn settle_active_turn_in_tx(
         &self,
         tx: &mut SqliteConnection,
         session_id: SessionId,
         turn_id: TurnId,
-        from_status: TurnStatus,
-        terminal_status: TurnStatus,
-        reason: Option<&str>,
-        summary: Option<&Value>,
-        input_tokens: Option<i64>,
-        output_tokens: Option<i64>,
+        outcome: ActiveTurnOutcome<'_>,
         now: &str,
     ) -> Result<Option<TurnTransition>, SessionsError> {
-        let summary_json = summary.map(Value::to_string);
-        let changed = if terminal_status == TurnStatus::Canceled {
-            sqlx::query(
-                "UPDATE turns SET status = 'canceled', \
-                        cancellation_reason = COALESCE(?, cancellation_reason), updated_at = ? \
-                 WHERE id = ? AND session_id = ? AND status = ? \
-                   AND EXISTS(SELECT 1 FROM sessions WHERE id = ? AND active_turn_id = ?)",
-            )
-            .bind(reason)
-            .bind(now)
-            .bind(turn_id.to_string())
-            .bind(session_id.to_string())
-            .bind(from_status.as_str())
-            .bind(session_id.to_string())
-            .bind(turn_id.to_string())
-            .execute(&mut *tx)
-            .await?
-        } else {
-            sqlx::query(
-                "UPDATE turns SET status = ?, completion_reason = COALESCE(?, completion_reason), \
-                        completion_summary_json = COALESCE(?, completion_summary_json), \
-                        input_tokens = COALESCE(?, input_tokens), \
-                        output_tokens = COALESCE(?, output_tokens), updated_at = ? \
-                 WHERE id = ? AND session_id = ? AND status = ? \
-                   AND EXISTS(SELECT 1 FROM sessions WHERE id = ? AND active_turn_id = ?)",
-            )
-            .bind(terminal_status.as_str())
-            .bind(reason)
-            .bind(summary_json)
-            .bind(input_tokens)
-            .bind(output_tokens)
-            .bind(now)
-            .bind(turn_id.to_string())
-            .bind(session_id.to_string())
-            .bind(from_status.as_str())
-            .bind(session_id.to_string())
-            .bind(turn_id.to_string())
-            .execute(&mut *tx)
-            .await?
+        let (
+            from_status,
+            terminal_status,
+            completion_reason,
+            cancellation_reason,
+            summary,
+            input_tokens,
+            output_tokens,
+        ) = match outcome {
+            ActiveTurnOutcome::Completed {
+                summary,
+                input_tokens,
+                output_tokens,
+            } => (
+                TurnStatus::Running,
+                TurnStatus::Completed,
+                Some("finish"),
+                None,
+                Some(summary.to_string()),
+                Some(input_tokens),
+                Some(output_tokens),
+            ),
+            ActiveTurnOutcome::Failed { reason, summary } => (
+                TurnStatus::Running,
+                TurnStatus::Failed,
+                Some(reason),
+                None,
+                Some(summary.to_string()),
+                None,
+                None,
+            ),
+            ActiveTurnOutcome::Canceled { reason } => (
+                TurnStatus::Canceling,
+                TurnStatus::Canceled,
+                None,
+                Some(reason),
+                None,
+                None,
+                None,
+            ),
+            ActiveTurnOutcome::Interrupted { reason } => (
+                TurnStatus::Canceling,
+                TurnStatus::Interrupted,
+                Some(reason),
+                None,
+                None,
+                None,
+                None,
+            ),
         };
+        if !from_status.can_transition_to(terminal_status) {
+            return Err(SessionsError::Internal(anyhow::anyhow!(
+                "invalid terminal Turn transition: {} -> {}",
+                from_status.as_str(),
+                terminal_status.as_str()
+            )));
+        }
+        let changed = sqlx::query(
+            "UPDATE turns SET status = ?, completion_reason = COALESCE(?, completion_reason), \
+                    cancellation_reason = COALESCE(?, cancellation_reason), \
+                    completion_summary_json = COALESCE(?, completion_summary_json), \
+                    input_tokens = COALESCE(?, input_tokens), \
+                    output_tokens = COALESCE(?, output_tokens), updated_at = ? \
+             WHERE id = ? AND session_id = ? AND status = ? \
+               AND EXISTS(SELECT 1 FROM sessions WHERE id = ? AND active_turn_id = ?)",
+        )
+        .bind(terminal_status.as_str())
+        .bind(completion_reason)
+        .bind(cancellation_reason)
+        .bind(summary)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(now)
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
+        .bind(from_status.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .execute(&mut *tx)
+        .await?;
         if changed.rows_affected() != 1 {
             return Ok(None);
         }
@@ -776,6 +1240,105 @@ impl SessionsInterface {
             to_status: terminal_status,
             session_version,
         }))
+    }
+
+    pub async fn accept_cancel_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        turn_id: TurnId,
+        reason: &str,
+        expected_version: &str,
+        now: &str,
+    ) -> Result<Option<TurnTransition>, SessionsError> {
+        let row = sqlx::query(
+            "SELECT turn.status, session.version FROM turns AS turn \
+             JOIN sessions AS session ON session.id = turn.session_id \
+             WHERE turn.id = ? AND turn.session_id = ? AND session.active_turn_id = turn.id",
+        )
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let current_version: String = row.try_get("version")?;
+        if current_version != expected_version {
+            return Err(SessionsError::VersionMismatch {
+                expected: expected_version.to_owned(),
+                current: current_version,
+            });
+        }
+        let from_status = row
+            .try_get::<String, _>("status")?
+            .parse::<TurnStatus>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        if !from_status.can_transition_to(TurnStatus::Canceling) {
+            return Ok(None);
+        }
+        let changed = sqlx::query(
+            "UPDATE turns SET status = 'canceling', cancellation_reason = ?, updated_at = ? \
+             WHERE id = ? AND session_id = ? AND status = ? \
+               AND EXISTS(SELECT 1 FROM sessions WHERE id = ? AND active_turn_id = ?)",
+        )
+        .bind(reason)
+        .bind(now)
+        .bind(turn_id.to_string())
+        .bind(session_id.to_string())
+        .bind(from_status.as_str())
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Ok(None);
+        }
+        let session_version = format!("v_{}", SessionId::new());
+        let session_changed = sqlx::query(
+            "UPDATE sessions SET version = ?, updated_at = ? \
+             WHERE id = ? AND active_turn_id = ? AND version = ?",
+        )
+        .bind(&session_version)
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(expected_version)
+        .execute(&mut *tx)
+        .await?;
+        if session_changed.rows_affected() != 1 {
+            return Err(SessionsError::Internal(anyhow::anyhow!(
+                "active Session changed while accepting Turn cancellation"
+            )));
+        }
+        Ok(Some(TurnTransition {
+            from_status,
+            to_status: TurnStatus::Canceling,
+            session_version,
+        }))
+    }
+
+    pub async fn settle_cancel_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        turn_id: TurnId,
+        uncertain: bool,
+        reason: &str,
+        now: &str,
+    ) -> Result<Option<TurnTransition>, SessionsError> {
+        self.settle_active_turn_in_tx(
+            tx,
+            session_id,
+            turn_id,
+            if uncertain {
+                ActiveTurnOutcome::Interrupted { reason }
+            } else {
+                ActiveTurnOutcome::Canceled { reason }
+            },
+            now,
+        )
+        .await
     }
 
     pub async fn insert_checkpoint_for_turn_in_tx(
@@ -810,6 +1373,98 @@ impl SessionsInterface {
         )
         .await
         .map(|_| ())
+    }
+
+    pub async fn queued_turn_candidate_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        terminal_turn_id: TurnId,
+        session_id: SessionId,
+    ) -> Result<Option<QueuedTurnCandidate>, SessionsError> {
+        let row = sqlx::query(
+            "SELECT next_turn.id, next_turn.session_id, session.project_id, session.next_model_ref \
+             FROM turns AS terminal_turn \
+             JOIN sessions AS session ON session.id = terminal_turn.session_id \
+             JOIN turns AS next_turn ON next_turn.session_id = terminal_turn.session_id \
+             WHERE terminal_turn.id = ? AND terminal_turn.session_id = ? \
+               AND terminal_turn.status IN ('completed', 'canceled') \
+               AND session.active_turn_id IS NULL \
+               AND next_turn.status = 'queued' \
+               AND next_turn.sequence = (SELECT MIN(sequence) FROM turns \
+                                          WHERE session_id = terminal_turn.session_id \
+                                            AND status = 'queued')",
+        )
+        .bind(terminal_turn_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.map(|row| {
+            Ok(QueuedTurnCandidate {
+                turn_id: row
+                    .try_get::<String, _>("id")?
+                    .parse::<TurnId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+                session_id: row
+                    .try_get::<String, _>("session_id")?
+                    .parse::<SessionId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+                project_id: row
+                    .try_get::<String, _>("project_id")?
+                    .parse::<crate::platform::id::ProjectId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+                next_model_ref: row.try_get("next_model_ref")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn activate_queued_turn_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        candidate: &QueuedTurnCandidate,
+        model_snapshot: Option<&TurnModelSnapshot>,
+        workspace_revision: &str,
+        now: &str,
+    ) -> Result<Option<String>, SessionsError> {
+        let model_snapshot_json = serde_json::to_string(&model_snapshot)?;
+        let promoted = sqlx::query(
+            "UPDATE turns SET status = 'running', model_snapshot_json = ?, updated_at = ? \
+             WHERE id = ? AND session_id = ? AND status = 'queued'",
+        )
+        .bind(model_snapshot_json)
+        .bind(now)
+        .bind(candidate.turn_id.to_string())
+        .bind(candidate.session_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if promoted.rows_affected() != 1 {
+            return Ok(None);
+        }
+        let session_version = format!("v_{}", SessionId::new());
+        let claimed = sqlx::query(
+            "UPDATE sessions SET state = 'active', active_turn_id = ?, version = ?, \
+                    updated_at = ?, last_activity_at = ? \
+             WHERE id = ? AND active_turn_id IS NULL",
+        )
+        .bind(candidate.turn_id.to_string())
+        .bind(&session_version)
+        .bind(now)
+        .bind(now)
+        .bind(candidate.session_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() != 1 {
+            return Ok(None);
+        }
+        self.insert_checkpoint_for_turn_in_tx(
+            tx,
+            candidate.session_id,
+            candidate.turn_id,
+            workspace_revision,
+            now,
+        )
+        .await?;
+        Ok(Some(session_version))
     }
 
     async fn next_timeline_position_in_tx(

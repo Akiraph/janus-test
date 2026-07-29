@@ -10,12 +10,17 @@ use utoipa::ToSchema;
 
 use crate::{
     AppState,
-    modules::sessions::types::{
-        MessageRouteResult, SessionSummary, SessionsError, TimelinePage, TurnSummary,
+    modules::sessions::interface::{
+        CancelResult, MessageRouteResult, SessionSummary, SessionsError, SteerResult, TimelinePage,
+        TurnSummary,
     },
-    platform::id::{ProjectId, SessionId, TurnId},
+    platform::{
+        id::{AskId, CorrelationId, ProjectId, SessionId, TurnId},
+        operations::OperationView,
+    },
     transport::http::{
         auth::authenticate,
+        conditions::{RawBody, if_match_version, require_idempotency},
         dto::DataResponse,
         problem::{Problem, codes},
         request_id::RequestContext,
@@ -38,6 +43,24 @@ pub struct CreateSessionRequest {
 pub struct PostMessageRequest {
     pub content: String,
     pub expected_session_version: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SteerRequest {
+    pub content: String,
+    pub expected_session_version: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CancelTurnRequest {
+    pub expected_session_version: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AnswerAskRequest {
+    pub answer: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,16 +102,24 @@ pub async fn list_sessions(
     path = "/api/v1/projects/{project_id}/sessions",
     request_body = CreateSessionRequest,
     params(("project_id" = String, Path)),
-    responses((status = 201, body = DataResponse<SessionSummary>), (status = 401, body = Problem))
+    responses((status = 202, body = DataResponse<OperationView>), (status = 401, body = Problem))
 )]
 pub async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(project_id): Path<String>,
     Extension(context): Extension<RequestContext>,
-    Json(body): Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<DataResponse<SessionSummary>>), Problem> {
+    body: RawBody,
+) -> Result<(StatusCode, Json<DataResponse<OperationView>>), Problem> {
     let auth = authenticate(&state, &headers).await?;
+    let input: CreateSessionRequest = serde_json::from_slice(body.as_slice()).map_err(|error| {
+        Problem::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            codes::VALIDATION_FAILED,
+            "Validation failed",
+            error.to_string(),
+        )
+    })?;
     let project_id: ProjectId = project_id
         .parse()
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid project id"))?;
@@ -97,12 +128,25 @@ pub async fn create_session(
         "id": auth.owner_id,
         "request_id": context.request_id,
     });
-    let data = state
-        .sessions()
-        .create_session(project_id, body.title, actor)
-        .await
-        .map_err(sessions_problem)?;
-    Ok((StatusCode::CREATED, Json(DataResponse { data })))
+    let idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "POST",
+        &format!("/api/v1/projects/{project_id}/sessions"),
+        body.as_slice(),
+    )?;
+    let data = crate::application::lifecycle::request_session_creation(
+        &state,
+        &auth.owner_id,
+        project_id,
+        input.title,
+        actor,
+        CorrelationId::new(),
+        idempotency,
+    )
+    .await
+    .map_err(lifecycle_problem)?;
+    Ok((StatusCode::ACCEPTED, Json(DataResponse { data })))
 }
 
 #[utoipa::path(
@@ -132,25 +176,43 @@ pub async fn get_session(
     delete,
     path = "/api/v1/sessions/{id}",
     params(("id" = String, Path)),
-    responses((status = 204), (status = 404, body = Problem))
+    responses((status = 202, body = DataResponse<OperationView>), (status = 404, body = Problem))
 )]
 pub async fn delete_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<StatusCode, Problem> {
+    Extension(context): Extension<RequestContext>,
+    body: RawBody,
+) -> Result<(StatusCode, Json<DataResponse<OperationView>>), Problem> {
     let auth = authenticate(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
-    let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
-    // Runtime cleanup first (Jobs/Services/Terminals/Runtime), then the durable
-    // Session row + workspace copy. Lives in application so sessions does not
-    // depend on the runtime module.
-    crate::application::lifecycle::delete_session_with_runtime(&state, session_id, actor)
-        .await
-        .map_err(sessions_problem)?;
-    Ok(StatusCode::NO_CONTENT)
+    let expected_version = if_match_version(&headers)?;
+    let idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "DELETE",
+        &format!("/api/v1/sessions/{session_id}"),
+        body.as_slice(),
+    )?;
+    let actor = serde_json::json!({
+        "kind": "owner",
+        "id": auth.owner_id,
+        "request_id": context.request_id,
+    });
+    let data = crate::application::lifecycle::request_session_deletion(
+        &state,
+        session_id,
+        expected_version,
+        actor,
+        CorrelationId::new(),
+        idempotency,
+    )
+    .await
+    .map_err(lifecycle_problem)?;
+    Ok((StatusCode::ACCEPTED, Json(DataResponse { data })))
 }
 
 #[utoipa::path(
@@ -174,6 +236,7 @@ pub async fn post_message(
     let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
     let data = state
         .post_session_message(
+            &auth.owner_id,
             session_id,
             &body.content,
             &body.expected_session_version,
@@ -186,30 +249,7 @@ pub async fn post_message(
             .turn_id
             .parse()
             .map_err(|_| Problem::from_code(codes::INTERNAL_ERROR, "invalid accepted Turn id"))?;
-        let supervisor = state.supervisor().clone();
-        let sess_state = state.clone();
-        let sess_session_id = session_id;
-        tokio::spawn(async move {
-            if let Err(error) = supervisor.execute_turn(run_turn).await {
-                tracing::error!(%error, turn_id = %run_turn, "execute_turn failed");
-            }
-            // After the Turn settles, drain the FIFO queue: completed/canceled
-            // promote the next queued Turn (supervisor re-enters it); the queue
-            // stays paused for failed/interrupted. promote_oldest_queued is a
-            // no-op when the queue is empty or the slot is held.
-            if let Some(next) = sess_state
-                .sessions()
-                .promote_oldest_queued(sess_session_id)
-                .await
-                .ok()
-                .flatten()
-            {
-                let supervisor = sess_state.supervisor().clone();
-                if let Err(error) = supervisor.execute_turn(next).await {
-                    tracing::error!(%error, turn_id = %next, "promoted execute_turn failed");
-                }
-            }
-        });
+        state.turn_runner().schedule(run_turn);
     }
 
     Ok(Json(DataResponse { data }))
@@ -310,21 +350,170 @@ pub async fn session_diff(
     Ok(Json(DataResponse { data }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/steer",
+    request_body = SteerRequest,
+    params(("id" = String, Path)),
+    responses((status = 200, body = DataResponse<SteerResult>), (status = 409, body = Problem))
+)]
+pub async fn steer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+    Json(body): Json<SteerRequest>,
+) -> Result<Json<DataResponse<SteerResult>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let actor = serde_json::json!({
+        "kind": "owner",
+        "id": auth.owner_id,
+        "request_id": context.request_id,
+    });
+    let data = state
+        .sessions()
+        .steer(
+            session_id,
+            &body.content,
+            &body.expected_session_version,
+            actor,
+        )
+        .await
+        .map_err(sessions_problem)?;
+    Ok(Json(DataResponse { data }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/turns/{turn_id}/cancel",
+    request_body = CancelTurnRequest,
+    params(("id" = String, Path), ("turn_id" = String, Path)),
+    responses((status = 200, body = DataResponse<CancelResult>), (status = 409, body = Problem))
+)]
+pub async fn cancel_turn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, turn_id)): Path<(String, String)>,
+    Extension(context): Extension<RequestContext>,
+    Json(body): Json<CancelTurnRequest>,
+) -> Result<Json<DataResponse<CancelResult>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let turn_id: TurnId = turn_id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::RESOURCE_NOT_FOUND, "invalid turn id"))?;
+    let actor = serde_json::json!({
+        "kind": "owner",
+        "id": auth.owner_id,
+        "request_id": context.request_id,
+    });
+    let reason = body.reason.as_deref().unwrap_or("user_cancel");
+    let data = state
+        .cancel_active_turn(
+            session_id,
+            turn_id,
+            reason,
+            &body.expected_session_version,
+            actor,
+        )
+        .await
+        .map_err(sessions_problem)?;
+    Ok(Json(DataResponse { data }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/asks/{ask_id}/answer",
+    request_body = AnswerAskRequest,
+    params(("ask_id" = String, Path)),
+    responses((status = 200, body = DataResponse<serde_json::Value>), (status = 404, body = Problem))
+)]
+pub async fn answer_ask(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(ask_id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+    Json(body): Json<AnswerAskRequest>,
+) -> Result<Json<DataResponse<serde_json::Value>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let ask_id: AskId = ask_id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::ASK_NOT_FOUND, "invalid ask id"))?;
+    let actor = serde_json::json!({
+        "kind": "owner",
+        "id": auth.owner_id,
+        "request_id": context.request_id,
+    });
+    let (turn_id, route_or_status, session_version) = state
+        .answer_ask(&auth.owner_id, ask_id, &body.answer, actor)
+        .await
+        .map_err(sessions_problem)?;
+    Ok(Json(DataResponse {
+        data: serde_json::json!({
+            "ask_id": ask_id.to_string(),
+            "turn_id": turn_id.to_string(),
+            "route_or_status": route_or_status,
+            "session_version": session_version,
+        }),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/turns/{turn_id}/retry-model",
+    params(("id" = String, Path), ("turn_id" = String, Path)),
+    responses((status = 200, body = DataResponse<serde_json::Value>), (status = 404, body = Problem))
+)]
+pub async fn retry_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<DataResponse<serde_json::Value>>, Problem> {
+    let _auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let turn_id: TurnId = turn_id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::RESOURCE_NOT_FOUND, "invalid turn id"))?;
+    // Ensure the Turn belongs to the Session before scheduling retry.
+    let _ = state
+        .sessions()
+        .get_turn(session_id, turn_id)
+        .await
+        .map_err(sessions_problem)?;
+    let scheduled = state
+        .retry_waiting_model(turn_id)
+        .await
+        .map_err(sessions_problem)?;
+    Ok(Json(DataResponse {
+        data: serde_json::json!({
+            "turn_id": turn_id.to_string(),
+            "scheduled": scheduled,
+        }),
+    }))
+}
+
 fn sessions_problem(error: SessionsError) -> Problem {
     match error {
         SessionsError::NotFound => Problem::from_code(codes::SESSION_NOT_FOUND, error.to_string()),
-        SessionsError::ProjectNotFound => {
-            Problem::from_code(codes::RESOURCE_NOT_FOUND, error.to_string())
-        }
-        SessionsError::ProjectNotReady => {
-            Problem::from_code(codes::VALIDATION_FAILED, error.to_string())
-        }
         SessionsError::SessionDeleting => {
             Problem::from_code(codes::SESSION_DELETING, error.to_string())
         }
         SessionsError::ActiveTurnExists => {
             Problem::from_code(codes::ACTIVE_TURN_EXISTS, error.to_string())
         }
+        SessionsError::TurnNotInteractive => {
+            Problem::from_code(codes::TURN_NOT_INTERACTIVE, error.to_string())
+        }
+        SessionsError::TurnTerminal => Problem::from_code(codes::TURN_TERMINAL, error.to_string()),
+        SessionsError::AskNotFound => Problem::from_code(codes::ASK_NOT_FOUND, error.to_string()),
+        SessionsError::AskNotOpen => Problem::from_code(codes::ASK_NOT_OPEN, error.to_string()),
         SessionsError::VersionMismatch { .. } => {
             Problem::from_code(codes::RESOURCE_VERSION_MISMATCH, error.to_string())
         }
@@ -336,4 +525,8 @@ fn sessions_problem(error: SessionsError) -> Problem {
         }
         other => Problem::from_code(codes::INTERNAL_ERROR, other.to_string()),
     }
+}
+
+fn lifecycle_problem(error: crate::application::lifecycle::SessionLifecycleError) -> Problem {
+    Problem::from_code(error.code(), error.to_string())
 }

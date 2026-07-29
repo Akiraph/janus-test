@@ -237,7 +237,7 @@ fn runtime_spec_requires_a_trusted_absolute_workspace() -> anyhow::Result<()> {
     assert!(
         RuntimeSpec::new(
             RuntimeId::new(),
-            SessionId::new(),
+            janus_server::modules::runtime::interface::RuntimeScope::session(SessionId::new()),
             janus_server::modules::runtime::interface::ExecutorKind::Local,
             PathBuf::from("relative"),
             limits(),
@@ -249,7 +249,7 @@ fn runtime_spec_requires_a_trusted_absolute_workspace() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let spec = RuntimeSpec::new(
         RuntimeId::new(),
-        SessionId::new(),
+        janus_server::modules::runtime::interface::RuntimeScope::session(SessionId::new()),
         janus_server::modules::runtime::interface::ExecutorKind::Local,
         directory.path().to_path_buf(),
         limits(),

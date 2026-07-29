@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
 use crate::platform::{
@@ -63,9 +63,12 @@ impl RevisionRef {
 pub struct SessionCopyResult {
     pub handle: WorkspaceHandle,
     pub revision: RevisionRef,
+    pub source_main_revision: RevisionRef,
     pub manifest_root_hash: String,
     pub managed_dir: String,
 }
+
+type ExistingSessionCopy = (Option<String>, Option<String>, String, Option<String>);
 
 /// Agent / tool file mutation against a Session (or, later, any) copy.
 #[derive(Debug, Clone)]
@@ -115,6 +118,10 @@ impl WorkspaceSyncInterface {
 
     pub fn data_root(&self) -> &Path {
         &self.data_root
+    }
+
+    pub fn session_repo_path(&self, session_id: SessionId) -> PathBuf {
+        session_repo_abs(&self.data_root, session_id)
     }
 
     /// Create the Main workspace copy for a project and its first Content
@@ -211,6 +218,18 @@ impl WorkspaceSyncInterface {
             .await
     }
 
+    pub async fn bump_revision_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        handle: &WorkspaceHandle,
+        expected: Option<&RevisionRef>,
+        cause: &str,
+        actor: serde_json::Value,
+    ) -> Result<RevisionRef, WorkspaceSyncError> {
+        self.advance_revision_in_tx(tx, handle, expected, cause, actor, None)
+            .await
+    }
+
     /// Create a Session workspace copy from Project Main.
     ///
     /// Idempotent: if the Session handle already exists, returns the existing
@@ -226,21 +245,24 @@ impl WorkspaceSyncInterface {
         actor: serde_json::Value,
     ) -> Result<SessionCopyResult, WorkspaceSyncError> {
         let handle = WorkspaceHandle::session(session_id);
-        let existing: Option<(Option<String>, Option<String>, String)> = sqlx::query_as(
+        let existing: Option<ExistingSessionCopy> = sqlx::query_as(
             "SELECT current_revision_id, \
                     (SELECT manifest_root_hash FROM content_revisions \
                      WHERE revision_id = workspace_copies.current_revision_id), \
-                    managed_dir \
+                    managed_dir, \
+                    (SELECT initial_main_revision_id FROM propagation_links \
+                     WHERE session_id = workspace_copies.session_id) \
              FROM workspace_copies WHERE handle = ?",
         )
         .bind(handle.as_str())
         .fetch_optional(&self.pool)
         .await?;
 
-        if let Some((Some(revision_id), root, managed_dir)) = existing {
+        if let Some((Some(revision_id), root, managed_dir, Some(source_main_revision))) = existing {
             return Ok(SessionCopyResult {
                 handle,
                 revision: RevisionRef(revision_id),
+                source_main_revision: RevisionRef(source_main_revision),
                 manifest_root_hash: root.unwrap_or_default(),
                 managed_dir,
             });
@@ -348,6 +370,7 @@ impl WorkspaceSyncInterface {
         Ok(SessionCopyResult {
             handle,
             revision: revision_ref,
+            source_main_revision: RevisionRef(main_revision_id),
             manifest_root_hash: root_hash,
             managed_dir,
         })
@@ -545,10 +568,34 @@ impl WorkspaceSyncInterface {
         manifest_root_hash: Option<&str>,
         snapshot_purpose: Option<&str>,
     ) -> Result<RevisionRef, WorkspaceSyncError> {
+        let mut tx = self.pool.begin().await?;
+        let revision = self
+            .advance_revision_in_tx(
+                &mut tx,
+                handle,
+                expected,
+                cause,
+                actor,
+                manifest_root_hash.zip(snapshot_purpose),
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(revision)
+    }
+
+    async fn advance_revision_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        handle: &WorkspaceHandle,
+        expected: Option<&RevisionRef>,
+        cause: &str,
+        actor: serde_json::Value,
+        snapshot: Option<(&str, &str)>,
+    ) -> Result<RevisionRef, WorkspaceSyncError> {
         let current: Option<Option<String>> =
             sqlx::query_scalar("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
                 .bind(handle.as_str())
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
         let current = current
             .ok_or(WorkspaceSyncError::NotFound)?
@@ -563,11 +610,16 @@ impl WorkspaceSyncInterface {
         }
 
         let now = format_utc(SystemClock.now());
-        let next_sequence = self.next_sequence(handle).await?;
+        let next_sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM content_revisions \
+             WHERE workspace_handle = ?",
+        )
+        .bind(handle.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
         let revision_ref = RevisionRef::new(RevisionId::new());
         let copy_version = format!("v_{}", RevisionId::new());
 
-        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO content_revisions \
              (revision_id, workspace_handle, sequence, manifest_root_hash, cause, \
@@ -577,14 +629,14 @@ impl WorkspaceSyncInterface {
         .bind(revision_ref.0.clone())
         .bind(handle.as_str())
         .bind(next_sequence)
-        .bind(manifest_root_hash)
+        .bind(snapshot.map(|(root, _)| root))
         .bind(cause)
         .bind(serde_json::to_string(&actor)?)
         .bind(&current)
         .bind(&now)
         .execute(&mut *tx)
         .await?;
-        if let (Some(root), Some(purpose)) = (manifest_root_hash, snapshot_purpose) {
+        if let Some((root, purpose)) = snapshot {
             let snapshot_id = SnapshotId::new();
             sqlx::query(
                 "INSERT INTO workspace_snapshots \
@@ -609,18 +661,7 @@ impl WorkspaceSyncInterface {
         .bind(handle.as_str())
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
         Ok(revision_ref)
-    }
-
-    async fn next_sequence(&self, handle: &WorkspaceHandle) -> Result<i64, WorkspaceSyncError> {
-        let max: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(sequence) FROM content_revisions WHERE workspace_handle = ?",
-        )
-        .bind(handle.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(max.unwrap_or(0) + 1)
     }
 }
 

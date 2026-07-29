@@ -1,8 +1,8 @@
-//! Terminal (M4 Stage 3) contract: PTY-less bash pipe backend.
+//! Terminal contract for the PTY-less Bash pipe backend.
 //!
 //! These tests exercise the durable RuntimeInterface surface for Terminals
 //! against the Local pipe backend (git bash on Windows, `/bin/bash` elsewhere).
-//! They do NOT exercise the WebSocket transport; that lives in `terminal_http_m4`.
+//! They do NOT exercise the WebSocket transport; that lives in `runtime_http`.
 
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -12,10 +12,10 @@ use janus_server::{
     config::{Config, RunMode},
     modules::runtime::interface::{
         ExecutionEnvironment, ExecutorKind, LogCursor, NetworkPolicy, RelativeWorkingDirectory,
-        ResourceLimits, RuntimeError, RuntimeSpec, RuntimeStatus, TerminalOwner, TerminalSignal,
+        ResourceLimits, RuntimeError, RuntimeScope, RuntimeSpec, RuntimeStatus, TerminalSignal,
         TerminalSize, TerminalSpec, TerminalStatus,
     },
-    platform::id::{ProjectId, RuntimeId, SessionId, TerminalId},
+    platform::id::{ProjectId, RuntimeId, TerminalId},
 };
 use tempfile::TempDir;
 
@@ -43,18 +43,18 @@ fn limits() -> ResourceLimits {
     }
 }
 
-async fn boot_state() -> anyhow::Result<(TempDir, AppState, RuntimeId, SessionId)> {
+async fn boot_state() -> anyhow::Result<(TempDir, AppState, RuntimeId, ProjectId)> {
     let temp = TempDir::new()?;
     let workspace = temp.path().join("workspace");
     tokio::fs::create_dir_all(&workspace).await?;
     let state = AppState::initialize(test_config(temp.path().join("data")))
         .await
         .context("initialize app state")?;
-    let session_id = SessionId::new();
+    let project_id = ProjectId::new();
     let runtime_id = RuntimeId::new();
     let runtime = RuntimeSpec::new(
         runtime_id,
-        session_id,
+        RuntimeScope::project(project_id),
         ExecutorKind::Local,
         workspace,
         limits(),
@@ -66,14 +66,14 @@ async fn boot_state() -> anyhow::Result<(TempDir, AppState, RuntimeId, SessionId
         .await
         .context("ensure runtime")?;
     assert_eq!(ready.status, RuntimeStatus::Ready);
-    Ok((temp, state, runtime_id, session_id))
+    Ok((temp, state, runtime_id, project_id))
 }
 
-fn terminal_spec(id: TerminalId, runtime_id: RuntimeId, owner: TerminalOwner) -> TerminalSpec {
+fn terminal_spec(id: TerminalId, runtime_id: RuntimeId, project_id: ProjectId) -> TerminalSpec {
     TerminalSpec {
         id,
         runtime_id,
-        owner,
+        project_id,
         working_directory: RelativeWorkingDirectory::new(".").expect("relative cwd"),
         environment: ExecutionEnvironment::new(BTreeMap::new(), Vec::new())
             .expect("empty environment"),
@@ -83,13 +83,9 @@ fn terminal_spec(id: TerminalId, runtime_id: RuntimeId, owner: TerminalOwner) ->
 
 #[tokio::test]
 async fn terminal_roundtrip_creates_issues_consumes_writes_and_closes() -> anyhow::Result<()> {
-    if !bash_available().await {
-        eprintln!("skipping terminal_roundtrip: bash not on PATH");
-        return Ok(());
-    }
-    let (_temp, state, runtime_id, session_id) = boot_state().await?;
+    let (_temp, state, runtime_id, project_id) = boot_state().await?;
     let terminal_id = TerminalId::new();
-    let spec = terminal_spec(terminal_id, runtime_id, TerminalOwner::Session(session_id));
+    let spec = terminal_spec(terminal_id, runtime_id, project_id);
     let terminal = state
         .runtime()
         .create_terminal(spec)
@@ -192,13 +188,9 @@ async fn terminal_roundtrip_creates_issues_consumes_writes_and_closes() -> anyho
 
 #[tokio::test]
 async fn terminal_resize_signal_and_scrollback_cursor_resume() -> anyhow::Result<()> {
-    if !bash_available().await {
-        eprintln!("skipping terminal_resize_signal: bash not on PATH");
-        return Ok(());
-    }
-    let (_temp, state, runtime_id, session_id) = boot_state().await?;
+    let (_temp, state, runtime_id, project_id) = boot_state().await?;
     let terminal_id = TerminalId::new();
-    let spec = terminal_spec(terminal_id, runtime_id, TerminalOwner::Session(session_id));
+    let spec = terminal_spec(terminal_id, runtime_id, project_id);
     let _terminal = state
         .runtime()
         .create_terminal(spec)
@@ -291,13 +283,9 @@ async fn terminal_resize_signal_and_scrollback_cursor_resume() -> anyhow::Result
 
 #[tokio::test]
 async fn terminal_recovery_converts_running_to_lost_and_revokes_tickets() -> anyhow::Result<()> {
-    if !bash_available().await {
-        eprintln!("skipping terminal_recovery: bash not on PATH");
-        return Ok(());
-    }
-    let (_temp, state, runtime_id, session_id) = boot_state().await?;
+    let (_temp, state, runtime_id, project_id) = boot_state().await?;
     let terminal_id = TerminalId::new();
-    let spec = terminal_spec(terminal_id, runtime_id, TerminalOwner::Session(session_id));
+    let spec = terminal_spec(terminal_id, runtime_id, project_id);
     let _ = state
         .runtime()
         .create_terminal(spec)
@@ -348,14 +336,9 @@ async fn terminal_recovery_converts_running_to_lost_and_revokes_tickets() -> any
 
 #[tokio::test]
 async fn project_owner_terminal_persists_and_lists() -> anyhow::Result<()> {
-    if !bash_available().await {
-        eprintln!("skipping project_owner_terminal: bash not on PATH");
-        return Ok(());
-    }
-    let (_temp, state, runtime_id, _session_id) = boot_state().await?;
-    let project_id = ProjectId::new();
+    let (_temp, state, runtime_id, project_id) = boot_state().await?;
     let terminal_id = TerminalId::new();
-    let spec = terminal_spec(terminal_id, runtime_id, TerminalOwner::Project(project_id));
+    let spec = terminal_spec(terminal_id, runtime_id, project_id);
     let _ = state.runtime().create_terminal(spec).await?;
     // Close the shell so the live handle is dropped before list.
     state
@@ -374,32 +357,10 @@ async fn project_owner_terminal_persists_and_lists() -> anyhow::Result<()> {
         }
     })
     .await;
-    let listed = state
-        .runtime()
-        .list_terminals(TerminalOwner::Project(project_id))
-        .await?;
+    let listed = state.runtime().list_terminals(project_id).await?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, terminal_id);
     Ok(())
-}
-
-async fn bash_available() -> bool {
-    let probe = if cfg!(windows) {
-        tokio::process::Command::new("bash")
-            .args(["--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-    } else {
-        tokio::process::Command::new("/bin/bash")
-            .args(["--version"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-    };
-    probe.map(|status| status.success()).unwrap_or(false)
 }
 
 fn terminal_ticket_request(

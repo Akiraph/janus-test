@@ -190,6 +190,18 @@ impl LogStore {
         self.projection_unlocked(id).await
     }
 
+    pub(crate) async fn delete_files(&self, ids: &[LogStreamId]) -> Result<(), RuntimeError> {
+        let _guard = self.gate.lock().await;
+        for id in ids {
+            match tokio::fs::remove_dir_all(self.root.join(id.to_string())).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(storage_error(error)),
+            }
+        }
+        Ok(())
+    }
+
     pub async fn projection(&self, id: LogStreamId) -> Result<LogStreamProjection, RuntimeError> {
         let _guard = self.gate.lock().await;
         self.projection_unlocked(id).await

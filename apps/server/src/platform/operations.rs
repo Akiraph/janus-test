@@ -10,10 +10,14 @@
 
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
-use super::clock::{Clock, SystemClock, format_utc};
+use super::{
+    clock::{Clock, SystemClock, format_utc},
+    events::{EventStore, NewEvent},
+    unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
+};
 use crate::platform::id::{CorrelationId, OperationId, WorkItemId};
 use rand::RngCore;
 
@@ -24,6 +28,8 @@ pub const KIND_GIT_FETCH: &str = "git.fetch";
 pub const KIND_GIT_UPDATE: &str = "git.update";
 pub const KIND_GIT_PUSH: &str = "git.push";
 pub const KIND_GIT_CHECKOUT: &str = "git.checkout";
+pub const KIND_CREATE_SESSION: &str = "session.create";
+pub const KIND_DELETE_SESSION: &str = "session.delete";
 
 /// Operation status. `needs_attention` means execution stopped at a decidable
 /// state requiring an explicit follow-up command (e.g. a Git Update Conflict),
@@ -94,11 +100,15 @@ pub enum IdempotencyOutcome {
 #[derive(Clone)]
 pub struct OperationInterface {
     pool: SqlitePool,
+    unit_of_work: UnitOfWork,
 }
 
 impl OperationInterface {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, events: EventStore) -> Self {
+        Self {
+            pool: pool.clone(),
+            unit_of_work: UnitOfWork::new(pool, events),
+        }
     }
 
     /// Create an operation, honoring idempotency. Same key + same digest returns
@@ -108,8 +118,47 @@ impl OperationInterface {
         &self,
         request: CreateOperation<'_>,
     ) -> Result<CreatedOperation, OperationError> {
+        self.create_internal(request, None).await
+    }
+
+    pub async fn create_with_work(
+        &self,
+        request: CreateOperation<'_>,
+        work: CreateWork<'_>,
+    ) -> Result<CreatedOperation, OperationError> {
+        self.create_internal(request, Some(work)).await
+    }
+
+    pub(crate) async fn create_with_work_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        request: CreateOperation<'_>,
+        work_item: CreateWork<'_>,
+    ) -> Result<CreatedOperation, OperationError> {
+        self.create_in_tx(work, request, Some(work_item)).await
+    }
+
+    async fn create_internal(
+        &self,
+        request: CreateOperation<'_>,
+        work: Option<CreateWork<'_>>,
+    ) -> Result<CreatedOperation, OperationError> {
+        let mut transaction = self.unit_of_work.begin().await?;
+        let created = self.create_in_tx(&mut transaction, request, work).await?;
+        transaction.commit().await?;
+        Ok(created)
+    }
+
+    async fn create_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        request: CreateOperation<'_>,
+        work_item: Option<CreateWork<'_>>,
+    ) -> Result<CreatedOperation, OperationError> {
         if let Some(idem) = &request.idempotency
-            && let Some(view) = self.lookup_idempotency(idem).await?
+            && let Some(view) = self
+                .lookup_idempotency_in_tx(work.connection(), idem)
+                .await?
         {
             let terminal = matches!(
                 view.status.as_str(),
@@ -130,7 +179,6 @@ impl OperationInterface {
         let now = format_utc(SystemClock.now());
         let version = format!("v_{}", crate::platform::id::OperationId::new());
         let operation_id = id.to_string();
-        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO operations (id, kind, actor_json, target_kind, target_id, status, current_step, conditions_json, result_json, problem_json, correlation_id, lease_nonce, lease_expires_at, progress_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?)")
             .bind(&operation_id)
             .bind(kind)
@@ -142,7 +190,7 @@ impl OperationInterface {
             .bind(&version)
             .bind(&now)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(work.connection())
             .await?;
         if let Some(idem) = &request.idempotency {
             sqlx::query("INSERT INTO idempotency_records (key, owner_id, method, normalized_route, request_digest, status, response_ref, operation_id, expires_at) VALUES (?, ?, ?, ?, ?, 'running', NULL, ?, ?)")
@@ -153,11 +201,30 @@ impl OperationInterface {
                 .bind(&idem.digest)
                 .bind(&operation_id)
                 .bind(&idem.expires_at)
-                .execute(&mut *tx)
+                .execute(work.connection())
+                .await?;
+        }
+        if let Some(work_item) = work_item {
+            let work_id = WorkItemId::new();
+            let mut payload = work_item.payload;
+            let fields = payload.as_object_mut().ok_or_else(|| {
+                OperationError::Internal(anyhow::anyhow!("work payload must be a JSON object"))
+            })?;
+            fields.insert(
+                "operation_id".into(),
+                serde_json::Value::String(operation_id.clone()),
+            );
+            sqlx::query("INSERT INTO work_items (id, handler_kind, payload_json, not_before, lease_nonce, lease_expires_at, attempts, dead, created_at) VALUES (?, ?, ?, ?, NULL, NULL, 0, 0, ?)")
+                .bind(work_id.to_string())
+                .bind(work_item.handler_kind)
+                .bind(serde_json::to_string(&payload)?)
+                .bind(&now)
+                .bind(&now)
+                .execute(work.connection())
                 .await?;
         }
         self.emit_operation_changed(
-            &mut tx,
+            work,
             &operation_id,
             kind,
             "queued",
@@ -165,33 +232,13 @@ impl OperationInterface {
             &request.correlation_id,
         )
         .await?;
-        tx.commit().await?;
         Ok(CreatedOperation {
             operation: self
-                .get(&operation_id)
+                .get_in_tx(work.connection(), &operation_id)
                 .await?
                 .ok_or(OperationError::NotFound)?,
             outcome: IdempotencyOutcome::New,
         })
-    }
-
-    /// Enqueue a work item for a background handler to lease.
-    pub async fn enqueue_work(
-        &self,
-        handler_kind: &str,
-        payload: Value,
-    ) -> Result<WorkItemId, OperationError> {
-        let id = WorkItemId::new();
-        let now = format_utc(SystemClock.now());
-        sqlx::query("INSERT INTO work_items (id, handler_kind, payload_json, not_before, lease_nonce, lease_expires_at, attempts, dead, created_at) VALUES (?, ?, ?, ?, NULL, NULL, 0, 0, ?)")
-            .bind(id.to_string())
-            .bind(handler_kind)
-            .bind(serde_json::to_string(&payload)?)
-            .bind(&now)
-            .bind(&now)
-            .execute(&self.pool)
-            .await?;
-        Ok(id)
     }
 
     /// Claim the oldest available work item for a handler. Returns the item id,
@@ -364,7 +411,7 @@ impl OperationInterface {
     ) -> Result<(), OperationError> {
         let now = format_utc(SystemClock.now());
         let version = format!("v_{}", crate::platform::id::OperationId::new());
-        let mut tx = self.pool.begin().await?;
+        let mut work = self.unit_of_work.begin().await?;
         let changed = sqlx::query("UPDATE operations SET status = ?, result_json = ?, problem_json = ?, current_step = NULL, version = ?, updated_at = ? WHERE id = ?")
             .bind(status.as_str())
             .bind(result.as_ref().map(serde_json::to_string).transpose()?)
@@ -372,7 +419,7 @@ impl OperationInterface {
             .bind(&version)
             .bind(&now)
             .bind(operation_id)
-            .execute(&mut *tx)
+            .execute(work.connection())
             .await?
             .rows_affected();
         if changed == 0 {
@@ -382,10 +429,10 @@ impl OperationInterface {
         sqlx::query("UPDATE idempotency_records SET status = ? WHERE operation_id = ?")
             .bind(status.as_str())
             .bind(operation_id)
-            .execute(&mut *tx)
+            .execute(work.connection())
             .await?;
         self.emit_operation_changed(
-            &mut tx,
+            &mut work,
             operation_id,
             "",
             status.as_str(),
@@ -393,7 +440,7 @@ impl OperationInterface {
             &correlation_id,
         )
         .await?;
-        tx.commit().await?;
+        work.commit().await?;
         Ok(())
     }
 
@@ -405,6 +452,40 @@ impl OperationInterface {
         .fetch_optional(&self.pool)
         .await?;
         row.map(view_from_row).transpose()
+    }
+
+    async fn get_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        operation_id: &str,
+    ) -> Result<Option<OperationView>, OperationError> {
+        let row = sqlx::query_as::<_, OperationRow>(
+            "SELECT id, kind, status, target_kind, target_id, current_step, progress_json, result_json, problem_json, correlation_id, version, created_at, updated_at FROM operations WHERE id = ?",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        row.map(view_from_row).transpose()
+    }
+
+    pub async fn in_flight_for_target(
+        &self,
+        kind: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> Result<Option<String>, OperationError> {
+        sqlx::query_scalar(
+            "SELECT id FROM operations \
+             WHERE kind = ? AND target_kind = ? AND target_id = ? \
+               AND status IN ('queued', 'running') \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(kind)
+        .bind(target_kind)
+        .bind(target_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(OperationError::from)
     }
 
     /// Operations that are `running` with an expired lease: a restart must
@@ -420,15 +501,16 @@ impl OperationInterface {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
-    async fn lookup_idempotency(
+    async fn lookup_idempotency_in_tx(
         &self,
+        tx: &mut SqliteConnection,
         idem: &IdempotencyRequest,
     ) -> Result<Option<OperationView>, OperationError> {
         let row: Option<(String, String)> = sqlx::query_as(
             "SELECT request_digest, operation_id FROM idempotency_records WHERE key = ?",
         )
         .bind(&idem.key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         match row {
             None => Ok(None),
@@ -438,42 +520,37 @@ impl OperationInterface {
                         "IDEMPOTENCY_KEY_REUSED"
                     )));
                 }
-                self.get(&operation_id).await
+                self.get_in_tx(tx, &operation_id).await
             }
         }
     }
 
     async fn emit_operation_changed(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        work: &mut UnitOfWorkTransaction<'_>,
         operation_id: &str,
         kind: &str,
         status: &str,
         version: &str,
         correlation_id: &CorrelationId,
     ) -> Result<(), OperationError> {
-        // Append to public_events in the same tx so the event and the status
-        // change commit atomically (`EVT-002`). The EventStore.append opens its
-        // own connection, so instead we insert directly here.
-        let event_id = crate::platform::id::EventId::new().to_string();
-        let now = format_utc(SystemClock.now());
-        let payload = serde_json::json!({
-            "operation_id": operation_id,
-            "kind": kind,
-            "status": status,
-        });
-        let actor = serde_json::json!({"kind": "system", "id": null, "display_name": "Janus"});
-        let resource =
-            serde_json::json!({"kind": "operation", "id": operation_id, "version": version});
-        sqlx::query("INSERT INTO public_events (event_id, event_type, schema_version, actor_json, resource_json, correlation_id, causation_id, payload_json, occurred_at) VALUES (?, 'operation.changed', 1, ?, ?, ?, NULL, ?, ?)")
-            .bind(&event_id)
-            .bind(serde_json::to_string(&actor)?)
-            .bind(serde_json::to_string(&resource)?)
-            .bind(correlation_id.to_string())
-            .bind(serde_json::to_string(&payload)?)
-            .bind(&now)
-            .execute(&mut **tx)
-            .await?;
+        work.append_event(NewEvent {
+            event_type: "operation.changed".into(),
+            actor: serde_json::json!({"kind": "system", "id": null, "display_name": "Janus"}),
+            resource: Some(serde_json::json!({
+                "kind": "operation",
+                "id": operation_id,
+                "version": version,
+            })),
+            correlation_id: correlation_id.to_string(),
+            causation_id: None,
+            payload: serde_json::json!({
+                "operation_id": operation_id,
+                "kind": kind,
+                "status": status,
+            }),
+        })
+        .await?;
         Ok(())
     }
 }
@@ -503,6 +580,12 @@ pub struct CreateOperation<'a> {
     pub conditions: Value,
     pub correlation_id: CorrelationId,
     pub idempotency: Option<IdempotencyRequest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateWork<'a> {
+    pub handler_kind: &'a str,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone)]

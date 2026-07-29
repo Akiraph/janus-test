@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
+syn = { version = "2.0", features = ["full", "visit"] }
 toml.workspace = true
 
 [lints]

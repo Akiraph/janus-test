@@ -15,8 +15,6 @@ import {
   listGithubCredentials,
   listProjects,
   listSessions,
-  listTerminals,
-  type TerminalOwnerFilter,
 } from "./api";
 
 export function useBootstrap() {
@@ -184,20 +182,6 @@ export function useTurn(sessionId: () => string | undefined, turnId: () => strin
         }
         return false;
       },
-    };
-  });
-}
-
-export function useTerminals(
-  owner: () => TerminalOwnerFilter | undefined,
-  enabled: () => boolean = () => true,
-) {
-  return createQuery(() => {
-    const filter = owner();
-    return {
-      queryKey: ["terminals", filter?.kind, filter?.id],
-      queryFn: () => listTerminals(filter as TerminalOwnerFilter),
-      enabled: Boolean(filter?.id) && enabled(),
     };
   });
 }

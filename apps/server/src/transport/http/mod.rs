@@ -49,7 +49,8 @@ pub use problem::Problem;
         operations::get_operation,
         sessions::list_sessions, sessions::create_session, sessions::get_session,
         sessions::delete_session, sessions::post_message, sessions::timeline,
-        sessions::get_turn, sessions::session_diff,
+        sessions::get_turn, sessions::session_diff, sessions::steer, sessions::cancel_turn,
+        sessions::answer_ask, sessions::retry_model,
         terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
         terminal::resize_terminal, terminal::signal_terminal, terminal::close_terminal,
         terminal::terminal_scrollback, terminal::connect_terminal
@@ -122,22 +123,25 @@ pub use problem::Problem;
         git::GitUpdateRequest,
         git::ResolveConflictRequest,
         git::ResolveConflictPathRequest,
-        crate::modules::sessions::types::SessionSummary,
-        crate::modules::sessions::types::TurnSummary,
-        crate::modules::sessions::types::MessageRouteResult,
-        crate::modules::sessions::types::TimelinePage,
-        crate::modules::sessions::types::TimelineItemView,
+        crate::modules::sessions::interface::SessionSummary,
+        crate::modules::sessions::interface::TurnSummary,
+        crate::modules::sessions::interface::MessageRouteResult,
+        crate::modules::sessions::interface::TimelinePage,
+        crate::modules::sessions::interface::TimelineItemView,
+        crate::modules::sessions::interface::CancelResult,
+        crate::modules::sessions::interface::SteerResult,
         sessions::CreateSessionRequest,
         sessions::PostMessageRequest,
+        sessions::SteerRequest,
+        sessions::CancelTurnRequest,
+        sessions::AnswerAskRequest,
         crate::modules::runtime::interface::TerminalProjection,
-        crate::modules::runtime::interface::TerminalOwner,
         crate::modules::runtime::interface::TerminalStatus,
         crate::modules::runtime::interface::TerminalSize,
         crate::modules::runtime::interface::TerminalSignal,
         crate::modules::runtime::interface::TerminalTicket,
         crate::modules::runtime::interface::LogRange,
         terminal::CreateTerminalRequest,
-        terminal::TerminalOwnerInput,
         terminal::TerminalSizeInput,
         terminal::EnvironmentInput,
         terminal::ResizeTerminalRequest,
@@ -295,11 +299,21 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/messages",
             post(sessions::post_message),
         )
+        .route("/api/v1/sessions/{id}/steer", post(sessions::steer))
         .route("/api/v1/sessions/{id}/timeline", get(sessions::timeline))
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}",
             get(sessions::get_turn),
         )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/cancel",
+            post(sessions::cancel_turn),
+        )
+        .route(
+            "/api/v1/sessions/{id}/turns/{turn_id}/retry-model",
+            post(sessions::retry_model),
+        )
+        .route("/api/v1/asks/{ask_id}/answer", post(sessions::answer_ask))
         .route("/api/v1/sessions/{id}/diff", get(sessions::session_diff))
         .route(
             "/api/v1/terminals",

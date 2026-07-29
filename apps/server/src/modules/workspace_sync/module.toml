@@ -7,6 +7,6 @@ owned_tables = [
   "propagation_links",
 ]
 publishes = ["session.revision_changed", "workspace.diff_changed"]
-allowed_module_dependencies = ["projects"]
+allowed_module_dependencies = []
 specs = []
 tests = []

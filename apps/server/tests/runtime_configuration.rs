@@ -19,8 +19,8 @@ use janus_server::{
         workspace_sync::interface::WorkspaceSyncInterface,
     },
     platform::{
-        database::Database, managed_storage::BlobStore, operations::OperationInterface,
-        secret::SecretCipher,
+        database::Database, events::EventStore, managed_storage::BlobStore,
+        operations::OperationInterface, secret::SecretCipher,
     },
 };
 use sqlx::{
@@ -50,14 +50,16 @@ impl Fx {
         let cipher = SecretCipher::load(temp.path(), RunMode::Development)?;
         let blobs = BlobStore::new(pool.clone(), temp.path())?;
         let workspace = WorkspaceSyncInterface::new(pool.clone(), temp.path(), blobs);
+        let events = EventStore::new(pool.clone());
         let projects = ProjectsInterface::new(
             pool.clone(),
             cipher.clone(),
-            OperationInterface::new(pool.clone()),
+            OperationInterface::new(pool.clone(), events.clone()),
             workspace,
+            events,
             temp.path(),
         );
-        let models = ModelsInterface::new(pool.clone(), cipher)?;
+        let models = ModelsInterface::new(pool.clone(), cipher, EventStore::new(pool.clone()))?;
         Ok(Self {
             _temp: temp,
             _database: database,
@@ -278,6 +280,7 @@ async fn normalized_models_keep_ids_and_validate_ordered_failover() -> anyhow::R
                 model("Fallback B", "model-b", true),
                 model("Fallback C", "model-c", false),
             ]),
+            "test-model-config",
         )
         .await?;
     let before = fx.models.models(OWNER_ID).await?;
@@ -297,6 +300,7 @@ async fn normalized_models_keep_ids_and_validate_ordered_failover() -> anyhow::R
                 model("Fallback B", "model-b", true),
                 model("Fallback C", "model-c", false),
             ]),
+            "test-model-config",
         )
         .await?;
     let after = fx.models.models(OWNER_ID).await?;
@@ -307,7 +311,7 @@ async fn normalized_models_keep_ids_and_validate_ordered_failover() -> anyhow::R
     let primary = &ids["model-a"];
     let candidates = vec![ids["model-b"].clone(), ids["model-c"].clone()];
     fx.models
-        .set_failover(OWNER_ID, primary, candidates.clone())
+        .set_failover(OWNER_ID, primary, candidates.clone(), "test-model-config")
         .await?;
     assert_eq!(
         fx.models.failover(OWNER_ID, primary).await?.candidates,
@@ -315,7 +319,12 @@ async fn normalized_models_keep_ids_and_validate_ordered_failover() -> anyhow::R
     );
     assert!(matches!(
         fx.models
-            .set_failover(OWNER_ID, primary, vec![primary.clone()])
+            .set_failover(
+                OWNER_ID,
+                primary,
+                vec![primary.clone()],
+                "test-model-config",
+            )
             .await,
         Err(ModelsError::Validation(_))
     ));
@@ -499,5 +508,147 @@ async fn populated_previous_schema_migrates_active_work_without_replay() -> anyh
         limits,
         vec![("default".into(), 200_000), ("large".into(), 1_000_000)]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_scope_migration_preserves_children_and_scope_uniqueness() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let database_path = temp.path().join("runtime-scope.db");
+    let options = SqliteConnectOptions::from_str(&database_path.to_string_lossy())?
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let migrator = sqlx::migrate!("./migrations");
+    let previous = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            migrator
+                .iter()
+                .filter(|migration| migration.version <= 14)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    previous.run(&pool).await?;
+
+    sqlx::query(
+        "INSERT INTO runtimes \
+         (id, session_id, executor_kind, executor_nonce, limits_json, \
+          capability_snapshot_json, status, version, created_at, updated_at) \
+         VALUES ('runtime-session', 'session-shared', 'local', 'nonce-session', '{}', \
+                 '{}', 'ready', 'v1', ?, ?)",
+    )
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await?;
+    for (id, owner_kind, owner_id) in [
+        ("log-job", "job", "job-existing"),
+        ("log-terminal", "terminal", "terminal-existing"),
+    ] {
+        sqlx::query(
+            "INSERT INTO log_streams \
+             (id, owner_kind, owner_id, relative_path, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(owner_kind)
+        .bind(owner_id)
+        .bind(format!("logs/{id}"))
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&pool)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO jobs \
+         (id, runtime_id, session_id, initiated_by_tool_call_id, controlling_turn_id, \
+          command_summary, executor_nonce, log_stream_id, status, version, created_at) \
+         VALUES ('job-existing', 'runtime-session', 'session-shared', 'tool-existing', \
+                 'turn-existing', 'echo migration', 'nonce-session', 'log-job', \
+                 'queued', 'v1', ?)",
+    )
+    .bind(NOW)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO terminals \
+         (id, runtime_id, owner_kind, owner_id, executor_nonce, cols, rows, \
+          scrollback_stream_id, status, version, created_at, updated_at) \
+         VALUES ('terminal-existing', 'runtime-session', 'project', 'project-existing', \
+                 'nonce-session', 80, 24, 'log-terminal', 'running', 'v1', ?, ?)",
+    )
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await?;
+
+    migrator.run(&pool).await?;
+
+    let scope: (String, String) =
+        sqlx::query_as("SELECT scope_kind, scope_id FROM runtimes WHERE id = 'runtime-session'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(scope, ("session".into(), "session-shared".into()));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT runtime_id FROM jobs WHERE id = 'job-existing'")
+            .fetch_one(&pool)
+            .await?,
+        "runtime-session"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT runtime_id FROM terminals WHERE id = 'terminal-existing'"
+        )
+        .fetch_one(&pool)
+        .await?,
+        "runtime-session"
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await?
+            .is_empty()
+    );
+
+    sqlx::query(
+        "INSERT INTO runtimes \
+         (id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
+          capability_snapshot_json, status, version, created_at, updated_at) \
+         VALUES ('runtime-project', 'project', 'session-shared', 'local', 'nonce-project', \
+                 '{}', '{}', 'ready', 'v1', ?, ?)",
+    )
+    .bind(NOW)
+    .bind(NOW)
+    .execute(&pool)
+    .await?;
+    for (id, scope_kind) in [
+        ("runtime-session-duplicate", "session"),
+        ("runtime-project-duplicate", "project"),
+    ] {
+        let duplicate = sqlx::query(
+            "INSERT INTO runtimes \
+             (id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
+              capability_snapshot_json, status, version, created_at, updated_at) \
+             VALUES (?, ?, 'session-shared', 'local', 'nonce-duplicate', '{}', '{}', \
+                     'ready', 'v1', ?, ?)",
+        )
+        .bind(id)
+        .bind(scope_kind)
+        .bind(NOW)
+        .bind(NOW)
+        .execute(&pool)
+        .await;
+        assert!(
+            duplicate.is_err(),
+            "duplicate {scope_kind} Runtime was accepted"
+        );
+    }
     Ok(())
 }

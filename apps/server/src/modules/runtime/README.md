@@ -4,7 +4,7 @@ Owns Runtime, finite Job, Session Service, Terminal, port registration, access-t
 
 Runtime owns process resources and recovery state. It does not decide Turn completion, inspect model credentials, or own workspace propagation state.
 
-## Terminal Backend (M4 Stage 3)
+## Terminal Backend
 
 Terminals use a **pipe backend**, not a PTY/ConPTY backend. The Local executor
 spawns `bash` (git bash on Windows, `/bin/bash` elsewhere) with stdin/stdout
@@ -22,9 +22,8 @@ bounded `LogStore` scrollback stream (`LogRetention::TERMINAL`).
 - A WebSocket connect replays scrollback from the requested cursor, then polls
   the scrollback projection to ship live bytes. Binary frames carry PTY output
   and raw input; JSON control frames carry `input`/`resize`/`signal`/`close`.
-- Session Terminal writes do not auto-advance `workspace_revision` yet; the
-  dirty/reconcile wiring ships with the M4/M5 Apply/Sync work that owns
-  propagation cursors.
+- Terminals are Project-owned and target the Main Workspace. Session workspaces
+  do not expose a Terminal.
 
 ## Recovery And Deletion
 
@@ -40,4 +39,3 @@ bounded `LogStore` scrollback stream (`LogRetention::TERMINAL`).
 - Graceful process shutdown (`application::lifecycle::graceful_shutdown`) walks
   live Runtimes with a wall-clock deadline so Local process groups do not leak
   across control-plane exits.
-

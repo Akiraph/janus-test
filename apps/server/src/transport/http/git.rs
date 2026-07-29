@@ -9,7 +9,7 @@
 //! `/git/update-conflicts/*`.
 
 use axum::{
-    Extension, Json,
+    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
@@ -29,7 +29,6 @@ use crate::{
         conditions::{RawBody, if_match_version, require_idempotency},
         dto::DataResponse,
         problem::Problem,
-        request_id::RequestContext,
     },
 };
 
@@ -439,18 +438,17 @@ pub async fn git_unstage(
 )]
 pub async fn git_commit(
     State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(input): Json<GitCommitRequest>,
 ) -> Result<Json<DataResponse<String>>, Problem> {
     let auth = authorized(&state, &headers).await?;
+    let correlation_id = CorrelationId::new();
     let sha = state
         .projects()
-        .git_commit(&auth.owner_id, &id, &input.message)
+        .git_commit(&auth.owner_id, &id, &input.message, correlation_id)
         .await
         .map_err(problem)?;
-    emit_git_state_changed(&state, &auth.owner_id, &id, &context).await;
     Ok(Json(DataResponse { data: sha }))
 }
 
@@ -674,30 +672,6 @@ pub async fn resolve_update_conflict(
         .await
         .map_err(problem)?;
     Ok(Json(DataResponse { data: view }))
-}
-
-// ----- Events --------------------------------------------------------------
-
-async fn emit_git_state_changed(
-    state: &AppState,
-    owner_id: &str,
-    project_id: &str,
-    context: &RequestContext,
-) {
-    if let Err(error) = state
-        .events()
-        .append(crate::platform::events::NewEvent {
-            event_type: "git.state_changed".into(),
-            actor: serde_json::json!({ "kind": "owner", "id": owner_id }),
-            resource: Some(serde_json::json!({ "kind": "project", "id": project_id })),
-            correlation_id: context.request_id.clone(),
-            causation_id: None,
-            payload: serde_json::json!({ "cause": "commit" }),
-        })
-        .await
-    {
-        tracing::error!(%error, %project_id, "append git state changed event");
-    }
 }
 
 // ----- Problem mapping -----------------------------------------------------

@@ -9,12 +9,15 @@ use crate::adapters::git::{GitRunner, SystemGit};
 use crate::modules::workspace_sync::interface::{
     FileMutation, WorkspaceHandle, WorkspaceSyncInterface,
 };
-use crate::platform::id::{SessionId, ToolCallId, TurnId};
+use crate::platform::id::{AskId, SessionId, ToolCallId, TurnId};
 use crate::platform::path::PathError;
 
 use super::paths::resolve_session_path;
 use super::registry::{is_forbidden_tool, is_registered};
-use super::types::{CompletionSummary, SupervisorError, ToolOutcome, ToolResultPart, TurnWait};
+use super::types::{
+    AskMode, AskRequest, CompletionSummary, SupervisorError, ToolExecutionDisposition, ToolOutcome,
+    ToolResultPart, TurnWait,
+};
 
 /// Hard image decode limits (SES-TOOL-READ-03 subset).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
@@ -38,7 +41,7 @@ pub async fn execute_tool(
 ) -> Result<ToolOutcome, SupervisorError> {
     if is_forbidden_tool(name) || !is_registered(name) {
         return Ok(ToolOutcome {
-            ok: false,
+            disposition: ToolExecutionDisposition::Failed,
             parts: vec![ToolResultPart::Text {
                 text: format!("tool not allowed: {name}"),
             }],
@@ -67,7 +70,7 @@ pub async fn execute_tool(
         "update_plan" => tool_update_plan(ctx, input).await,
         "ask_user" => tool_ask_user(ctx, input).await,
         other => Ok(ToolOutcome {
-            ok: false,
+            disposition: ToolExecutionDisposition::Failed,
             parts: vec![ToolResultPart::Text {
                 text: format!("unknown tool: {other}"),
             }],
@@ -83,12 +86,7 @@ fn session_repo(
     workspace: &WorkspaceSyncInterface,
     session_id: SessionId,
 ) -> Result<std::path::PathBuf, SupervisorError> {
-    Ok(
-        crate::modules::workspace_sync::session_copy::session_repo_abs(
-            workspace.data_root(),
-            session_id,
-        ),
-    )
+    Ok(workspace.session_repo_path(session_id))
 }
 
 async fn tool_list(repo: &Path, input: &Value) -> Result<ToolOutcome, SupervisorError> {
@@ -127,7 +125,7 @@ async fn tool_list(repo: &Path, input: &Value) -> Result<ToolOutcome, Supervisor
         }));
     }
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Json {
             value: json!({"entries": entries}),
         }],
@@ -144,7 +142,7 @@ fn path_invalid() -> Result<ToolOutcome, SupervisorError> {
 
 fn fail_text(msg: &str, code: &str) -> ToolOutcome {
     ToolOutcome {
-        ok: false,
+        disposition: ToolExecutionDisposition::Failed,
         parts: vec![ToolResultPart::Text {
             text: msg.to_owned(),
         }],
@@ -208,7 +206,7 @@ async fn tool_read(
         return Ok(fail_text("binary content", "UNSUPPORTED_IMAGE"));
     }
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text { text: text.clone() }],
         summary: json!({"path": raw, "kind": "text", "bytes": text.len()}),
         error_code: None,
@@ -418,7 +416,7 @@ async fn read_image(
     });
 
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![
             ToolResultPart::Image {
                 mime: mime_of(kind).into(),
@@ -485,7 +483,7 @@ async fn tool_write(
         )
         .await?;
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text {
             text: format!("wrote {path} -> {}", rev.0),
         }],
@@ -520,7 +518,7 @@ async fn tool_remove(
         )
         .await?;
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text {
             text: format!("removed {path} -> {}", rev.0),
         }],
@@ -544,7 +542,7 @@ async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
                 "untracked": st.untracked,
             });
             Ok(ToolOutcome {
-                ok: true,
+                disposition: ToolExecutionDisposition::Succeeded,
                 parts: vec![ToolResultPart::Json {
                     value: summary.clone(),
                 }],
@@ -568,7 +566,7 @@ fn tool_finish(input: &Value) -> Result<ToolOutcome, SupervisorError> {
     let summary_text = finish.summary.clone();
     let summary = serde_json::to_value(&finish)?;
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text {
             text: format!("finished: {summary_text}"),
         }],
@@ -583,15 +581,10 @@ async fn tool_finish_checked(
     ctx: &ToolContext<'_>,
     input: &Value,
 ) -> Result<ToolOutcome, SupervisorError> {
-    // A Turn cannot complete while it still controls unfinished finite Jobs.
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT COUNT(1) FROM jobs \
-         WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
-    )
-    .bind(ctx.turn_id.to_string())
-    .fetch_one(ctx.pool)
-    .await
-    .unwrap_or(0);
+    let remaining = match ctx.runtime {
+        Some(runtime) => runtime.unfinished_job_count(ctx.turn_id).await?,
+        None => 0,
+    };
     if remaining > 0 {
         let summary = json!({
             "waiting_for_job": true,
@@ -599,14 +592,14 @@ async fn tool_finish_checked(
             "note": "finish deferred until finite Jobs settle",
         });
         return Ok(ToolOutcome {
-            ok: true,
+            disposition: ToolExecutionDisposition::Succeeded,
             parts: vec![ToolResultPart::Text {
                 text: format!("finish deferred: {remaining} unfinished job(s)"),
             }],
             summary,
             error_code: None,
             finish_summary: None,
-            wait: Some(TurnWait::Job),
+            wait: Some(TurnWait::job()),
         });
     }
     tool_finish(input)
@@ -638,20 +631,23 @@ fn require_runtime<'a>(
 async fn ensure_session_runtime(
     ctx: &ToolContext<'_>,
 ) -> Result<crate::modules::runtime::interface::RuntimeProjection, SupervisorError> {
-    use crate::modules::runtime::interface::{ExecutorKind, NetworkPolicy, RuntimeSpec};
+    use crate::modules::runtime::interface::{
+        ExecutorKind, NetworkPolicy, RuntimeScope, RuntimeSpec,
+    };
     use crate::platform::id::RuntimeId;
 
     let runtime = require_runtime(ctx)?;
-    if let Ok(existing) = runtime.current_runtime(ctx.session_id).await {
-        if let Some(r) = existing {
-            return Ok(r);
-        }
+    if let Ok(Some(existing)) = runtime
+        .current_runtime(RuntimeScope::session(ctx.session_id))
+        .await
+    {
+        return Ok(existing);
     }
     let workspace_root = session_repo(ctx.workspace, ctx.session_id)?;
     let abs = workspace_root.canonicalize().unwrap_or(workspace_root);
     let spec = RuntimeSpec::new(
         RuntimeId::new(),
-        ctx.session_id,
+        RuntimeScope::session(ctx.session_id),
         ExecutorKind::Local,
         abs,
         default_limits(30_000),
@@ -743,7 +739,11 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
         exit_code, result.timed_out, result.duration_ms, stdout, stderr
     );
     Ok(ToolOutcome {
-        ok,
+        disposition: if ok {
+            ToolExecutionDisposition::Succeeded
+        } else {
+            ToolExecutionDisposition::Failed
+        },
         parts: vec![ToolResultPart::Text { text }],
         summary,
         error_code: if ok {
@@ -814,14 +814,14 @@ async fn tool_job(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, S
         "command_summary": job.command_summary,
     });
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Waiting,
         parts: vec![ToolResultPart::Text {
             text: format!("job {} started ({})", job.id, job.command_summary),
         }],
         summary,
         error_code: None,
         finish_summary: None,
-        wait: Some(TurnWait::Job),
+        wait: Some(TurnWait::job()),
     })
 }
 
@@ -900,7 +900,7 @@ async fn tool_service(
     });
     // Services do not block the Turn: they are Session-owned and outlive a Turn.
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text {
             text: format!(
                 "service {} started ({}, impact={:?})",
@@ -1019,7 +1019,7 @@ async fn tool_delegate_cli(
         "follow_up": cli_session_id.is_some(),
     });
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Waiting,
         parts: vec![ToolResultPart::Text {
             text: format!(
                 "delegate_cli ({cli_raw}) job {} started{}",
@@ -1034,7 +1034,7 @@ async fn tool_delegate_cli(
         summary,
         error_code: None,
         finish_summary: None,
-        wait: Some(TurnWait::Job),
+        wait: Some(TurnWait::job()),
     })
 }
 
@@ -1074,7 +1074,7 @@ async fn tool_update_plan(
         "sequence": next_seq,
     });
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Json {
             value: summary.clone(),
         }],
@@ -1090,7 +1090,6 @@ async fn tool_ask_user(
     input: &Value,
 ) -> Result<ToolOutcome, SupervisorError> {
     use crate::platform::clock::{Clock, SystemClock, format_utc};
-    use crate::platform::id::AskId;
 
     let prompt = input
         .get("prompt")
@@ -1100,65 +1099,79 @@ async fn tool_ask_user(
     if prompt.trim().is_empty() {
         return Ok(fail_text("prompt is required", "VALIDATION_FAILED"));
     }
-    let mode = input
+    let mode = match input
         .get("mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("blocking");
-    if mode != "blocking" && mode != "best_effort" {
+        .and_then(Value::as_str)
+        .unwrap_or("blocking")
+    {
+        "blocking" => AskMode::Blocking,
+        "best_effort" => AskMode::BestEffort,
+        _ => {
+            return Ok(fail_text(
+                "mode must be blocking|best_effort",
+                "VALIDATION_FAILED",
+            ));
+        }
+    };
+    let choices = input.get("choices").cloned().unwrap_or(json!([]));
+    let default = input.get("default").cloned();
+    let expires_in_ms = match input.get("expires_in_ms") {
+        None => None,
+        Some(value) => match value.as_u64().filter(|value| *value > 0) {
+            Some(value) => Some(value),
+            None => {
+                return Ok(fail_text(
+                    "expires_in_ms must be a positive integer",
+                    "VALIDATION_FAILED",
+                ));
+            }
+        },
+    };
+    if mode == AskMode::BestEffort && (default.is_none() || expires_in_ms.is_none()) {
         return Ok(fail_text(
-            "mode must be blocking|best_effort",
+            "best_effort requires default and expires_in_ms",
             "VALIDATION_FAILED",
         ));
     }
-    let choices = input.get("choices").cloned().unwrap_or(json!([]));
-    let default = input.get("default").cloned();
-    let expires_at = input
-        .get("expires_in_ms")
-        .and_then(|v| v.as_u64())
-        .map(|ms| {
-            let ts = SystemClock.now() + chrono::Duration::milliseconds(ms as i64);
-            format_utc(ts)
-        });
+    let expires_at = match expires_in_ms {
+        Some(milliseconds) => {
+            let milliseconds = match i64::try_from(milliseconds) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(fail_text("expires_in_ms is too large", "VALIDATION_FAILED"));
+                }
+            };
+            Some(format_utc(
+                SystemClock.now() + chrono::Duration::milliseconds(milliseconds),
+            ))
+        }
+        None => None,
+    };
     let ask_id = AskId::new();
-    let now = format_utc(SystemClock.now());
-    sqlx::query(
-        "INSERT INTO asks \
-         (id, turn_id, tool_call_id, mode, prompt_json, choices_json, default_json, \
-          answer_json, status, expires_at, answered_at, version, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'open', ?, NULL, ?, ?, ?)",
-    )
-    .bind(ask_id.to_string())
-    .bind(ctx.turn_id.to_string())
-    .bind(ctx.tool_call_id.to_string())
-    .bind(mode)
-    .bind(json!({"text": prompt}).to_string())
-    .bind(choices.to_string())
-    .bind(default.as_ref().map(|v| v.to_string()))
-    .bind(expires_at.as_deref())
-    .bind(format!("v_{}", AskId::new()))
-    .bind(&now)
-    .bind(&now)
-    .execute(ctx.pool)
-    .await?;
-
     let summary = json!({
         "ask_id": ask_id.to_string(),
-        "mode": mode,
+        "mode": mode.as_str(),
         "prompt": prompt,
         "expires_at": expires_at,
     });
+    let request = AskRequest {
+        id: ask_id,
+        turn_id: ctx.turn_id,
+        tool_call_id: ctx.tool_call_id,
+        mode,
+        prompt: json!({"text": prompt}),
+        choices,
+        default,
+        expires_at,
+    };
     Ok(ToolOutcome {
-        ok: true,
+        disposition: ToolExecutionDisposition::Waiting,
         parts: vec![ToolResultPart::Text {
-            text: format!("ask_user ({mode}): {prompt}"),
+            text: format!("ask_user ({}): {prompt}", mode.as_str()),
         }],
         summary,
         error_code: None,
         finish_summary: None,
-        wait: if mode == "blocking" {
-            Some(TurnWait::Ask)
-        } else {
-            None
-        },
+        wait: Some(TurnWait::ask(request)),
     })
 }

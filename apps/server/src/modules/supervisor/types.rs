@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::modules::models::interface::ModelsError;
-use crate::modules::sessions::types::SessionsError;
+use crate::modules::projects::interface::ProjectsError;
+use crate::modules::runtime::interface::RuntimeError;
+use crate::modules::sessions::interface::SessionsError;
 use crate::modules::workspace_sync::interface::WorkspaceSyncError;
+use crate::platform::id::{AskId, ToolCallId, TurnId};
 use crate::platform::path::PathError;
 
 #[derive(Debug, Error)]
@@ -16,6 +19,8 @@ pub enum SupervisorError {
     SessionNotFound,
     #[error("model is not configured")]
     ModelNotConfigured,
+    #[error("ask not found")]
+    AskNotFound,
     #[error("tool not allowed: {0}")]
     ToolNotAllowed(String),
     #[error("tool path invalid")]
@@ -32,6 +37,10 @@ pub enum SupervisorError {
     Workspace(#[from] WorkspaceSyncError),
     #[error("models error: {0}")]
     Models(#[from] ModelsError),
+    #[error("projects error: {0}")]
+    Projects(#[from] ProjectsError),
+    #[error("runtime error: {0}")]
+    Runtime(#[from] RuntimeError),
     #[error("path error: {0}")]
     Path(#[from] PathError),
     #[error("storage error: {0}")]
@@ -74,13 +83,70 @@ pub enum ToolResultPart {
 
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
-    pub ok: bool,
+    pub disposition: ToolExecutionDisposition,
     pub parts: Vec<ToolResultPart>,
     pub summary: serde_json::Value,
     pub error_code: Option<String>,
     /// When set, the Turn should complete with this summary.
     pub finish_summary: Option<CompletionSummary>,
     pub wait: Option<TurnWait>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExecutionDisposition {
+    Succeeded,
+    Failed,
+    Waiting,
+}
+
+impl ToolExecutionDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Waiting => "waiting",
+        }
+    }
+
+    pub const fn is_waiting(self) -> bool {
+        matches!(self, Self::Waiting)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallStatus {
+    Requested,
+    Running,
+    Waiting,
+    Succeeded,
+    Failed,
+    Canceled,
+    Lost,
+}
+
+impl ToolCallStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallSettlement {
+    pub tool_call_id: String,
+    pub source_turn_id: String,
+    pub provider_call_id: String,
+    pub tool_name: String,
+    pub status: ToolCallStatus,
+    pub summary: serde_json::Value,
+    pub model_parts: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,23 +211,178 @@ fn string_items(value: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnWait {
-    Job,
-    Ask,
+pub enum AskMode {
+    Blocking,
+    BestEffort,
 }
 
-impl TurnWait {
-    pub const fn status(self) -> &'static str {
+impl AskMode {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Job => "waiting_for_job",
-            Self::Ask => "waiting_for_ask",
+            Self::Blocking => "blocking",
+            Self::BestEffort => "best_effort",
         }
     }
 
-    pub const fn combine(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Ask, _) | (_, Self::Ask) => Self::Ask,
-            _ => Self::Job,
+    pub const fn is_blocking(self) -> bool {
+        matches!(self, Self::Blocking)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskStatus {
+    Open,
+    Answered,
+    Expired,
+    ClosedByHandoff,
+    Canceled,
+}
+
+impl AskStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Answered => "answered",
+            Self::Expired => "expired",
+            Self::ClosedByHandoff => "closed_by_handoff",
+            Self::Canceled => "canceled",
+        }
+    }
+}
+
+impl TryFrom<&str> for AskStatus {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "open" => Ok(Self::Open),
+            "answered" => Ok(Self::Answered),
+            "expired" => Ok(Self::Expired),
+            "closed_by_handoff" => Ok(Self::ClosedByHandoff),
+            "canceled" => Ok(Self::Canceled),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskClosure {
+    Handoff,
+    UserCancel,
+    ControlPlaneRestart,
+}
+
+impl AskClosure {
+    pub const fn status(self) -> AskStatus {
+        match self {
+            Self::Handoff => AskStatus::ClosedByHandoff,
+            Self::UserCancel | Self::ControlPlaneRestart => AskStatus::Canceled,
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Handoff => "handoff",
+            Self::UserCancel => "user_cancel",
+            Self::ControlPlaneRestart => "control_plane_restart",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AskRequest {
+    pub id: AskId,
+    pub turn_id: TurnId,
+    pub tool_call_id: ToolCallId,
+    pub mode: AskMode,
+    pub prompt: serde_json::Value,
+    pub choices: serde_json::Value,
+    pub default: Option<serde_json::Value>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskAnswerDisposition {
+    Accepted,
+    Duplicate,
+    Late,
+}
+
+#[derive(Debug, Clone)]
+pub struct AskAnswer {
+    pub ask_id: AskId,
+    pub turn_id: TurnId,
+    pub disposition: AskAnswerDisposition,
+    pub tool_call: Option<ToolCallSettlement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpiredAsk {
+    pub ask_id: AskId,
+    pub turn_id: TurnId,
+    pub default: Option<serde_json::Value>,
+    pub tool_call: ToolCallSettlement,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnWait {
+    waits_for_job: bool,
+    asks: Vec<AskRequest>,
+}
+
+impl TurnWait {
+    pub fn job() -> Self {
+        Self {
+            waits_for_job: true,
+            asks: Vec::new(),
+        }
+    }
+
+    pub fn ask(request: AskRequest) -> Self {
+        Self {
+            waits_for_job: false,
+            asks: vec![request],
+        }
+    }
+
+    pub fn status(&self) -> &'static str {
+        if self.has_ask() {
+            "waiting_for_ask"
+        } else if self.waits_for_job {
+            "waiting_for_job"
+        } else {
+            "running"
+        }
+    }
+
+    pub fn combine(mut self, mut other: Self) -> Self {
+        self.waits_for_job |= other.waits_for_job;
+        self.asks.append(&mut other.asks);
+        self
+    }
+
+    pub fn waits_for_job(&self) -> bool {
+        self.waits_for_job
+    }
+
+    pub fn has_ask(&self) -> bool {
+        !self.asks.is_empty()
+    }
+
+    pub fn asks(&self) -> &[AskRequest] {
+        &self.asks
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TurnExecutionOutcome {
+    pub coordination: Option<TurnWait>,
+}
+
+impl TurnExecutionOutcome {
+    pub fn coordinate(wait: TurnWait) -> Self {
+        Self {
+            coordination: Some(wait),
         }
     }
 }

@@ -9,7 +9,7 @@ import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
-import type { TerminalOwnerInput, TerminalProjection, TerminalTicket } from "../../../lib/api";
+import type { TerminalProjection, TerminalTicket } from "../../../lib/api";
 import {
   closeTerminal,
   createTerminal,
@@ -37,22 +37,13 @@ type ConnectState =
   | "error"
   | "closed";
 
-/**
- * Lazy Terminal panel. The xterm emulator is dynamically imported only when this
- * component mounts so the initial web bundle stays free of the emulator weight.
- *
- * createTerminal currently requires a durable Runtime id. Public HTTP does not
- * yet expose Runtime ensure/list for Project owners, so the panel reuses an
- * existing Terminal when present and surfaces a clear recovery state when create
- * cannot proceed without a Runtime.
- */
+/** Lazy Terminal panel; xterm stays outside the initial bundle. */
 export function TerminalPanel(props: TerminalPanelProps) {
   const queryClient = useQueryClient();
   const isMobile = useIsMobile();
   const [status, setStatus] = createSignal<ConnectState>("idle");
   const [error, setError] = createSignal("");
   const [terminal, setTerminal] = createSignal<TerminalProjection | null>(null);
-  const [runtimeHint, setRuntimeHint] = createSignal("");
 
   let hostEl: HTMLDivElement | undefined;
   // Emulator handles are intentionally untyped (`any`) here to keep the static
@@ -67,16 +58,10 @@ export function TerminalPanel(props: TerminalPanelProps) {
   let resizeObserver: ResizeObserver | undefined;
   let dataDisposable: { dispose: () => void } | undefined;
 
-  const owner = (): TerminalOwnerInput | undefined => {
-    const id = props.projectId();
-    if (!id) return undefined;
-    return { kind: "project", id };
-  };
-
   function invalidateList() {
-    const o = owner();
-    if (!o) return;
-    void queryClient.invalidateQueries({ queryKey: ["terminals", o.kind, o.id] });
+    const projectId = props.projectId();
+    if (!projectId) return;
+    void queryClient.invalidateQueries({ queryKey: ["terminals", projectId] });
   }
 
   async function ensureEmulator() {
@@ -226,37 +211,23 @@ export function TerminalPanel(props: TerminalPanelProps) {
   }
 
   async function bootstrap() {
-    const o = owner();
-    if (!o) return;
+    const projectId = props.projectId();
+    if (!projectId) return;
     if (isMobile()) return;
     setStatus("loading");
     setError("");
-    setRuntimeHint("");
     try {
-      const existing = await listTerminals({ kind: o.kind, id: o.id });
+      const existing = await listTerminals(projectId);
       const live = existing.find((t) => t.status === "running" || t.status === "starting");
       if (live) {
         await connectTo(live);
         return;
       }
 
-      // Prefer reusing a runtime_id from a prior terminal for this owner when
-      // present; otherwise we cannot create without a public Runtime ensure API.
-      const prior = existing[existing.length - 1];
-      if (!prior?.runtime_id) {
-        setStatus("error");
-        setRuntimeHint(
-          "No Runtime is attached yet. Start a Session Turn that uses process execution first, or wait until Runtime ensure is exposed over HTTP.",
-        );
-        setError("Terminal needs a Runtime before it can start");
-        return;
-      }
-
       const cols = Math.max(40, term?.cols ?? 80);
       const rows = Math.max(10, term?.rows ?? 24);
       const created = await createTerminal({
-        runtime_id: prior.runtime_id,
-        owner: o,
+        project_id: projectId,
         size: { cols, rows },
         working_directory: ".",
       });
@@ -334,7 +305,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
   });
 
   return (
-    <div class="terminal-panel" data-owner-kind="project">
+    <div class="terminal-panel">
       <div class="ide-sidebar-header terminal-panel__header">
         <span>{props.title ?? "Terminal"}</span>
         <div class="terminal-panel__actions">
@@ -394,9 +365,6 @@ export function TerminalPanel(props: TerminalPanelProps) {
         <Show when={error()}>
           <div class="terminal-panel__error">
             <ErrorBlock message={error()} retry={() => void onReconnect()} />
-            <Show when={runtimeHint()}>
-              <p class="terminal-panel__hint muted">{runtimeHint()}</p>
-            </Show>
           </div>
         </Show>
         <Show when={status() === "loading" || status() === "connecting"}>

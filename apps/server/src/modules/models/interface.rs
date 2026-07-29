@@ -4,15 +4,22 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use thiserror::Error;
 use url::Url;
 use utoipa::ToSchema;
 
 use crate::platform::{
     clock::format_utc,
-    id::{ModelId, ProviderId},
+    events::{EventStore, NewEvent},
+    id::{AttemptId, ModelId, ProviderId, RoundId},
     secret::{Secret, SecretCipher, fingerprint, mask_key},
+    unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
+};
+
+pub use super::stream_types::{
+    ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
+    StreamChannel, TokenUsage, ToolCallDelta, ToolSpec,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -106,6 +113,25 @@ pub struct ModelView {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedModel {
+    pub model_id: String,
+    pub provider_id: String,
+    pub display_name: String,
+    pub upstream_model_id: String,
+    pub context_limit: u32,
+    pub supports_images: bool,
+    pub supports_tools: bool,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelPreference<'a> {
+    pub model_id: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+    pub upstream_model_id: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelFailoverView {
     pub primary_model_id: String,
@@ -141,6 +167,7 @@ pub enum ModelsError {
 #[derive(Clone)]
 pub struct ModelsInterface {
     pool: SqlitePool,
+    unit_of_work: UnitOfWork,
     cipher: SecretCipher,
     client: reqwest::Client,
 }
@@ -176,9 +203,11 @@ struct ModelRow {
 }
 
 impl ModelsInterface {
-    pub fn new(pool: SqlitePool, cipher: SecretCipher) -> anyhow::Result<Self> {
+    pub fn new(pool: SqlitePool, cipher: SecretCipher, events: EventStore) -> anyhow::Result<Self> {
+        let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Ok(Self {
             pool,
+            unit_of_work,
             cipher,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(8))
@@ -207,11 +236,67 @@ impl ModelsInterface {
         rows.into_iter().map(model_view).collect()
     }
 
+    pub async fn resolve_for_turn_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        owner_id: &str,
+        preference: ModelPreference<'_>,
+    ) -> Result<Option<ResolvedModel>, ModelsError> {
+        let row = if let (Some(provider_id), Some(upstream_model_id)) =
+            (preference.provider_id, preference.upstream_model_id)
+        {
+            sqlx::query_as::<_, ModelRow>(
+                "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
+                        model.context_limit, model.supports_images, model.supports_tools, \
+                        model.parameters_json, model.enabled, model.created_at, model.updated_at \
+                 FROM models AS model \
+                 JOIN model_providers AS provider ON provider.id = model.provider_id \
+                 WHERE provider.owner_id = ? AND provider.id = ? \
+                   AND model.upstream_model_id = ? AND provider.enabled = 1 AND model.enabled = 1 \
+                 ORDER BY model.display_name, model.id LIMIT 1",
+            )
+            .bind(owner_id)
+            .bind(provider_id)
+            .bind(upstream_model_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else if let Some(model_id) = preference.model_id {
+            sqlx::query_as::<_, ModelRow>(
+                "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
+                        model.context_limit, model.supports_images, model.supports_tools, \
+                        model.parameters_json, model.enabled, model.created_at, model.updated_at \
+                 FROM models AS model \
+                 JOIN model_providers AS provider ON provider.id = model.provider_id \
+                 WHERE provider.owner_id = ? AND model.id = ? \
+                   AND provider.enabled = 1 AND model.enabled = 1",
+            )
+            .bind(owner_id)
+            .bind(model_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_as::<_, ModelRow>(
+                "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
+                        model.context_limit, model.supports_images, model.supports_tools, \
+                        model.parameters_json, model.enabled, model.created_at, model.updated_at \
+                 FROM models AS model \
+                 JOIN model_providers AS provider ON provider.id = model.provider_id \
+                 WHERE provider.owner_id = ? AND provider.enabled = 1 AND model.enabled = 1 \
+                 ORDER BY provider.display_name, model.display_name, model.id LIMIT 1",
+            )
+            .bind(owner_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        };
+        row.map(resolved_model).transpose()
+    }
+
     pub async fn set_failover(
         &self,
         owner_id: &str,
         primary_model_id: &str,
         candidates: Vec<String>,
+        correlation_id: &str,
     ) -> Result<ModelFailoverView, ModelsError> {
         if candidates.len() > 2 {
             return Err(ModelsError::Validation(
@@ -246,10 +331,10 @@ impl ModelsInterface {
             }
         }
         let now = format_utc(Utc::now());
-        let mut tx = self.pool.begin().await?;
+        let mut work = self.unit_of_work.begin().await?;
         sqlx::query("DELETE FROM model_failover WHERE primary_model_id = ?")
             .bind(primary_model_id)
-            .execute(&mut *tx)
+            .execute(work.connection())
             .await?;
         for (ordinal, candidate) in candidates.iter().enumerate() {
             sqlx::query(
@@ -260,10 +345,19 @@ impl ModelsInterface {
             .bind(candidate)
             .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(work.connection())
             .await?;
         }
-        tx.commit().await?;
+        self.append_config_changed_in_tx(
+            &mut work,
+            owner_id,
+            primary_model_id,
+            "model",
+            "failover_updated",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
         Ok(ModelFailoverView {
             primary_model_id: primary_model_id.into(),
             candidates,
@@ -302,6 +396,7 @@ impl ModelsInterface {
         &self,
         owner_id: &str,
         input: ProviderInput,
+        correlation_id: &str,
     ) -> Result<ProviderView, ModelsError> {
         validate_provider(&input)?;
         validate_models(&input)?;
@@ -316,12 +411,21 @@ impl ModelsInterface {
                 .map(EmbeddedModelInput::to_view)
                 .collect::<Vec<_>>(),
         )?;
-        let mut tx = self.pool.begin().await?;
+        let mut work = self.unit_of_work.begin().await?;
         sqlx::query("INSERT INTO model_providers (id, owner_id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&id).bind(owner_id).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(&mut *tx).await?;
-        self.sync_normalized_models(&mut tx, &id, &input.models, &now)
+            .bind(&id).bind(owner_id).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(work.connection()).await?;
+        self.sync_normalized_models(work.connection(), &id, &input.models, &now)
             .await?;
-        tx.commit().await?;
+        self.append_config_changed_in_tx(
+            &mut work,
+            owner_id,
+            &id,
+            "provider",
+            "created",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
         self.provider(owner_id, &id).await
     }
 
@@ -330,6 +434,7 @@ impl ModelsInterface {
         owner_id: &str,
         id: &str,
         input: ProviderInput,
+        correlation_id: &str,
     ) -> Result<ProviderView, ModelsError> {
         validate_provider(&input)?;
         validate_models(&input)?;
@@ -354,29 +459,56 @@ impl ModelsInterface {
                 .collect::<Vec<_>>(),
         )?;
         let now = format_utc(Utc::now());
-        let mut tx = self.pool.begin().await?;
+        let mut work = self.unit_of_work.begin().await?;
         let changed = sqlx::query("UPDATE model_providers SET kind=?, display_name=?, base_url=?, api_key_ciphertext=?, api_key_fingerprint=?, api_key_preview=?, models_json=?, enabled=?, updated_at=? WHERE id=? AND owner_id=?")
-            .bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(&mut *tx).await?.rows_affected();
+            .bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(work.connection()).await?.rows_affected();
         if changed == 0 {
+            work.rollback().await?;
             return Err(ModelsError::ProviderNotFound);
         }
-        self.sync_normalized_models(&mut tx, id, &input.models, &now)
+        self.sync_normalized_models(work.connection(), id, &input.models, &now)
             .await?;
-        tx.commit().await?;
+        self.append_config_changed_in_tx(
+            &mut work,
+            owner_id,
+            id,
+            "provider",
+            "updated",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
         self.provider(owner_id, id).await
     }
 
-    pub async fn delete_provider(&self, owner_id: &str, id: &str) -> Result<(), ModelsError> {
+    pub async fn delete_provider(
+        &self,
+        owner_id: &str,
+        id: &str,
+        correlation_id: &str,
+    ) -> Result<(), ModelsError> {
+        let mut work = self.unit_of_work.begin().await?;
         if sqlx::query("DELETE FROM model_providers WHERE id=? AND owner_id=?")
             .bind(id)
             .bind(owner_id)
-            .execute(&self.pool)
+            .execute(work.connection())
             .await?
             .rows_affected()
             == 0
         {
+            work.rollback().await?;
             return Err(ModelsError::ProviderNotFound);
         }
+        self.append_config_changed_in_tx(
+            &mut work,
+            owner_id,
+            id,
+            "provider",
+            "deleted",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
         Ok(())
     }
 
@@ -499,9 +631,9 @@ impl ModelsInterface {
         req: &super::stream_types::ModelRequest,
     ) -> Result<(), ModelsError> {
         let ended = format_utc(Utc::now());
-        sqlx::query(
+        let changed = sqlx::query(
             "UPDATE model_attempts SET status = ?, input_tokens = ?, output_tokens = ?, \
-             normalized_error_json = ?, ended_at = ? WHERE id = ?",
+             normalized_error_json = ?, ended_at = ? WHERE id = ? AND status = 'running'",
         )
         .bind(status)
         .bind(input_tokens)
@@ -510,10 +642,12 @@ impl ModelsInterface {
         .bind(&ended)
         .bind(attempt_id)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
 
         // Ledger only when usage was reported (including failed attempts with tokens).
-        if let (Some(inp), Some(out)) = (input_tokens, output_tokens)
+        if changed == 1
+            && let (Some(inp), Some(out)) = (input_tokens, output_tokens)
             && let (Some(project_id), Some(session_id), Some(turn_id), Some(round_id)) = (
                 req.project_id.as_ref(),
                 req.session_id.as_ref(),
@@ -547,9 +681,86 @@ impl ModelsInterface {
         Ok(())
     }
 
+    pub(crate) async fn interrupt_running_attempts_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        now: &str,
+    ) -> Result<(), ModelsError> {
+        sqlx::query(
+            "UPDATE model_attempts SET status = 'interrupted', normalized_error_json = ?, \
+                    ended_at = ? WHERE status = 'running'",
+        )
+        .bind(serde_json::json!({"code": "CONTROL_PLANE_RESTART"}).to_string())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn cancel_running_attempts_for_rounds_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        round_ids: &[RoundId],
+        now: &str,
+    ) -> Result<u64, ModelsError> {
+        let mut canceled = 0;
+        for round_id in round_ids {
+            canceled += sqlx::query(
+                "UPDATE model_attempts SET status = 'canceled', normalized_error_json = ?, \
+                        ended_at = ? WHERE round_id = ? AND status = 'running'",
+            )
+            .bind(serde_json::json!({"code": "USER_CANCEL"}).to_string())
+            .bind(now)
+            .bind(round_id.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        Ok(canceled)
+    }
+
+    pub(crate) async fn attempt_ids_for_rounds_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        round_ids: &[RoundId],
+    ) -> Result<Vec<AttemptId>, ModelsError> {
+        let mut attempts = Vec::new();
+        for round_id in round_ids {
+            let rows = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM model_attempts WHERE round_id = ? ORDER BY created_at",
+            )
+            .bind(round_id.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+            for id in rows {
+                attempts.push(
+                    id.parse::<AttemptId>()
+                        .map_err(|error| ModelsError::Internal(anyhow::anyhow!(error)))?,
+                );
+            }
+        }
+        Ok(attempts)
+    }
+
+    pub(crate) async fn delete_attempts_for_rounds_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        round_ids: &[RoundId],
+    ) -> Result<u64, ModelsError> {
+        let mut deleted = 0;
+        for round_id in round_ids {
+            deleted += sqlx::query("DELETE FROM model_attempts WHERE round_id = ?")
+                .bind(round_id.to_string())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        Ok(deleted)
+    }
+
     async fn sync_normalized_models(
         &self,
-        tx: &mut Transaction<'_, Sqlite>,
+        tx: &mut SqliteConnection,
         provider_id: &str,
         inputs: &[EmbeddedModelInput],
         now: &str,
@@ -558,7 +769,7 @@ impl ModelsInterface {
             "SELECT id, display_name, upstream_model_id FROM models WHERE provider_id = ?",
         )
         .bind(provider_id)
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut *tx)
         .await?;
         let mut retained = std::collections::BTreeSet::new();
         for input in inputs {
@@ -593,17 +804,38 @@ impl ModelsInterface {
             .bind(input.enabled)
             .bind(now)
             .bind(now)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         }
         for (id, _, _) in existing {
             if !retained.contains(&id) {
                 sqlx::query("DELETE FROM models WHERE id = ?")
                     .bind(id)
-                    .execute(&mut **tx)
+                    .execute(&mut *tx)
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    async fn append_config_changed_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        owner_id: &str,
+        resource_id: &str,
+        resource_kind: &str,
+        operation: &str,
+        correlation_id: &str,
+    ) -> Result<(), ModelsError> {
+        work.append_event(NewEvent {
+            event_type: "model_config.changed".into(),
+            actor: serde_json::json!({"kind": "owner", "id": owner_id}),
+            resource: Some(serde_json::json!({"kind": resource_kind, "id": resource_id})),
+            correlation_id: correlation_id.to_owned(),
+            causation_id: None,
+            payload: serde_json::json!({"operation": operation}),
+        })
+        .await?;
         Ok(())
     }
 
@@ -771,5 +1003,19 @@ fn model_view(row: ModelRow) -> Result<ModelView, ModelsError> {
         enabled: row.enabled != 0,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    })
+}
+
+fn resolved_model(row: ModelRow) -> Result<ResolvedModel, ModelsError> {
+    Ok(ResolvedModel {
+        model_id: row.id,
+        provider_id: row.provider_id,
+        display_name: row.display_name,
+        upstream_model_id: row.upstream_model_id,
+        context_limit: u32::try_from(row.context_limit)
+            .map_err(|_| ModelsError::Validation("invalid stored context limit".into()))?,
+        supports_images: row.supports_images != 0,
+        supports_tools: row.supports_tools != 0,
+        parameters: serde_json::from_str(&row.parameters_json)?,
     })
 }

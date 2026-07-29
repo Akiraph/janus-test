@@ -13,7 +13,7 @@
     "format": "biome check --write src e2e playwright.config.ts vite.config.ts",
     "generate:types": "openapi-typescript ../../generated/openapi.json -o src/generated/api.ts && biome check --write src/generated/api.ts",
     "test:e2e": "playwright test",
-    "test:e2e:live": "cargo build --manifest-path ../../Cargo.toml -p janus-server && playwright test live-supervisor.spec.ts"
+    "test:e2e:live": "cargo build --manifest-path ../../Cargo.toml -p janus-server -p janus-test && playwright test live-supervisor.spec.ts"
   },
   "dependencies": {
     "@fontsource-variable/cascadia-code": "^5.3.0",

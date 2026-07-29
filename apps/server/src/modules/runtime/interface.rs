@@ -20,6 +20,7 @@ use crate::platform::{
     secret::Secret,
 };
 
+pub(crate) use super::log_store::{LogRetention, LogStore};
 pub use super::service::RuntimeInterface;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -354,6 +355,44 @@ pub enum RuntimeStatus {
     Lost,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeScope {
+    Project { project_id: ProjectId },
+    Session { session_id: SessionId },
+}
+
+impl RuntimeScope {
+    pub const fn project(project_id: ProjectId) -> Self {
+        Self::Project { project_id }
+    }
+
+    pub const fn session(session_id: SessionId) -> Self {
+        Self::Session { session_id }
+    }
+
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::Project { .. } => "project",
+            Self::Session { .. } => "session",
+        }
+    }
+
+    pub(crate) fn id(self) -> String {
+        match self {
+            Self::Project { project_id } => project_id.to_string(),
+            Self::Session { session_id } => session_id.to_string(),
+        }
+    }
+
+    pub(crate) const fn capability_scope(self) -> CapabilityScope {
+        match self {
+            Self::Project { .. } => CapabilityScope::Project,
+            Self::Session { .. } => CapabilityScope::Session,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -363,6 +402,26 @@ pub enum JobStatus {
     Failed,
     Canceled,
     Lost,
+}
+
+impl JobStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Lost => "lost",
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Canceled | Self::Lost
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -634,7 +693,7 @@ fn validate_environment_name(name: &str) -> Result<(), RuntimeError> {
 #[derive(Debug)]
 pub struct RuntimeSpec {
     id: RuntimeId,
-    session_id: SessionId,
+    scope: RuntimeScope,
     executor: ExecutorKind,
     workspace_root: PathBuf,
     limits: ResourceLimits,
@@ -644,7 +703,7 @@ pub struct RuntimeSpec {
 impl RuntimeSpec {
     pub fn new(
         id: RuntimeId,
-        session_id: SessionId,
+        scope: RuntimeScope,
         executor: ExecutorKind,
         workspace_root: PathBuf,
         limits: ResourceLimits,
@@ -658,7 +717,7 @@ impl RuntimeSpec {
         limits.validate()?;
         Ok(Self {
             id,
-            session_id,
+            scope,
             executor,
             workspace_root,
             limits,
@@ -670,8 +729,8 @@ impl RuntimeSpec {
         self.id
     }
 
-    pub fn session_id(&self) -> SessionId {
-        self.session_id
+    pub fn scope(&self) -> RuntimeScope {
+        self.scope
     }
 
     pub fn executor(&self) -> ExecutorKind {
@@ -813,13 +872,6 @@ impl ServiceSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
-pub enum TerminalOwner {
-    Project(ProjectId),
-    Session(SessionId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TerminalSize {
     pub cols: u16,
     pub rows: u16,
@@ -840,7 +892,7 @@ impl TerminalSize {
 pub struct TerminalSpec {
     pub id: TerminalId,
     pub runtime_id: RuntimeId,
-    pub owner: TerminalOwner,
+    pub project_id: ProjectId,
     pub working_directory: RelativeWorkingDirectory,
     pub environment: ExecutionEnvironment,
     pub size: TerminalSize,
@@ -1109,7 +1161,7 @@ pub trait RuntimeExecutor: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RuntimeProjection {
     pub id: RuntimeId,
-    pub session_id: SessionId,
+    pub scope: RuntimeScope,
     pub executor: ExecutorKind,
     pub status: RuntimeStatus,
     pub capabilities: Vec<RuntimeCapability>,
@@ -1180,7 +1232,7 @@ pub struct RuntimePortProjection {
 pub struct TerminalProjection {
     pub id: TerminalId,
     pub runtime_id: RuntimeId,
-    pub owner: TerminalOwner,
+    pub project_id: ProjectId,
     pub status: TerminalStatus,
     pub size: TerminalSize,
     pub scrollback_stream_id: LogStreamId,

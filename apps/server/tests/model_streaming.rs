@@ -1,4 +1,4 @@
-//! TST-MODEL-M3: OpenAI-compatible + Anthropic stream against a local fixture HTTP server.
+//! OpenAI-compatible and Anthropic streaming against a local fixture HTTP server.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use janus_server::modules::models::interface::{ModelsInterface, ProviderInput, P
 use janus_server::modules::models::stream_types::{
     ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
 };
-use janus_server::platform::{database::Database, secret::SecretCipher};
+use janus_server::platform::{database::Database, events::EventStore, secret::SecretCipher};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -125,7 +125,8 @@ async fn models_with_root(temp: &TempDir) -> anyhow::Result<(Database, ModelsInt
         .execute(&pool)
         .await?;
     let cipher = SecretCipher::load(temp.path(), RunMode::Development)?;
-    let models = ModelsInterface::new(pool, cipher)?;
+    let events = EventStore::new(pool.clone());
+    let models = ModelsInterface::new(pool, cipher, events)?;
     Ok((database, models, owner_id.into()))
 }
 
@@ -136,11 +137,12 @@ fn user_msg(text: &str) -> ChatMessage {
             text: text.to_owned(),
         }],
         tool_call_id: None,
+        tool_calls: Vec::new(),
     }
 }
 
 #[tokio::test]
-async fn tst_model_m3_openai_chat_stream() -> anyhow::Result<()> {
+async fn openai_chat_stream() -> anyhow::Result<()> {
     let (addr, _state) = spawn_fixture("openai").await?;
     let temp = TempDir::new()?;
     let (_db, models, owner) = models_with_root(&temp).await?;
@@ -163,6 +165,7 @@ async fn tst_model_m3_openai_chat_stream() -> anyhow::Result<()> {
                 ],
                 enabled: true,
             },
+            "test-model-config",
         )
         .await?;
 
@@ -224,7 +227,7 @@ async fn tst_model_m3_openai_chat_stream() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn tst_model_m3_anthropic_stream() -> anyhow::Result<()> {
+async fn anthropic_messages_stream() -> anyhow::Result<()> {
     let (addr, _state) = spawn_fixture("anthropic").await?;
     let temp = TempDir::new()?;
     let (_db, models, owner) = models_with_root(&temp).await?;
@@ -247,6 +250,7 @@ async fn tst_model_m3_anthropic_stream() -> anyhow::Result<()> {
                 ],
                 enabled: true,
             },
+            "test-model-config",
         )
         .await?;
 
@@ -299,6 +303,7 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
                 ],
                 enabled: true,
             },
+            "test-model-config",
         )
         .await?;
 

@@ -61,6 +61,10 @@ pub mod codes {
     pub const ACTIVE_TURN_EXISTS: &str = "ACTIVE_TURN_EXISTS";
     pub const SESSION_DELETING: &str = "SESSION_DELETING";
     pub const TIMELINE_CURSOR_INVALID: &str = "TIMELINE_CURSOR_INVALID";
+    pub const TURN_NOT_INTERACTIVE: &str = "TURN_NOT_INTERACTIVE";
+    pub const TURN_TERMINAL: &str = "TURN_TERMINAL";
+    pub const ASK_NOT_FOUND: &str = "ASK_NOT_FOUND";
+    pub const ASK_NOT_OPEN: &str = "ASK_NOT_OPEN";
 
     // Models
     pub const PROVIDER_STREAM_FAILED: &str = "PROVIDER_STREAM_FAILED";
@@ -93,13 +97,19 @@ pub mod codes {
 fn code_status_title(code: &str) -> (StatusCode, &'static str) {
     use codes::*;
     match code {
-        RESOURCE_NOT_FOUND | SESSION_NOT_FOUND => (StatusCode::NOT_FOUND, "Resource not found"),
+        RESOURCE_NOT_FOUND | SESSION_NOT_FOUND | ASK_NOT_FOUND => {
+            (StatusCode::NOT_FOUND, "Resource not found")
+        }
         RESOURCE_VERSION_MISMATCH => (StatusCode::PRECONDITION_FAILED, "Resource version mismatch"),
         PRECONDITION_REQUIRED => (StatusCode::PRECONDITION_REQUIRED, "Precondition required"),
         IDEMPOTENCY_KEY_REUSED => (StatusCode::CONFLICT, "Idempotency key reused"),
-        OPERATION_IN_PROGRESS | ACTIVE_TURN_EXISTS | SESSION_DELETING | RESOURCE_BUSY => {
-            (StatusCode::CONFLICT, "Operation conflict")
-        }
+        OPERATION_IN_PROGRESS
+        | ACTIVE_TURN_EXISTS
+        | SESSION_DELETING
+        | RESOURCE_BUSY
+        | TURN_NOT_INTERACTIVE
+        | TURN_TERMINAL
+        | ASK_NOT_OPEN => (StatusCode::CONFLICT, "Operation conflict"),
         VALIDATION_FAILED
         | TIMELINE_CURSOR_INVALID
         | TOOL_PATH_INVALID

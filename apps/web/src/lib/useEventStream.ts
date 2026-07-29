@@ -106,7 +106,6 @@ export function useEventStream() {
         void queryClient.invalidateQueries({ queryKey: ["session-timeline", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["session-diff", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["turn", sessionId] });
-        void queryClient.invalidateQueries({ queryKey: ["terminals", "session", sessionId] });
       }
       // Project session lists are keyed by project id when known.
       const projectId = (payload as { project_id?: string }).project_id;
@@ -134,13 +133,9 @@ export function useEventStream() {
       if (terminalId) {
         void queryClient.invalidateQueries({ queryKey: ["terminal", terminalId] });
       }
-      const ownerKind = (payload as { owner_kind?: string }).owner_kind;
-      const ownerId =
-        (payload as { owner_id?: string; project_id?: string; session_id?: string }).owner_id ??
-        (payload as { project_id?: string }).project_id ??
-        (payload as { session_id?: string }).session_id;
-      if (ownerKind && ownerId) {
-        void queryClient.invalidateQueries({ queryKey: ["terminals", ownerKind, ownerId] });
+      const projectId = (payload as { project_id?: string }).project_id;
+      if (projectId) {
+        void queryClient.invalidateQueries({ queryKey: ["terminals", projectId] });
       } else {
         void queryClient.invalidateQueries({ queryKey: ["terminals"] });
       }

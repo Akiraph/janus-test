@@ -115,6 +115,18 @@ impl EventStore {
     }
 
     pub async fn append(&self, event: NewEvent) -> anyhow::Result<EventEnvelope> {
+        let mut transaction = self.inner.pool.begin().await?;
+        let envelope = self.append_in_tx(&mut transaction, event).await?;
+        transaction.commit().await?;
+        self.notify_committed();
+        Ok(envelope)
+    }
+
+    pub(crate) async fn append_in_tx(
+        &self,
+        transaction: &mut sqlx::SqliteConnection,
+        event: NewEvent,
+    ) -> anyhow::Result<EventEnvelope> {
         let event_id = EventId::new().to_string();
         let occurred_at = format_utc(SystemClock.now());
         let result = sqlx::query(
@@ -128,11 +140,10 @@ impl EventStore {
         .bind(&event.causation_id)
         .bind(serde_json::to_string(&event.payload)?)
         .bind(&occurred_at)
-        .execute(&self.inner.pool)
+        .execute(&mut *transaction)
         .await
         .context("append public event")?;
         let cursor = u64::try_from(result.last_insert_rowid())?;
-        let _ = self.inner.notifier.send(());
 
         Ok(EventEnvelope {
             schema_version: 1,
@@ -146,6 +157,10 @@ impl EventStore {
             causation_id: event.causation_id,
             payload: event.payload,
         })
+    }
+
+    pub(crate) fn notify_committed(&self) {
+        let _ = self.inner.notifier.send(());
     }
 
     pub async fn bounds(&self) -> anyhow::Result<EventBounds> {

@@ -4,15 +4,12 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::modules::workspace_sync::interface::WorkspaceSyncError;
+use crate::platform::id::{AskId, ProjectId, SessionId, TurnId};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionsError {
     #[error("session not found")]
     NotFound,
-    #[error("project not found")]
-    ProjectNotFound,
-    #[error("project is not ready")]
-    ProjectNotReady,
     #[error("session is deleting")]
     SessionDeleting,
     #[error("active turn already exists")]
@@ -101,6 +98,43 @@ impl TurnStatus {
     pub const fn advances_queue(self) -> bool {
         matches!(self, Self::Completed | Self::Canceled)
     }
+
+    pub const fn can_transition_to(self, target: Self) -> bool {
+        match self {
+            Self::Queued => matches!(target, Self::Running),
+            Self::Running => matches!(
+                target,
+                Self::WaitingForJob
+                    | Self::WaitingForAsk
+                    | Self::WaitingForModel
+                    | Self::Canceling
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Interrupted
+            ),
+            Self::WaitingForJob => matches!(
+                target,
+                Self::Running
+                    | Self::WaitingForAsk
+                    | Self::Canceling
+                    | Self::Interrupted
+                    | Self::HandedOff
+            ),
+            Self::WaitingForAsk => matches!(
+                target,
+                Self::Running | Self::WaitingForJob | Self::Canceling | Self::Interrupted
+            ),
+            Self::WaitingForModel => {
+                matches!(target, Self::Running | Self::Canceling | Self::Interrupted)
+            }
+            Self::Canceling => matches!(target, Self::Canceled | Self::Interrupted),
+            Self::Completed
+            | Self::Failed
+            | Self::Canceled
+            | Self::Interrupted
+            | Self::HandedOff => false,
+        }
+    }
 }
 
 impl std::str::FromStr for TurnStatus {
@@ -168,12 +202,39 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TurnModelSnapshot {
+    pub model_id: String,
+    pub provider_id: String,
+    pub display_name: String,
+    pub upstream_model_id: String,
+    pub context_limit: u32,
+    pub supports_images: bool,
+    pub supports_tools: bool,
+    pub parameters: serde_json::Value,
+}
+
+impl TurnModelSnapshot {
+    pub(crate) fn parse(raw: &str) -> Result<Option<Self>, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(raw)?;
+        if value.is_null()
+            || value
+                .get("provider_id")
+                .is_none_or(serde_json::Value::is_null)
+        {
+            return Ok(None);
+        }
+        serde_json::from_value(value).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TurnSummary {
     pub id: String,
     pub session_id: String,
     pub sequence: i64,
     pub status: String,
     pub input_message_id: Option<String>,
+    pub model_snapshot: Option<TurnModelSnapshot>,
     pub predecessor_turn_id: Option<String>,
     pub handoff_from_turn_id: Option<String>,
     pub handoff_to_turn_id: Option<String>,
@@ -197,14 +258,13 @@ pub struct MessageRouteResult {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionTurn {
-    pub id: String,
-    pub session_id: String,
-    pub project_id: String,
-    pub owner_id: String,
+    pub id: TurnId,
+    pub session_id: SessionId,
+    pub project_id: ProjectId,
     pub status: TurnStatus,
     pub sequence: i64,
     pub active: bool,
-    pub next_model_ref: Option<String>,
+    pub model_snapshot: Option<TurnModelSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +282,60 @@ pub struct TurnTransition {
     pub session_version: String,
 }
 
+pub enum ActiveTurnOutcome<'a> {
+    Completed {
+        summary: &'a serde_json::Value,
+        input_tokens: i64,
+        output_tokens: i64,
+    },
+    Failed {
+        reason: &'a str,
+        summary: &'a serde_json::Value,
+    },
+    Canceled {
+        reason: &'a str,
+    },
+    Interrupted {
+        reason: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnBlockers {
+    pub open_ask: bool,
+    pub unfinished_job: bool,
+}
+
+impl TurnBlockers {
+    pub const fn status(self) -> TurnStatus {
+        if self.open_ask {
+            TurnStatus::WaitingForAsk
+        } else if self.unfinished_job {
+            TurnStatus::WaitingForJob
+        } else {
+            TurnStatus::Running
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnBlockerOutcome {
+    pub session_id: SessionId,
+    pub status: TurnStatus,
+    pub active: bool,
+    pub session_version: String,
+    pub transition: Option<TurnTransition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredTurn {
+    pub turn_id: TurnId,
+    pub session_id: SessionId,
+    pub from_status: TurnStatus,
+    pub turn_version: String,
+    pub session_version: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalSettlement {
     pub transition: Option<TurnTransition>,
@@ -233,8 +347,17 @@ pub struct SessionCommandState {
     pub project_id: String,
     pub state: String,
     pub workspace_handle: String,
+    pub next_model_ref: Option<String>,
     pub active_turn_id: Option<String>,
     pub session_version: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedTurnCandidate {
+    pub turn_id: TurnId,
+    pub session_id: SessionId,
+    pub project_id: ProjectId,
+    pub next_model_ref: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +368,31 @@ pub struct CreatedTurnInput {
     pub sequence: i64,
     pub display_order: i64,
     pub checkpoint_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordedTurnInput {
+    pub message_id: String,
+    pub timeline_item_id: String,
+    pub display_order: i64,
+}
+
+pub struct RecordAskAnswer<'a> {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub ask_id: AskId,
+    pub answer: &'a serde_json::Value,
+    pub actor: &'a serde_json::Value,
+    pub now: &'a str,
+}
+
+pub struct AppendAssistantMessage<'a> {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub text: &'a str,
+    pub tool_calls: &'a serde_json::Value,
+    pub actor: &'a serde_json::Value,
+    pub now: &'a str,
 }
 
 /// A queued Turn awaiting promotion (projection used by Session UI queue view).

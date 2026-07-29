@@ -6,6 +6,7 @@
 //! disconnects and process restarts (`DAT-OP-01/02`).
 
 pub mod lifecycle;
-pub mod runtime_events;
+pub mod project_terminal;
 pub mod session_flow;
+pub mod turn_execution;
 pub mod workers;

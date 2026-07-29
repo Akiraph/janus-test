@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
 
     workers::spawn(state.clone());
     workers::spawn_job_wake(state.clone());
+    workers::spawn_ask_expiry(state.clone());
 
     let listener = TcpListener::bind(bind)
         .await

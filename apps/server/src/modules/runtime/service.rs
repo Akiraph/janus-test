@@ -1,16 +1,16 @@
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use serde_json::json;
 use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 use super::{
     interface::{
-        CapabilityScope, DeploymentCapabilityProbe, EffectiveCapabilityConfig, ExecutionResult,
-        ExecutionSpec, ExecutorKind, ExitSummary, JobProjection, JobSpec, JobStatus, LogChannel,
-        LogCursor, LogRange, LogStreamProjection, ProcessCompletion, ResourceLimits, ResourceUsage,
-        RuntimeCapabilityEvaluator, RuntimeError, RuntimeExecutor, RuntimeProjection, RuntimeSpec,
-        RuntimeStatus, ServiceHealth, ServiceImpact, ServiceProjection, ServiceSpec, ServiceStatus,
-        TerminalOwner, TerminalProjection, TerminalSignal, TerminalSize, TerminalSpec,
+        DeploymentCapabilityProbe, EffectiveCapabilityConfig, ExecutionResult, ExecutionSpec,
+        ExecutorKind, ExitSummary, JobProjection, JobSpec, JobStatus, LogChannel, LogCursor,
+        LogRange, LogStreamProjection, ProcessCompletion, ResourceLimits, ResourceUsage,
+        RuntimeCapabilityEvaluator, RuntimeError, RuntimeExecutor, RuntimeProjection, RuntimeScope,
+        RuntimeSpec, RuntimeStatus, ServiceHealth, ServiceImpact, ServiceProjection, ServiceSpec,
+        ServiceStatus, TerminalProjection, TerminalSignal, TerminalSize, TerminalSpec,
         TerminalStatus, TerminalTicket, TerminalTicketRequest,
     },
     log_store::{LogRetention, LogStore},
@@ -18,14 +18,15 @@ use super::{
 use crate::platform::{
     clock::{Clock, SystemClock, format_utc},
     events::{EventStore, NewEvent},
-    id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId, TurnId},
+    id::{JobId, LogStreamId, ProjectId, RuntimeId, ServiceId, TerminalId, TurnId},
     secret::{purpose_hash, random_token},
+    unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 
 #[derive(Clone)]
 pub struct RuntimeInterface {
     pool: SqlitePool,
-    events: EventStore,
+    unit_of_work: UnitOfWork,
     logs: LogStore,
     executor: Arc<dyn RuntimeExecutor>,
     /// Broadcast of Job ids that just reached a durable terminal status.
@@ -36,7 +37,8 @@ pub struct RuntimeInterface {
 #[derive(FromRow)]
 struct RuntimeRow {
     id: String,
-    session_id: String,
+    scope_kind: String,
+    scope_id: String,
     executor_kind: String,
     executor_nonce: String,
     limits_json: String,
@@ -127,10 +129,11 @@ impl RuntimeInterface {
         executor: Arc<dyn RuntimeExecutor>,
     ) -> Self {
         let (job_settled_tx, _) = tokio::sync::broadcast::channel(64);
+        let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Self {
             logs: LogStore::new(pool.clone(), data_root),
             pool,
-            events,
+            unit_of_work,
             executor,
             job_settled_tx,
         }
@@ -146,22 +149,101 @@ impl RuntimeInterface {
         tx: &mut SqliteConnection,
         turn_id: TurnId,
     ) -> Result<bool, RuntimeError> {
-        let count: i64 = sqlx::query_scalar(
+        Ok(self.unfinished_job_count_in_tx(tx, turn_id).await? > 0)
+    }
+
+    pub async fn unfinished_job_count(&self, turn_id: TurnId) -> Result<i64, RuntimeError> {
+        sqlx::query_scalar(
+            "SELECT COUNT(1) FROM jobs \
+             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
+        )
+        .bind(turn_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_error)
+    }
+
+    /// Finite Jobs still controlled by `turn_id` that have not reached a terminal
+    /// status. Used by application Cancel to bound Runtime cancellation before
+    /// settling the Turn.
+    pub async fn unfinished_jobs_for_turn(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<Vec<JobProjection>, RuntimeError> {
+        sqlx::query_as::<_, JobRow>(&format!(
+            "{} WHERE controlling_turn_id = ? \
+             AND status IN ('queued', 'running') \
+             ORDER BY created_at, id",
+            JOB_SELECT
+        ))
+        .bind(turn_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(job_projection)
+        .collect()
+    }
+
+    pub async fn unfinished_job_count_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        turn_id: TurnId,
+    ) -> Result<i64, RuntimeError> {
+        sqlx::query_scalar(
             "SELECT COUNT(1) FROM jobs \
              WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
         )
         .bind(turn_id.to_string())
         .fetch_one(&mut *tx)
         .await
-        .map_err(storage_error)?;
-        Ok(count > 0)
+        .map_err(storage_error)
+    }
+
+    pub async fn transfer_unfinished_jobs_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        from_turn_id: TurnId,
+        to_turn_id: TurnId,
+    ) -> Result<u64, RuntimeError> {
+        sqlx::query(
+            "UPDATE jobs SET controlling_turn_id = ?, version = ? \
+             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
+        )
+        .bind(to_turn_id.to_string())
+        .bind(new_version())
+        .bind(from_turn_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(storage_error)
+    }
+
+    pub async fn terminal_jobs_for_turn_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        turn_id: TurnId,
+    ) -> Result<Vec<JobProjection>, RuntimeError> {
+        sqlx::query_as::<_, JobRow>(&format!(
+            "{} WHERE controlling_turn_id = ? \
+             AND status IN ('succeeded', 'failed', 'canceled', 'lost') \
+             ORDER BY created_at, id",
+            JOB_SELECT
+        ))
+        .bind(turn_id.to_string())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(job_projection)
+        .collect()
     }
 
     pub async fn ensure_runtime(
         &self,
         spec: &RuntimeSpec,
     ) -> Result<RuntimeProjection, RuntimeError> {
-        if let Some(existing) = self.current_runtime(spec.session_id()).await?
+        if let Some(existing) = self.current_runtime(spec.scope()).await?
             && existing.id == spec.id()
             && existing.status == RuntimeStatus::Ready
         {
@@ -177,17 +259,18 @@ impl RuntimeInterface {
                 bash_egress_configured: spec.network_policy()
                     == super::interface::NetworkPolicy::ProjectRules,
                 live_preview_configured: false,
-                scope: CapabilityScope::Session,
+                scope: spec.scope().capability_scope(),
             },
         );
         let placeholder_nonce = format!("pending-{}", spec.id());
         sqlx::query(
             "INSERT INTO runtimes \
-             (id, session_id, executor_kind, executor_nonce, limits_json, capability_snapshot_json, \
-              status, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?)",
+             (id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, capability_snapshot_json, \
+              status, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?)",
         )
         .bind(spec.id().to_string())
-        .bind(spec.session_id().to_string())
+        .bind(spec.scope().kind())
+        .bind(spec.scope().id())
         .bind(executor_kind_str(spec.executor()))
         .bind(placeholder_nonce)
         .bind(serde_json::to_string(spec.limits()).map_err(storage_error)?)
@@ -273,7 +356,12 @@ impl RuntimeInterface {
 
     pub async fn start_job(&self, spec: JobSpec) -> Result<JobProjection, RuntimeError> {
         let job_id = spec.id;
-        let runtime_nonce = self.runtime_nonce(spec.execution.runtime_id()).await?;
+        let runtime_nonce = self
+            .runtime_nonce_for_scope(
+                spec.execution.runtime_id(),
+                RuntimeScope::session(spec.session_id),
+            )
+            .await?;
         let log = self
             .logs
             .create(super::interface::LogOwnerKind::Job, &spec.id.to_string())
@@ -308,21 +396,45 @@ impl RuntimeInterface {
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
+        if self.job_cancellation_requested(job_id).await? {
+            self.finalize_job(
+                job_id,
+                ProcessCompletion {
+                    exit: ExitSummary {
+                        exit_code: None,
+                        signal: Some("canceled_before_start".into()),
+                    },
+                    duration_ms: 0,
+                    usage: ResourceUsage::default(),
+                },
+                Some(JobStatus::Canceled),
+            )
+            .await?;
+            return self.job(job_id).await;
+        }
         match self.executor.start_job(spec, log.id).await {
             Ok(handle) if handle.executor_nonce == runtime_nonce => {
-                sqlx::query(
+                let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+                let started_at = format_utc(SystemClock.now());
+                let changed = sqlx::query(
                     "UPDATE jobs SET executor_process_identity = ?, status = 'running', \
-                     version = ?, started_at = ? WHERE id = ? AND status = 'queued'",
+                     version = ?, started_at = ? WHERE id = ? AND status = 'queued' \
+                       AND cancellation_requested_at IS NULL",
                 )
                 .bind(handle.process_identity)
                 .bind(new_version())
-                .bind(&now)
+                .bind(&started_at)
                 .bind(job_id.to_string())
-                .execute(&self.pool)
+                .execute(work.connection())
                 .await
-                .map_err(storage_error)?;
-                let job = self.job_by_log(log.id).await?;
-                self.emit_job(&job).await;
+                .map_err(storage_error)?
+                .rows_affected();
+                if changed == 0 {
+                    work.rollback().await.map_err(storage_error)?;
+                    return self.cancel_started_job(job_id, &runtime_nonce).await;
+                }
+                let job = self.append_job_changed_in_tx(&mut work, job_id).await?;
+                work.commit().await.map_err(storage_error)?;
                 let this = self.clone();
                 let job_id = job.id;
                 tokio::spawn(async move {
@@ -332,12 +444,18 @@ impl RuntimeInterface {
                 });
                 Ok(job)
             }
-            Ok(_) => {
-                self.mark_job_lost_by_log(log.id).await?;
+            Ok(handle) => {
+                let _ = tokio::time::timeout(
+                    JOB_CANCEL_TIMEOUT,
+                    self.executor.cancel_job(job_id, &handle.executor_nonce),
+                )
+                .await;
+                self.mark_job_lost(job_id, "executor_nonce_mismatch")
+                    .await?;
                 Err(RuntimeError::RuntimeUnavailable)
             }
             Err(error) => {
-                self.mark_job_lost_by_log(log.id).await?;
+                self.mark_job_lost(job_id, "start_failed").await?;
                 Err(error)
             }
         }
@@ -349,30 +467,48 @@ impl RuntimeInterface {
     }
 
     pub async fn cancel_job(&self, id: JobId) -> Result<JobProjection, RuntimeError> {
-        let nonce = self.job_nonce(id).await?;
         sqlx::query(
-            "UPDATE jobs SET exit_json = ?, version = ? WHERE id = ? AND status = 'running'",
+            "UPDATE jobs SET cancellation_requested_at = ?, version = ? \
+             WHERE id = ? AND status IN ('queued', 'running') \
+               AND cancellation_requested_at IS NULL",
         )
-        .bind(
-            json!({"exit_code": null, "signal": "cancel_requested", "cancel_requested": true})
-                .to_string(),
-        )
+        .bind(format_utc(SystemClock.now()))
         .bind(new_version())
         .bind(id.to_string())
         .execute(&self.pool)
         .await
         .map_err(storage_error)?;
-        let completion = self.executor.cancel_job(id, &nonce).await?;
-        self.finalize_job(id, completion, Some(JobStatus::Canceled))
-            .await?;
-        self.job(id).await
+        let deadline = tokio::time::Instant::now() + JOB_CANCEL_TIMEOUT;
+        loop {
+            let job = self.job(id).await?;
+            match job.status {
+                JobStatus::Running => {
+                    let nonce = self.job_nonce(id).await?;
+                    return self.cancel_started_job(id, &nonce).await;
+                }
+                status if status.is_terminal() => return Ok(job),
+                JobStatus::Queued if tokio::time::Instant::now() >= deadline => {
+                    self.mark_job_lost(id, "cancel_before_start_unconfirmed")
+                        .await?;
+                    return self.job(id).await;
+                }
+                JobStatus::Queued => tokio::time::sleep(JOB_CANCEL_POLL_INTERVAL).await,
+                _ => unreachable!("all Job statuses are covered"),
+            }
+        }
     }
 
     pub async fn start_service(
         &self,
         spec: ServiceSpec,
     ) -> Result<ServiceProjection, RuntimeError> {
-        let runtime_nonce = self.runtime_nonce(spec.execution.runtime_id()).await?;
+        let service_id = spec.id;
+        let runtime_nonce = self
+            .runtime_nonce_for_scope(
+                spec.execution.runtime_id(),
+                RuntimeScope::session(spec.session_id),
+            )
+            .await?;
         let log = self
             .logs
             .create(
@@ -402,19 +538,22 @@ impl RuntimeInterface {
         .map_err(storage_error)?;
         match self.executor.start_service(spec, log.id).await {
             Ok(handle) if handle.executor_nonce == runtime_nonce => {
+                let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
                 sqlx::query(
                     "UPDATE services SET executor_process_identity = ?, status = 'running', \
-                     version = ?, started_at = ? WHERE log_stream_id = ? AND status = 'starting'",
+                     version = ?, started_at = ? WHERE id = ? AND status = 'starting'",
                 )
                 .bind(handle.process_identity)
                 .bind(new_version())
                 .bind(&now)
-                .bind(log.id.to_string())
-                .execute(&self.pool)
+                .bind(service_id.to_string())
+                .execute(work.connection())
                 .await
                 .map_err(storage_error)?;
-                let service = self.service_by_log(log.id).await?;
-                self.emit_service(&service).await;
+                let service = self
+                    .append_service_changed_in_tx(&mut work, service_id)
+                    .await?;
+                work.commit().await.map_err(storage_error)?;
                 let this = self.clone();
                 let service_id = service.id;
                 tokio::spawn(async move {
@@ -460,18 +599,151 @@ impl RuntimeInterface {
 
     pub async fn current_runtime(
         &self,
-        session_id: crate::platform::id::SessionId,
+        scope: RuntimeScope,
     ) -> Result<Option<RuntimeProjection>, RuntimeError> {
         let row = sqlx::query_as::<_, RuntimeRow>(
-            "SELECT id, session_id, executor_kind, executor_nonce, limits_json, \
+            "SELECT id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
              capability_snapshot_json, status, version, created_at, updated_at, stopped_at \
-             FROM runtimes WHERE session_id = ? AND status IN ('starting', 'ready', 'stopping')",
+             FROM runtimes WHERE scope_kind = ? AND scope_id = ? \
+               AND status IN ('starting', 'ready', 'stopping')",
         )
-        .bind(session_id.to_string())
+        .bind(scope.kind())
+        .bind(scope.id())
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_error)?;
         row.map(runtime_projection).transpose()
+    }
+
+    pub async fn live_runtimes(&self) -> Result<Vec<RuntimeProjection>, RuntimeError> {
+        sqlx::query_as::<_, RuntimeRow>(
+            "SELECT id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
+             capability_snapshot_json, status, version, created_at, updated_at, stopped_at \
+             FROM runtimes WHERE status IN ('starting', 'ready', 'stopping') \
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(runtime_projection)
+        .collect()
+    }
+
+    pub async fn delete_session_log_files(
+        &self,
+        session_id: crate::platform::id::SessionId,
+    ) -> Result<(), RuntimeError> {
+        let ids = sqlx::query_scalar::<_, String>(SESSION_LOG_STREAMS)
+            .bind(session_id.to_string())
+            .bind(session_id.to_string())
+            .bind(session_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|id| id.parse().map_err(storage_error))
+            .collect::<Result<Vec<LogStreamId>, _>>()?;
+        self.logs.delete_files(&ids).await
+    }
+
+    pub async fn delete_project_log_files(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), RuntimeError> {
+        let ids = sqlx::query_scalar::<_, String>(PROJECT_LOG_STREAMS)
+            .bind(project_id.to_string())
+            .bind(project_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|id| id.parse().map_err(storage_error))
+            .collect::<Result<Vec<LogStreamId>, _>>()?;
+        self.logs.delete_files(&ids).await
+    }
+
+    pub async fn delete_project_resources(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), RuntimeError> {
+        let project_id = project_id.to_string();
+        let log_ids = sqlx::query_scalar::<_, String>(PROJECT_LOG_STREAMS)
+            .bind(&project_id)
+            .bind(&project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+        sqlx::query(
+            "DELETE FROM terminals WHERE runtime_id IN \
+             (SELECT id FROM runtimes WHERE scope_kind = 'project' AND scope_id = ?)",
+        )
+        .bind(&project_id)
+        .execute(work.connection())
+        .await
+        .map_err(storage_error)?;
+        sqlx::query("DELETE FROM runtimes WHERE scope_kind = 'project' AND scope_id = ?")
+            .bind(&project_id)
+            .execute(work.connection())
+            .await
+            .map_err(storage_error)?;
+        for log_id in log_ids {
+            sqlx::query("DELETE FROM log_streams WHERE id = ?")
+                .bind(log_id)
+                .execute(work.connection())
+                .await
+                .map_err(storage_error)?;
+        }
+        work.commit().await.map_err(storage_error)
+    }
+
+    pub(crate) async fn delete_session_resources_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: crate::platform::id::SessionId,
+    ) -> Result<(), RuntimeError> {
+        let session_id = session_id.to_string();
+        let log_ids = sqlx::query_scalar::<_, String>(SESSION_LOG_STREAMS)
+            .bind(&session_id)
+            .bind(&session_id)
+            .bind(&session_id)
+            .bind(&session_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(
+            "DELETE FROM terminals WHERE runtime_id IN \
+             (SELECT id FROM runtimes WHERE scope_kind = 'session' AND scope_id = ?)",
+        )
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query("DELETE FROM jobs WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query("DELETE FROM services WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query("DELETE FROM runtimes WHERE scope_kind = 'session' AND scope_id = ?")
+            .bind(&session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        for log_id in log_ids {
+            sqlx::query("DELETE FROM log_streams WHERE id = ?")
+                .bind(log_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(storage_error)?;
+        }
+        Ok(())
     }
 
     pub async fn job(&self, id: JobId) -> Result<JobProjection, RuntimeError> {
@@ -564,7 +836,9 @@ impl RuntimeInterface {
         &self,
         spec: TerminalSpec,
     ) -> Result<TerminalProjection, RuntimeError> {
-        let runtime_nonce = self.runtime_nonce(spec.runtime_id).await?;
+        let runtime_nonce = self
+            .runtime_nonce_for_scope(spec.runtime_id, RuntimeScope::project(spec.project_id))
+            .await?;
         let scrollback = self
             .logs
             .create(
@@ -573,7 +847,6 @@ impl RuntimeInterface {
             )
             .await?;
         let now = format_utc(SystemClock.now());
-        let (owner_kind, owner_id) = terminal_owner_parts(spec.owner);
         sqlx::query(
             "INSERT INTO terminals \
              (id, runtime_id, owner_kind, owner_id, executor_nonce, cols, rows, \
@@ -582,8 +855,8 @@ impl RuntimeInterface {
         )
         .bind(spec.id.to_string())
         .bind(spec.runtime_id.to_string())
-        .bind(owner_kind)
-        .bind(&owner_id)
+        .bind("project")
+        .bind(spec.project_id.to_string())
         .bind(&runtime_nonce)
         .bind(i64::from(spec.size.cols))
         .bind(i64::from(spec.size.rows))
@@ -597,6 +870,7 @@ impl RuntimeInterface {
         let terminal_id = spec.id;
         match self.executor.start_terminal(spec, scrollback.id).await {
             Ok(handle) if handle.executor_nonce == runtime_nonce => {
+                let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
                 let changed = sqlx::query(
                     "UPDATE terminals SET executor_pty_identity = ?, status = 'running', \
                      version = ?, updated_at = ? WHERE id = ? AND status = 'starting'",
@@ -605,14 +879,20 @@ impl RuntimeInterface {
                 .bind(new_version())
                 .bind(format_utc(SystemClock.now()))
                 .bind(terminal_id.to_string())
-                .execute(&self.pool)
+                .execute(work.connection())
                 .await
                 .map_err(storage_error)?
                 .rows_affected();
-                let terminal = self.terminal(terminal_id).await?;
-                if changed != 0 {
-                    self.emit_terminal(&terminal).await;
-                }
+                let terminal = if changed != 0 {
+                    let terminal = self
+                        .append_terminal_changed_in_tx(&mut work, terminal_id)
+                        .await?;
+                    work.commit().await.map_err(storage_error)?;
+                    terminal
+                } else {
+                    work.rollback().await.map_err(storage_error)?;
+                    self.terminal(terminal_id).await?
+                };
                 let this = self.clone();
                 let terminal_id = terminal.id;
                 let nonce = runtime_nonce;
@@ -644,15 +924,13 @@ impl RuntimeInterface {
 
     pub async fn list_terminals(
         &self,
-        owner: TerminalOwner,
+        project_id: ProjectId,
     ) -> Result<Vec<TerminalProjection>, RuntimeError> {
-        let (owner_kind, owner_id) = terminal_owner_parts(owner);
         let mut projections = sqlx::query_as::<_, TerminalRow>(&format!(
-            "{} WHERE owner_kind = ? AND owner_id = ? ORDER BY created_at",
+            "{} WHERE owner_kind = 'project' AND owner_id = ? ORDER BY created_at",
             TERMINAL_SELECT
         ))
-        .bind(owner_kind)
-        .bind(&owner_id)
+        .bind(project_id.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(storage_error)?
@@ -776,6 +1054,7 @@ impl RuntimeInterface {
     ) -> Result<TerminalProjection, RuntimeError> {
         let nonce = self.terminal_nonce(id).await?;
         self.executor.resize_terminal(id, &nonce, size).await?;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
         sqlx::query(
             "UPDATE terminals SET cols = ?, rows = ?, version = ?, updated_at = ? \
              WHERE id = ? AND status IN ('starting', 'running')",
@@ -785,11 +1064,11 @@ impl RuntimeInterface {
         .bind(new_version())
         .bind(format_utc(SystemClock.now()))
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?;
-        let terminal = self.terminal(id).await?;
-        self.emit_terminal(&terminal).await;
+        let terminal = self.append_terminal_changed_in_tx(&mut work, id).await?;
+        work.commit().await.map_err(storage_error)?;
         Ok(terminal)
     }
 
@@ -849,6 +1128,7 @@ impl RuntimeInterface {
         // floor and the recorded completion decides the projection.
         let _ = self.terminal_row(id).await.ok();
         let status = TerminalStatus::Exited;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
         let changed = sqlx::query(
             "UPDATE terminals SET status = ?, exit_json = ?, version = ?, updated_at = ?, \
              ended_at = ? WHERE id = ? AND status IN ('starting', 'running', 'closing')",
@@ -859,12 +1139,15 @@ impl RuntimeInterface {
         .bind(format_utc(SystemClock.now()))
         .bind(format_utc(SystemClock.now()))
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?
         .rows_affected();
         if changed != 0 {
-            self.emit_terminal(&self.terminal(id).await?).await;
+            self.append_terminal_changed_in_tx(&mut work, id).await?;
+            work.commit().await.map_err(storage_error)?;
+        } else {
+            work.rollback().await.map_err(storage_error)?;
         }
         Ok(())
     }
@@ -895,37 +1178,69 @@ impl RuntimeInterface {
         Ok(())
     }
 
-    async fn emit_terminal(&self, terminal: &TerminalProjection) {
-        let _ = self
-            .events
-            .append(NewEvent {
-                event_type: "terminal.changed".into(),
-                actor: json!({"kind": "runtime_system"}),
-                resource: Some(json!({"kind": "terminal", "id": terminal.id})),
-                correlation_id: format!("runtime-terminal-{}", terminal.id),
-                causation_id: None,
-                payload: json!({
-                    "id": terminal.id,
-                    "owner": terminal.owner,
-                    "status": terminal.status,
-                    "next_cursor": terminal.next_cursor,
-                    "version": terminal.version,
-                }),
-            })
-            .await;
+    async fn append_terminal_changed_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        id: TerminalId,
+    ) -> Result<TerminalProjection, RuntimeError> {
+        let row = sqlx::query_as::<_, TerminalRow>(&format!("{} WHERE id = ?", TERMINAL_SELECT))
+            .bind(id.to_string())
+            .fetch_one(work.connection())
+            .await
+            .map_err(storage_error)?;
+        let mut terminal = terminal_projection(row)?;
+        if let Some((first_cursor, next_cursor)) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT first_cursor, next_cursor FROM log_streams WHERE id = ?",
+        )
+        .bind(terminal.scrollback_stream_id.to_string())
+        .fetch_optional(work.connection())
+        .await
+        .map_err(storage_error)?
+        {
+            terminal.first_cursor =
+                LogCursor::new(u64::try_from(first_cursor).map_err(storage_error)?);
+            terminal.next_cursor =
+                LogCursor::new(u64::try_from(next_cursor).map_err(storage_error)?);
+        }
+        work.append_event(NewEvent {
+            event_type: "terminal.changed".into(),
+            actor: json!({"kind": "runtime_system"}),
+            resource: Some(json!({"kind": "terminal", "id": terminal.id})),
+            correlation_id: format!("runtime-terminal-{}", terminal.id),
+            causation_id: None,
+            payload: json!({
+                "id": terminal.id,
+                "project_id": terminal.project_id,
+                "status": terminal.status,
+                "next_cursor": terminal.next_cursor,
+                "version": terminal.version,
+            }),
+        })
+        .await
+        .map_err(storage_error)?;
+        Ok(terminal)
     }
 
     pub async fn recover_uncertain(&self) -> Result<(), RuntimeError> {
         let now = format_utc(SystemClock.now());
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        self.recover_uncertain_in_tx(&mut tx, &now).await?;
+        tx.commit().await.map_err(storage_error)
+    }
+
+    pub(crate) async fn recover_uncertain_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        now: &str,
+    ) -> Result<(), RuntimeError> {
         sqlx::query(
             "UPDATE runtimes SET status = 'lost', stop_reason = 'control_plane_restart', \
              version = ?, updated_at = ?, stopped_at = ? \
              WHERE status IN ('starting', 'ready', 'stopping')",
         )
         .bind(new_version())
-        .bind(&now)
-        .bind(&now)
+        .bind(now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
@@ -935,7 +1250,7 @@ impl RuntimeInterface {
         )
         .bind(json!({"exit_code": null, "signal": "control_plane_restart"}).to_string())
         .bind(new_version())
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
@@ -945,7 +1260,7 @@ impl RuntimeInterface {
         )
         .bind(json!({"exit_code": null, "signal": "control_plane_restart"}).to_string())
         .bind(new_version())
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
@@ -954,8 +1269,8 @@ impl RuntimeInterface {
              WHERE status IN ('starting', 'running', 'closing')",
         )
         .bind(new_version())
-        .bind(&now)
-        .bind(&now)
+        .bind(now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
@@ -963,11 +1278,11 @@ impl RuntimeInterface {
             "UPDATE runtime_access_tickets SET revoked_at = ? \
              WHERE consumed_at IS NULL AND revoked_at IS NULL",
         )
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(storage_error)?;
-        tx.commit().await.map_err(storage_error)
+        Ok(())
     }
 
     async fn finalize_job(
@@ -976,15 +1291,16 @@ impl RuntimeInterface {
         completion: ProcessCompletion,
         forced: Option<JobStatus>,
     ) -> Result<(), RuntimeError> {
-        let cancel_requested: i64 = sqlx::query_scalar(
-            "SELECT coalesce(json_extract(exit_json, '$.cancel_requested'), 0) FROM jobs WHERE id = ?",
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+        let cancel_requested: bool = sqlx::query_scalar(
+            "SELECT cancellation_requested_at IS NOT NULL FROM jobs WHERE id = ?",
         )
         .bind(id.to_string())
-        .fetch_one(&self.pool)
+        .fetch_one(work.connection())
         .await
         .map_err(storage_error)?;
         let status = forced.unwrap_or_else(|| {
-            if cancel_requested != 0 {
+            if cancel_requested {
                 JobStatus::Canceled
             } else if completion.exit.exit_code == Some(0) {
                 JobStatus::Succeeded
@@ -1002,14 +1318,17 @@ impl RuntimeInterface {
         .bind(new_version())
         .bind(format_utc(SystemClock.now()))
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?
         .rows_affected();
         if changed != 0 {
-            self.emit_job(&self.job(id).await?).await;
+            self.append_job_changed_in_tx(&mut work, id).await?;
+            work.commit().await.map_err(storage_error)?;
             // Notify application wake-up; lagging/disconnected receivers are fine.
             let _ = self.job_settled_tx.send(id);
+        } else {
+            work.rollback().await.map_err(storage_error)?;
         }
         Ok(())
     }
@@ -1020,10 +1339,11 @@ impl RuntimeInterface {
         completion: ProcessCompletion,
         forced: Option<ServiceStatus>,
     ) -> Result<(), RuntimeError> {
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
         let stop_requested: bool =
             sqlx::query_scalar("SELECT status = 'stopping' FROM services WHERE id = ?")
                 .bind(id.to_string())
-                .fetch_one(&self.pool)
+                .fetch_one(work.connection())
                 .await
                 .map_err(storage_error)?;
         let status = forced.unwrap_or_else(|| {
@@ -1042,20 +1362,32 @@ impl RuntimeInterface {
         .bind(new_version())
         .bind(format_utc(SystemClock.now()))
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?
         .rows_affected();
         if changed != 0 {
-            self.emit_service(&self.service(id).await?).await;
+            self.append_service_changed_in_tx(&mut work, id).await?;
+            work.commit().await.map_err(storage_error)?;
+        } else {
+            work.rollback().await.map_err(storage_error)?;
         }
         Ok(())
     }
 
-    async fn emit_job(&self, job: &JobProjection) {
-        let _ = self
-            .events
-            .append(NewEvent {
+    async fn append_job_changed_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        id: JobId,
+    ) -> Result<JobProjection, RuntimeError> {
+        let row = sqlx::query_as::<_, JobRow>(&format!("{} WHERE id = ?", JOB_SELECT))
+            .bind(id.to_string())
+            .fetch_one(work.connection())
+            .await
+            .map_err(storage_error)?;
+        let job = job_projection(row)?;
+        work
+            .append_event(NewEvent {
                 event_type: "job.changed".into(),
                 actor: json!({"kind": "runtime_system"}),
                 resource: Some(json!({"kind": "job", "id": job.id})),
@@ -1063,13 +1395,24 @@ impl RuntimeInterface {
                 causation_id: None,
                 payload: json!({"id": job.id, "session_id": job.session_id, "status": job.status, "version": job.version}),
             })
-            .await;
+            .await
+            .map_err(storage_error)?;
+        Ok(job)
     }
 
-    async fn emit_service(&self, service: &ServiceProjection) {
-        let _ = self
-            .events
-            .append(NewEvent {
+    async fn append_service_changed_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        id: ServiceId,
+    ) -> Result<ServiceProjection, RuntimeError> {
+        let row = sqlx::query_as::<_, ServiceRow>(&format!("{} WHERE id = ?", SERVICE_SELECT))
+            .bind(id.to_string())
+            .fetch_one(work.connection())
+            .await
+            .map_err(storage_error)?;
+        let service = service_projection(row)?;
+        work
+            .append_event(NewEvent {
                 event_type: "service.changed".into(),
                 actor: json!({"kind": "runtime_system"}),
                 resource: Some(json!({"kind": "service", "id": service.id})),
@@ -1077,7 +1420,9 @@ impl RuntimeInterface {
                 causation_id: None,
                 payload: json!({"id": service.id, "session_id": service.session_id, "status": service.status, "version": service.version}),
             })
-            .await;
+            .await
+            .map_err(storage_error)?;
+        Ok(service)
     }
 
     async fn runtime_row(&self, id: RuntimeId) -> Result<RuntimeRow, RuntimeError> {
@@ -1097,6 +1442,18 @@ impl RuntimeInterface {
         Ok(row.executor_nonce)
     }
 
+    async fn runtime_nonce_for_scope(
+        &self,
+        id: RuntimeId,
+        expected: RuntimeScope,
+    ) -> Result<String, RuntimeError> {
+        let row = self.runtime_row(id).await?;
+        if row.status != "ready" || runtime_scope(&row.scope_kind, &row.scope_id)? != expected {
+            return Err(RuntimeError::RuntimeUnavailable);
+        }
+        Ok(row.executor_nonce)
+    }
+
     async fn job_row(&self, id: JobId) -> Result<JobRow, RuntimeError> {
         sqlx::query_as::<_, JobRow>(&format!("{} WHERE id = ?", JOB_SELECT))
             .bind(id.to_string())
@@ -1104,15 +1461,6 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?
             .ok_or(RuntimeError::JobLost(id))
-    }
-
-    async fn job_by_log(&self, id: LogStreamId) -> Result<JobProjection, RuntimeError> {
-        let row = sqlx::query_as::<_, JobRow>(&format!("{} WHERE log_stream_id = ?", JOB_SELECT))
-            .bind(id.to_string())
-            .fetch_one(&self.pool)
-            .await
-            .map_err(storage_error)?;
-        job_projection(row)
     }
 
     async fn job_nonce(&self, id: JobId) -> Result<String, RuntimeError> {
@@ -1126,16 +1474,6 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?
             .ok_or(RuntimeError::ServiceLost(id))
-    }
-
-    async fn service_by_log(&self, id: LogStreamId) -> Result<ServiceProjection, RuntimeError> {
-        let row =
-            sqlx::query_as::<_, ServiceRow>(&format!("{} WHERE log_stream_id = ?", SERVICE_SELECT))
-                .bind(id.to_string())
-                .fetch_one(&self.pool)
-                .await
-                .map_err(storage_error)?;
-        service_projection(row)
     }
 
     async fn service_nonce(&self, id: ServiceId) -> Result<String, RuntimeError> {
@@ -1162,19 +1500,59 @@ impl RuntimeInterface {
         Ok(row.executor_nonce)
     }
 
-    async fn mark_job_lost_by_log(&self, id: LogStreamId) -> Result<(), RuntimeError> {
-        sqlx::query(
+    async fn job_cancellation_requested(&self, id: JobId) -> Result<bool, RuntimeError> {
+        sqlx::query_scalar("SELECT cancellation_requested_at IS NOT NULL FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_error)
+    }
+
+    async fn cancel_started_job(
+        &self,
+        id: JobId,
+        nonce: &str,
+    ) -> Result<JobProjection, RuntimeError> {
+        match tokio::time::timeout(JOB_CANCEL_TIMEOUT, self.executor.cancel_job(id, nonce)).await {
+            Ok(Ok(completion)) => {
+                self.finalize_job(id, completion, Some(JobStatus::Canceled))
+                    .await?;
+            }
+            Ok(Err(_)) | Err(_) => {
+                self.mark_job_lost(id, "cancel_unconfirmed").await?;
+            }
+        }
+        self.job(id).await
+    }
+
+    async fn mark_job_lost(&self, id: JobId, reason: &str) -> Result<(), RuntimeError> {
+        let log_stream_id = self
+            .job_row(id)
+            .await?
+            .log_stream_id
+            .parse::<LogStreamId>()
+            .map_err(storage_error)?;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+        let changed = sqlx::query(
             "UPDATE jobs SET status = 'lost', exit_json = ?, version = ?, ended_at = ? \
-             WHERE log_stream_id = ? AND status IN ('queued', 'running')",
+             WHERE id = ? AND status IN ('queued', 'running')",
         )
-        .bind(json!({"exit_code": null, "signal": "start_failed"}).to_string())
+        .bind(json!({"exit_code": null, "signal": reason}).to_string())
         .bind(new_version())
         .bind(format_utc(SystemClock.now()))
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(work.connection())
         .await
-        .map_err(storage_error)?;
-        let _ = self.logs.close(id).await;
+        .map_err(storage_error)?
+        .rows_affected();
+        if changed == 0 {
+            work.rollback().await.map_err(storage_error)?;
+            return Ok(());
+        }
+        self.append_job_changed_in_tx(&mut work, id).await?;
+        work.commit().await.map_err(storage_error)?;
+        let _ = self.logs.close(log_stream_id).await;
+        let _ = self.job_settled_tx.send(id);
         Ok(())
     }
 
@@ -1195,7 +1573,7 @@ impl RuntimeInterface {
     }
 }
 
-const RUNTIME_SELECT: &str = "SELECT id, session_id, executor_kind, executor_nonce, limits_json, \
+const RUNTIME_SELECT: &str = "SELECT id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
     capability_snapshot_json, status, version, created_at, updated_at, stopped_at FROM runtimes WHERE id = ?";
 const JOB_SELECT: &str = "SELECT id, runtime_id, session_id, initiated_by_tool_call_id, \
     controlling_turn_id, cli_session_id, command_summary, executor_nonce, log_stream_id, status, exit_json, \
@@ -1206,11 +1584,27 @@ const SERVICE_SELECT: &str = "SELECT id, runtime_id, session_id, initiated_by_to
 const TERMINAL_SELECT: &str = "SELECT id, runtime_id, owner_kind, owner_id, executor_pty_identity, \
     executor_nonce, cols, rows, scrollback_stream_id, status, exit_json, version, created_at, \
     updated_at, ended_at FROM terminals";
+const SESSION_LOG_STREAMS: &str = "SELECT id FROM log_streams WHERE \
+    (owner_kind = 'job' AND owner_id IN (SELECT id FROM jobs WHERE session_id = ?)) OR \
+    (owner_kind = 'service' AND owner_id IN (SELECT id FROM services WHERE session_id = ?)) OR \
+    (owner_kind = 'terminal' AND owner_id IN (SELECT id FROM terminals WHERE runtime_id IN \
+        (SELECT id FROM runtimes WHERE scope_kind = 'session' AND scope_id = ?))) OR \
+    (owner_kind = 'sync' AND owner_id IN (SELECT id FROM runtimes \
+        WHERE scope_kind = 'session' AND scope_id = ?))";
+const PROJECT_LOG_STREAMS: &str = "SELECT id FROM log_streams WHERE \
+    (owner_kind = 'terminal' AND owner_id IN (SELECT id FROM terminals WHERE runtime_id IN \
+        (SELECT id FROM runtimes WHERE scope_kind = 'project' AND scope_id = ?))) OR \
+    (owner_kind = 'sync' AND owner_id IN (SELECT id FROM runtimes \
+        WHERE scope_kind = 'project' AND scope_id = ?))";
 
 const TICKET_TTL: chrono::TimeDelta = chrono::Duration::seconds(30);
+const JOB_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+const JOB_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn terminal_projection(row: TerminalRow) -> Result<TerminalProjection, RuntimeError> {
-    let owner = parse_terminal_owner(&row.owner_kind, &row.owner_id)?;
+    if row.owner_kind != "project" {
+        return Err(RuntimeError::RuntimeUnavailable);
+    }
     let exit = row
         .exit_json
         .map(|value| serde_json::from_str::<ExitSummary>(&value).map_err(storage_error))
@@ -1218,7 +1612,7 @@ fn terminal_projection(row: TerminalRow) -> Result<TerminalProjection, RuntimeEr
     Ok(TerminalProjection {
         id: row.id.parse().map_err(storage_error)?,
         runtime_id: row.runtime_id.parse().map_err(storage_error)?,
-        owner,
+        project_id: row.owner_id.parse().map_err(storage_error)?,
         status: parse_terminal_status(&row.status)?,
         size: TerminalSize::new(
             u16::try_from(row.cols).unwrap_or(1).max(1),
@@ -1263,21 +1657,6 @@ const fn terminal_status_str(value: TerminalStatus) -> &'static str {
     }
 }
 
-fn terminal_owner_parts(owner: TerminalOwner) -> (&'static str, String) {
-    match owner {
-        TerminalOwner::Project(id) => ("project", id.to_string()),
-        TerminalOwner::Session(id) => ("session", id.to_string()),
-    }
-}
-
-fn parse_terminal_owner(kind: &str, id: &str) -> Result<TerminalOwner, RuntimeError> {
-    match kind {
-        "project" => Ok(TerminalOwner::Project(id.parse().map_err(storage_error)?)),
-        "session" => Ok(TerminalOwner::Session(id.parse().map_err(storage_error)?)),
-        _ => Err(RuntimeError::RuntimeUnavailable),
-    }
-}
-
 /// Parse an ISO-8601 UTC timestamp previously produced by `format_utc`. Returns
 /// the millisecond-precision `DateTime` used for expiry comparisons.
 fn parse_iso(value: &str) -> Result<chrono::DateTime<chrono::Utc>, RuntimeError> {
@@ -1289,7 +1668,7 @@ fn parse_iso(value: &str) -> Result<chrono::DateTime<chrono::Utc>, RuntimeError>
 fn runtime_projection(row: RuntimeRow) -> Result<RuntimeProjection, RuntimeError> {
     Ok(RuntimeProjection {
         id: row.id.parse().map_err(storage_error)?,
-        session_id: row.session_id.parse().map_err(storage_error)?,
+        scope: runtime_scope(&row.scope_kind, &row.scope_id)?,
         executor: parse_executor_kind(&row.executor_kind)?,
         status: parse_runtime_status(&row.status)?,
         capabilities: serde_json::from_str(&row.capability_snapshot_json).map_err(storage_error)?,
@@ -1299,6 +1678,14 @@ fn runtime_projection(row: RuntimeRow) -> Result<RuntimeProjection, RuntimeError
         updated_at: row.updated_at,
         stopped_at: row.stopped_at,
     })
+}
+
+fn runtime_scope(kind: &str, id: &str) -> Result<RuntimeScope, RuntimeError> {
+    match kind {
+        "project" => Ok(RuntimeScope::project(id.parse().map_err(storage_error)?)),
+        "session" => Ok(RuntimeScope::session(id.parse().map_err(storage_error)?)),
+        _ => Err(RuntimeError::RuntimeUnavailable),
+    }
 }
 
 fn job_projection(row: JobRow) -> Result<JobProjection, RuntimeError> {

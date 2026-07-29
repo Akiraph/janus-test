@@ -10,7 +10,7 @@ import { EmptyState } from "../../../components/ui/EmptyState";
 import { ErrorBlock } from "../../../components/ui/ErrorBlock";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../../lib/api";
-import { createSession, deleteSession } from "../../../lib/api";
+import { createSession, deleteSession, getSession, waitForOperation } from "../../../lib/api";
 import { useSessions } from "../../../lib/queries";
 
 interface SessionsPanelProps {
@@ -29,7 +29,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
   const queryClient = useQueryClient();
   const [creating, setCreating] = createSignal(false);
   const [deletingId, setDeletingId] = createSignal<string | null>(null);
-  const [createError, setCreateError] = createSignal("");
+  const [actionError, setActionError] = createSignal("");
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
 
   async function onCreate() {
@@ -37,12 +37,13 @@ export function SessionsPanel(props: SessionsPanelProps) {
     if (!id || creating()) return;
     if (props.projectReady && !props.projectReady()) return;
     setCreating(true);
-    setCreateError("");
+    setActionError("");
     try {
-      const session = await createSession(id, { title: "New session" });
-      // Pre-warm caches so opening the new tab does not suspend on first paint:
-      // create already returns the SessionSummary, and a brand-new session has
-      // an empty timeline (no need to wait for that round-trip either).
+      const accepted = await createSession(id, { title: "New session" }, crypto.randomUUID());
+      const completed = await waitForOperation(accepted.id);
+      const sessionId = completed.target_id ?? accepted.target_id;
+      if (!sessionId) throw new Error("Session creation completed without a Session id");
+      const session = await getSession(sessionId);
       queryClient.setQueryData(["session", session.id], session);
       queryClient.setQueryData(["session-timeline", session.id], {
         items: [],
@@ -51,8 +52,6 @@ export function SessionsPanel(props: SessionsPanelProps) {
         oldest_cursor: null,
         newest_cursor: null,
       });
-      // Optimistically put the new session at the top of the list instead of
-      // waiting on a full listSessions refetch before the tab can open.
       queryClient.setQueryData<SessionSummary[]>(["sessions", id], (prev) => {
         const list = prev ?? [];
         if (list.some((s) => s.id === session.id)) return list;
@@ -61,7 +60,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
       void sessions.refetch();
       props.onOpenSession(session.id, session.title);
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : "Failed to create session");
+      setActionError(error instanceof Error ? error.message : "Failed to create session");
     } finally {
       setCreating(false);
     }
@@ -70,12 +69,14 @@ export function SessionsPanel(props: SessionsPanelProps) {
   async function onDelete(session: SessionSummary) {
     if (deletingId()) return;
     setDeletingId(session.id);
+    setActionError("");
     try {
-      await deleteSession(session.id);
+      const accepted = await deleteSession(session.id, session.version, crypto.randomUUID());
+      await waitForOperation(accepted.id);
       props.onSessionDeleted?.(session.id);
       void sessions.refetch();
-    } catch {
-      // Failure surfaces as the row staying put; the API error is transient.
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Failed to delete session");
     } finally {
       setDeletingId(null);
     }
@@ -98,9 +99,9 @@ export function SessionsPanel(props: SessionsPanelProps) {
         </button>
       </div>
 
-      <Show when={createError()}>
+      <Show when={actionError()}>
         <div class="sessions-panel__error">
-          <ErrorBlock message={createError()} />
+          <ErrorBlock message={actionError()} />
         </div>
       </Show>
 

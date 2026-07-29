@@ -1,36 +1,46 @@
-//! Cross-module Turn coordination (M4).
+//! Cross-module Turn coordination.
 //!
 //! Lives in `application` because it must update more than one module's owned
 //! tables in one SQLite transaction. Sessions owns turns/sessions/checkpoints;
 //! supervisor owns asks; runtime owns jobs. This module opens one transaction
 //! against the shared pool and drives each owner's `*_in_tx` primitive inside
-//! it, then commits and best-effort appends events. The HTTP layer calls
-//! `handle_message` / `handoff_message`; the supervisor calls `settle_cancel`
-//! after Runtime confirms finite resources owned by a cancelling Turn settled.
+//! it, then commits and schedules further work only after commit.
 //!
 //! No persistent business state lives here: only orchestration and correlation.
+
+use std::collections::HashMap;
 
 use serde_json::json;
 
 use crate::AppState;
+use crate::modules::runtime::interface::JobStatus;
+use crate::modules::sessions::interface::{
+    CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionsError,
+    TurnBlockerOutcome, TurnBlockers, TurnStatus,
+};
+use crate::modules::supervisor::interface::{
+    AskAnswerDisposition, AskClosure, SupervisorError, ToolCallSettlement,
+};
 use crate::platform::clock::{Clock, SystemClock, format_utc};
 use crate::platform::events::NewEvent;
-use crate::platform::id::{AskId, CorrelationId, SessionId, ToolCallId, TurnId};
+use crate::platform::id::{AskId, CorrelationId, ProjectId, SessionId, TurnId};
+use crate::platform::unit_of_work::UnitOfWorkTransaction;
 
-use crate::modules::sessions::types::{
-    MessageRoute, MessageRouteResult, SessionsError, TurnStatus,
-};
-
-/// Outcome of handling a freshly accepted message via the M4 state machine.
-pub struct HandledMessage {
-    /// The Turn that should be executed next, if any. `None` when the message
-    /// was queued behind an active Turn (no execution to spawn).
-    pub run_turn: Option<TurnId>,
+struct SessionInput<'a> {
+    owner_id: &'a str,
+    session_id: SessionId,
+    content: &'a str,
+    expected_version: &'a str,
+    actor: serde_json::Value,
+    source_ask_id: Option<&'a str>,
+    workspace_revision: &'a str,
+    now: &'a str,
 }
 
 impl AppState {
     pub async fn post_session_message(
         &self,
+        owner_id: &str,
         session_id: SessionId,
         content: &str,
         expected_version: &str,
@@ -41,17 +51,55 @@ impl AppState {
             .current_workspace_revision(session_id)
             .await?;
         let now = format_utc(SystemClock.now());
-        let mut tx = self.sessions().pool().begin().await?;
+        let mut work = self.unit_of_work().begin().await?;
+        let result = self
+            .route_session_input_in_tx(
+                &mut work,
+                SessionInput {
+                    owner_id,
+                    session_id,
+                    content,
+                    expected_version,
+                    actor,
+                    source_ask_id: None,
+                    workspace_revision: &workspace_revision,
+                    now: &now,
+                },
+            )
+            .await?;
+        work.commit().await?;
+        Ok(result)
+    }
+
+    async fn route_session_input_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        input: SessionInput<'_>,
+    ) -> Result<MessageRouteResult, SessionsError> {
+        let SessionInput {
+            owner_id,
+            session_id,
+            content,
+            expected_version,
+            actor,
+            source_ask_id,
+            workspace_revision,
+            now,
+        } = input;
         let command = self
             .sessions()
-            .lock_session_command_in_tx(&mut *tx, session_id, expected_version, &now)
+            .lock_session_command_in_tx(work.connection(), session_id, expected_version, now)
             .await?;
         let has_queued = self
             .sessions()
-            .has_queued_turn_in_tx(&mut *tx, session_id)
+            .has_queued_turn_in_tx(work.connection(), session_id)
             .await?;
         let active_status = match command.active_turn_id.as_deref() {
-            Some(turn_id) => self.sessions().turn_status_in_tx(&mut *tx, turn_id).await?,
+            Some(turn_id) => {
+                self.sessions()
+                    .turn_status_in_tx(work.connection(), turn_id)
+                    .await?
+            }
             None => None,
         };
         let route = match (command.active_turn_id.as_deref(), active_status, has_queued) {
@@ -63,18 +111,36 @@ impl AppState {
             .then_some(command.active_turn_id.as_deref())
             .flatten();
         let checkpoint_revision = matches!(route, MessageRoute::Started | MessageRoute::HandedOff)
-            .then_some(workspace_revision.as_str());
+            .then_some(workspace_revision);
+        let model_snapshot = if route == MessageRoute::Queued {
+            None
+        } else {
+            let project_id = command.project_id.parse::<ProjectId>().map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("invalid Project id: {error}"))
+            })?;
+            self.turn_runner()
+                .resolve_model_snapshot_in_tx(
+                    work.connection(),
+                    project_id,
+                    Some(owner_id),
+                    command.next_model_ref.as_deref(),
+                )
+                .await
+                .map_err(|error| {
+                    SessionsError::Internal(anyhow::anyhow!("resolve Turn model: {error}"))
+                })?
+        };
         let created = self
             .sessions()
             .create_turn_input_in_tx(
-                &mut *tx,
+                work.connection(),
                 session_id,
                 content,
                 &actor,
                 predecessor,
-                None,
+                source_ask_id,
                 checkpoint_revision,
-                &now,
+                now,
             )
             .await?;
 
@@ -82,7 +148,13 @@ impl AppState {
             MessageRoute::Started => {
                 let activated = self
                     .sessions()
-                    .activate_created_turn_in_tx(&mut *tx, session_id, &created.turn_id, &now)
+                    .activate_created_turn_in_tx(
+                        work.connection(),
+                        session_id,
+                        &created.turn_id,
+                        model_snapshot.as_ref(),
+                        now,
+                    )
                     .await?;
                 if !activated {
                     return Err(SessionsError::ActiveTurnExists);
@@ -90,33 +162,55 @@ impl AppState {
             }
             MessageRoute::HandedOff => {
                 let predecessor = predecessor.ok_or(SessionsError::HandoffNotApplicable)?;
+                let predecessor_id: TurnId = predecessor.parse().map_err(|_| {
+                    SessionsError::Internal(anyhow::anyhow!("invalid predecessor Turn id"))
+                })?;
+                self.turn_runner()
+                    .settle_terminal_jobs_for_turn_in_tx(work, predecessor_id, now)
+                    .await
+                    .map_err(|error| {
+                        SessionsError::Internal(anyhow::anyhow!(
+                            "settle predecessor Jobs before Handoff: {error}"
+                        ))
+                    })?;
                 let handed_off = self
                     .sessions()
-                    .begin_handoff_in_tx(&mut *tx, session_id, predecessor, &created.turn_id, &now)
+                    .begin_handoff_in_tx(
+                        work.connection(),
+                        session_id,
+                        predecessor,
+                        &created.turn_id,
+                        now,
+                    )
                     .await?;
                 if !handed_off {
                     return Err(SessionsError::HandoffNotApplicable);
                 }
                 self.supervisor()
-                    .close_open_asks_in_tx(&mut *tx, predecessor, &now)
+                    .close_open_asks_in_tx(
+                        work.connection(),
+                        predecessor_id,
+                        AskClosure::Handoff,
+                        now,
+                    )
                     .await
                     .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-                sqlx::query(
-                    "UPDATE jobs SET controlling_turn_id = ? \
-                     WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
-                )
-                .bind(&created.turn_id)
-                .bind(predecessor)
-                .execute(&mut *tx)
-                .await?;
+                let successor_id: TurnId = created.turn_id.parse().map_err(|_| {
+                    SessionsError::Internal(anyhow::anyhow!("invalid successor Turn id"))
+                })?;
+                self.runtime()
+                    .transfer_unfinished_jobs_in_tx(work.connection(), predecessor_id, successor_id)
+                    .await
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
                 let activated = self
                     .sessions()
                     .activate_handoff_successor_in_tx(
-                        &mut *tx,
+                        work.connection(),
                         session_id,
                         predecessor,
                         &created.turn_id,
-                        &now,
+                        model_snapshot.as_ref(),
+                        now,
                     )
                     .await?;
                 if !activated {
@@ -128,103 +222,94 @@ impl AppState {
                 unreachable!("ordinary messages cannot use Ask routing")
             }
         }
-        tx.commit().await?;
 
-        let result = MessageRouteResult {
+        for event in
+            Self::message_accepted_events(session_id, &created, &command, route, predecessor, actor)
+        {
+            work.append_event(event)
+                .await
+                .map_err(SessionsError::Internal)?;
+        }
+        Ok(MessageRouteResult {
             route: route.as_str().to_owned(),
             message_id: created.message_id.clone(),
             turn_id: created.turn_id.clone(),
             session_version: command.session_version.clone(),
             handoff_from_turn_id: predecessor.map(str::to_owned),
-        };
-        self.publish_message_accepted(session_id, &created, &command, route, predecessor, actor)
-            .await;
-        Ok(result)
+        })
     }
 
-    async fn publish_message_accepted(
-        &self,
+    fn message_accepted_events(
         session_id: SessionId,
-        created: &crate::modules::sessions::types::CreatedTurnInput,
-        command: &crate::modules::sessions::types::SessionCommandState,
+        created: &crate::modules::sessions::interface::CreatedTurnInput,
+        command: &crate::modules::sessions::interface::SessionCommandState,
         route: MessageRoute,
         predecessor: Option<&str>,
         actor: serde_json::Value,
-    ) {
+    ) -> Vec<NewEvent> {
         let correlation_id = CorrelationId::new().to_string();
+        let mut events = Vec::with_capacity(5);
         if let Some(checkpoint_id) = &created.checkpoint_id {
-            let _ = self
-                .events()
-                .append(NewEvent {
-                    event_type: "checkpoint.created".into(),
-                    actor: actor.clone(),
-                    resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
-                    correlation_id: correlation_id.clone(),
-                    causation_id: None,
-                    payload: json!({
-                        "checkpoint_id": checkpoint_id,
-                        "session_id": session_id.to_string(),
-                        "kind": "pre_turn",
-                    }),
-                })
-                .await;
+            events.push(NewEvent {
+                event_type: "checkpoint.created".into(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "checkpoint_id": checkpoint_id,
+                    "session_id": session_id.to_string(),
+                    "kind": "pre_turn",
+                }),
+            });
         }
         if let Some(predecessor) = predecessor {
-            let _ = self
-                .events()
-                .append(NewEvent {
-                    event_type: "turn.status_changed".into(),
-                    actor: json!({"kind": "supervisor"}),
-                    resource: Some(json!({"kind": "turn", "id": predecessor})),
-                    correlation_id: correlation_id.clone(),
-                    causation_id: None,
-                    payload: json!({
-                        "turn_id": predecessor,
-                        "to": "handed_off",
-                        "handoff_to_turn_id": created.turn_id,
-                    }),
-                })
-                .await;
+            events.push(NewEvent {
+                event_type: "turn.status_changed".into(),
+                actor: json!({"kind": "supervisor"}),
+                resource: Some(json!({"kind": "turn", "id": predecessor})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "turn_id": predecessor,
+                    "to": "handed_off",
+                    "handoff_to_turn_id": created.turn_id,
+                }),
+            });
         }
         let status = if route == MessageRoute::Queued {
             "queued"
         } else {
             "running"
         };
-        let _ = self
-            .events()
-            .append(NewEvent {
-                event_type: "turn.created".into(),
-                actor: actor.clone(),
-                resource: Some(json!({"kind": "turn", "id": created.turn_id})),
-                correlation_id: correlation_id.clone(),
-                causation_id: None,
-                payload: json!({
-                    "turn_id": created.turn_id,
-                    "session_id": session_id.to_string(),
-                    "sequence": created.sequence,
-                    "status": status,
-                    "route": route.as_str(),
-                    "handoff_from_turn_id": predecessor,
-                }),
-            })
-            .await;
-        let _ = self
-            .events()
-            .append(NewEvent {
-                event_type: "timeline.item_created".into(),
-                actor: actor.clone(),
-                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
-                correlation_id: correlation_id.clone(),
-                causation_id: None,
-                payload: json!({
-                    "timeline_item_id": created.timeline_item_id,
-                    "session_id": session_id.to_string(),
-                    "kind": "user_message",
-                    "display_order": created.display_order,
-                }),
-            })
-            .await;
+        events.push(NewEvent {
+            event_type: "turn.created".into(),
+            actor: actor.clone(),
+            resource: Some(json!({"kind": "turn", "id": created.turn_id})),
+            correlation_id: correlation_id.clone(),
+            causation_id: None,
+            payload: json!({
+                "turn_id": created.turn_id,
+                "session_id": session_id.to_string(),
+                "sequence": created.sequence,
+                "status": status,
+                "route": route.as_str(),
+                "handoff_from_turn_id": predecessor,
+            }),
+        });
+        events.push(NewEvent {
+            event_type: "timeline.item_created".into(),
+            actor: actor.clone(),
+            resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+            correlation_id: correlation_id.clone(),
+            causation_id: None,
+            payload: json!({
+                "timeline_item_id": created.timeline_item_id,
+                "session_id": session_id.to_string(),
+                "kind": "user_message",
+                "display_order": created.display_order,
+            }),
+        });
         let session_state = if route == MessageRoute::Queued {
             command.state.as_str()
         } else {
@@ -235,256 +320,25 @@ impl AppState {
         } else {
             Some(created.turn_id.as_str())
         };
-        let _ = self
-            .events()
-            .append(NewEvent {
-                event_type: "session.changed".into(),
-                actor,
-                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
-                correlation_id,
-                causation_id: None,
-                payload: json!({
-                    "session_id": session_id.to_string(),
-                    "state": session_state,
-                    "active_turn_id": active_turn_id,
-                    "version": command.session_version,
-                }),
-            })
-            .await;
-    }
-
-    /// Route a just-accepted message: if it should take over an active
-    /// `waiting_for_job` Turn via an atomic Handoff, perform that Handoff and
-    /// return the successor Turn to execute; otherwise return the Turn
-    /// `post_message` already created (started -> execute; queued -> nothing).
-    pub async fn handle_message(
-        &self,
-        session_id: SessionId,
-        result: crate::modules::sessions::types::MessageRouteResult,
-        content: &str,
-        _owner_id: &str,
-    ) -> Result<HandledMessage, SessionsError> {
-        let turn_id: TurnId = result
-            .turn_id
-            .parse()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid turn id")))?;
-        if result.route != "handed_off" {
-            // started -> execute; queued -> nothing to run now.
-            if result.route == "started" {
-                return Ok(HandledMessage {
-                    run_turn: Some(turn_id),
-                });
-            }
-            return Ok(HandledMessage { run_turn: None });
-        }
-        // Handoff: promote the queued Turn to the successor of the active
-        // waiting_for_job Turn, transactionally closing the predecessor's Asks
-        // and transferring its unfinished finite Jobs.
-        let active: Option<String> =
-            sqlx::query_scalar("SELECT active_turn_id FROM sessions WHERE id = ?")
-                .bind(session_id.to_string())
-                .fetch_optional(self.sessions().pool())
-                .await?
-                .flatten();
-        let Some(predecessor_str) = active else {
-            // No active Turn anymore (concurrency) — just promote the queued Turn.
-            let _ = self.sessions().promote_oldest_queued(session_id).await?;
-            return Ok(HandledMessage {
-                run_turn: self
-                    .sessions()
-                    .active_turn_status(session_id)
-                    .await?
-                    .map(|(t, _)| t),
-            });
-        };
-        let predecessor: TurnId = predecessor_str
-            .parse()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid active_turn_id")))?;
-
-        let supervisor = self.supervisor().clone();
-        self.handoff_message_internal(session_id, predecessor, turn_id, content, &supervisor)
-            .await?;
-        Ok(HandledMessage {
-            run_turn: Some(turn_id),
-        })
-    }
-
-    /// Atomically hand a `waiting_for_job` Turn off to a queued successor Turn:
-    /// attach the predecessor link, close the predecessor's open Asks, transfer
-    /// its unfinished finite Jobs, record both handoff links, settle the
-    /// predecessor `handed_off`, and promote the successor to `running`. Commits
-    /// one SQLite transaction; events are appended best-effort after commit.
-    async fn handoff_message_internal(
-        &self,
-        session_id: SessionId,
-        predecessor: TurnId,
-        successor: TurnId,
-        content: &str,
-        supervisor: &crate::modules::supervisor::interface::SupervisorInterface,
-    ) -> Result<(), SessionsError> {
-        let now = format_utc(SystemClock.now());
-        let mut tx = self.sessions().pool().begin().await?;
-
-        // The queued successor was created by post_message without a predecessor
-        // link; stamp it so the queue projection reports source = handoff.
-        self.sessions()
-            .attach_predecessor_in_tx(&mut *tx, successor, predecessor)
-            .await?;
-
-        // Close the predecessor's open Asks (canceled) so a late answer cannot
-        // resume a Turn we are handing off.
-        supervisor
-            .close_open_asks_in_tx(&mut *tx, &predecessor.to_string(), &now)
-            .await
-            .map_err(|e| SessionsError::Internal(anyhow::anyhow!("close_open_asks: {e}")))?;
-
-        // Transfer every unfinished finite Job to the successor so the
-        // `waiting_for_job` Turn cannot complete while those Jobs run; the new
-        // owning Turn sees them via runtime_events wake-up.
-        sqlx::query(
-            "UPDATE jobs SET controlling_turn_id = ? \
-             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(successor.to_string())
-        .bind(predecessor.to_string())
-        .execute(&mut *tx)
-        .await?;
-
-        // Record bidirectional links + settle predecessor (releases active slot).
-        self.sessions()
-            .record_handoff_links_in_tx(&mut *tx, predecessor, successor)
-            .await?;
-        self.sessions()
-            .mark_predecessor_handed_off_in_tx(&mut *tx, session_id, predecessor, Some("handoff"))
-            .await?;
-
-        // Promote the successor to running and claim the now-empty active slot.
-        let promoted = self
-            .sessions()
-            .promote_successor_in_tx(&mut *tx, session_id, successor)
-            .await?;
-        tx.commit().await?;
-        if promoted.is_none() {
-            tracing::warn!(%session_id, %successor, "handoff successor could not claim the slot");
-        }
-
-        let _ = self
-            .events()
-            .append(NewEvent {
-                event_type: "turn.status_changed".into(),
-                actor: json!({"kind": "supervisor"}),
-                resource: Some(json!({"kind": "turn", "id": predecessor.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
-                causation_id: None,
-                payload: json!({
-                    "turn_id": predecessor.to_string(),
-                    "to": "handed_off",
-                    "handoff_to": successor.to_string(),
-                }),
-            })
-            .await;
-        let _ = self
-            .events()
-            .append(NewEvent {
-                event_type: "turn.status_changed".into(),
-                actor: json!({"kind": "supervisor"}),
-                resource: Some(json!({"kind": "turn", "id": successor.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
-                causation_id: None,
-                payload: json!({
-                    "turn_id": successor.to_string(),
-                    "to": "running",
-                    "route": "handoff",
-                    "handoff_from": predecessor.to_string(),
-                }),
-            })
-            .await;
-        let _ = content; // body already persisted by post_message before handoff.
-        Ok(())
+        events.push(NewEvent {
+            event_type: "session.changed".into(),
+            actor,
+            resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+            correlation_id,
+            causation_id: None,
+            payload: json!({
+                "session_id": session_id.to_string(),
+                "state": session_state,
+                "active_turn_id": active_turn_id,
+                "version": command.session_version,
+            }),
+        });
+        events
     }
 
     // ------------------------------------------------------------------
     // Ask creation / answer / expiry
     // ------------------------------------------------------------------
-
-    /// Coordinator for the `ask_user` tool path: one shared transaction writes
-    /// the Ask row (supervisor owns `asks`) then pauses the Turn to
-    /// `waiting_for_ask` (sessions owns `turns`). A blocking Ask moves the Turn
-    /// out of `running` so the supervisor loop blocks; a best-effort Ask leaves
-    /// the Turn `running` (the model continues and the Ask may expire with a
-    /// default it reads later). Returns the Ask id (already known by the caller)
-    /// and the resulting Turn status + session version.
-    pub async fn create_ask(
-        &self,
-        owner_id: &str,
-        session_id: SessionId,
-        turn_id: TurnId,
-        tool_call_id: ToolCallId,
-        mode: &str,
-        prompt: &serde_json::Value,
-        choices: &serde_json::Value,
-        default: Option<&serde_json::Value>,
-        expires_at: Option<&str>,
-    ) -> Result<(AskId, String, String), SessionsError> {
-        let ask_id = AskId::new();
-        let supervisor = self.supervisor().clone();
-        let now = format_utc(SystemClock.now());
-        let mut tx = self.sessions().pool().begin().await?;
-        supervisor
-            .create_ask_in_tx(
-                &mut *tx,
-                &ask_id.to_string(),
-                &turn_id.to_string(),
-                &tool_call_id.to_string(),
-                mode,
-                &prompt.to_string(),
-                &choices.to_string(),
-                default.map(|v| v.to_string()).as_deref(),
-                expires_at,
-                &format!("v_{}", AskId::new()),
-                &now,
-            )
-            .await
-            .map_err(|e| SessionsError::Internal(anyhow::anyhow!("create_ask: {e}")))?;
-        tx.commit().await?;
-
-        // Blocking Ask: pause the running Turn. sessions writes turns state.
-        let (status, version) = if mode == "blocking" {
-            let _ = owner_id;
-            let v = self
-                .sessions()
-                .pause_turn_for(
-                    session_id,
-                    turn_id,
-                    "waiting_for_ask",
-                    json!({"kind": "supervisor"}),
-                )
-                .await?;
-            ("waiting_for_ask".to_string(), v)
-        } else {
-            // Best-effort: the Turn stays running; the Ask may expire with its
-            // default the supervisor reads on a later Round.
-            let s = self.sessions().get_session(session_id).await?;
-            ("running".to_string(), s.version)
-        };
-        let _ = self
-            .events()
-            .append(NewEvent {
-                event_type: "ask.changed".into(),
-                actor: json!({"kind": "supervisor"}),
-                resource: Some(json!({"kind": "ask", "id": ask_id.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
-                causation_id: None,
-                payload: json!({
-                    "ask_id": ask_id.to_string(),
-                    "turn_id": turn_id.to_string(),
-                    "mode": mode,
-                    "status": "open",
-                }),
-            })
-            .await;
-        Ok((ask_id, status, version))
-    }
 
     /// Answer an open Ask. One shared transaction writes the answer (supervisor
     /// owns `asks`) then resumes the Turn to `running` (sessions owns `turns`).
@@ -501,113 +355,442 @@ impl AppState {
         answer: &serde_json::Value,
         actor: serde_json::Value,
     ) -> Result<(TurnId, String, String), SessionsError> {
-        let supervisor = self.supervisor().clone();
         let now = format_utc(SystemClock.now());
-
-        // Look up the Ask's Turn + session (best-effort if it still exists).
-        let row = sqlx::query("SELECT turn_id, session_id FROM asks JOIN turns ON turns.id = asks.turn_id JOIN sessions ON sessions.id = turns.session_id WHERE asks.id = ?")
-            .bind(ask_id.to_string())
-            .fetch_optional(self.sessions().pool())
-            .await?
-            .ok_or(SessionsError::AskNotFound)?;
-        use sqlx::Row;
-        let turn_id_str: String = row.try_get("turn_id")?;
-        let session_id_str: String = row.try_get("session_id")?;
-        let turn_id: TurnId = turn_id_str
-            .parse()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid turn_id")))?;
-        let session_id: SessionId = session_id_str
-            .parse()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid session_id")))?;
-
-        let mut tx = self.sessions().pool().begin().await?;
-        let still_open = supervisor
-            .record_ask_answer_in_tx(&mut *tx, &ask_id.to_string(), &answer.to_string(), &now)
+        let mut work = self.unit_of_work().begin().await?;
+        let answered = self
+            .supervisor()
+            .answer_ask_in_tx(work.connection(), ask_id, answer, &now)
             .await
-            .map_err(|e| SessionsError::Internal(anyhow::anyhow!("record_ask_answer: {e}")))?;
-        tx.commit().await?;
-
-        if !still_open {
-            // Late answer: Ask was no longer open. Enqueue a new ordinary Turn
-            // carrying this answer as its message (source = ask_answer). The
-            // supervisor will run it when it reaches the head of the queue.
-            let current = self.sessions().get_session(session_id).await?;
-            let result = self
-                .sessions()
-                .post_message(session_id, &answer.to_string(), &current.version, actor)
-                .await?;
-            let new_turn: TurnId = result
-                .turn_id
-                .parse()
-                .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid turn id")))?;
-            return Ok((new_turn, result.route, result.session_version));
-        }
-
-        // Resume the Turn: waiting_for_ask -> running.
-        let version = self
-            .sessions()
-            .resume_turn(session_id, turn_id, "waiting_for_ask", actor)
+            .map_err(|error| match error {
+                SupervisorError::AskNotFound => SessionsError::AskNotFound,
+                error => SessionsError::Internal(anyhow::anyhow!("answer Ask: {error}")),
+            })?;
+        let outcome = self
+            .reconcile_turn_blockers_in_tx(work.connection(), answered.turn_id, &now)
             .await?;
-        let _ = self
-            .events()
-            .append(NewEvent {
+        let correlation_id = CorrelationId::new().to_string();
+        if let Some(settlement) = &answered.tool_call {
+            self.record_ask_tool_call_settlement_in_tx(
+                &mut work,
+                outcome.session_id,
+                settlement,
+                &actor,
+                &correlation_id,
+                &now,
+            )
+            .await?;
+        }
+        let accepted_by_original = answered.disposition == AskAnswerDisposition::Accepted
+            && outcome.active
+            && matches!(
+                outcome.status,
+                TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
+            );
+        let answer_text = answer
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| answer.to_string());
+        let source_ask_id = answered.ask_id.to_string();
+        let recorded = if accepted_by_original {
+            Some(
+                self.sessions()
+                    .record_ask_answer_in_tx(
+                        work.connection(),
+                        RecordAskAnswer {
+                            session_id: outcome.session_id,
+                            turn_id: answered.turn_id,
+                            ask_id: answered.ask_id,
+                            answer,
+                            actor: &actor,
+                            now: &now,
+                        },
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut late_steer = None;
+        let mut late_message = None;
+        if answered.disposition == AskAnswerDisposition::Late {
+            if outcome.active && outcome.status.is_interactive() {
+                late_steer = Some(
+                    self.sessions()
+                        .append_steer_in_tx(
+                            work.connection(),
+                            outcome.session_id,
+                            Some(answered.turn_id),
+                            &answer_text,
+                            &outcome.session_version,
+                            &actor,
+                            Some(&source_ask_id),
+                            &now,
+                        )
+                        .await?,
+                );
+            } else {
+                let workspace_revision = self
+                    .sessions()
+                    .current_workspace_revision(outcome.session_id)
+                    .await?;
+                late_message = Some(
+                    self.route_session_input_in_tx(
+                        &mut work,
+                        SessionInput {
+                            owner_id,
+                            session_id: outcome.session_id,
+                            content: &answer_text,
+                            expected_version: &outcome.session_version,
+                            actor: actor.clone(),
+                            source_ask_id: Some(&source_ask_id),
+                            workspace_revision: &workspace_revision,
+                            now: &now,
+                        },
+                    )
+                    .await?,
+                );
+            }
+        }
+        if answered.disposition == AskAnswerDisposition::Accepted {
+            work.append_event(NewEvent {
                 event_type: "ask.changed".into(),
-                actor: json!({"kind": "supervisor"}),
-                resource: Some(json!({"kind": "ask", "id": ask_id.to_string()})),
-                correlation_id: CorrelationId::new().to_string(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "ask", "id": answered.ask_id.to_string()})),
+                correlation_id: correlation_id.clone(),
                 causation_id: None,
                 payload: json!({
-                    "ask_id": ask_id.to_string(),
-                    "turn_id": turn_id.to_string(),
+                    "ask_id": answered.ask_id.to_string(),
+                    "turn_id": answered.turn_id.to_string(),
                     "status": "answered",
                 }),
             })
-            .await;
-        Ok((turn_id, "running".to_string(), version))
+            .await
+            .map_err(SessionsError::Internal)?;
+        }
+        if let Some(recorded) = &recorded {
+            work.append_event(NewEvent {
+                event_type: "timeline.item_created".into(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "session", "id": outcome.session_id.to_string()})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "timeline_item_id": recorded.timeline_item_id,
+                    "message_id": recorded.message_id,
+                    "display_order": recorded.display_order,
+                    "kind": "user_message",
+                    "source_ask_id": answered.ask_id.to_string(),
+                }),
+            })
+            .await
+            .map_err(SessionsError::Internal)?;
+        }
+        if let Some(transition) = &outcome.transition {
+            work.append_event(Self::blocker_transition_event(
+                answered.turn_id,
+                transition,
+                actor.clone(),
+                &correlation_id,
+            ))
+            .await
+            .map_err(SessionsError::Internal)?;
+        }
+        if let Some((steered, timeline_item_id)) = &late_steer {
+            work.append_event(NewEvent {
+                event_type: "timeline.item_created".into(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "session", "id": outcome.session_id.to_string()})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "timeline_item_id": timeline_item_id,
+                    "kind": "steer",
+                    "turn_id": steered.turn_id,
+                    "source_ask_id": source_ask_id,
+                }),
+            })
+            .await
+            .map_err(SessionsError::Internal)?;
+            work.append_event(NewEvent {
+                event_type: "session.changed".into(),
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "session", "id": outcome.session_id.to_string()})),
+                correlation_id: correlation_id.clone(),
+                causation_id: None,
+                payload: json!({
+                    "session_id": outcome.session_id.to_string(),
+                    "version": steered.session_version,
+                    "steer": {
+                        "turn_id": steered.turn_id,
+                        "source_ask_id": source_ask_id,
+                    },
+                }),
+            })
+            .await
+            .map_err(SessionsError::Internal)?;
+        }
+        let resumed_original = outcome
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.to_status == TurnStatus::Running);
+        let (response, schedule) = if let Some((steered, _)) = late_steer {
+            (
+                (
+                    answered.turn_id,
+                    MessageRoute::AskAnswerSteer.as_str().to_owned(),
+                    steered.session_version,
+                ),
+                resumed_original.then_some(answered.turn_id),
+            )
+        } else if let Some(result) = late_message {
+            let turn_id = result
+                .turn_id
+                .parse::<TurnId>()
+                .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid turn id")))?;
+            let schedule =
+                matches!(result.route.as_str(), "started" | "handed_off").then_some(turn_id);
+            ((turn_id, result.route, result.session_version), schedule)
+        } else {
+            (
+                (
+                    answered.turn_id,
+                    outcome.status.as_str().to_owned(),
+                    outcome.session_version,
+                ),
+                resumed_original.then_some(answered.turn_id),
+            )
+        };
+        work.commit().await?;
+        if let Some(turn_id) = schedule {
+            self.turn_runner().schedule(turn_id);
+        }
+        Ok(response)
     }
 
     /// Expire any due best-effort Asks, applying their default answer and
     /// resuming the controlling Turn if it is still `waiting_for_ask`. Called by
     /// a periodic sweeper (and at startup). Stale notifications are harmless.
-    pub async fn expire_asks(&self, owner_id: &str) -> Result<u64, SessionsError> {
-        let supervisor = self.supervisor().clone();
+    pub async fn expire_asks(&self, _owner_id: &str) -> Result<u64, SessionsError> {
         let now = format_utc(SystemClock.now());
-        let expired = supervisor
-            .expire_open_asks(&now)
+        let mut work = self.unit_of_work().begin().await?;
+        let expired = self
+            .supervisor()
+            .expire_due_asks_in_tx(work.connection(), &now, 100)
             .await
-            .map_err(|e| SessionsError::Internal(anyhow::anyhow!("expire_open_asks: {e}")))?;
-        let mut count = 0u64;
-        for (_ask_id, turn_id_str, _default) in &expired {
-            let Ok(turn_id) = turn_id_str.parse::<TurnId>() else {
-                continue;
-            };
-            // Find the session for this turn.
-            let session_id_str: Option<String> =
-                sqlx::query_scalar("SELECT session_id FROM turns WHERE id = ?")
-                    .bind(turn_id_str)
-                    .fetch_optional(self.sessions().pool())
-                    .await?
-                    .flatten();
-            let Some(session_id_str) = session_id_str else {
-                continue;
-            };
-            let Ok(session_id) = session_id_str.parse::<SessionId>() else {
-                continue;
-            };
-            // Resume only if still waiting for the Ask.
-            let _ = self
-                .sessions()
-                .resume_turn(
-                    session_id,
-                    turn_id,
-                    "waiting_for_ask",
-                    json!({"kind": "supervisor"}),
-                )
-                .await;
-            count += 1;
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!("expire Asks: {error}")))?;
+        let mut by_turn = HashMap::<TurnId, Vec<_>>::new();
+        for ask in &expired {
+            by_turn.entry(ask.turn_id).or_default().push(ask);
         }
-        let _ = owner_id;
-        Ok(count)
+        let actor = json!({"kind": "supervisor"});
+        let correlation_id = CorrelationId::new().to_string();
+        let mut schedule = Vec::new();
+        for (turn_id, asks) in by_turn {
+            let outcome = self
+                .reconcile_turn_blockers_in_tx(work.connection(), turn_id, &now)
+                .await?;
+            let original_can_consume = outcome.active
+                && matches!(
+                    outcome.status,
+                    TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
+                );
+            for ask in asks {
+                self.record_ask_tool_call_settlement_in_tx(
+                    &mut work,
+                    outcome.session_id,
+                    &ask.tool_call,
+                    &actor,
+                    &correlation_id,
+                    &now,
+                )
+                .await?;
+                work.append_event(NewEvent {
+                    event_type: "ask.changed".into(),
+                    actor: actor.clone(),
+                    resource: Some(json!({"kind": "ask", "id": ask.ask_id.to_string()})),
+                    correlation_id: correlation_id.clone(),
+                    causation_id: None,
+                    payload: json!({
+                        "ask_id": ask.ask_id.to_string(),
+                        "turn_id": turn_id.to_string(),
+                        "status": "expired",
+                    }),
+                })
+                .await
+                .map_err(SessionsError::Internal)?;
+                if original_can_consume && let Some(default) = &ask.default {
+                    let recorded = self
+                        .sessions()
+                        .record_ask_answer_in_tx(
+                            work.connection(),
+                            RecordAskAnswer {
+                                session_id: outcome.session_id,
+                                turn_id,
+                                ask_id: ask.ask_id,
+                                answer: default,
+                                actor: &actor,
+                                now: &now,
+                            },
+                        )
+                        .await?;
+                    work.append_event(NewEvent {
+                        event_type: "timeline.item_created".into(),
+                        actor: actor.clone(),
+                        resource: Some(json!({
+                            "kind": "session",
+                            "id": outcome.session_id.to_string(),
+                        })),
+                        correlation_id: correlation_id.clone(),
+                        causation_id: None,
+                        payload: json!({
+                            "timeline_item_id": recorded.timeline_item_id,
+                            "message_id": recorded.message_id,
+                            "display_order": recorded.display_order,
+                            "kind": "user_message",
+                            "source_ask_id": ask.ask_id.to_string(),
+                        }),
+                    })
+                    .await
+                    .map_err(SessionsError::Internal)?;
+                }
+            }
+            if let Some(transition) = &outcome.transition {
+                work.append_event(Self::blocker_transition_event(
+                    turn_id,
+                    transition,
+                    actor.clone(),
+                    &correlation_id,
+                ))
+                .await
+                .map_err(SessionsError::Internal)?;
+                if transition.to_status == TurnStatus::Running {
+                    schedule.push(turn_id);
+                }
+            }
+        }
+        work.commit().await?;
+        for turn_id in schedule {
+            self.turn_runner().schedule(turn_id);
+        }
+        Ok(expired.len() as u64)
+    }
+
+    async fn record_ask_tool_call_settlement_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        session_id: SessionId,
+        settlement: &ToolCallSettlement,
+        actor: &serde_json::Value,
+        correlation_id: &str,
+        now: &str,
+    ) -> Result<(), SessionsError> {
+        let source_turn_id = settlement
+            .source_turn_id
+            .parse::<TurnId>()
+            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid source Turn id")))?;
+        let timeline_item_id = self
+            .sessions()
+            .replace_tool_result_in_tx(
+                work.connection(),
+                session_id,
+                source_turn_id,
+                &settlement.tool_call_id,
+                &settlement.provider_call_id,
+                &settlement.tool_name,
+                settlement.status.as_str(),
+                &settlement.summary,
+                &settlement.model_parts,
+                now,
+            )
+            .await?;
+        work.append_event(NewEvent {
+            event_type: "tool_call.changed".into(),
+            actor: actor.clone(),
+            resource: Some(json!({
+                "kind": "tool_call",
+                "id": settlement.tool_call_id,
+            })),
+            correlation_id: correlation_id.to_owned(),
+            causation_id: None,
+            payload: json!({
+                "tool_call_id": settlement.tool_call_id,
+                "provider_call_id": settlement.provider_call_id,
+                "tool_name": settlement.tool_name,
+                "status": settlement.status.as_str(),
+                "summary": settlement.summary,
+                "timeline_item_id": timeline_item_id,
+            }),
+        })
+        .await
+        .map_err(SessionsError::Internal)?;
+        work.append_event(NewEvent {
+            event_type: "timeline.item_updated".into(),
+            actor: actor.clone(),
+            resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+            correlation_id: correlation_id.to_owned(),
+            causation_id: None,
+            payload: json!({
+                "timeline_item_id": timeline_item_id,
+                "tool_call_id": settlement.tool_call_id,
+            }),
+        })
+        .await
+        .map_err(SessionsError::Internal)?;
+        Ok(())
+    }
+
+    async fn reconcile_turn_blockers_in_tx(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        turn_id: TurnId,
+        now: &str,
+    ) -> Result<TurnBlockerOutcome, SessionsError> {
+        let open_ask = self
+            .supervisor()
+            .has_open_asks_in_tx(tx, turn_id)
+            .await
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("inspect Ask blockers: {error}"))
+            })?;
+        let unfinished_job = self
+            .runtime()
+            .has_unfinished_jobs_in_tx(tx, turn_id)
+            .await
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("inspect Job blockers: {error}"))
+            })?;
+        self.sessions()
+            .reconcile_turn_blockers_in_tx(
+                tx,
+                turn_id,
+                TurnBlockers {
+                    open_ask,
+                    unfinished_job,
+                },
+                now,
+            )
+            .await
+    }
+
+    fn blocker_transition_event(
+        turn_id: TurnId,
+        transition: &crate::modules::sessions::interface::TurnTransition,
+        actor: serde_json::Value,
+        correlation_id: &str,
+    ) -> NewEvent {
+        NewEvent {
+            event_type: "turn.status_changed".into(),
+            actor,
+            resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
+            correlation_id: correlation_id.to_owned(),
+            causation_id: None,
+            payload: json!({
+                "turn_id": turn_id.to_string(),
+                "from": transition.from_status.as_str(),
+                "to": transition.to_status.as_str(),
+                "session_version": transition.session_version,
+            }),
+        }
     }
 
     /// Final Cancel settlement after Runtime confirms finite resources owned by
@@ -617,30 +800,218 @@ impl AppState {
     /// - `interrupted` when some Job is `lost` / Runtime cannot confirm the
     ///   process is gone (queue stays paused).
     ///
-    /// Called by the cancel workflow once Runtime reports process-group exit
-    /// (or after a bounded wait). Sessions owns the Turn state write via
-    /// `settle_terminal_turn`.
+    /// Sessions owns the Turn state write via `settle_cancel_in_tx`.
     pub async fn settle_cancel(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
         uncertain: bool,
         actor: serde_json::Value,
-    ) -> Result<Option<TurnId>, SessionsError> {
-        // Close any still-open Asks the canceling Turn owned so a late answer
-        // cannot resume it after settlement.
+    ) -> Result<(), SessionsError> {
         let now = format_utc(SystemClock.now());
-        let mut tx = self.sessions().pool().begin().await?;
-        let supervisor = self.supervisor().clone();
-        supervisor
-            .close_open_asks_in_tx(&mut *tx, &turn_id.to_string(), &now)
+        let mut work = self.unit_of_work().begin().await?;
+        self.turn_runner()
+            .settle_terminal_jobs_for_turn_in_tx(&mut work, turn_id, &now)
             .await
-            .map_err(|e| SessionsError::Internal(anyhow::anyhow!("close_open_asks: {e}")))?;
-        tx.commit().await?;
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("settle canceled Turn Jobs: {error}"))
+            })?;
+        let round_ids = self
+            .supervisor()
+            .cancel_execution_in_tx(work.connection(), turn_id, &now)
+            .await
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!(
+                    "cancel Supervisor execution ledger: {error}"
+                ))
+            })?;
+        self.models()
+            .cancel_running_attempts_for_rounds_in_tx(work.connection(), &round_ids, &now)
+            .await
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("cancel Model Attempts: {error}"))
+            })?;
+        let transition = self
+            .sessions()
+            .settle_cancel_in_tx(
+                work.connection(),
+                session_id,
+                turn_id,
+                uncertain,
+                "user_cancel",
+                &now,
+            )
+            .await?;
+        if let Some(transition) = &transition {
+            let correlation_id = CorrelationId::new().to_string();
+            work.append_event(Self::blocker_transition_event(
+                turn_id,
+                transition,
+                actor.clone(),
+                &correlation_id,
+            ))
+            .await
+            .map_err(SessionsError::Internal)?;
+            work.append_event(NewEvent {
+                event_type: "session.changed".into(),
+                actor,
+                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                correlation_id,
+                causation_id: None,
+                payload: json!({
+                    "session_id": session_id.to_string(),
+                    "state": "ready",
+                    "active_turn_id": null,
+                    "version": transition.session_version,
+                }),
+            })
+            .await
+            .map_err(SessionsError::Internal)?;
+        }
+        work.commit().await?;
+        if transition.is_some_and(|transition| transition.to_status == TurnStatus::Canceled) {
+            // Terminal canceled Turns advance the FIFO queue through the runner
+            // without re-entering model execution for the canceled Turn.
+            self.turn_runner().schedule(turn_id);
+        }
+        Ok(())
+    }
 
-        let terminal = if uncertain { "interrupted" } else { "canceled" };
-        self.sessions()
-            .settle_terminal_turn(session_id, turn_id, terminal, Some("user_cancel"), actor)
+    /// Accept Cancel, bound-cancel finite Jobs owned by the Turn, then settle the
+    /// Turn as `canceled` or `interrupted`. Only `canceled` advances the queue.
+    pub async fn cancel_active_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        reason: &str,
+        expected_version: &str,
+        actor: serde_json::Value,
+    ) -> Result<CancelResult, SessionsError> {
+        let initial = self.sessions().execution_turn(turn_id).await?;
+        if initial.session_id != session_id {
+            return Err(SessionsError::NotFound);
+        }
+        let mut from_status = initial.status.as_str().to_owned();
+        if matches!(
+            initial.status,
+            TurnStatus::Canceled | TurnStatus::Interrupted
+        ) {
+            let session = self.sessions().get_session(session_id).await?;
+            return Ok(CancelResult {
+                turn_id: turn_id.to_string(),
+                from_status,
+                to_status: initial.status.as_str().to_owned(),
+                session_version: session.version,
+            });
+        }
+        if initial.status != TurnStatus::Canceling {
+            match self
+                .sessions()
+                .cancel_turn(session_id, turn_id, reason, expected_version, actor.clone())
+                .await
+            {
+                Ok(accepted) => from_status = accepted.from_status,
+                Err(error) => {
+                    let current = self.sessions().execution_turn(turn_id).await?;
+                    if current.session_id != session_id
+                        || !matches!(
+                            current.status,
+                            TurnStatus::Canceling | TurnStatus::Canceled | TurnStatus::Interrupted
+                        )
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        } else if !initial.active {
+            return Err(SessionsError::Internal(anyhow::anyhow!(
+                "canceling Turn no longer owns its Session"
+            )));
+        }
+
+        let current = self.sessions().execution_turn(turn_id).await?;
+        if matches!(
+            current.status,
+            TurnStatus::Canceled | TurnStatus::Interrupted
+        ) {
+            let session = self.sessions().get_session(session_id).await?;
+            return Ok(CancelResult {
+                turn_id: turn_id.to_string(),
+                from_status,
+                to_status: current.status.as_str().to_owned(),
+                session_version: session.version,
+            });
+        }
+
+        let unfinished = self
+            .runtime()
+            .unfinished_jobs_for_turn(turn_id)
             .await
+            .map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!("list unfinished Jobs for Cancel: {error}"))
+            })?;
+        let mut uncertain = false;
+        for job in unfinished {
+            match self.runtime().cancel_job(job.id).await {
+                Ok(projection) => {
+                    if matches!(projection.status, JobStatus::Lost) {
+                        uncertain = true;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        job_id = %job.id,
+                        turn_id = %turn_id,
+                        "bounded Job cancellation failed during Turn Cancel"
+                    );
+                    uncertain = true;
+                }
+            }
+        }
+
+        if !uncertain {
+            let remaining =
+                self.runtime()
+                    .unfinished_job_count(turn_id)
+                    .await
+                    .map_err(|error| {
+                        SessionsError::Internal(anyhow::anyhow!(
+                            "recheck unfinished Jobs after Cancel: {error}"
+                        ))
+                    })?;
+            uncertain = remaining > 0;
+        }
+
+        self.settle_cancel(session_id, turn_id, uncertain, actor)
+            .await?;
+
+        let turn = self.sessions().get_turn(session_id, turn_id).await?;
+        let session = self.sessions().get_session(session_id).await?;
+        Ok(CancelResult {
+            turn_id: turn_id.to_string(),
+            from_status,
+            to_status: turn.status,
+            session_version: session.version,
+        })
+    }
+
+    /// Resume a Turn parked on `waiting_for_model` and schedule execution through
+    /// the application Turn runner. Returns whether a runnable wake was scheduled.
+    pub async fn retry_waiting_model(&self, turn_id: TurnId) -> Result<bool, SessionsError> {
+        let runnable =
+            self.supervisor()
+                .retry_model(turn_id)
+                .await
+                .map_err(|error| match error {
+                    SupervisorError::TurnNotFound => SessionsError::NotFound,
+                    error => {
+                        SessionsError::Internal(anyhow::anyhow!("retry waiting model: {error}"))
+                    }
+                })?;
+        if runnable {
+            self.turn_runner().schedule(turn_id);
+        }
+        Ok(runnable)
     }
 }

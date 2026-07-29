@@ -80,7 +80,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
     let runtime_id = RuntimeId::new();
     let runtime = RuntimeSpec::new(
         runtime_id,
-        session_id,
+        janus_server::modules::runtime::interface::RuntimeScope::session(session_id),
         ExecutorKind::Local,
         workspace,
         limits(10_000),

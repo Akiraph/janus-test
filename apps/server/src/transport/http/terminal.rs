@@ -25,11 +25,10 @@ use utoipa::ToSchema;
 use crate::{
     AppState,
     modules::runtime::interface::{
-        ExecutionEnvironment, LogCursor, RelativeWorkingDirectory, TerminalOwner,
-        TerminalProjection, TerminalSignal, TerminalSize, TerminalSpec, TerminalTicket,
-        TerminalTicketRequest,
+        ExecutionEnvironment, LogCursor, RelativeWorkingDirectory, TerminalProjection,
+        TerminalSignal, TerminalSize, TerminalTicket, TerminalTicketRequest,
     },
-    platform::id::{ProjectId, RuntimeId, SessionId, TerminalId},
+    platform::id::{ProjectId, TerminalId},
     transport::http::{
         auth::authenticate,
         dto::DataResponse,
@@ -40,8 +39,7 @@ use crate::{
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateTerminalRequest {
-    pub runtime_id: String,
-    pub owner: TerminalOwnerInput,
+    pub project_id: String,
     #[serde(default = "default_cwd")]
     pub working_directory: String,
     #[serde(default)]
@@ -51,13 +49,6 @@ pub struct CreateTerminalRequest {
 
 fn default_cwd() -> String {
     ".".to_owned()
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
-pub enum TerminalOwnerInput {
-    Project(String),
-    Session(String),
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -111,7 +102,10 @@ pub async fn create_terminal(
     Json(body): Json<CreateTerminalRequest>,
 ) -> Result<(StatusCode, Json<DataResponse<TerminalProjection>>), Problem> {
     let auth = authenticate(&state, &headers).await?;
-    let owner = parse_owner(&body.owner)?;
+    let project_id: ProjectId = body
+        .project_id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid project id"))?;
     let size = TerminalSize::new(body.size.cols, body.size.rows)
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid terminal size"))?;
     let working_directory = RelativeWorkingDirectory::new(&body.working_directory)
@@ -122,25 +116,31 @@ pub async fn create_terminal(
         .unwrap_or_default();
     let environment = ExecutionEnvironment::new(ordinary, Vec::new())
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid environment"))?;
-    let runtime_id: RuntimeId = body
-        .runtime_id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid runtime id"))?;
-    let spec = TerminalSpec {
-        id: TerminalId::new(),
-        runtime_id,
-        owner,
-        working_directory,
-        environment,
-        size,
-    };
-    let _ = (auth, context);
+    let _ = context;
     let data = state
-        .runtime()
-        .create_terminal(spec)
+        .create_project_terminal(
+            &auth.owner_id,
+            project_id,
+            working_directory,
+            environment,
+            size,
+        )
         .await
-        .map_err(map_runtime_error)?;
+        .map_err(map_project_terminal_error)?;
     Ok((StatusCode::CREATED, Json(DataResponse { data })))
+}
+
+fn map_project_terminal_error(
+    error: crate::application::project_terminal::ProjectTerminalError,
+) -> Problem {
+    match error {
+        crate::application::project_terminal::ProjectTerminalError::Projects(error) => {
+            Problem::from_code(error.code(), error.to_string())
+        }
+        crate::application::project_terminal::ProjectTerminalError::Runtime(error) => {
+            map_runtime_error(error)
+        }
+    }
 }
 
 #[utoipa::path(
@@ -154,10 +154,13 @@ pub async fn list_terminals(
     Query(query): Query<ListTerminalsQuery>,
 ) -> Result<Json<DataResponse<Vec<TerminalProjection>>>, Problem> {
     let _auth = authenticate(&state, &headers).await?;
-    let owner = parse_owner(&query.owner())?;
+    let project_id: ProjectId = query
+        .project_id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid project id"))?;
     let data = state
         .runtime()
-        .list_terminals(owner)
+        .list_terminals(project_id)
         .await
         .map_err(map_runtime_error)?;
     Ok(Json(DataResponse { data }))
@@ -165,18 +168,7 @@ pub async fn list_terminals(
 
 #[derive(Debug, Deserialize)]
 pub struct ListTerminalsQuery {
-    pub owner_kind: String,
-    pub owner_id: String,
-}
-
-impl ListTerminalsQuery {
-    fn owner(&self) -> TerminalOwnerInput {
-        match self.owner_kind.as_str() {
-            "project" => TerminalOwnerInput::Project(self.owner_id.clone()),
-            "session" => TerminalOwnerInput::Session(self.owner_id.clone()),
-            other => TerminalOwnerInput::Project(other.to_owned()),
-        }
-    }
+    pub project_id: String,
 }
 
 #[utoipa::path(
@@ -551,22 +543,4 @@ fn origin_for(headers: &HeaderMap) -> Result<String, Problem> {
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .ok_or_else(|| Problem::from_code(codes::TERMINAL_TICKET_INVALID, "missing Origin"))
-}
-
-#[allow(clippy::result_large_err)]
-fn parse_owner(input: &TerminalOwnerInput) -> Result<TerminalOwner, Problem> {
-    match input {
-        TerminalOwnerInput::Project(id) => {
-            let project_id: ProjectId = id
-                .parse()
-                .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid project id"))?;
-            Ok(TerminalOwner::Project(project_id))
-        }
-        TerminalOwnerInput::Session(id) => {
-            let session_id: SessionId = id
-                .parse()
-                .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid session id"))?;
-            Ok(TerminalOwner::Session(session_id))
-        }
-    }
 }

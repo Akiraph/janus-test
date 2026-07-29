@@ -14,7 +14,9 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::AppState;
-use crate::platform::operations::{KIND_CLONE, KIND_DELETE_PROJECT, OperationStatus};
+use crate::platform::operations::{
+    KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION, OperationStatus,
+};
 
 /// Lease TTL for a claimed work item: short enough that a dead worker's lease
 /// is reclaimed quickly, long enough for a clone to finish.
@@ -22,7 +24,12 @@ const LEASE_TTL_SECONDS: i64 = 120;
 
 /// The kinds the worker claims. Short git commands run inline in the request
 /// path; only the long external side effects go through the queue.
-const HANDLED_KINDS: &[&str] = &[KIND_CLONE, KIND_DELETE_PROJECT];
+const HANDLED_KINDS: &[&str] = &[
+    KIND_CLONE,
+    KIND_DELETE_PROJECT,
+    KIND_CREATE_SESSION,
+    KIND_DELETE_SESSION,
+];
 
 /// Spawn the background worker. Runs until the runtime shuts down.
 pub fn spawn(state: AppState) {
@@ -42,36 +49,47 @@ pub fn spawn(state: AppState) {
 /// Spawn the Job-settled wake-up loop. Subscribes to Runtime's broadcast of
 /// terminal Job ids and resumes any `waiting_for_job` Turn that no longer has
 /// unfinished finite Jobs. Single-flight: each resume schedules one next
-/// Supervisor Round via `execute_turn`.
+/// Supervisor Round via the application Turn runner.
 pub fn spawn_job_wake(state: AppState) {
     let mut rx = state.runtime().subscribe_job_settled();
     tokio::spawn(async move {
         info!("janus job-wake worker started");
+        let mut reconciliation = tokio::time::interval(Duration::from_millis(500));
         loop {
-            match rx.recv().await {
-                Ok(job_id) => {
-                    match state.on_job_settled(job_id).await {
-                        Ok(Some(turn_id)) => {
-                            // Resume schedules one next Round. Owner is the
-                            // bootstrap supervisor; HTTP request-scoped owner
-                            // binding is not available on this path.
-                            let supervisor = state.supervisor().clone();
-                            tokio::spawn(async move {
-                                if let Err(error) = supervisor.execute_turn(turn_id).await {
-                                    warn!(%error, %turn_id, "job-wake execute_turn failed");
-                                }
-                            });
-                        }
+            tokio::select! {
+                notification = rx.recv() => match notification {
+                    Ok(job_id) => match state.turn_runner().settle_job(job_id).await {
+                        Ok(Some(turn_id)) => state.turn_runner().schedule(turn_id),
                         Ok(None) => {}
                         Err(error) => {
-                            warn!(%error, %job_id, "on_job_settled failed");
+                            warn!(%error, %job_id, "settle Job notification failed");
                         }
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "job-wake receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = reconciliation.tick() => {
+                    if let Err(error) = state.turn_runner().reconcile_waiting_jobs().await {
+                        warn!(%error, "waiting Job reconciliation failed");
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(lagged = n, "job-wake receiver lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Periodically expire due best-effort Asks through the application command so
+/// defaults become durable Turn input and only runnable Turns are scheduled.
+pub fn spawn_ask_expiry(state: AppState) {
+    tokio::spawn(async move {
+        info!("janus ask-expiry worker started");
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if let Err(error) = state.expire_asks("system").await {
+                warn!(%error, "Ask expiry sweep failed");
             }
         }
     });
@@ -110,24 +128,32 @@ async fn run_once(state: &AppState) -> anyhow::Result<()> {
 }
 
 async fn dispatch(state: &AppState, kind: &str, payload: &Value) -> anyhow::Result<()> {
-    let project_id = payload
-        .get("project_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("work item missing project_id"))?;
     match kind {
-        KIND_CLONE => match state.projects().run_clone(project_id).await {
-            Ok(()) => {
-                record_operation_success(state, kind, project_id, payload).await;
-                Ok(())
+        KIND_CLONE => {
+            let project_id = payload_string(payload, "project_id")?;
+            match state.projects().run_clone(project_id).await {
+                Ok(()) => {
+                    record_operation_success(state, kind, project_id, payload).await;
+                    Ok(())
+                }
+                Err(error) => {
+                    record_operation_failure(state, kind, project_id, payload, &error).await;
+                    Err(anyhow::anyhow!("clone failed: {error}"))
+                }
             }
-            Err(error) => {
-                record_operation_failure(state, kind, project_id, payload, &error).await;
-                Err(anyhow::anyhow!("clone failed: {error}"))
-            }
-        },
+        }
         KIND_DELETE_PROJECT => {
-            match crate::application::lifecycle::delete_project_with_runtime(state, project_id)
-                .await
+            let project_id = payload_string(payload, "project_id")?;
+            let operation_id = payload
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("project delete work item missing operation_id"))?;
+            match crate::application::lifecycle::delete_project_with_runtime(
+                state,
+                project_id,
+                operation_id,
+            )
+            .await
             {
                 Ok(()) => {
                     record_operation_success(state, kind, project_id, payload).await;
@@ -147,12 +173,27 @@ async fn dispatch(state: &AppState, kind: &str, payload: &Value) -> anyhow::Resu
                         ),
                     )
                     .await;
-                    Err(error)
+                    Err(error.into())
                 }
             }
         }
+        KIND_CREATE_SESSION => {
+            crate::application::lifecycle::run_session_creation_operation(state, payload).await?;
+            Ok(())
+        }
+        KIND_DELETE_SESSION => {
+            crate::application::lifecycle::run_session_deletion_operation(state, payload).await?;
+            Ok(())
+        }
         other => Err(anyhow::anyhow!("no handler for kind {other}")),
     }
+}
+
+fn payload_string<'a>(payload: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("work item missing {field}"))
 }
 
 /// Resolve the Operation id from the work payload when present; otherwise fall
@@ -168,15 +209,12 @@ async fn resolve_operation_id(
     if let Some(op_id) = payload.get("operation_id").and_then(|v| v.as_str()) {
         return Some(op_id.to_owned());
     }
-    sqlx::query_scalar(
-        "SELECT id FROM operations WHERE kind = ? AND target_kind = 'project' AND target_id = ? AND status IN ('queued', 'running') ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(kind)
-    .bind(project_id)
-    .fetch_optional(state.database().pool())
-    .await
-    .ok()
-    .flatten()
+    state
+        .operations()
+        .in_flight_for_target(kind, "project", project_id)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Mark the Operation backing this work item as succeeded so clients polling

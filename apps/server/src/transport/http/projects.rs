@@ -26,7 +26,7 @@ use crate::{
         FileMetaView, FileTreeView, GithubCredentialView, MoveFileInput, ProjectView,
         ProjectsError, RetryProjectInput, SaveTextInput, UpdateGithubCredentialInput,
     },
-    platform::{events::NewEvent, id::CorrelationId},
+    platform::id::CorrelationId,
     transport::http::{
         auth::{authenticate, authorized},
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -104,7 +104,6 @@ pub async fn list_projects(
 )]
 pub async fn create_project(
     State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
     headers: HeaderMap,
     body: RawBody,
 ) -> Result<
@@ -131,7 +130,7 @@ pub async fn create_project(
         "/api/v1/projects",
         body.as_slice(),
     )?;
-    let (project, operation) = state
+    let (_project, operation) = state
         .projects()
         .create_project(
             &auth.owner_id,
@@ -142,15 +141,6 @@ pub async fn create_project(
         )
         .await
         .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &project.id,
-        "project",
-        "created",
-        &context,
-    )
-    .await;
     Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
 }
 
@@ -209,10 +199,10 @@ pub async fn update_project(
             &expected_version,
             input.name.as_deref(),
             input.default_model_id.as_ref().map(|m| m.as_deref()),
+            &context.request_id,
         )
         .await
         .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "project", "updated", &context).await;
     Ok(Json(DataResponse { data: view }))
 }
 
@@ -229,7 +219,6 @@ pub async fn update_project(
 )]
 pub async fn delete_project(
     State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: RawBody,
@@ -246,7 +235,7 @@ pub async fn delete_project(
     // The DELETE Project contract requires an Idempotency-Key per `API-IDEM-01`;
     // the underlying Module currently records intent via correlation_id only,
     // so we validate presence here and forward the correlation_id.
-    let _idempotency = require_idempotency(
+    let idempotency = require_idempotency(
         &headers,
         &auth.owner_id,
         "DELETE",
@@ -255,10 +244,15 @@ pub async fn delete_project(
     )?;
     let operation = state
         .projects()
-        .delete_project(&auth.owner_id, &id, &expected_version, correlation_id)
+        .delete_project(
+            &auth.owner_id,
+            &id,
+            &expected_version,
+            correlation_id,
+            idempotency,
+        )
         .await
         .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "project", "deleted", &context).await;
     Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
 }
 
@@ -277,7 +271,6 @@ pub async fn delete_project(
 )]
 pub async fn retry_project(
     State(state): State<AppState>,
-    Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(input): Json<RetryProjectInput>,
@@ -295,7 +288,6 @@ pub async fn retry_project(
         .retry_project(&auth.owner_id, &id, input, correlation_id)
         .await
         .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "project", "retry", &context).await;
     Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
 }
 
@@ -342,18 +334,9 @@ pub async fn create_credential(
     let auth = authorized(&state, &headers).await?;
     let view = state
         .projects()
-        .create_credential(&auth.owner_id, input)
+        .create_credential(&auth.owner_id, input, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &view.id,
-        "github_credential",
-        "created",
-        &context,
-    )
-    .await;
     Ok((StatusCode::CREATED, Json(DataResponse { data: view })))
 }
 
@@ -406,18 +389,15 @@ pub async fn update_credential(
     let expected_version = if_match_version(&headers)?;
     let view = state
         .projects()
-        .update_credential(&auth.owner_id, &id, &expected_version, input)
+        .update_credential(
+            &auth.owner_id,
+            &id,
+            &expected_version,
+            input,
+            &context.request_id,
+        )
         .await
         .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &id,
-        "github_credential",
-        "updated",
-        &context,
-    )
-    .await;
     Ok(Json(DataResponse { data: view }))
 }
 
@@ -441,18 +421,9 @@ pub async fn delete_credential(
     let auth = authorized(&state, &headers).await?;
     state
         .projects()
-        .delete_credential(&auth.owner_id, &id)
+        .delete_credential(&auth.owner_id, &id, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &id,
-        "github_credential",
-        "deleted",
-        &context,
-    )
-    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -570,10 +541,9 @@ pub async fn save_text(
     let actor = serde_json::json!({ "kind": "owner", "id": auth.owner_id });
     let revision = state
         .projects()
-        .save_text(&auth.owner_id, &id, input, actor)
+        .save_text(&auth.owner_id, &id, input, actor, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_main_revision_changed(&state, &auth.owner_id, &id, &revision.0, &context).await;
     Ok(Json(DataResponse { data: revision }))
 }
 
@@ -630,10 +600,9 @@ pub async fn move_file(
     let actor = serde_json::json!({ "kind": "owner", "id": auth.owner_id });
     let revision = state
         .projects()
-        .move_file(&auth.owner_id, &id, input, actor)
+        .move_file(&auth.owner_id, &id, input, actor, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_main_revision_changed(&state, &auth.owner_id, &id, &revision.0, &context).await;
     Ok(Json(DataResponse { data: revision }))
 }
 
@@ -660,61 +629,13 @@ pub async fn delete_file(
     let actor = serde_json::json!({ "kind": "owner", "id": auth.owner_id });
     let revision = state
         .projects()
-        .delete_file(&auth.owner_id, &id, input, actor)
+        .delete_file(&auth.owner_id, &id, input, actor, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_main_revision_changed(&state, &auth.owner_id, &id, &revision.0, &context).await;
     Ok(Json(DataResponse { data: revision }))
 }
 
 // ----- Events --------------------------------------------------------------
-
-async fn emit_change(
-    state: &AppState,
-    owner_id: &str,
-    resource_id: &str,
-    resource_kind: &str,
-    operation: &str,
-    context: &RequestContext,
-) {
-    if let Err(error) = state
-        .events()
-        .append(NewEvent {
-            event_type: "project.changed".into(),
-            actor: serde_json::json!({ "kind": "owner", "id": owner_id }),
-            resource: Some(serde_json::json!({ "kind": resource_kind, "id": resource_id })),
-            correlation_id: context.request_id.clone(),
-            causation_id: None,
-            payload: serde_json::json!({ "operation": operation }),
-        })
-        .await
-    {
-        tracing::error!(%error, %resource_id, %operation, "append project change event");
-    }
-}
-
-async fn emit_main_revision_changed(
-    state: &AppState,
-    owner_id: &str,
-    project_id: &str,
-    revision: &str,
-    context: &RequestContext,
-) {
-    if let Err(error) = state
-        .events()
-        .append(NewEvent {
-            event_type: "project.main_revision_changed".into(),
-            actor: serde_json::json!({ "kind": "owner", "id": owner_id }),
-            resource: Some(serde_json::json!({ "kind": "project", "id": project_id })),
-            correlation_id: context.request_id.clone(),
-            causation_id: None,
-            payload: serde_json::json!({ "main_revision": revision, "source": "editor" }),
-        })
-        .await
-    {
-        tracing::error!(%error, %project_id, "append main revision changed event");
-    }
-}
 
 // ----- Problem mapping -----------------------------------------------------
 

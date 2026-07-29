@@ -10,6 +10,56 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/api/v1/asks/{ask_id}/answer": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "answer_ask",
+        "parameters": [
+          {
+            "name": "ask_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnswerAskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Value"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/initialize/complete": {
       "post": {
         "tags": [
@@ -3033,12 +3083,12 @@
           "required": true
         },
         "responses": {
-          "201": {
+          "202": {
             "description": "",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_SessionSummary"
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
                 }
               }
             }
@@ -3111,8 +3161,15 @@
           }
         ],
         "responses": {
-          "204": {
-            "description": ""
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
@@ -3200,6 +3257,56 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DataResponse_MessageRouteResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/steer": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "steer",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SteerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_SteerResult"
                 }
               }
             }
@@ -3313,6 +3420,112 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DataResponse_TurnSummary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/turns/{turn_id}/cancel": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "cancel_turn",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "turn_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_CancelResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/turns/{turn_id}/retry-model": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "retry_model",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "turn_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Value"
                 }
               }
             }
@@ -3768,6 +3981,15 @@
   },
   "components": {
     "schemas": {
+      "AnswerAskRequest": {
+        "type": "object",
+        "required": [
+          "answer"
+        ],
+        "properties": {
+          "answer": {}
+        }
+      },
       "AuthenticationMode": {
         "type": "string",
         "enum": [
@@ -3819,6 +4041,47 @@
           "uninitialized",
           "initialized"
         ]
+      },
+      "CancelResult": {
+        "type": "object",
+        "description": "Result of cancelling a Turn (Stage 4 state machine: `running ->\ncanceling -> canceled|interrupted`).",
+        "required": [
+          "turn_id",
+          "from_status",
+          "to_status",
+          "session_version"
+        ],
+        "properties": {
+          "from_status": {
+            "type": "string"
+          },
+          "session_version": {
+            "type": "string"
+          },
+          "to_status": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        }
+      },
+      "CancelTurnRequest": {
+        "type": "object",
+        "required": [
+          "expected_session_version"
+        ],
+        "properties": {
+          "expected_session_version": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "CapabilityReason": {
         "type": "string",
@@ -3924,8 +4187,7 @@
       "CreateTerminalRequest": {
         "type": "object",
         "required": [
-          "runtime_id",
-          "owner",
+          "project_id",
           "size"
         ],
         "properties": {
@@ -3939,10 +4201,7 @@
               }
             ]
           },
-          "owner": {
-            "$ref": "#/components/schemas/TerminalOwnerInput"
-          },
-          "runtime_id": {
+          "project_id": {
             "type": "string"
           },
           "size": {
@@ -3973,6 +4232,38 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "DataResponse_CancelResult": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "description": "Result of cancelling a Turn (Stage 4 state machine: `running ->\ncanceling -> canceled|interrupted`).",
+            "required": [
+              "turn_id",
+              "from_status",
+              "to_status",
+              "session_version"
+            ],
+            "properties": {
+              "from_status": {
+                "type": "string"
+              },
+              "session_version": {
+                "type": "string"
+              },
+              "to_status": {
+                "type": "string"
+              },
+              "turn_id": {
+                "type": "string"
+              }
+            }
           }
         }
       },
@@ -4307,9 +4598,11 @@
               "session_version"
             ],
             "properties": {
-              "awaiting_handoff": {
-                "type": "boolean",
-                "description": "True when the active Turn is `waiting_for_job` and the just-queued\nmessage is intended to take over via an atomic Handoff. The HTTP layer\nhands this Turn to `application::session_flow::handoff_message`, which\npromotes it to the successor and transfers the predecessor's finite\nJobs/Asks transactionally. `route` stays `queued` until the coordinator\npromotes it."
+              "handoff_from_turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "message_id": {
                 "type": "string"
@@ -4720,6 +5013,34 @@
           }
         }
       },
+      "DataResponse_SteerResult": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "description": "Result of a Steer: bound to the running Turn, visible at the next safe Round.",
+            "required": [
+              "turn_id",
+              "message_id",
+              "session_version"
+            ],
+            "properties": {
+              "message_id": {
+                "type": "string"
+              },
+              "session_version": {
+                "type": "string"
+              },
+              "turn_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "DataResponse_String": {
         "type": "object",
         "required": [
@@ -4742,7 +5063,7 @@
             "required": [
               "id",
               "runtime_id",
-              "owner",
+              "project_id",
               "status",
               "size",
               "scrollback_stream_id",
@@ -4782,8 +5103,8 @@
               "next_cursor": {
                 "$ref": "#/components/schemas/LogCursor"
               },
-              "owner": {
-                "$ref": "#/components/schemas/TerminalOwner"
+              "project_id": {
+                "$ref": "#/components/schemas/ProjectId"
               },
               "runtime_id": {
                 "$ref": "#/components/schemas/RuntimeId"
@@ -4933,6 +5254,16 @@
                 "type": [
                   "string",
                   "null"
+                ]
+              },
+              "model_snapshot": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/TurnModelSnapshot"
+                  }
                 ]
               },
               "predecessor_turn_id": {
@@ -5404,7 +5735,7 @@
               "required": [
                 "id",
                 "runtime_id",
-                "owner",
+                "project_id",
                 "status",
                 "size",
                 "scrollback_stream_id",
@@ -5444,8 +5775,8 @@
                 "next_cursor": {
                   "$ref": "#/components/schemas/LogCursor"
                 },
-                "owner": {
-                  "$ref": "#/components/schemas/TerminalOwner"
+                "project_id": {
+                  "$ref": "#/components/schemas/ProjectId"
                 },
                 "runtime_id": {
                   "$ref": "#/components/schemas/RuntimeId"
@@ -6168,9 +6499,11 @@
           "session_version"
         ],
         "properties": {
-          "awaiting_handoff": {
-            "type": "boolean",
-            "description": "True when the active Turn is `waiting_for_job` and the just-queued\nmessage is intended to take over via an atomic Handoff. The HTTP layer\nhands this Turn to `application::session_flow::handoff_message`, which\npromotes it to the successor and transfers the predecessor's finite\nJobs/Asks transactionally. `route` stays `queued` until the coordinator\npromotes it."
+          "handoff_from_turn_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "message_id": {
             "type": "string"
@@ -6926,10 +7259,6 @@
           }
         }
       },
-      "SessionId": {
-        "type": "string",
-        "format": "uuid"
-      },
       "SessionSummary": {
         "type": "object",
         "required": [
@@ -7006,6 +7335,41 @@
           }
         }
       },
+      "SteerRequest": {
+        "type": "object",
+        "required": [
+          "content",
+          "expected_session_version"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "expected_session_version": {
+            "type": "string"
+          }
+        }
+      },
+      "SteerResult": {
+        "type": "object",
+        "description": "Result of a Steer: bound to the running Turn, visible at the next safe Round.",
+        "required": [
+          "turn_id",
+          "message_id",
+          "session_version"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string"
+          },
+          "session_version": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        }
+      },
       "SystemInfo": {
         "type": "object",
         "required": [
@@ -7060,92 +7424,12 @@
         "type": "string",
         "format": "uuid"
       },
-      "TerminalOwner": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "kind"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/ProjectId"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "project"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "kind"
-            ],
-            "properties": {
-              "id": {
-                "$ref": "#/components/schemas/SessionId"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "session"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "TerminalOwnerInput": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "kind"
-            ],
-            "properties": {
-              "id": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "project"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "kind"
-            ],
-            "properties": {
-              "id": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "session"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "TerminalProjection": {
         "type": "object",
         "required": [
           "id",
           "runtime_id",
-          "owner",
+          "project_id",
           "status",
           "size",
           "scrollback_stream_id",
@@ -7185,8 +7469,8 @@
           "next_cursor": {
             "$ref": "#/components/schemas/LogCursor"
           },
-          "owner": {
-            "$ref": "#/components/schemas/TerminalOwner"
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId"
           },
           "runtime_id": {
             "$ref": "#/components/schemas/RuntimeId"
@@ -7373,6 +7657,45 @@
           }
         }
       },
+      "TurnModelSnapshot": {
+        "type": "object",
+        "required": [
+          "model_id",
+          "provider_id",
+          "display_name",
+          "upstream_model_id",
+          "context_limit",
+          "supports_images",
+          "supports_tools",
+          "parameters"
+        ],
+        "properties": {
+          "context_limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "parameters": {},
+          "provider_id": {
+            "type": "string"
+          },
+          "supports_images": {
+            "type": "boolean"
+          },
+          "supports_tools": {
+            "type": "boolean"
+          },
+          "upstream_model_id": {
+            "type": "string"
+          }
+        }
+      },
       "TurnSummary": {
         "type": "object",
         "required": [
@@ -7419,6 +7742,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "model_snapshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnModelSnapshot"
+              }
             ]
           },
           "predecessor_turn_id": {

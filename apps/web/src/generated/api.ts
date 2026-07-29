@@ -4,6 +4,22 @@
  */
 
 export interface paths {
+  "/api/v1/asks/{ask_id}/answer": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["answer_ask"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/auth/initialize/complete": {
     parameters: {
       query?: never;
@@ -804,6 +820,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/sessions/{id}/steer": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["steer"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/sessions/{id}/timeline": {
     parameters: {
       query?: never;
@@ -830,6 +862,38 @@ export interface paths {
     get: operations["get_turn"];
     put?: never;
     post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/turns/{turn_id}/cancel": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["cancel_turn"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/turns/{turn_id}/retry-model": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["retry_model"];
     delete?: never;
     options?: never;
     head?: never;
@@ -1006,6 +1070,9 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
+    AnswerAskRequest: {
+      answer: unknown;
+    };
     /** @enum {string} */
     AuthenticationMode: "passkey" | "development";
     BootstrapData: {
@@ -1020,6 +1087,20 @@ export interface components {
     };
     /** @enum {string} */
     BootstrapState: "uninitialized" | "initialized";
+    /**
+     * @description Result of cancelling a Turn (Stage 4 state machine: `running ->
+     *     canceling -> canceled|interrupted`).
+     */
+    CancelResult: {
+      from_status: string;
+      session_version: string;
+      to_status: string;
+      turn_id: string;
+    };
+    CancelTurnRequest: {
+      expected_session_version: string;
+      reason?: string | null;
+    };
     /** @enum {string} */
     CapabilityReason:
       | "LOCAL_EXECUTOR"
@@ -1054,8 +1135,7 @@ export interface components {
     };
     CreateTerminalRequest: {
       environment?: null | components["schemas"]["EnvironmentInput"];
-      owner: components["schemas"]["TerminalOwnerInput"];
-      runtime_id: string;
+      project_id: string;
       size: components["schemas"]["TerminalSizeInput"];
       working_directory?: string;
     };
@@ -1064,6 +1144,18 @@ export interface components {
       /** Format: int32 */
       http_status?: number | null;
       status: string;
+    };
+    DataResponse_CancelResult: {
+      /**
+       * @description Result of cancelling a Turn (Stage 4 state machine: `running ->
+       *     canceling -> canceled|interrupted`).
+       */
+      data: {
+        from_status: string;
+        session_version: string;
+        to_status: string;
+        turn_id: string;
+      };
     };
     DataResponse_CeremonyOptions: {
       data: {
@@ -1143,15 +1235,7 @@ export interface components {
     };
     DataResponse_MessageRouteResult: {
       data: {
-        /**
-         * @description True when the active Turn is `waiting_for_job` and the just-queued
-         *     message is intended to take over via an atomic Handoff. The HTTP layer
-         *     hands this Turn to `application::session_flow::handoff_message`, which
-         *     promotes it to the successor and transfers the predecessor's finite
-         *     Jobs/Asks transactionally. `route` stays `queued` until the coordinator
-         *     promotes it.
-         */
-        awaiting_handoff?: boolean;
+        handoff_from_turn_id?: string | null;
         message_id: string;
         /** @description Current routing result for the accepted message. */
         route: string;
@@ -1255,6 +1339,14 @@ export interface components {
         workspace_revision?: string | null;
       };
     };
+    DataResponse_SteerResult: {
+      /** @description Result of a Steer: bound to the running Turn, visible at the next safe Round. */
+      data: {
+        message_id: string;
+        session_version: string;
+        turn_id: string;
+      };
+    };
     DataResponse_String: {
       data: string;
     };
@@ -1266,7 +1358,7 @@ export interface components {
         first_cursor: components["schemas"]["LogCursor"];
         id: components["schemas"]["TerminalId"];
         next_cursor: components["schemas"]["LogCursor"];
-        owner: components["schemas"]["TerminalOwner"];
+        project_id: components["schemas"]["ProjectId"];
         runtime_id: components["schemas"]["RuntimeId"];
         scrollback_stream_id: components["schemas"]["LogStreamId"];
         size: components["schemas"]["TerminalSize"];
@@ -1312,6 +1404,7 @@ export interface components {
         handoff_to_turn_id?: string | null;
         id: string;
         input_message_id?: string | null;
+        model_snapshot?: null | components["schemas"]["TurnModelSnapshot"];
         predecessor_turn_id?: string | null;
         /** Format: int64 */
         sequence: number;
@@ -1426,7 +1519,7 @@ export interface components {
         first_cursor: components["schemas"]["LogCursor"];
         id: components["schemas"]["TerminalId"];
         next_cursor: components["schemas"]["LogCursor"];
-        owner: components["schemas"]["TerminalOwner"];
+        project_id: components["schemas"]["ProjectId"];
         runtime_id: components["schemas"]["RuntimeId"];
         scrollback_stream_id: components["schemas"]["LogStreamId"];
         size: components["schemas"]["TerminalSize"];
@@ -1619,15 +1712,7 @@ export interface components {
       truncated: boolean;
     };
     MessageRouteResult: {
-      /**
-       * @description True when the active Turn is `waiting_for_job` and the just-queued
-       *     message is intended to take over via an atomic Handoff. The HTTP layer
-       *     hands this Turn to `application::session_flow::handoff_message`, which
-       *     promotes it to the successor and transfers the predecessor's finite
-       *     Jobs/Asks transactionally. `route` stays `queued` until the coordinator
-       *     promotes it.
-       */
-      awaiting_handoff?: boolean;
+      handoff_from_turn_id?: string | null;
       message_id: string;
       /** @description Current routing result for the accepted message. */
       route: string;
@@ -1830,8 +1915,6 @@ export interface components {
       expected_main_revision?: string | null;
       path: string;
     };
-    /** Format: uuid */
-    SessionId: string;
     SessionSummary: {
       active_turn_id?: string | null;
       created_at: string;
@@ -1850,6 +1933,16 @@ export interface components {
     SignalTerminalRequest: {
       signal: components["schemas"]["TerminalSignal"];
     };
+    SteerRequest: {
+      content: string;
+      expected_session_version: string;
+    };
+    /** @description Result of a Steer: bound to the running Turn, visible at the next safe Round. */
+    SteerResult: {
+      message_id: string;
+      session_version: string;
+      turn_id: string;
+    };
     SystemInfo: {
       capabilities: components["schemas"]["RuntimeCapability"][];
       database: components["schemas"]["DatabaseInfo"];
@@ -1865,28 +1958,6 @@ export interface components {
     };
     /** Format: uuid */
     TerminalId: string;
-    TerminalOwner:
-      | {
-          id: components["schemas"]["ProjectId"];
-          /** @enum {string} */
-          kind: "project";
-        }
-      | {
-          id: components["schemas"]["SessionId"];
-          /** @enum {string} */
-          kind: "session";
-        };
-    TerminalOwnerInput:
-      | {
-          id: string;
-          /** @enum {string} */
-          kind: "project";
-        }
-      | {
-          id: string;
-          /** @enum {string} */
-          kind: "session";
-        };
     TerminalProjection: {
       created_at: string;
       ended_at?: string | null;
@@ -1894,7 +1965,7 @@ export interface components {
       first_cursor: components["schemas"]["LogCursor"];
       id: components["schemas"]["TerminalId"];
       next_cursor: components["schemas"]["LogCursor"];
-      owner: components["schemas"]["TerminalOwner"];
+      project_id: components["schemas"]["ProjectId"];
       runtime_id: components["schemas"]["RuntimeId"];
       scrollback_stream_id: components["schemas"]["LogStreamId"];
       size: components["schemas"]["TerminalSize"];
@@ -1965,6 +2036,17 @@ export interface components {
       newest_cursor?: string | null;
       oldest_cursor?: string | null;
     };
+    TurnModelSnapshot: {
+      /** Format: int32 */
+      context_limit: number;
+      display_name: string;
+      model_id: string;
+      parameters: unknown;
+      provider_id: string;
+      supports_images: boolean;
+      supports_tools: boolean;
+      upstream_model_id: string;
+    };
     TurnSummary: {
       cancellation_reason?: string | null;
       completion_reason?: string | null;
@@ -1973,6 +2055,7 @@ export interface components {
       handoff_to_turn_id?: string | null;
       id: string;
       input_message_id?: string | null;
+      model_snapshot?: null | components["schemas"]["TurnModelSnapshot"];
       predecessor_turn_id?: string | null;
       /** Format: int64 */
       sequence: number;
@@ -2001,6 +2084,39 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+  answer_ask: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        ask_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["AnswerAskRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Value"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   initialize_complete: {
     parameters: {
       query?: never;
@@ -4275,12 +4391,12 @@ export interface operations {
       };
     };
     responses: {
-      201: {
+      202: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_SessionSummary"];
+          "application/json": components["schemas"]["DataResponse_OperationView"];
         };
       };
       401: {
@@ -4333,11 +4449,13 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      204: {
+      202: {
         headers: {
           [name: string]: unknown;
         };
-        content?: never;
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
       };
       404: {
         headers: {
@@ -4411,6 +4529,39 @@ export interface operations {
       };
     };
   };
+  steer: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["SteerRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_SteerResult"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   timeline: {
     parameters: {
       query?: {
@@ -4462,6 +4613,70 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["DataResponse_TurnSummary"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  cancel_turn: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+        turn_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["CancelTurnRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_CancelResult"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  retry_model: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+        turn_id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Value"];
         };
       };
       404: {

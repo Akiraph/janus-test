@@ -1,12 +1,8 @@
-//! Stage 6: ContextAssembler + manual Compact scheduling.
+//! Context assembly and manual Compact scheduling.
 //!
 //! Exercises the durable `context_versions` / `compact_summaries` ledger that
-//! Stage 6 lands. Real token estimation and automatic compaction are deferred
-//! (implement.md Stage 6); the wire-able manual `schedule_compact` path and the
-//! context-version record are tested here so the surface is stable for later
-//! Round wiring.
-
-mod support;
+//! supports compaction. The manual `schedule_compact` path and context-version
+//! record are tested independently of automatic Round wiring.
 
 use janus_server::modules::supervisor::context::{
     SYSTEM_PREFIX_VERSION, latest_compact_summary, record_context_version, schedule_compact,
@@ -131,6 +127,6 @@ async fn schedule_compact_marks_context_scheduled() -> anyhow::Result<()> {
     .bind(sid.to_string())
     .fetch_optional(&pool)
     .await?;
-    assert!(linked.is_some() && !linked.unwrap().is_empty());
+    assert!(linked.is_some_and(|id| !id.is_empty()));
     Ok(())
 }

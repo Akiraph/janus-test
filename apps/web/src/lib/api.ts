@@ -36,7 +36,6 @@ export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"]
 export type PostMessageRequest = components["schemas"]["PostMessageRequest"];
 export type TerminalProjection = components["schemas"]["TerminalProjection"];
 export type TerminalTicket = components["schemas"]["TerminalTicket"];
-export type TerminalOwnerInput = components["schemas"]["TerminalOwnerInput"];
 export type TerminalSizeInput = components["schemas"]["TerminalSizeInput"];
 export type TerminalSignal = components["schemas"]["TerminalSignal"];
 export type CreateTerminalRequest = components["schemas"]["CreateTerminalRequest"];
@@ -234,11 +233,16 @@ export async function listSessions(projectId: string, limit = 50): Promise<Sessi
 export async function createSession(
   projectId: string,
   input: CreateSessionRequest = {},
-): Promise<SessionSummary> {
+  idempotencyKey: string,
+): Promise<OperationView> {
   return (
-    await requestJson<{ data: SessionSummary }>(
+    await requestJson<{ data: OperationView }>(
       `/api/v1/projects/${projectId}/sessions`,
-      { method: "POST", body: JSON.stringify(input) },
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
       isDataResponse,
     )
   ).data;
@@ -254,8 +258,24 @@ export async function getSession(id: string): Promise<SessionSummary> {
   ).data;
 }
 
-export async function deleteSession(id: string): Promise<void> {
-  await requestJson(`/api/v1/sessions/${id}`, { method: "DELETE" }, () => true);
+export async function deleteSession(
+  id: string,
+  ifMatch: string,
+  idempotencyKey: string,
+): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/sessions/${id}`,
+      {
+        method: "DELETE",
+        headers: {
+          "If-Match": ifMatch,
+          "Idempotency-Key": idempotencyKey,
+        },
+      },
+      isDataResponse,
+    )
+  ).data;
 }
 
 export async function postSessionMessage(
@@ -309,16 +329,8 @@ export async function getTurn(sessionId: string, turnId: string): Promise<TurnSu
   ).data;
 }
 
-export type TerminalOwnerFilter = {
-  kind: "project" | "session";
-  id: string;
-};
-
-export async function listTerminals(owner: TerminalOwnerFilter): Promise<TerminalProjection[]> {
-  const query = new URLSearchParams({
-    owner_kind: owner.kind,
-    owner_id: owner.id,
-  });
+export async function listTerminals(projectId: string): Promise<TerminalProjection[]> {
+  const query = new URLSearchParams({ project_id: projectId });
   return (
     await requestJson<{ data: TerminalProjection[] }>(
       `/api/v1/terminals?${query}`,
@@ -690,6 +702,29 @@ export async function getOperation(id: string): Promise<OperationView> {
   ).data;
 }
 
+export async function waitForOperation(
+  id: string,
+  timeoutMs = 120_000,
+  pollIntervalMs = 250,
+): Promise<OperationView> {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const operation = await getOperation(id);
+    if (operation.status === "succeeded") return operation;
+    if (
+      operation.status === "failed" ||
+      operation.status === "canceled" ||
+      operation.status === "needs_attention"
+    ) {
+      throw new ApiError(409, operationFailureMessage(operation.problem));
+    }
+    if (Date.now() >= deadline) {
+      throw new ApiError(504, `Operation ${id} did not finish in time`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
+}
+
 async function getJson<T>(path: string, decode: (value: unknown) => value is T): Promise<T> {
   return requestJson(path, { method: "GET" }, decode);
 }
@@ -746,6 +781,14 @@ function rememberCsrf(value: string): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function operationFailureMessage(problem: unknown): string {
+  if (!isRecord(problem)) return "Operation failed";
+  for (const key of ["detail", "title", "code"] as const) {
+    if (typeof problem[key] === "string") return problem[key];
+  }
+  return "Operation failed";
 }
 
 function isBootstrapResponse(value: unknown): value is BootstrapResponse {

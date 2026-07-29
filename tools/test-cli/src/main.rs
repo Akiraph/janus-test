@@ -1,4 +1,4 @@
-use std::{io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};
@@ -39,6 +39,11 @@ enum Command {
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
+    },
+    /// Inspect or wait for durable background Operations.
+    Operations {
+        #[command(subcommand)]
+        command: OperationsCommand,
     },
 }
 
@@ -129,15 +134,12 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Command::Terminal { command } => match command {
-            TerminalCommand::Create {
-                runtime_id,
-                owner_kind,
-                owner_id,
-            } => terminal_create(&client, &cli.base_url, runtime_id, owner_kind, owner_id).await,
-            TerminalCommand::List {
-                owner_kind,
-                owner_id,
-            } => terminal_list(&client, &cli.base_url, owner_kind, owner_id).await,
+            TerminalCommand::Create { project_id } => {
+                terminal_create(&client, &cli.base_url, project_id).await
+            }
+            TerminalCommand::List { project_id } => {
+                terminal_list(&client, &cli.base_url, project_id).await
+            }
             TerminalCommand::Ticket { id } => terminal_ticket(&client, &cli.base_url, &id).await,
             TerminalCommand::Scrollback { id, after, limit } => {
                 terminal_scrollback(&client, &cli.base_url, &id, after, limit).await
@@ -154,11 +156,26 @@ async fn main() -> anyhow::Result<()> {
             SessionsCommand::List { project_id } => {
                 sessions_list(&client, &cli.base_url, &project_id).await
             }
-            SessionsCommand::Create { project_id, title } => {
-                sessions_create(&client, &cli.base_url, &project_id, title).await
-            }
+            SessionsCommand::Create {
+                project_id,
+                title,
+                idempotency_key,
+            } => sessions_create(&client, &cli.base_url, &project_id, title, idempotency_key).await,
             SessionsCommand::Get { id } => sessions_get(&client, &cli.base_url, &id).await,
-            SessionsCommand::Delete { id } => sessions_delete(&client, &cli.base_url, &id).await,
+            SessionsCommand::Delete {
+                id,
+                expected_version,
+                idempotency_key,
+            } => {
+                sessions_delete(
+                    &client,
+                    &cli.base_url,
+                    &id,
+                    &expected_version,
+                    idempotency_key,
+                )
+                .await
+            }
             SessionsCommand::PostMessage {
                 id,
                 content,
@@ -183,6 +200,59 @@ async fn main() -> anyhow::Result<()> {
                 sessions_get_turn(&client, &cli.base_url, &id, &turn_id).await
             }
             SessionsCommand::Diff { id } => sessions_diff(&client, &cli.base_url, &id).await,
+            SessionsCommand::Steer {
+                id,
+                content,
+                expected_session_version,
+            } => {
+                sessions_steer(
+                    &client,
+                    &cli.base_url,
+                    &id,
+                    &content,
+                    &expected_session_version,
+                )
+                .await
+            }
+            SessionsCommand::Cancel {
+                id,
+                turn_id,
+                expected_session_version,
+                reason,
+            } => {
+                sessions_cancel(
+                    &client,
+                    &cli.base_url,
+                    &id,
+                    &turn_id,
+                    &expected_session_version,
+                    reason,
+                )
+                .await
+            }
+            SessionsCommand::AnswerAsk { ask_id, answer } => {
+                sessions_answer_ask(&client, &cli.base_url, &ask_id, &answer).await
+            }
+            SessionsCommand::RetryModel { id, turn_id } => {
+                sessions_retry_model(&client, &cli.base_url, &id, &turn_id).await
+            }
+        },
+        Command::Operations { command } => match command {
+            OperationsCommand::Get { id } => operation_get(&client, &cli.base_url, &id).await,
+            OperationsCommand::Wait {
+                id,
+                timeout_seconds,
+                poll_millis,
+            } => {
+                operation_wait(
+                    &client,
+                    &cli.base_url,
+                    &id,
+                    Duration::from_secs(timeout_seconds),
+                    Duration::from_millis(poll_millis),
+                )
+                .await
+            }
         },
     }
 }
@@ -240,11 +310,6 @@ async fn projects_create(
     branch: Option<String>,
     idempotency_key: Option<String>,
 ) -> anyhow::Result<()> {
-    let key = idempotency_key.unwrap_or_else(|| {
-        let mut bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut bytes);
-        hex::encode(bytes)
-    });
     let body = serde_json::json!({
         "name": name,
         "repository": {
@@ -255,7 +320,7 @@ async fn projects_create(
     });
     let response = client
         .post(url(base_url, "/api/v1/projects"))
-        .header("Idempotency-Key", key)
+        .header("Idempotency-Key", random_key(idempotency_key))
         .json(&body)
         .send()
         .await?;
@@ -272,17 +337,10 @@ async fn projects_get(client: &Client, base_url: &str, id: &str) -> anyhow::Resu
 
 #[derive(Debug, Subcommand)]
 enum TerminalCommand {
-    /// Create a terminal under a ready Runtime.
-    Create {
-        runtime_id: String,
-        owner_kind: String,
-        owner_id: String,
-    },
-    /// List terminals owned by a project or session.
-    List {
-        owner_kind: String,
-        owner_id: String,
-    },
+    /// Create a terminal for a Project Main Workspace.
+    Create { project_id: String },
+    /// List terminals owned by a project.
+    List { project_id: String },
     /// Issue a one-use access ticket and print the raw token once.
     Ticket { id: String },
     /// Read scrollback bytes after an optional cursor.
@@ -310,11 +368,21 @@ enum SessionsCommand {
         project_id: String,
         #[arg(long)]
         title: Option<String>,
+        /// Random idempotency key if omitted.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Fetch a single session projection.
     Get { id: String },
     /// Delete a session.
-    Delete { id: String },
+    Delete {
+        id: String,
+        #[arg(long)]
+        expected_version: String,
+        /// Random idempotency key if omitted.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
     /// Post a message, advancing the session under `expected_session_version`.
     PostMessage {
         id: String,
@@ -335,18 +403,51 @@ enum SessionsCommand {
     GetTurn { id: String, turn_id: String },
     /// Read the session diff projection.
     Diff { id: String },
+    /// Steer an interactive active Turn.
+    Steer {
+        id: String,
+        content: String,
+        expected_session_version: String,
+    },
+    /// Cancel an active Turn and wait for final settlement.
+    Cancel {
+        id: String,
+        turn_id: String,
+        expected_session_version: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Answer an open Ask by id.
+    AnswerAsk {
+        ask_id: String,
+        /// JSON value or plain text string.
+        answer: String,
+    },
+    /// Retry a Turn parked on waiting_for_model.
+    RetryModel { id: String, turn_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperationsCommand {
+    Get {
+        id: String,
+    },
+    Wait {
+        id: String,
+        #[arg(long, default_value = "120")]
+        timeout_seconds: u64,
+        #[arg(long, default_value = "250")]
+        poll_millis: u64,
+    },
 }
 
 async fn terminal_create(
     client: &Client,
     base_url: &str,
-    runtime_id: String,
-    owner_kind: String,
-    owner_id: String,
+    project_id: String,
 ) -> anyhow::Result<()> {
     let body = serde_json::json!({
-        "runtime_id": runtime_id,
-        "owner": { "kind": owner_kind, "id": owner_id },
+        "project_id": project_id,
         "working_directory": ".",
         "size": { "cols": 80, "rows": 24 },
     });
@@ -358,18 +459,10 @@ async fn terminal_create(
     print_response(response).await
 }
 
-async fn terminal_list(
-    client: &Client,
-    base_url: &str,
-    owner_kind: String,
-    owner_id: String,
-) -> anyhow::Result<()> {
+async fn terminal_list(client: &Client, base_url: &str, project_id: String) -> anyhow::Result<()> {
     let response = client
         .get(url(base_url, "/api/v1/terminals"))
-        .query(&[
-            ("owner_kind", owner_kind.as_str()),
-            ("owner_id", owner_id.as_str()),
-        ])
+        .query(&[("project_id", project_id.as_str())])
         .send()
         .await?;
     print_response(response).await
@@ -584,6 +677,7 @@ async fn sessions_create(
     base_url: &str,
     project_id: &str,
     title: Option<String>,
+    idempotency_key: Option<String>,
 ) -> anyhow::Result<()> {
     let body = serde_json::json!({ "title": title });
     let response = client
@@ -591,6 +685,7 @@ async fn sessions_create(
             base_url,
             &format!("/api/v1/projects/{project_id}/sessions"),
         ))
+        .header("Idempotency-Key", random_key(idempotency_key))
         .json(&body)
         .send()
         .await?;
@@ -605,20 +700,70 @@ async fn sessions_get(client: &Client, base_url: &str, id: &str) -> anyhow::Resu
     print_response(response).await
 }
 
-async fn sessions_delete(client: &Client, base_url: &str, id: &str) -> anyhow::Result<()> {
+async fn sessions_delete(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    expected_version: &str,
+    idempotency_key: Option<String>,
+) -> anyhow::Result<()> {
     let response = client
         .delete(url(base_url, &format!("/api/v1/sessions/{id}")))
+        .header("If-Match", expected_version)
+        .header("Idempotency-Key", random_key(idempotency_key))
         .send()
         .await?;
-    let status = response.status();
-    let text = response.text().await?;
-    if !text.is_empty() {
-        println!("{text}");
+    print_response(response).await
+}
+
+async fn operation_get(client: &Client, base_url: &str, id: &str) -> anyhow::Result<()> {
+    let response = client
+        .get(url(base_url, &format!("/api/v1/operations/{id}")))
+        .send()
+        .await?;
+    print_response(response).await
+}
+
+async fn operation_wait(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let response = client
+            .get(url(base_url, &format!("/api/v1/operations/{id}")))
+            .send()
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        if !status.is_success() {
+            bail!("operation read returned {status}: {body}");
+        }
+        let operation_status = body
+            .pointer("/data/status")
+            .and_then(serde_json::Value::as_str)
+            .context("operation response is missing data.status")?;
+        if matches!(
+            operation_status,
+            "succeeded" | "failed" | "canceled" | "needs_attention"
+        ) {
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            if operation_status == "succeeded" {
+                return Ok(());
+            }
+            bail!("operation ended with status {operation_status}");
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "operation did not finish within {} seconds",
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
     }
-    if !status.is_success() {
-        bail!("delete returned {status}");
-    }
-    Ok(())
 }
 
 async fn sessions_post_message(
@@ -684,6 +829,83 @@ async fn sessions_diff(client: &Client, base_url: &str, id: &str) -> anyhow::Res
     print_response(response).await
 }
 
+async fn sessions_steer(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    content: &str,
+    expected_session_version: &str,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "content": content,
+        "expected_session_version": expected_session_version,
+    });
+    let response = client
+        .post(url(base_url, &format!("/api/v1/sessions/{id}/steer")))
+        .json(&body)
+        .send()
+        .await?;
+    print_response(response).await
+}
+
+async fn sessions_cancel(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    turn_id: &str,
+    expected_session_version: &str,
+    reason: Option<String>,
+) -> anyhow::Result<()> {
+    let mut body = serde_json::json!({
+        "expected_session_version": expected_session_version,
+    });
+    if let Some(reason) = reason {
+        body["reason"] = serde_json::Value::String(reason);
+    }
+    let response = client
+        .post(url(
+            base_url,
+            &format!("/api/v1/sessions/{id}/turns/{turn_id}/cancel"),
+        ))
+        .json(&body)
+        .send()
+        .await?;
+    print_response(response).await
+}
+
+async fn sessions_answer_ask(
+    client: &Client,
+    base_url: &str,
+    ask_id: &str,
+    answer: &str,
+) -> anyhow::Result<()> {
+    let answer_value = serde_json::from_str::<serde_json::Value>(answer)
+        .unwrap_or_else(|_| serde_json::Value::String(answer.to_owned()));
+    let body = serde_json::json!({ "answer": answer_value });
+    let response = client
+        .post(url(base_url, &format!("/api/v1/asks/{ask_id}/answer")))
+        .json(&body)
+        .send()
+        .await?;
+    print_response(response).await
+}
+
+async fn sessions_retry_model(
+    client: &Client,
+    base_url: &str,
+    id: &str,
+    turn_id: &str,
+) -> anyhow::Result<()> {
+    let response = client
+        .post(url(
+            base_url,
+            &format!("/api/v1/sessions/{id}/turns/{turn_id}/retry-model"),
+        ))
+        .send()
+        .await?;
+    print_response(response).await
+}
+
 fn url(base_url: &str, path: &str) -> String {
     format!(
         "{}{}",
@@ -694,6 +916,14 @@ fn url(base_url: &str, path: &str) -> String {
             format!("/{path}")
         }
     )
+}
+
+fn random_key(value: Option<String>) -> String {
+    value.unwrap_or_else(|| {
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    })
 }
 
 fn read_body(path: &PathBuf) -> anyhow::Result<String> {

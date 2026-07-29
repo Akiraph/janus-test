@@ -1,7 +1,6 @@
 use crate::{
     AppState,
     modules::models::interface::{ModelsError, ProviderInput},
-    platform::events::NewEvent,
     transport::http::{
         auth::{authenticate, authorized},
         dto::DataResponse,
@@ -45,18 +44,9 @@ pub async fn create_provider(
     let auth = authorized(&state, &headers).await?;
     let view = state
         .models()
-        .create_provider(&auth.owner_id, input)
+        .create_provider(&auth.owner_id, input, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_change(
-        &state,
-        &auth.owner_id,
-        &view.id,
-        "provider",
-        "created",
-        &context,
-    )
-    .await;
     Ok((StatusCode::CREATED, Json(DataResponse { data: view })))
 }
 #[utoipa::path(patch, path = "/api/v1/model-providers/{id}", params(("id" = String, Path)), request_body = ProviderInput, responses((status = 200, body = DataResponse<crate::modules::models::interface::ProviderView>), (status = 404, body = Problem)))]
@@ -70,10 +60,9 @@ pub async fn update_provider(
     let auth = authorized(&state, &headers).await?;
     let view = state
         .models()
-        .update_provider(&auth.owner_id, &id, input)
+        .update_provider(&auth.owner_id, &id, input, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "provider", "updated", &context).await;
     Ok(Json(DataResponse { data: view }))
 }
 #[utoipa::path(delete, path = "/api/v1/model-providers/{id}", params(("id" = String, Path)), responses((status = 204), (status = 404, body = Problem)))]
@@ -86,10 +75,9 @@ pub async fn delete_provider(
     let auth = authorized(&state, &headers).await?;
     state
         .models()
-        .delete_provider(&auth.owner_id, &id)
+        .delete_provider(&auth.owner_id, &id, &context.request_id)
         .await
         .map_err(problem)?;
-    emit_change(&state, &auth.owner_id, &id, "provider", "deleted", &context).await;
     Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(post, path = "/api/v1/model-providers/{id}/probe", params(("id" = String, Path)), responses((status = 200, body = DataResponse<crate::modules::models::interface::ProbeResult>), (status = 404, body = Problem)))]
@@ -108,29 +96,6 @@ pub async fn probe_provider(
     }))
 }
 
-async fn emit_change(
-    state: &AppState,
-    owner_id: &str,
-    resource_id: &str,
-    resource_kind: &str,
-    operation: &str,
-    context: &RequestContext,
-) {
-    if let Err(error) = state
-        .events()
-        .append(NewEvent {
-            event_type: "model_config.changed".into(),
-            actor: serde_json::json!({ "kind": "owner", "id": owner_id }),
-            resource: Some(serde_json::json!({ "kind": resource_kind, "id": resource_id })),
-            correlation_id: context.request_id.clone(),
-            causation_id: None,
-            payload: serde_json::json!({ "operation": operation }),
-        })
-        .await
-    {
-        tracing::error!(%error, %resource_id, %operation, "append model configuration event");
-    }
-}
 fn problem(error: ModelsError) -> Problem {
     match error {
         ModelsError::Validation(_) => Problem::new(

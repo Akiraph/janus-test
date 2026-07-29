@@ -1,4 +1,10 @@
-use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures_util::future::BoxFuture;
 use tokio::{
@@ -9,14 +15,11 @@ use tokio::{
 };
 
 use crate::{
-    modules::runtime::{
-        interface::{
-            CommandKind, ExecutionMode, ExecutionResult, ExecutionSpec, ExecutorKind,
-            ExecutorProcessHandle, ExecutorRuntimeHandle, ExitSummary, JobSpec, LogChannel,
-            NetworkPolicy, ProcessCompletion, ResourceUsage, RuntimeError, RuntimeExecutor,
-            RuntimeSpec, ServiceSpec, TerminalSignal, TerminalSize, TerminalSpec,
-        },
-        log_store::{LogRetention, LogStore},
+    modules::runtime::interface::{
+        CommandKind, ExecutionMode, ExecutionResult, ExecutionSpec, ExecutorKind,
+        ExecutorProcessHandle, ExecutorRuntimeHandle, ExitSummary, JobSpec, LogChannel,
+        LogRetention, LogStore, NetworkPolicy, ProcessCompletion, ResourceUsage, RuntimeError,
+        RuntimeExecutor, RuntimeSpec, ServiceSpec, TerminalSignal, TerminalSize, TerminalSpec,
     },
     platform::{
         id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
@@ -896,10 +899,8 @@ fn terminal_command(size: TerminalSize) -> Command {
     #[cfg(windows)]
     {
         let program = which_bash().unwrap_or_else(|| {
-            tracing::warn!(
-                "no bash.exe on PATH; Terminal backend will refuse to spawn (git bash required)"
-            );
-            "bash".to_owned()
+            tracing::warn!("Git Bash could not be located; Terminal backend will refuse to spawn");
+            PathBuf::from("bash")
         });
         let mut command = Command::new(program);
         command.args(["--login", "-i"]);
@@ -920,12 +921,30 @@ fn terminal_command(size: TerminalSize) -> Command {
 }
 
 #[cfg(windows)]
-fn which_bash() -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join("bash.exe");
-        if candidate.is_file() {
-            return candidate.to_str().map(|value| value.to_owned());
+fn which_bash() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join("bash.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let output = std::process::Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    for ancestor in exec_path.ancestors() {
+        for relative in ["bin/bash.exe", "usr/bin/bash.exe"] {
+            let candidate = ancestor.join(relative);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -965,8 +984,15 @@ where
     })
 }
 
-async fn join_output(task: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    task.await.unwrap_or_default()
+async fn join_output(mut task: JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, &mut task).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            task.abort();
+            Vec::new()
+        }
+    }
 }
 
 fn ensure_nonce(process: &ManagedProcess, expected: &str) -> Result<(), RuntimeError> {
@@ -1096,21 +1122,24 @@ fn has_forbidden_background_syntax(script: &str) -> bool {
 
 #[cfg(windows)]
 async fn terminate_process_tree(child: &mut Child, pid: u32) {
-    let _ = Command::new("taskkill.exe")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    let _ = tokio::time::timeout(
+        PROCESS_TERMINATION_TIMEOUT,
+        Command::new("taskkill.exe")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
     let _ = child.start_kill();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+    let _ = tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, child.wait()).await;
 }
 
 #[cfg(not(windows))]
 async fn terminate_process_tree(child: &mut Child, pid: u32) {
     cleanup_descendants(pid).await;
     let _ = child.start_kill();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+    let _ = tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, child.wait()).await;
     cleanup_descendants(pid).await;
 }
 
@@ -1124,29 +1153,37 @@ async fn cleanup_descendants(pid: u32) {
          @($ids | Where-Object {{ $_ -ne $root }}) | Sort-Object -Descending | \
          ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
     );
-    let _ = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    let _ = tokio::time::timeout(
+        PROCESS_TERMINATION_TIMEOUT,
+        Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
 }
 
 #[cfg(not(windows))]
 async fn cleanup_descendants(pid: u32) {
-    let _ = Command::new("pkill")
-        .args(["-TERM", "-P", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    let _ = tokio::time::timeout(
+        PROCESS_TERMINATION_TIMEOUT,
+        Command::new("pkill")
+            .args(["-TERM", "-P", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
 }
+
+const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn exit_summary(status: Option<&std::process::ExitStatus>) -> ExitSummary {
     ExitSummary {
@@ -1174,13 +1211,10 @@ mod tests {
 
     use super::LocalExecutor;
     use crate::{
-        modules::runtime::{
-            interface::{
-                ExecutionEnvironment, ExecutionSpec, ExecutorKind, JobSpec, LogChannel, LogCursor,
-                LogOwnerKind, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
-                RuntimeError, RuntimeExecutor, RuntimeSpec, ValidatedCommand,
-            },
-            log_store::LogStore,
+        modules::runtime::interface::{
+            ExecutionEnvironment, ExecutionSpec, ExecutorKind, JobSpec, LogChannel, LogCursor,
+            LogOwnerKind, LogStore, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
+            RuntimeError, RuntimeExecutor, RuntimeSpec, ValidatedCommand,
         },
         platform::{
             database::Database,
@@ -1210,7 +1244,7 @@ mod tests {
         let runtime_id = crate::platform::id::RuntimeId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            SessionId::new(),
+            crate::modules::runtime::interface::RuntimeScope::session(SessionId::new()),
             ExecutorKind::Local,
             workspace,
             limits(5_000),
@@ -1276,7 +1310,7 @@ mod tests {
         let session_id = SessionId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            session_id,
+            crate::modules::runtime::interface::RuntimeScope::session(session_id),
             ExecutorKind::Local,
             workspace,
             limits(30_000),

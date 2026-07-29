@@ -20,13 +20,58 @@ const FINISH_STREAM = [
   "",
 ].join("\n");
 
+function toolStream(callId: string, name: string, argumentsValue: unknown): string {
+  const frames = [
+    {
+      choices: [{ index: 0, delta: { role: "assistant", content: "" } }],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: callId,
+                type: "function",
+                function: { name, arguments: "" },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                function: { arguments: JSON.stringify(argumentsValue) },
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      usage: { prompt_tokens: 9, completion_tokens: 4 },
+    },
+  ];
+  return `${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("")}data: [DONE]\n\n`;
+}
+
 type DataResponse<T> = { data: T };
 
 interface OperationView {
   id: string;
   status: string;
   target_id?: string | null;
-  error?: unknown;
+  problem?: unknown;
 }
 
 interface SessionView {
@@ -38,6 +83,11 @@ export interface LiveJanusEnvironment {
   projectId: string;
   sessionId: string;
   sessionTitle: string;
+  cli: <T>(args: string[]) => T;
+  request: <T>(path: string, init?: RequestInit) => Promise<T>;
+  providerRequestCount: () => number;
+  restart: () => Promise<void>;
+  serverLog: () => string;
   stop: () => Promise<void>;
 }
 
@@ -64,24 +114,34 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
       "debug",
       process.platform === "win32" ? "janus-server.exe" : "janus-server",
     );
-    server = spawn(executable, [], {
-      cwd: repoRoot,
-      env: {
-        ...process.env,
-        JANUS_DATA_ROOT: dataRoot,
-        JANUS_DEV_AUTH: "true",
-        JANUS_PUBLIC_ORIGIN: "http://localhost:4317",
-        JANUS_WEBAUTHN_RP_ID: "localhost",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const collectLog = (chunk: Buffer) => {
-      serverLog = `${serverLog}${chunk.toString("utf8")}`.slice(-16_000);
+    const testCli = resolve(
+      repoRoot,
+      "target",
+      "debug",
+      process.platform === "win32" ? "janus-test.exe" : "janus-test",
+    );
+    const launchServer = () => {
+      const child = spawn(executable, [], {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          JANUS_DATA_ROOT: dataRoot,
+          JANUS_DEV_AUTH: "true",
+          JANUS_PUBLIC_ORIGIN: "http://localhost:4317",
+          JANUS_WEBAUTHN_RP_ID: "localhost",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      const collectLog = (chunk: Buffer) => {
+        serverLog = `${serverLog}${chunk.toString("utf8")}`.slice(-16_000);
+      };
+      child.stdout?.on("data", collectLog);
+      child.stderr?.on("data", collectLog);
+      return child;
     };
-    server.stdout?.on("data", collectLog);
-    server.stderr?.on("data", collectLog);
 
+    server = launchServer();
     await waitForReady(server, () => serverLog);
     await requestJson("/api/v1/model-providers", {
       method: "POST",
@@ -103,36 +163,82 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
       }),
     });
 
-    const operation = await requestJson<DataResponse<OperationView>>("/api/v1/projects", {
-      method: "POST",
-      headers: { "idempotency-key": `web-live-${Date.now()}` },
-      body: JSON.stringify({
-        name: "Live project",
-        repository: {
-          access: "public_https",
-          url: pathToFileURL(bareRepo).href,
-          branch: "main",
-        },
-      }),
-    });
-    const projectId = await waitForProject(operation.data.id);
+    const projectOperation = runCliJson<DataResponse<OperationView>>(testCli, [
+      "--base-url",
+      CONTROL_ORIGIN,
+      "projects",
+      "create",
+      "--name",
+      "Live project",
+      "--url",
+      pathToFileURL(bareRepo).href,
+      "--branch",
+      "main",
+      "--idempotency-key",
+      `web-live-${Date.now()}`,
+    ]);
+    const project = runCliJson<DataResponse<OperationView>>(testCli, [
+      "--base-url",
+      CONTROL_ORIGIN,
+      "operations",
+      "wait",
+      projectOperation.data.id,
+      "--poll-millis",
+      "50",
+    ]);
+    const projectId = requireOperationTarget(project.data, "project creation");
     const sessionTitle = "Live supervisor";
-    const session = await requestJson<DataResponse<SessionView>>(
-      `/api/v1/projects/${projectId}/sessions`,
-      {
-        method: "POST",
-        body: JSON.stringify({ title: sessionTitle }),
-      },
-    );
+    const sessionOperation = runCliJson<DataResponse<OperationView>>(testCli, [
+      "--base-url",
+      CONTROL_ORIGIN,
+      "sessions",
+      "create",
+      projectId,
+      "--title",
+      sessionTitle,
+      "--idempotency-key",
+      `web-live-session-${Date.now()}`,
+    ]);
+    const session = runCliJson<DataResponse<OperationView>>(testCli, [
+      "--base-url",
+      CONTROL_ORIGIN,
+      "operations",
+      "wait",
+      sessionOperation.data.id,
+      "--poll-millis",
+      "50",
+    ]);
+    const sessionId = requireOperationTarget(session.data, "session creation");
 
     return {
       projectId,
-      sessionId: session.data.id,
+      sessionId,
       sessionTitle,
-      stop: async () => {
+      cli: <T>(args: string[]) => {
+        try {
+          return runCliJson<T>(testCli, ["--base-url", CONTROL_ORIGIN, ...args]);
+        } catch (error) {
+          const details = serverLog ? `\nJanus server output:\n${serverLog}` : "";
+          throw new Error(`${error instanceof Error ? error.message : String(error)}${details}`);
+        }
+      },
+      request: requestJson,
+      providerRequestCount: provider.requestCount,
+      restart: async () => {
         await stopProcess(server);
-        await closeServer(provider.server);
-        await rm(fixtureRoot, { recursive: true, force: true });
+        serverLog = "";
+        server = launchServer();
+        await waitForReady(server, () => serverLog);
+      },
+      serverLog: () => serverLog,
+      stop: async () => {
+        try {
+          deleteSessionWithCli(testCli, sessionId);
+        } finally {
+          await stopProcess(server);
+          await closeServer(provider.server);
+          await rm(fixtureRoot, { recursive: true, force: true });
+        }
       },
     };
   } catch (error) {
@@ -144,14 +250,73 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
   }
 }
 
-async function startProvider(): Promise<{ origin: string; server: Server }> {
+async function startProvider(): Promise<{
+  origin: string;
+  server: Server;
+  requestCount: () => number;
+}> {
+  let requestCount = 0;
   const server = createServer((request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
       response.writeHead(404).end();
       return;
     }
-    response.writeHead(200, { "content-type": "text/event-stream" });
-    response.end(FINISH_STREAM);
+    let requestBody = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => {
+      requestBody += chunk;
+    });
+    request.on("end", () => {
+      requestCount += 1;
+      let latestUser = "";
+      let hasToolResult = false;
+      try {
+        const payload = JSON.parse(requestBody);
+        latestUser = latestUserContent(payload);
+        hasToolResult = hasToolResultAfterLatestUser(payload);
+      } catch {
+        response.writeHead(400).end();
+        return;
+      }
+
+      const callId = `fixture_call_${requestCount}`;
+      let stream = FINISH_STREAM;
+      if (latestUser.includes("[fixture:ask-expire]")) {
+        stream = toolStream(callId, "ask_user", {
+          prompt: "Use the fixture default",
+          mode: "best_effort",
+          default: "fixture expiry default",
+          expires_in_ms: 100,
+        });
+      } else if (
+        latestUser.includes("[fixture:ask]") ||
+        latestUser.includes("[fixture:restart-ask]")
+      ) {
+        stream = toolStream(callId, "ask_user", {
+          prompt: "Choose the fixture answer",
+          mode: "blocking",
+          choices: ["fixture answer"],
+        });
+      } else if (latestUser.includes("[fixture:cancel-job]")) {
+        stream = toolStream(callId, "job", {
+          command: fixtureSleepCommand(30),
+          timeout_ms: 60_000,
+        });
+      } else if (latestUser.includes("[fixture:job-resume]") && !hasToolResult) {
+        stream = toolStream(callId, "job", {
+          command: fixtureSleepCommand(1),
+          timeout_ms: 30_000,
+        });
+      } else if (latestUser.includes("[fixture:handoff-job]")) {
+        stream = toolStream(callId, "job", {
+          command: fixtureSleepCommand(3),
+          timeout_ms: 30_000,
+        });
+      }
+
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end(stream);
+    });
   });
   await new Promise<void>((resolvePromise, reject) => {
     server.once("error", reject);
@@ -165,7 +330,55 @@ async function startProvider(): Promise<{ origin: string; server: Server }> {
     await closeServer(server);
     throw new Error("fixture provider did not expose a TCP address");
   }
-  return { origin: `http://127.0.0.1:${address.port}`, server };
+  return {
+    origin: `http://127.0.0.1:${address.port}`,
+    server,
+    requestCount: () => requestCount,
+  };
+}
+
+function latestUserContent(payload: unknown): string {
+  if (typeof payload !== "object" || payload === null) return "";
+  const messages = Reflect.get(payload, "messages");
+  if (!Array.isArray(messages)) return "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (typeof message !== "object" || message === null) continue;
+    if (Reflect.get(message, "role") !== "user") continue;
+    const content = Reflect.get(message, "content");
+    return typeof content === "string" ? content : JSON.stringify(content);
+  }
+  return "";
+}
+
+function hasToolResultAfterLatestUser(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const messages = Reflect.get(payload, "messages");
+  if (!Array.isArray(messages)) return false;
+  let latestUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      Reflect.get(message, "role") === "user"
+    ) {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  return messages
+    .slice(latestUserIndex + 1)
+    .some(
+      (message) =>
+        typeof message === "object" && message !== null && Reflect.get(message, "role") === "tool",
+    );
+}
+
+function fixtureSleepCommand(seconds: number): string {
+  return process.platform === "win32"
+    ? `powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds ${seconds}"`
+    : `sleep ${seconds}`;
 }
 
 async function waitForReady(server: ChildProcess, getLog: () => string): Promise<void> {
@@ -184,22 +397,61 @@ async function waitForReady(server: ChildProcess, getLog: () => string): Promise
   throw new Error(`Janus server did not become ready\n${getLog()}`);
 }
 
-async function waitForProject(operationId: string): Promise<string> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const operation = await requestJson<DataResponse<OperationView>>(
-      `/api/v1/operations/${operationId}`,
-    );
-    if (operation.data.status === "succeeded" && operation.data.target_id) {
-      return operation.data.target_id;
-    }
-    if (["failed", "needs_attention", "canceled"].includes(operation.data.status)) {
-      throw new Error(
-        `fixture project creation ${operation.data.status}: ${JSON.stringify(operation.data.error)}`,
-      );
-    }
-    await delay(100);
+function requireOperationTarget(operation: OperationView, label: string): string {
+  if (operation.status !== "succeeded" || !operation.target_id) {
+    throw new Error(`${label} did not return a target: ${JSON.stringify(operation)}`);
   }
-  throw new Error("fixture project creation timed out");
+  return operation.target_id;
+}
+
+function deleteSessionWithCli(executable: string, sessionId: string): void {
+  const session = runCliJson<DataResponse<SessionView>>(executable, [
+    "--base-url",
+    CONTROL_ORIGIN,
+    "sessions",
+    "get",
+    sessionId,
+  ]);
+  const deletion = runCliJson<DataResponse<OperationView>>(executable, [
+    "--base-url",
+    CONTROL_ORIGIN,
+    "sessions",
+    "delete",
+    sessionId,
+    "--expected-version",
+    session.data.version,
+  ]);
+  runCliJson<DataResponse<OperationView>>(executable, [
+    "--base-url",
+    CONTROL_ORIGIN,
+    "operations",
+    "wait",
+    deletion.data.id,
+    "--poll-millis",
+    "50",
+  ]);
+  const missing = spawnSync(
+    executable,
+    ["--base-url", CONTROL_ORIGIN, "sessions", "get", sessionId],
+    { encoding: "utf8", windowsHide: true },
+  );
+  const output = `${missing.stdout ?? ""}\n${missing.stderr ?? ""}`;
+  if (missing.status === 0 || !output.includes("404")) {
+    throw new Error(`deleted Session remained readable: ${output}`);
+  }
+}
+
+function runCliJson<T>(executable: string, args: string[]): T {
+  const result = spawnSync(executable, args, { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0) {
+    const diagnostics = [result.stderr, result.stdout].filter(Boolean).join("\n");
+    throw new Error(`janus-test ${args.join(" ")} failed (${result.status}): ${diagnostics}`);
+  }
+  try {
+    return JSON.parse(result.stdout) as T;
+  } catch (error) {
+    throw new Error(`janus-test returned invalid JSON: ${result.stdout}`, { cause: error });
+  }
 }
 
 async function requestJson<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
