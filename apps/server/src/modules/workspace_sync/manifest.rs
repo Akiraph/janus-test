@@ -129,7 +129,6 @@ async fn collect_dir(
                 let len = bytes.len() as u64;
                 let blob_ref =
                     BlobReference::new("workspace_sync", "manifest_file", blob_owner_id, "content");
-                // blob_sha preserves raw bytes (CAS is content-addressed, never normalized).
                 let blob_sha = blobs.write(&bytes, blob_ref).await?;
                 // node_hash is over line-normalized text so CRLF/LF do not differ.
                 let is_text = is_text_bytes(&bytes);
@@ -163,7 +162,7 @@ fn path_to_rel(path: &Path) -> RelPath {
         .join("/")
 }
 
-fn file_mode(meta: &std::fs::Metadata) -> u32 {
+pub(super) fn file_mode(meta: &std::fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

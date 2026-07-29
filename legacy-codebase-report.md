@@ -58,11 +58,11 @@ Overall         ░░░░░░░░░░  --   -   Pending
 | Severity | Count | Confirmed | Suspected |
 | --- | ---: | ---: | ---: |
 | Critical | 0 | 0 | 0 |
-| High | 38 | 37 | 1 |
-| Medium | 35 | 35 | 0 |
+| High | 44 | 43 | 1 |
+| Medium | 37 | 37 | 0 |
 | Low | 7 | 7 | 0 |
 | Info | 0 | 0 | 0 |
-| **Total** | 80 | 79 | 1 |
+| **Total** | 88 | 87 | 1 |
 
 Rejected candidates remain in the decision record but are excluded from the counts.
 
@@ -155,6 +155,15 @@ This additive Before snapshot was frozen before the workspace stylesheet and bro
 | Frontend tests | 8 files / 1970 lines | Tracked `e2e` and colocated test/spec TypeScript. |
 
 After the retirement slices, frontend production is 82 files / 11055 lines and tests are 2 files / 918 lines. The workspace feature CSS is 1284 lines across four owner files instead of 1891 lines in one file; its largest file is 562 lines.
+
+### Workspace synchronization performance
+
+| Measure | Before | After | Delta |
+| --- | ---: | ---: | ---: |
+| Session creation, 1,222 files / 33 MB | 5.26 s | 2.92-3.21 s | 39-44% faster |
+| Empty Session Diff after warm-up | 7.61-7.76 s | 0.31 s | about 96% faster |
+
+Both measurements use the same real Git project and compiled server path. Session creation still records a deterministic Managed Content root; Diff now reads only Git-discovered candidate paths.
 
 Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-project-tab/sessions-tab-desktop.png` and `apps/web/test-results/sessions-mobile-session-opens-as-project-tab/sessions-tab-mobile.png`. The mobile image directly records F-010; both images record F-011 and the unfinished-control presentation already covered by F-002/F-003.
 
@@ -261,6 +270,14 @@ Baseline screenshots: `apps/web/test-results/sessions-desktop-session-opens-as-p
 | F-079 | Low | Confirmed | Fixed | Module Interfaces retained zero-consumer query and Log Store wrappers after their workflows moved to guarded commands and owner-specific paths. | Before: Sessions queue queries/projection and four Runtime Log Store forwards were definition-only across production, routes, CLI, tests, and docs. After: all seven symbols are absent; documented `patch_session` and future compaction code remain. | Module navigation now presents only retained workflow entry points without deleting declared future behavior. | Preserve queue behavior through transaction-scoped activation commands and Terminal behavior through `create_terminal`, executor logging, and `terminal_scrollback`. |
 | F-080 | Medium | Confirmed | Fixed | Retired Project Files/Git/Graph surfaces remained in workspace CSS and a test-only graph projection remained in production source. | Before: `workspace.css` had 1891 lines and 58 exact class tokens absent from production TS/TSX; `.graph-*` rendered nowhere and `commitGraph.ts` was test-only. After: zero such selectors or projection references remain, and the retained CSS is split by Workspace, Files, SCM, and Sessions ownership. | Maintainers no longer navigate or preserve UI paths that cannot render. | Keep retired private selectors out unless a production owner and live behavior require them. |
 | F-081 | Medium | Confirmed | Fixed | A diagnostic Playwright file could mutate a hard-coded Project file, had no assertions, and could report success before exercising Save or Git. | Before: `diag-save.spec.ts` prepended a timestamped marker and never restored it. After: the file is deleted; the isolated live fixture opens a real temporary-repository file, keeps an unsaved draft, exercises SCM, and closes the tab without persisting it. | The default suite no longer risks developer data or false-green diagnostic output. | Keep mutable file scenarios inside disposable repositories with explicit assertions. |
+| F-082 | High | Confirmed | Open | The Session Composer cannot select the model that will own the next Turn. | `SessionComposer` exposes only delivery text and send; `sessions.next_model_ref` is read during model snapshot resolution but has no public writer, while enabled Provider/model data is already available to Web. | Users cannot deliberately route work to a configured model and the internal preference field remains ambient dead state. | Add one typed Session execution-preference command, expose the effective selection in `SessionSummary`, and compose a model picker from the existing Provider query without mutating Project settings. |
+| F-083 | High | Confirmed | Open | Stored model parameters never reach the Provider request, so a reasoning-effort control would currently be decorative. | `TurnModelSnapshot.parameters` is persisted, but `ModelRequest` omits it and both Provider adapters construct bodies without merging supported model parameters. | Configured or Composer-selected reasoning behavior cannot affect inference, and history claims to snapshot parameters that execution ignores. | Carry validated parameters through `ModelRequest`, map only explicit supported fields at each adapter, and keep the immutable Turn snapshot as the execution source. |
+| F-084 | High | Confirmed | Open | Attachment tables and public limits exist without an upload, attachment, or message-binding HTTP/application path. | Migrations own `uploads`, `attachments`, and `message_attachments`; bootstrap returns `max_attachments`; `PostMessageRequest` accepts only text and version. | The Composer cannot attach files despite the primary UX and HTTP contracts, and adding a file button alone would be a false affordance. | Implement the smallest complete draft-upload to Session-attachment to message-binding path with size/count validation and real browser coverage before exposing the control. |
+| F-085 | Medium | Confirmed | Open | Context usage is recorded internally but unavailable as a public Session projection. | `context_versions` stores estimated input tokens and model limit and emits `context.changed`; no HTTP query or Composer indicator reads the latest row. | Users cannot see whether the next Round is near its limit or make an informed model/Compact decision. | Expose a typed read-only latest-context projection and render a stable-size accessible indicator beside the Composer; keep manual Compact separate until its command exists. |
+| F-086 | Medium | Confirmed | Fixed | New Session completion was dominated by a full Merkle/CAS scan after worktree creation. | Before: the real 1,222-file/33 MB Project took 5.26 s. After: Git enumerates Managed Content, files are hashed concurrently without fake CAS hydration, and repeated compiled-server runs take 2.92-3.21 s; the UI no longer says it is copying the workspace. | Session creation is 39-44% faster while retaining a deterministic initial Content Revision root. | Keep the root computation stateless until a measured need justifies a persistent manifest cache. |
+| F-087 | High | Confirmed | Fixed | Every Session Diff request fully rescanned and re-persisted both Session and Main trees before comparing them. | Before: repeated empty Diff calls took 7.61-7.76 s. After: Git discovers candidates from both HEADs and working trees, only candidate bytes are read, and warmed empty Diff takes 0.31 s with the response contract unchanged. | Opening or revisiting Diff is about 96% faster and no longer writes unrelated blobs. | Keep Git as candidate discovery only; current working-tree bytes remain authoritative for the returned diff. |
+| F-088 | High | Confirmed | Open | Manifest collection writes every file with the same logical Blob reference key, so only one file per owner can remain referenced. | `collect_manifest` constructs every reference as `(workspace_sync, manifest_file, <workspace handle>, content)`, while `blob_references` has primary key `(owner_module, owner_type, owner_id, purpose)` and `BlobStore` uses `INSERT OR IGNORE`. | The expensive full CAS scan does not produce a complete recoverable snapshot: all but the first distinct file object are unreferenced and eligible for future collection. | Stop treating per-file writes under one reference as a snapshot; persist a manifest-owned root/node graph with distinct references when checkpoint recovery is implemented, and keep request-time identity/diff observation free of fake CAS hydration. |
+| F-089 | High | Confirmed | Fixed | A new Session was checked out from Main `HEAD`, not from Main's current Managed Content. | Before: staged, unstaged, deleted, and non-ignored untracked paths were absent. After: Session creation projects Git-reported Main changes into the worktree before recording its initial revision; a real Git/SQLite integration case proves tracked edits/deletions and untracked inclusion, ignored exclusion, and a zero Diff baseline. | A Session now starts from the content the user actually sees in Main without mutating Main's index. | Preserve this Managed Content contract when container execution or future synchronization is added. |
 
 ## Pending user decisions
 
@@ -328,6 +345,10 @@ Migration state is deliberately short because Janus is single-node and startup h
 | F-079 | Sessions and Runtime exposed seven definition-only query/log wrapper symbols. | Removed only the proven zero-consumer methods/type and made retained implementation modules private where no test imports remain. | Reference search is empty; architecture check and all 9 live scenarios pass. | Fixed. |
 | F-080 | Workspace CSS retained 58 no-production-consumer class selectors and a test-only graph projection. | Removed the retired rules/projection/tests, split retained styles into Workspace, Files, SCM, and Sessions owners, and consolidated three spinner animations into one UI primitive. | Workspace feature CSS: 1891 to 1284 lines; largest owner: 562 lines; TypeScript, Biome, build, live 10/10, and desktop/mobile screenshot inspection pass. | Fixed. |
 | F-081 | A hard-coded diagnostic browser test could mutate developer data and pass without assertions. | Deleted it after adding a disposable real-Git browser scenario that keeps its edit as an unsaved draft. | The live file/SCM scenario passes and the temporary fixture is removed during teardown. | Fixed. |
+| F-086 | Session creation took 5.26 s on the real 1,222-file/33 MB Project. | Replaced recursive CAS hydration with Git enumeration plus bounded concurrent content hashing and corrected the UI status text. | Compiled-server runs take 2.92-3.21 s; Rust formatting, warnings-denied Clippy, Web typecheck/lint/build, and workspace-sync integration tests pass. | Fixed. |
+| F-087 | Empty Diff took 7.61-7.76 s and wrote both complete trees into CAS. | Replaced dual scans with Git candidate discovery and direct candidate-byte comparison. | Warm empty Diff takes 0.31 s; empty and changed-path HTTP shapes remain correct. | Fixed. |
+| F-088 | Per-file CAS writes shared one logical reference key and could not retain a complete snapshot. | Removed those writes from Session creation, mutation hashing, and Diff hot paths without claiming snapshot recovery. | Request-time observation no longer creates misleading blob references; the complete recoverable manifest graph remains unimplemented. | Partial mitigation; open. |
+| F-089 | Session checkout represented Main `HEAD` rather than its current Managed Content. | Projected tracked edits/deletions and non-ignored untracked files into the worktree before the initial revision. | `cargo test -p janus-server --test workspace_sync`: 7/7 with real Git and SQLite, including a zero-Diff creation baseline. | Fixed. |
 
 ## Documentation feedback
 
@@ -337,7 +358,7 @@ Migration state is deliberately short because Janus is single-node and startup h
 
 ## Remaining risk and uninspected areas
 
-- Deferred/accepted/open findings retain their individual ledger dispositions; this slice closes F-006, F-080, and F-081.
-- Checks not run and why: The affected user's exact provider/configuration failure has not been reproduced; Stage 7 is excluded by host capability.
+- Deferred/accepted/open findings retain their individual ledger dispositions; the current workspace-sync slice closes F-086, F-087, and F-089 while F-088 remains open.
+- Checks not run and why: The affected user's exact provider/configuration failure has not been reproduced; Linux target checking stops in `ring` because this Windows host has no `x86_64-linux-gnu-gcc`; Stage 7 is excluded by host capability.
 - Currently unjudgeable: Real low-end device performance, production provider behavior, and Linux container behavior; none will be reported as verified without evidence.
 - Uninspected areas: Non-workspace pages remain in the declared UI scope for token/semantic consistency, but detailed issue enumeration follows the code-size and workflow priority order.

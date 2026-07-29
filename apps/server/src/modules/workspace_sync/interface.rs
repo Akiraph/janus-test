@@ -20,12 +20,13 @@ use crate::platform::{
     path::{PathError, validate_workspace_path},
 };
 
-use super::diff::{DiffChangeKind, DiffSummary, diff_manifests, line_hunks};
+use super::diff::DiffSummary;
 use super::manifest::{ManifestRoot, collect_manifest as walk_manifest};
 use super::session_copy::{
     create_session_worktree, main_repo_abs, remove_session_tree, session_managed_dir,
     session_repo_abs,
 };
+use super::working_tree::{diff_working_trees, hash_working_tree, seed_session_from_main};
 
 /// Opaque handle for a workspace copy, stored in `workspace_copies.handle`.
 /// Main: `main:<project-id>`; Session: `session:<session-id>`.
@@ -296,8 +297,9 @@ impl WorkspaceSyncInterface {
         // store, detached-HEAD checkout at Main's current tree. No file copy,
         // no re-init; the Session inherits Main's history.
         create_session_worktree(&main_abs, &session_abs).map_err(WorkspaceSyncError::Internal)?;
+        seed_session_from_main(&main_abs, &session_abs).map_err(WorkspaceSyncError::Internal)?;
 
-        let manifest = walk_manifest(&session_abs, &self.blobs, handle.as_str())
+        let manifest = hash_working_tree(&session_abs)
             .await
             .map_err(WorkspaceSyncError::Internal)?;
         let root_hash = manifest.root_hash.clone();
@@ -441,7 +443,7 @@ impl WorkspaceSyncInterface {
             }
         }
 
-        let manifest = walk_manifest(&root, &self.blobs, handle.as_str())
+        let manifest = hash_working_tree(&root)
             .await
             .map_err(WorkspaceSyncError::Internal)?;
         self.advance_revision(
@@ -473,43 +475,23 @@ impl WorkspaceSyncInterface {
         session_id: SessionId,
     ) -> Result<DiffSummary, WorkspaceSyncError> {
         let session_handle = WorkspaceHandle::session(session_id);
-        let project_id: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
-                .bind(session_handle.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        let project_id = project_id.ok_or(WorkspaceSyncError::NotFound)?;
-        let project_id: ProjectId = project_id
-            .parse()
-            .map_err(|_| WorkspaceSyncError::Internal(anyhow!("bad project id")))?;
-        let main_handle = WorkspaceHandle::main(project_id);
-
-        let session_manifest = self.collect_manifest(&session_handle).await?;
-        // Main may not yet have a stored root; always rescan from disk for M3.
-        let main_manifest = self.collect_manifest(&main_handle).await?;
-        let mut summary = diff_manifests(&session_manifest, &main_manifest);
-        // Attach line-level hunks for each changed path so the Diff pane can
-        // expand a file and show only the changed lines (+ context / collapse).
-        for entry in &mut summary.paths {
-            let session_bytes = match entry.kind {
-                DiffChangeKind::Added | DiffChangeKind::Modified => {
-                    read_node_bytes(&self.blobs, &session_manifest, &entry.path).await?
-                }
-                DiffChangeKind::Deleted => None,
-            };
-            let main_bytes = match entry.kind {
-                DiffChangeKind::Deleted | DiffChangeKind::Modified => {
-                    read_node_bytes(&self.blobs, &main_manifest, &entry.path).await?
-                }
-                DiffChangeKind::Added => None,
-            };
-            let session_slice = session_bytes.as_deref().unwrap_or(&[]);
-            let main_slice = main_bytes.as_deref().unwrap_or(&[]);
-            let (hunks, binary) = line_hunks(session_slice, main_slice);
-            entry.hunks = hunks;
-            entry.binary = binary;
-        }
-        Ok(summary)
+        let dirs: Option<(String, String)> = sqlx::query_as(
+            "SELECT session.managed_dir, main.managed_dir \
+             FROM workspace_copies AS session \
+             JOIN workspace_copies AS main \
+               ON main.project_id = session.project_id AND main.kind = 'main' \
+             WHERE session.handle = ?",
+        )
+        .bind(session_handle.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        let (session_dir, main_dir) = dirs.ok_or(WorkspaceSyncError::NotFound)?;
+        diff_working_trees(
+            &self.data_root.join(session_dir),
+            &self.data_root.join(main_dir),
+        )
+        .await
+        .map_err(WorkspaceSyncError::Internal)
     }
 
     /// Cascade-delete a Session copy: directory tree + DB rows for that handle
@@ -667,26 +649,6 @@ impl WorkspaceSyncInterface {
 
 fn is_git_path(rel: &Path) -> bool {
     rel.components().any(|c| c.as_os_str() == ".git")
-}
-
-/// Load raw file bytes from the blob store for a path in a collected manifest.
-/// Returns `None` when the path is missing or has no blob (directory / absent).
-async fn read_node_bytes(
-    blobs: &BlobStore,
-    manifest: &ManifestRoot,
-    path: &str,
-) -> Result<Option<Vec<u8>>, WorkspaceSyncError> {
-    let Some(node) = manifest.nodes.get(path) else {
-        return Ok(None);
-    };
-    let Some(sha) = node.blob_sha.as_deref() else {
-        return Ok(None);
-    };
-    let bytes = blobs
-        .read(sha)
-        .await
-        .map_err(|e| WorkspaceSyncError::Internal(anyhow!("blob read {sha}: {e}")))?;
-    Ok(Some(bytes))
 }
 
 async fn atomic_write(abs: &Path, content: &[u8]) -> Result<(), WorkspaceSyncError> {

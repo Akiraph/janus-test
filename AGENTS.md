@@ -20,6 +20,7 @@
 ## Product scope
 
 - Janus has one deployment Owner; do not add User, Membership, RBAC, sharing, or multi-user UI abstractions.
+- A new Session starts from Main's current Git-managed content, including tracked changes, deletions, and non-ignored untracked files; ignored files remain outside the Session.
 - Session workspaces are user read-only; do not expose a Session Terminal or ordinary Session file writes.
 - Project Runtimes host Main Workspace Terminals; Session Runtimes host Supervisor Jobs and Services.
 

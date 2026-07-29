@@ -3,9 +3,9 @@
 Owns physical workspace copies (`workspace_copies`), immutable Content Revision
 identity (`content_revisions`), Session Merkle snapshots (`workspace_snapshots`),
 and bidirectional propagation cursor rows (`propagation_links`). It does **not**
-own user Git operations, Session messages, or Apply/Sync execution (M5).
+own user Git operations, Session messages, or Apply/Sync execution.
 
-## M3 ownership
+## Ownership
 
 | Kind | Names |
 | --- | --- |
@@ -22,6 +22,11 @@ diff base).
 
 - Session directory: `data/workspaces/sessions/<session-id>/repo/`.
 - Handle: `session:<session-id>` (symmetric to Main `main:<project-id>`).
-- M3 fills `content_revisions.manifest_root_hash` on Session create and each
-  managed tool write; M2 left it NULL for Main-only copies.
-- Diff summary is read-only; Apply/Sync buttons stay disabled until M5.
+- A Session is a Git worktree seeded from Main's current tracked changes,
+  deletions, and non-ignored untracked files; ignored files are excluded.
+- `content_revisions.manifest_root_hash` records Managed Content identity on
+  Session creation and managed tool writes; a recoverable manifest/blob graph
+  is not yet persisted.
+- Diff uses Git to discover candidate paths and compares their current bytes;
+  it does not persist request-time snapshots.
+- Diff summary is read-only; Apply/Sync execution is not implemented here.

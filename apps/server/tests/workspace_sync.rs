@@ -49,6 +49,7 @@ impl Fixture {
         let main_abs = data_root.join(&main_managed);
         std::fs::create_dir_all(&main_abs)?;
         std::fs::write(main_abs.join("README.md"), b"# main\n")?;
+        std::fs::write(main_abs.join(".gitignore"), b"*.ignored\n")?;
         std::fs::create_dir_all(main_abs.join("src"))?;
         std::fs::write(main_abs.join("src").join("lib.rs"), b"fn main() {}\n")?;
         support::init_git_repo(&main_abs)?;
@@ -71,6 +72,46 @@ impl Fixture {
             project_id,
         })
     }
+}
+
+#[tokio::test]
+async fn session_copy_includes_main_working_tree_content() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let main = fx
+        .data_root
+        .join("workspaces")
+        .join("main")
+        .join(fx.project_id.to_string())
+        .join("repo");
+    std::fs::write(main.join("README.md"), b"# uncommitted main\n")?;
+    std::fs::remove_file(main.join("src").join("lib.rs"))?;
+    std::fs::write(main.join("draft.txt"), b"untracked\n")?;
+    std::fs::write(main.join("cache.ignored"), b"ignored\n")?;
+
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let session = fx
+        .data_root
+        .join("workspaces")
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("repo");
+
+    assert_eq!(
+        std::fs::read(session.join("README.md"))?,
+        b"# uncommitted main\n"
+    );
+    assert!(!session.join("src").join("lib.rs").exists());
+    assert_eq!(std::fs::read(session.join("draft.txt"))?, b"untracked\n");
+    assert!(!session.join("cache.ignored").exists());
+
+    let summary = fx.sync.diff_summary(session_id).await?;
+    assert_eq!(summary.added, 0);
+    assert_eq!(summary.modified, 0);
+    assert_eq!(summary.deleted, 0);
+    Ok(())
 }
 
 async fn seed_project(pool: &SqlitePool, project_id: ProjectId) -> anyhow::Result<()> {

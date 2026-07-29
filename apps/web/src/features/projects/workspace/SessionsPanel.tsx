@@ -90,7 +90,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
         <button
           type="button"
           class="sessions-panel__new"
-          title={creating() ? "Creating session — copying workspace…" : "New session"}
+          title={creating() ? "Creating session..." : "New session"}
           disabled={creating() || (props.projectReady ? !props.projectReady() : false)}
           onClick={() => void onCreate()}
         >
