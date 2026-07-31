@@ -8,7 +8,7 @@ import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { EmptyState } from "../../../components/ui/EmptyState";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../../components/ui/notifications";
 import type { TerminalProjection, TerminalTicket } from "../../../lib/api";
 import {
   closeTerminal,
@@ -306,6 +306,11 @@ export function TerminalPanel(props: TerminalPanelProps) {
 
   return (
     <div class="terminal-panel">
+      <NotificationEvent
+        message={error()}
+        variant="danger"
+        action={{ label: "Reconnect", onClick: () => void onReconnect() }}
+      />
       <div class="ide-sidebar-header terminal-panel__header">
         <span>{props.title ?? "Terminal"}</span>
         <div class="terminal-panel__actions">
@@ -362,11 +367,6 @@ export function TerminalPanel(props: TerminalPanelProps) {
           />
         }
       >
-        <Show when={error()}>
-          <div class="terminal-panel__error">
-            <ErrorBlock message={error()} retry={() => void onReconnect()} />
-          </div>
-        </Show>
         <Show when={status() === "loading" || status() === "connecting"}>
           <div class="terminal-panel__loading" role="status" aria-label="Opening terminal">
             <Loader2 size={16} class="ui-spinner" />

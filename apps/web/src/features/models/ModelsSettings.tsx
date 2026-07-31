@@ -10,8 +10,7 @@ import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { ErrorBlock } from "../../components/ui/ErrorBlock";
-import { useNotifications } from "../../components/ui/notifications";
+import { NotificationEvent, useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
 import type { EmbeddedModelInput, ProviderInput, ProviderView } from "../../lib/api";
 import { createProvider, deleteProvider, probeProvider, updateProvider } from "../../lib/api";
@@ -503,9 +502,7 @@ function ProviderForm(props: ProviderFormProps) {
           </For>
         </div>
 
-        <Show when={error()}>
-          <ErrorBlock variant="inline" message={error()} />
-        </Show>
+        <NotificationEvent message={error()} variant="danger" />
         <div class="dialog-footer">
           <Button variant="outline" type="button" onClick={props.close}>
             Cancel

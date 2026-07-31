@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -8,6 +9,22 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const CONTROL_ORIGIN = "http://127.0.0.1:4317";
 const FINISH_STREAM = [
   'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Live fixture reply"}}]}',
+  "",
+  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_f","type":"function","function":{"name":"finish","arguments":""}}]}}]}',
+  "",
+  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"summary\\":\\"fixture complete\\"}"}}]}}]}',
+  "",
+  'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}',
+  "",
+  "data: [DONE]",
+  "",
+  "",
+].join("\n");
+
+const DELAYED_MARKDOWN_START =
+  'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"## Live stream"}}]}\n\n';
+const DELAYED_MARKDOWN_END = [
+  'data: {"choices":[{"index":0,"delta":{"content":"\n\n- Live fixture reply"}}]}',
   "",
   'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_f","type":"function","function":{"name":"finish","arguments":""}}]}}]}',
   "",
@@ -137,6 +154,12 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
       });
       const collectLog = (chunk: Buffer) => {
         serverLog = `${serverLog}${chunk.toString("utf8")}`.slice(-16_000);
+        // DIAGNOSTIC: also persist full server log to disk.
+        try {
+          appendFileSync(`${tmpdir()}/janus-live-server.log`, chunk.toString("utf8"));
+        } catch {
+          // ignore
+        }
       };
       child.stdout?.on("data", collectLog);
       child.stderr?.on("data", collectLog);
@@ -340,6 +363,11 @@ async function startProvider(): Promise<{
       }
 
       response.writeHead(200, { "content-type": "text/event-stream" });
+      if (latestUser === "你好") {
+        response.write(DELAYED_MARKDOWN_START);
+        setTimeout(() => response.end(DELAYED_MARKDOWN_END), 1_000);
+        return;
+      }
       response.end(stream);
     });
   });

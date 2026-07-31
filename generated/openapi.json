@@ -5584,6 +5584,16 @@
                   "null"
                 ]
               },
+              "model_attempt": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/TurnModelAttempt"
+                  }
+                ]
+              },
               "model_snapshot": {
                 "oneOf": [
                   {
@@ -6858,6 +6868,16 @@
           }
         }
       },
+      "ModelAttemptStatus": {
+        "type": "string",
+        "enum": [
+          "running",
+          "succeeded",
+          "failed",
+          "canceled",
+          "interrupted"
+        ]
+      },
       "MoveFileInput": {
         "type": "object",
         "required": [
@@ -8050,6 +8070,31 @@
           }
         }
       },
+      "TurnModelAttempt": {
+        "type": "object",
+        "description": "The most recent model attempt for this Turn's active Round, projected onto\n`TurnSummary` so the UI can render the live retry counter\n(\"Reconnecting (X/5): reason\") even when the SSE event that announced it has\nalready been consumed. Absent when the Turn has had no attempts yet.",
+        "required": [
+          "attempt",
+          "status"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "1-based retry index surfaced to the UI (0 = the initial attempt, not a\nretry). Matches the `attempt` field of `model.attempt_retrying` events."
+          },
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Normalized failure detail for a `failed` attempt; null otherwise."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ModelAttemptStatus"
+          }
+        }
+      },
       "TurnModelSnapshot": {
         "type": "object",
         "required": [
@@ -8135,6 +8180,16 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "model_attempt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnModelAttempt"
+              }
             ]
           },
           "model_snapshot": {

@@ -3,8 +3,7 @@ import ChevronRight from "lucide-solid/icons/chevron-right";
 import { createEffect, createSignal, For, Show } from "solid-js";
 import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
-import { useNotifications } from "../../../components/ui/notifications";
+import { NotificationEvent, useNotifications } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { GitUpdateConflictView } from "../../../lib/api";
 import {
@@ -103,15 +102,23 @@ export function ScmPanel(props: ScmPanelProps) {
 
   return (
     <section class="ide-sidebar-panel scm-panel" aria-label="Source Control">
+      <NotificationEvent
+        message={
+          status.isError
+            ? status.error instanceof Error
+              ? status.error.message
+              : "Git status failed"
+            : null
+        }
+        variant="danger"
+        action={{ label: "Retry", onClick: () => void status.refetch() }}
+      />
       <div class="ide-sidebar-header">Source Control</div>
       <Show
         when={status.data}
         fallback={
-          <Show when={status.isError} fallback={<p class="surface-note">Loading...</p>}>
-            <ErrorBlock
-              message={status.error instanceof Error ? status.error.message : "Git status failed"}
-              retry={() => void status.refetch()}
-            />
+          <Show when={!status.isError}>
+            <p class="surface-note">Loading...</p>
           </Show>
         }
       >

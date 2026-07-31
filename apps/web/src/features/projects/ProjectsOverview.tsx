@@ -10,8 +10,7 @@ import { Badge, type BadgeVariant } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { ErrorBlock } from "../../components/ui/ErrorBlock";
-import { useNotifications } from "../../components/ui/notifications";
+import { NotificationEvent, useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
 import type { CreateProjectInput, OperationView, ProjectView, RepoAccess } from "../../lib/api";
 import {
@@ -167,6 +166,17 @@ export function ProjectsOverview() {
 
   return (
     <section class="projects" aria-labelledby="workspace-title">
+      <NotificationEvent
+        message={
+          projects.isError
+            ? projects.error instanceof Error
+              ? projects.error.message
+              : "Failed to load projects"
+            : null
+        }
+        variant="danger"
+        action={{ label: "Retry", onClick: () => void projects.refetch() }}
+      />
       <div class="projects-heading projects-heading-row">
         <div>
           <h1 id="workspace-title">Projects</h1>
@@ -204,85 +214,73 @@ export function ProjectsOverview() {
         }
       >
         <Show
-          when={!projects.isError}
+          when={(projects.data?.length ?? 0) > 0}
           fallback={
-            <ErrorBlock
-              message={
-                projects.error instanceof Error ? projects.error.message : "Failed to load projects"
+            <EmptyState
+              icon={Folder}
+              title="No projects yet"
+              description="Create a project from a public or private Git repository."
+              action={
+                <Button variant="primary" onClick={() => setFormOpen(true)}>
+                  Create project
+                </Button>
               }
-              retry={() => void projects.refetch()}
             />
           }
         >
-          <Show
-            when={(projects.data?.length ?? 0) > 0}
-            fallback={
-              <EmptyState
-                icon={Folder}
-                title="No projects yet"
-                description="Create a project from a public or private Git repository."
-                action={
-                  <Button variant="primary" onClick={() => setFormOpen(true)}>
-                    Create project
-                  </Button>
-                }
-              />
-            }
-          >
-            <div class="record-list">
-              <For each={projects.data}>
-                {(project) => (
-                  <article class="record-card project-card">
-                    <div class="record-copy">
-                      <div class="record-title">
-                        <h3>
-                          <Show when={project.state === "ready"} fallback={project.name}>
-                            <A href={`/projects/${project.id}`}>{project.name}</A>
-                          </Show>
-                        </h3>
-                        <Badge variant={stateVariant(project.state)}>{project.state}</Badge>
-                      </div>
-                      <p class="project-repo">{project.repository.url}</p>
-                      <div class="record-chips">
-                        <span>{project.current_branch ?? project.repository.branch ?? "—"}</span>
-                        <span>{project.repository.access}</span>
-                        <span>Updated {formatActivity(project.updated_at)}</span>
-                      </div>
+          <div class="record-list">
+            <For each={projects.data}>
+              {(project) => (
+                <article class="record-card project-card">
+                  <div class="record-copy">
+                    <div class="record-title">
+                      <h3>
+                        <Show when={project.state === "ready"} fallback={project.name}>
+                          <A href={`/projects/${project.id}`}>{project.name}</A>
+                        </Show>
+                      </h3>
+                      <Badge variant={stateVariant(project.state)}>{project.state}</Badge>
                     </div>
-                    <div class="record-actions">
-                      <Show when={project.state === "ready"}>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => navigate(`/projects/${project.id}`)}
-                        >
-                          <FolderGit2 size={14} />
-                          Open
-                        </Button>
-                      </Show>
-                      <Show when={project.state === "error"}>
-                        <Button variant="outline" size="sm" onClick={() => void onRetry(project)}>
-                          <RefreshCw size={14} />
-                          Retry
-                        </Button>
-                      </Show>
-                      <Show when={project.state === "error" || project.state === "ready"}>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          iconOnly
-                          aria-label={`Delete ${project.name}`}
-                          onClick={() => void onDelete(project)}
-                        >
-                          <Trash2 size={16} />
-                        </Button>
-                      </Show>
+                    <p class="project-repo">{project.repository.url}</p>
+                    <div class="record-chips">
+                      <span>{project.current_branch ?? project.repository.branch ?? "—"}</span>
+                      <span>{project.repository.access}</span>
+                      <span>Updated {formatActivity(project.updated_at)}</span>
                     </div>
-                  </article>
-                )}
-              </For>
-            </div>
-          </Show>
+                  </div>
+                  <div class="record-actions">
+                    <Show when={project.state === "ready"}>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => navigate(`/projects/${project.id}`)}
+                      >
+                        <FolderGit2 size={14} />
+                        Open
+                      </Button>
+                    </Show>
+                    <Show when={project.state === "error"}>
+                      <Button variant="outline" size="sm" onClick={() => void onRetry(project)}>
+                        <RefreshCw size={14} />
+                        Retry
+                      </Button>
+                    </Show>
+                    <Show when={project.state === "error" || project.state === "ready"}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        iconOnly
+                        aria-label={`Delete ${project.name}`}
+                        onClick={() => void onDelete(project)}
+                      >
+                        <Trash2 size={16} />
+                      </Button>
+                    </Show>
+                  </div>
+                </article>
+              )}
+            </For>
+          </div>
         </Show>
       </Show>
 
@@ -444,9 +442,7 @@ function CreateProjectDialog(props: CreateProjectDialogProps) {
             </div>
           </Show>
         </div>
-        <Show when={error()}>
-          <ErrorBlock variant="inline" message={error()} />
-        </Show>
+        <NotificationEvent message={error()} variant="danger" />
         <div class="dialog-footer">
           <Button variant="outline" type="button" onClick={props.close}>
             Cancel

@@ -5,8 +5,7 @@ import { createEffect, createSignal, Show } from "solid-js";
 import { produce } from "solid-js/store";
 import { Button } from "../../../components/ui/Button";
 import { EmptyState } from "../../../components/ui/EmptyState";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
-import { useNotifications } from "../../../components/ui/notifications";
+import { NotificationEvent, useNotifications } from "../../../components/ui/notifications";
 import { getFileContentText, getFileMeta, saveFileText } from "../../../lib/api";
 import type { FileDocument } from "./workspaceState";
 import "./files.css";
@@ -113,7 +112,6 @@ export function FileEditor(props: FileEditorProps) {
       props.onPatch((item) => {
         item.loadError = message;
       });
-      notify(message, { variant: "danger" });
       return false;
     } finally {
       setSaving(false);
@@ -122,6 +120,7 @@ export function FileEditor(props: FileEditorProps) {
 
   return (
     <div class="ide-editor-surface">
+      <NotificationEvent message={props.tab().loadError} variant="danger" />
       <Show
         when={props.tab().meta || !props.tab().loading}
         fallback={<p class="surface-note">Loading…</p>}
@@ -148,9 +147,6 @@ export function FileEditor(props: FileEditorProps) {
             Save
           </Button>
         </div>
-        <Show when={props.tab().loadError}>
-          <ErrorBlock variant="inline" message={props.tab().loadError} />
-        </Show>
         <Show when={!props.tab().loading && props.tab().meta && !props.tab().meta?.editable}>
           <EmptyState
             icon={FileCode2}

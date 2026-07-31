@@ -945,7 +945,10 @@ impl SessionsInterface {
         let AppendAssistantMessage {
             session_id,
             turn_id,
+            round_id,
             text,
+            reasoning,
+            duration_ms,
             tool_calls,
             actor,
             now,
@@ -954,6 +957,7 @@ impl SessionsInterface {
         let message_id = MessageId::new();
         let body = json!({
             "parts": [{"type": "text", "text": text}],
+            "reasoning": reasoning,
             "tool_calls": tool_calls,
         });
         sqlx::query(
@@ -972,7 +976,7 @@ impl SessionsInterface {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        if text.is_empty() {
+        if text.is_empty() && reasoning.is_empty() {
             return Ok((message_id.to_string(), None, display_order));
         }
         let timeline_item_id = TimelineItemId::new();
@@ -987,10 +991,21 @@ impl SessionsInterface {
         .bind(turn_id.to_string())
         .bind(message_id.to_string())
         .bind(display_order)
-        .bind(
-            json!({"kind": "assistant_message", "message_id": message_id.to_string(), "text": text})
-                .to_string(),
-        )
+        .bind({
+            let mut proj = json!({
+                "kind": "assistant_message",
+                "message_id": message_id.to_string(),
+                "round_id": round_id.to_string(),
+                "text": text,
+                "reasoning": reasoning,
+            });
+            if let Some(ms) = duration_ms {
+                proj.as_object_mut()
+                    .expect("proj is object")
+                    .insert("duration_ms".into(), json!(ms));
+            }
+            proj.to_string()
+        })
         .bind(format!("v_{}", TimelineItemId::new()))
         .bind(now)
         .bind(now)

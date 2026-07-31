@@ -5,7 +5,6 @@ use std::path::Path;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::adapters::git::{GitRunner, SystemGit};
 use crate::modules::sessions::interface::{AttachmentResource, SessionsInterface};
 use crate::modules::workspace_sync::interface::{
     FileMutation, WorkspaceHandle, WorkspaceSyncInterface,
@@ -13,12 +12,13 @@ use crate::modules::workspace_sync::interface::{
 use crate::platform::id::{AskId, AttachmentId, SessionId, ToolCallId, TurnId};
 use crate::platform::managed_storage::BlobStore;
 use crate::platform::path::PathError;
+use crate::platform::shell::{bash_program, decode_process_output};
 
 use super::paths::resolve_session_path;
 use super::registry::{is_forbidden_tool, is_registered};
 use super::types::{
-    AskMode, AskRequest, CompletionSummary, SupervisorError, ToolExecutionDisposition, ToolOutcome,
-    ToolResultPart, TurnWait,
+    AskMode, AskRequest, SupervisorError, ToolDisplay, ToolDisplayBody, ToolExecutionDisposition,
+    ToolOutcome, ToolResultPart, TurnWait,
 };
 
 /// Hard image decode limits (SES-TOOL-READ-03 subset).
@@ -45,7 +45,7 @@ pub async fn execute_tool(
     input: &Value,
 ) -> Result<ToolOutcome, SupervisorError> {
     if is_forbidden_tool(name) || !is_registered(name) {
-        return Ok(ToolOutcome {
+        let mut outcome = ToolOutcome {
             disposition: ToolExecutionDisposition::Failed,
             parts: vec![ToolResultPart::Text {
                 text: format!("tool not allowed: {name}"),
@@ -54,29 +54,28 @@ pub async fn execute_tool(
             error_code: Some("TOOL_NOT_ALLOWED".into()),
             finish_summary: None,
             wait: None,
-        });
+        };
+        attach_tool_display(name, input, &mut outcome);
+        return Ok(outcome);
     }
 
     let handle = WorkspaceHandle::session(ctx.session_id);
     let repo = session_repo(ctx.workspace, ctx.session_id)?;
 
-    match name {
-        "fs.list" => tool_list(&repo, input).await,
-        "fs.read" => tool_read(&repo, input, &handle, ctx).await,
-        "fs.write" => tool_write(ctx, &handle, input, false).await,
-        "fs.patch" => tool_write(ctx, &handle, input, true).await,
-        "fs.remove" => tool_remove(ctx, &handle, input).await,
-        "git.inspect" => tool_git_status(&repo).await,
-        "attachment.list" => tool_attachment_list(ctx).await,
-        "attachment.read" => tool_attachment_read(ctx, input).await,
-        "attachment.save" => tool_attachment_save(ctx, &handle, input).await,
-        "finish" => tool_finish_checked(ctx, input).await,
+    let mut outcome = match name {
+        "read" => tool_read(&repo, input, &handle, ctx).await,
+        "write" => tool_write(ctx, &handle, input).await,
+        "edit" => tool_edit(ctx, &handle, input).await,
+        "delete" => tool_remove(ctx, &handle, input).await,
         "bash" => tool_bash(ctx, input).await,
-        "job" => tool_job(ctx, input).await,
-        "service" => tool_service(ctx, input).await,
         "delegate_cli" => tool_delegate_cli(ctx, input).await,
-        "update_plan" => tool_update_plan(ctx, input).await,
+        "read_output" => tool_read_output(ctx, input).await,
+        "stop" => tool_stop(ctx, input).await,
+        "todo" => tool_todo(ctx, input).await,
         "ask_user" => tool_ask_user(ctx, input).await,
+        "attachment_list" => tool_attachment_list(ctx).await,
+        "attachment_read" => tool_attachment_read(ctx, input).await,
+        "attachment_save" => tool_attachment_save(ctx, &handle, input).await,
         other => Ok(ToolOutcome {
             disposition: ToolExecutionDisposition::Failed,
             parts: vec![ToolResultPart::Text {
@@ -87,7 +86,222 @@ pub async fn execute_tool(
             finish_summary: None,
             wait: None,
         }),
+    }?;
+    attach_tool_display(name, input, &mut outcome);
+    Ok(outcome)
+}
+
+pub(super) fn attach_tool_display(name: &str, input: &Value, outcome: &mut ToolOutcome) {
+    let display = build_tool_display(name, input, outcome);
+    if !outcome.summary.is_object() {
+        outcome.summary = json!({"result": outcome.summary.clone()});
     }
+    outcome
+        .summary
+        .as_object_mut()
+        .expect("Tool summary normalized to an object")
+        .insert(
+            "display".into(),
+            serde_json::to_value(display).expect("ToolDisplay is serializable"),
+        );
+}
+
+fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolDisplay {
+    let summary = outcome.summary.as_object();
+    let string = |key: &str| {
+        summary
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let input_string = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let status = outcome.disposition.as_str().to_owned();
+    if outcome.disposition == ToolExecutionDisposition::Failed {
+        let code = outcome
+            .error_code
+            .clone()
+            .unwrap_or_else(|| "TOOL_EXECUTION_FAILED".into());
+        let detail = summary
+            .and_then(|value| value.get("detail").or_else(|| value.get("error")))
+            .and_then(Value::as_str)
+            .unwrap_or("Tool execution failed")
+            .to_owned();
+        return ToolDisplay {
+            version: 1,
+            title: format!("{} failed", display_tool_name(name)),
+            status,
+            body: ToolDisplayBody::Error { code, detail },
+        };
+    }
+
+    let (title, body) = match name {
+        "bash" => {
+            let command = {
+                let value = string("command");
+                if value.is_empty() {
+                    input_string("command")
+                } else {
+                    value
+                }
+            };
+            let mode = string("mode");
+            let title = if mode == "async" {
+                format!("Started {}", one_line(&command))
+            } else {
+                format!("Ran {}", one_line(&command))
+            };
+            let exit_code = summary
+                .and_then(|value| value.get("exit_code"))
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok());
+            let truncated = summary
+                .and_then(|value| value.get("truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (
+                title.trim().to_owned(),
+                ToolDisplayBody::CommandOutput {
+                    command,
+                    stdout: string("stdout"),
+                    stderr: string("stderr"),
+                    exit_code,
+                    truncated,
+                },
+            )
+        }
+        "read" => {
+            let path = input_string("path");
+            (format!("Read {path}"), ToolDisplayBody::None)
+        }
+        "write" => {
+            let path = input_string("path");
+            let created = summary
+                .and_then(|value| value.get("created"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let action = if created { "Created" } else { "Wrote" };
+            (format!("{action} {path}"), patch_or_summary(outcome))
+        }
+        "edit" => {
+            let path = input_string("path");
+            (format!("Edited {path}"), patch_or_summary(outcome))
+        }
+        "delete" => {
+            let path = input_string("path");
+            (format!("Removed {path}"), ToolDisplayBody::None)
+        }
+        "delegate_cli" => {
+            let cli = input_string("cli");
+            (
+                format!("Delegated to {}", display_tool_name(&cli)),
+                ToolDisplayBody::Structured {
+                    value: outcome.summary.clone(),
+                },
+            )
+        }
+        "read_output" => {
+            let job_id = input_string("job_id");
+            (
+                format!("Read output for {job_id}"),
+                ToolDisplayBody::Structured {
+                    value: outcome.summary.clone(),
+                },
+            )
+        }
+        "stop" => {
+            let job_id = input_string("job_id");
+            (format!("Stopped job {job_id}"), ToolDisplayBody::None)
+        }
+        "todo" => (
+            "Updated plan".into(),
+            ToolDisplayBody::Structured {
+                value: input.clone(),
+            },
+        ),
+        "ask_user" => {
+            let prompt = input_string("prompt");
+            (format!("Asked {prompt}"), ToolDisplayBody::None)
+        }
+        "attachment_list" => (
+            "Listed attachments".into(),
+            ToolDisplayBody::Structured {
+                value: outcome.summary.clone(),
+            },
+        ),
+        "attachment_read" => {
+            let target = input_string("attachment_id");
+            (format!("Read attachment {target}"), result_body(outcome))
+        }
+        "attachment_save" => {
+            let path = input_string("path");
+            (format!("Saved attachment to {path}"), ToolDisplayBody::None)
+        }
+        _ => (
+            format!("Used {}", display_tool_name(name)),
+            result_body(outcome),
+        ),
+    };
+    ToolDisplay {
+        version: 1,
+        title: if title.trim().is_empty() {
+            format!("Used {}", display_tool_name(name))
+        } else {
+            title
+        },
+        status,
+        body,
+    }
+}
+
+fn result_body(outcome: &ToolOutcome) -> ToolDisplayBody {
+    match outcome.parts.first() {
+        Some(ToolResultPart::Text { text }) => ToolDisplayBody::Text { text: text.clone() },
+        Some(ToolResultPart::Json { value }) => ToolDisplayBody::Structured {
+            value: value.clone(),
+        },
+        _ => ToolDisplayBody::Structured {
+            value: outcome.summary.clone(),
+        },
+    }
+}
+
+fn patch_or_summary(outcome: &ToolOutcome) -> ToolDisplayBody {
+    outcome
+        .summary
+        .get("patch")
+        .and_then(Value::as_str)
+        .map(|patch| ToolDisplayBody::Patch {
+            patch: patch.to_owned(),
+        })
+        .unwrap_or_else(|| ToolDisplayBody::Structured {
+            value: outcome.summary.clone(),
+        })
+}
+
+fn one_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn display_tool_name(value: &str) -> String {
+    value
+        .split(['_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn session_repo(
@@ -95,57 +309,6 @@ fn session_repo(
     session_id: SessionId,
 ) -> Result<std::path::PathBuf, SupervisorError> {
     Ok(workspace.session_repo_path(session_id))
-}
-
-async fn tool_list(repo: &Path, input: &Value) -> Result<ToolOutcome, SupervisorError> {
-    let raw = input.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let dir = match resolve_session_path(repo, raw) {
-        Ok(p) => p,
-        Err(_) => return path_invalid(),
-    };
-    if !dir.exists() {
-        return Ok(fail_text("path not found", "TOOL_PATH_INVALID"));
-    }
-    if !dir.is_dir() {
-        return Ok(fail_text("not a directory", "TOOL_PATH_INVALID"));
-    }
-    let mut entries = Vec::new();
-    let mut rd = tokio::fs::read_dir(&dir)
-        .await
-        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!(e)))?;
-    while let Some(ent) = rd
-        .next_entry()
-        .await
-        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!(e)))?
-    {
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
-            continue;
-        }
-        let meta = ent
-            .metadata()
-            .await
-            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!(e)))?;
-        entries.push(json!({
-            "name": name,
-            "kind": if meta.is_dir() { "dir" } else { "file" },
-            "size": meta.len(),
-        }));
-    }
-    Ok(ToolOutcome {
-        disposition: ToolExecutionDisposition::Succeeded,
-        parts: vec![ToolResultPart::Json {
-            value: json!({"entries": entries}),
-        }],
-        summary: json!({"count": entries.len()}),
-        error_code: None,
-        finish_summary: None,
-        wait: None,
-    })
-}
-
-fn path_invalid() -> Result<ToolOutcome, SupervisorError> {
-    Ok(fail_text("invalid path", "TOOL_PATH_INVALID"))
 }
 
 fn fail_text(msg: &str, code: &str) -> ToolOutcome {
@@ -213,14 +376,51 @@ async fn tool_read(
     if text.contains('\0') {
         return Ok(fail_text("binary content", "UNSUPPORTED_IMAGE"));
     }
+    let (text, offset, limit) = apply_read_range(text, input);
     Ok(ToolOutcome {
         disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text { text: text.clone() }],
-        summary: json!({"path": raw, "kind": "text", "bytes": text.len()}),
+        summary: json!({
+            "path": raw,
+            "kind": "text",
+            "bytes": text.len(),
+            "offset": offset,
+            "limit": limit,
+        }),
         error_code: None,
         finish_summary: None,
         wait: None,
     })
+}
+
+/// Apply the optional `offset` (1-indexed) / `limit` (line count) read range to
+/// the full file text. Returns the slice plus the effective offset/limit used
+/// so the caller can echo them back. When neither is given, the full text is
+/// returned and offset/limit are null.
+fn apply_read_range(text: String, input: &Value) -> (String, Option<i64>, Option<i64>) {
+    let offset = input
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v >= 1);
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v >= 1);
+    let Some(offset) = offset else {
+        return (text, None, None);
+    };
+    let start = (offset as usize).saturating_sub(1);
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total = lines.len();
+    if start >= total {
+        return (String::new(), Some(offset as i64), Some(0));
+    }
+    let end = match limit {
+        Some(l) => (start + l as usize).min(total),
+        None => total,
+    };
+    let slice: String = lines[start..end].concat();
+    (slice, Some(offset as i64), Some((end - start) as i64))
 }
 
 #[derive(Clone, Copy)]
@@ -474,7 +674,6 @@ async fn tool_write(
     ctx: &ToolContext<'_>,
     handle: &WorkspaceHandle,
     input: &Value,
-    is_patch: bool,
 ) -> Result<ToolOutcome, SupervisorError> {
     let path = input
         .get("path")
@@ -485,40 +684,191 @@ async fn tool_write(
         .and_then(|c| c.as_str())
         .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("content required")))?;
     // Path validation only (mutation API re-validates).
-    let _ = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+    let abs = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
         .map_err(|_| SupervisorError::ToolPathInvalid)?;
-
-    let mutation = if is_patch {
-        FileMutation::Patch {
-            path: path.to_owned(),
-            content: content.as_bytes().to_vec(),
-        }
+    // Detect whether this is a create vs an overwrite so the UI can show
+    // "Created" vs "Wrote". Best-effort: a metadata error counts as absent.
+    let existed = tokio::fs::metadata(&abs).await.is_ok();
+    let old_text = if existed {
+        tokio::fs::read_to_string(&abs).await.ok()
     } else {
-        FileMutation::Write {
-            path: path.to_owned(),
-            content: content.as_bytes().to_vec(),
-        }
+        None
+    };
+
+    let mutation = FileMutation::Write {
+        path: path.to_owned(),
+        content: content.as_bytes().to_vec(),
     };
     let rev = ctx
         .workspace
-        .apply_file_mutation(
-            handle,
-            mutation,
-            None,
-            if is_patch {
-                "tool.fs.patch"
-            } else {
-                "tool.fs.write"
-            },
-            ctx.actor.clone(),
-        )
+        .apply_file_mutation(handle, mutation, None, "tool.write", ctx.actor.clone())
         .await?;
+    let patch = compute_patch(old_text.as_deref(), content);
+    let summary = match patch {
+        Some(ref p) => json!({"path": path, "revision": rev.0, "created": !existed, "patch": p}),
+        None => json!({"path": path, "revision": rev.0, "created": !existed}),
+    };
     Ok(ToolOutcome {
         disposition: ToolExecutionDisposition::Succeeded,
         parts: vec![ToolResultPart::Text {
             text: format!("wrote {path} -> {}", rev.0),
         }],
-        summary: json!({"path": path, "revision": rev.0}),
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait: None,
+    })
+}
+
+/// Render a compact unified-diff string for the tool summary so the UI can show
+/// `+x -y` line counts and an expandable diff. Reuses the workspace diff LCS so
+/// the algorithm matches the Session diff view. `old=None` means a newly created
+/// file (every new line is an addition).
+fn compute_patch(old: Option<&str>, new: &str) -> Option<String> {
+    use crate::modules::workspace_sync::diff::{DiffLineKind, line_hunks};
+    let new_bytes = new.as_bytes();
+    let old_bytes = old.map(str::as_bytes).unwrap_or(&[]);
+    if old_bytes == new_bytes {
+        return None;
+    }
+    let (hunks, _binary) = line_hunks(old_bytes, new_bytes);
+    if _binary {
+        return None;
+    }
+    let mut out = String::new();
+    for hunk in &hunks {
+        for line in &hunk.lines {
+            match line.kind {
+                DiffLineKind::Context => {
+                    out.push(' ');
+                    out.push_str(&line.text);
+                }
+                DiffLineKind::Add => {
+                    out.push('+');
+                    out.push_str(&line.text);
+                }
+                DiffLineKind::Delete => {
+                    out.push('-');
+                    out.push_str(&line.text);
+                }
+                DiffLineKind::Skip => {
+                    out.push_str(&line.text);
+                    out.push('\n');
+                    continue;
+                }
+            }
+            if !line.text.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+async fn tool_edit(
+    ctx: &ToolContext<'_>,
+    handle: &WorkspaceHandle,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
+    let path = input
+        .get("path")
+        .and_then(|p| p.as_str())
+        .ok_or(SupervisorError::ToolPathInvalid)?;
+    let abs = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+        .map_err(|_| SupervisorError::ToolPathInvalid)?;
+    // edit cannot create files — the model must use `write` for new files.
+    if tokio::fs::metadata(&abs).await.is_err() {
+        return Ok(fail_text(
+            "edit target does not exist; use write to create a file",
+            "TOOL_EDIT_TARGET_MISSING",
+        ));
+    }
+    // Guard: the model must have read the file in this Turn before editing it,
+    // so it edits against content it has actually seen.
+    let read_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_calls tc \
+         JOIN rounds r ON r.id = tc.round_id \
+         WHERE r.turn_id = ? AND tc.tool_name = 'read' AND tc.status = 'succeeded' \
+         AND json_extract(tc.input_json, '$.path') = ?",
+    )
+    .bind(ctx.turn_id.to_string())
+    .bind(path)
+    .fetch_one(ctx.pool)
+    .await
+    .unwrap_or(0);
+    if read_count == 0 {
+        return Ok(fail_text(
+            "edit requires reading the file first; call read on this path before editing",
+            "TOOL_EDIT_NOT_READ",
+        ));
+    }
+    let edits = match input.get("edits").and_then(|e| e.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            return Ok(fail_text(
+                "edit requires a non-empty edits array",
+                "TOOL_EDIT_EMPTY",
+            ));
+        }
+    };
+
+    let original = tokio::fs::read_to_string(&abs)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!(e)))?;
+    let mut content = original.clone();
+    let mut applied = 0u32;
+    for edit in edits {
+        let old_text = edit.get("oldText").and_then(|v| v.as_str()).unwrap_or("");
+        let new_text = edit.get("newText").and_then(|v| v.as_str()).unwrap_or("");
+        if old_text.is_empty() {
+            return Ok(fail_text(
+                "edit oldText must not be empty",
+                "TOOL_EDIT_EMPTY_OLDTEXT",
+            ));
+        }
+        // Each edit matches against the running result of prior edits in this
+        // call; edits must be disjoint and oldText unique within the current
+        // content (matches the schema contract).
+        let occurrences = content.matches(old_text).count();
+        match occurrences {
+            0 => {
+                return Ok(fail_text(
+                    "edit oldText was not found in the file",
+                    "TOOL_EDIT_NOT_FOUND",
+                ));
+            }
+            1 => {
+                content = content.replacen(old_text, new_text, 1);
+                applied += 1;
+            }
+            _ => {
+                return Ok(fail_text(
+                    "edit oldText is not unique in the file",
+                    "TOOL_EDIT_NOT_UNIQUE",
+                ));
+            }
+        }
+    }
+
+    let mutation = FileMutation::Write {
+        path: path.to_owned(),
+        content: content.as_bytes().to_vec(),
+    };
+    let rev = ctx
+        .workspace
+        .apply_file_mutation(handle, mutation, None, "tool.edit", ctx.actor.clone())
+        .await?;
+    let patch = compute_patch(Some(&original), &content);
+    let summary = match patch {
+        Some(ref p) => json!({"path": path, "revision": rev.0, "edits": applied, "patch": p}),
+        None => json!({"path": path, "revision": rev.0, "edits": applied}),
+    };
+    Ok(ToolOutcome {
+        disposition: ToolExecutionDisposition::Succeeded,
+        parts: vec![ToolResultPart::Text {
+            text: format!("edited {path} -> {} ({applied} edit(s))", rev.0),
+        }],
+        summary,
         error_code: None,
         finish_summary: None,
         wait: None,
@@ -544,7 +894,7 @@ async fn tool_remove(
                 path: path.to_owned(),
             },
             None,
-            "tool.fs.remove",
+            "tool.delete",
             ctx.actor.clone(),
         )
         .await?;
@@ -558,36 +908,6 @@ async fn tool_remove(
         finish_summary: None,
         wait: None,
     })
-}
-
-async fn tool_git_status(repo: &Path) -> Result<ToolOutcome, SupervisorError> {
-    match SystemGit.status(repo).await {
-        Ok(st) => {
-            let summary = json!({
-                "head_sha": st.head_sha,
-                "branch": st.branch,
-                "ahead": st.ahead,
-                "behind": st.behind,
-                "working": st.working,
-                "index": st.index,
-                "untracked": st.untracked,
-            });
-            Ok(ToolOutcome {
-                disposition: ToolExecutionDisposition::Succeeded,
-                parts: vec![ToolResultPart::Json {
-                    value: summary.clone(),
-                }],
-                summary,
-                error_code: None,
-                finish_summary: None,
-                wait: None,
-            })
-        }
-        Err(e) => Ok(fail_text(
-            &format!("git status failed: {e}"),
-            "TOOL_PATH_INVALID",
-        )),
-    }
 }
 
 async fn tool_attachment_list(ctx: &ToolContext<'_>) -> Result<ToolOutcome, SupervisorError> {
@@ -772,52 +1092,6 @@ pub(super) async fn read_attachment_bytes(
     Ok(Some(bytes))
 }
 
-fn tool_finish(input: &Value) -> Result<ToolOutcome, SupervisorError> {
-    // Async Job-check variant is tool_finish_checked; this keeps the pure
-    // summary path for callers that already verified no unfinished Jobs.
-    let finish = CompletionSummary::from_tool_input(input);
-    let summary_text = finish.summary.clone();
-    let summary = serde_json::to_value(&finish)?;
-    Ok(ToolOutcome {
-        disposition: ToolExecutionDisposition::Succeeded,
-        parts: vec![ToolResultPart::Text {
-            text: format!("finished: {summary_text}"),
-        }],
-        summary,
-        error_code: None,
-        finish_summary: Some(finish),
-        wait: None,
-    })
-}
-
-async fn tool_finish_checked(
-    ctx: &ToolContext<'_>,
-    input: &Value,
-) -> Result<ToolOutcome, SupervisorError> {
-    let remaining = match ctx.runtime {
-        Some(runtime) => runtime.unfinished_job_count(ctx.turn_id).await?,
-        None => 0,
-    };
-    if remaining > 0 {
-        let summary = json!({
-            "waiting_for_job": true,
-            "unfinished_jobs": remaining,
-            "note": "finish deferred until finite Jobs settle",
-        });
-        return Ok(ToolOutcome {
-            disposition: ToolExecutionDisposition::Succeeded,
-            parts: vec![ToolResultPart::Text {
-                text: format!("finish deferred: {remaining} unfinished job(s)"),
-            }],
-            summary,
-            error_code: None,
-            finish_summary: None,
-            wait: Some(TurnWait::job()),
-        });
-    }
-    tool_finish(input)
-}
-
 // ---------------------------------------------------------------------------
 // Stage 5 runtime tools
 // ---------------------------------------------------------------------------
@@ -850,16 +1124,14 @@ async fn ensure_session_runtime(
     use crate::platform::id::RuntimeId;
 
     let runtime = require_runtime(ctx)?;
-    if let Ok(Some(existing)) = runtime
+    let existing = runtime
         .current_runtime(RuntimeScope::session(ctx.session_id))
         .await
-    {
-        return Ok(existing);
-    }
+        .map_err(SupervisorError::Runtime)?;
     let workspace_root = session_repo(ctx.workspace, ctx.session_id)?;
     let abs = workspace_root.canonicalize().unwrap_or(workspace_root);
     let spec = RuntimeSpec::new(
-        RuntimeId::new(),
+        existing.map_or_else(RuntimeId::new, |runtime| runtime.id),
         RuntimeScope::session(ctx.session_id),
         ExecutorKind::Local,
         abs,
@@ -870,7 +1142,7 @@ async fn ensure_session_runtime(
     runtime
         .ensure_runtime(&spec)
         .await
-        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("ensure_runtime: {e}")))
+        .map_err(SupervisorError::Runtime)
 }
 
 fn working_directory(
@@ -906,12 +1178,61 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
     if command.trim().is_empty() {
         return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
     }
-    let runtime_proj = ensure_session_runtime(ctx).await?;
-    let runtime = require_runtime(ctx)?;
+    let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("sync");
+    if mode == "async" {
+        return tool_bash_async(ctx, command, input).await;
+    }
+    if mode != "sync" {
+        return Ok(fail_text(
+            &format!("unknown bash mode: {mode}"),
+            "VALIDATION_FAILED",
+        ));
+    }
+
     let timeout = timeout_ms(input, 30_000).min(120_000);
+
+    // sync mode: prefer the Runtime interface when available; fall back to a
+    // local shell process otherwise so bash stays usable in environments
+    // without a bound Runtime (e.g. unit tests). On Windows the fallback uses
+    // Git Bash; elsewhere it uses /bin/sh.
+    let Some(runtime) = ctx.runtime else {
+        // Local fallback needs an absolute working directory rooted at the
+        // Session workspace, since tokio::process::Command::current_dir takes
+        // an absolute path.
+        let repo = session_repo(ctx.workspace, ctx.session_id)?;
+        let raw_cwd = input
+            .get("working_directory")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+        let abs_cwd = if raw_cwd == "." {
+            Some(repo)
+        } else {
+            Some(repo.join(raw_cwd))
+        };
+        return run_local_sync(ctx, command, abs_cwd.as_deref(), timeout).await;
+    };
+    let runtime_proj = match ensure_session_runtime(ctx).await {
+        Ok(runtime) => runtime,
+        Err(SupervisorError::Runtime(error)) if error.retryable() => {
+            tracing::warn!(%error, "preferred Runtime unavailable; using system Bash fallback");
+            let repo = session_repo(ctx.workspace, ctx.session_id)?;
+            let raw_cwd = input
+                .get("working_directory")
+                .and_then(|value| value.as_str())
+                .unwrap_or(".");
+            let abs_cwd = if raw_cwd == "." {
+                repo
+            } else {
+                repo.join(raw_cwd)
+            };
+            return run_local_sync(ctx, command, Some(&abs_cwd), timeout).await;
+        }
+        Err(error) => return Err(error),
+    };
+    let cwd = working_directory(input)?;
     let spec = ExecutionSpec::new(
         runtime_proj.id,
-        working_directory(input)?,
+        cwd,
         ValidatedCommand::shell(command)
             .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("command: {e}")))?,
         ExecutionEnvironment::new(BTreeMap::new(), vec![])
@@ -924,69 +1245,40 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
     let result = runtime
         .execute_sync(spec)
         .await
-        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("bash: {e}")))?;
+        .map_err(SupervisorError::Runtime)?;
 
-    let stdout = if result.stdout.len() > 8_000 {
-        format!("{}...[truncated]", &result.stdout[..8_000])
-    } else {
-        result.stdout.clone()
-    };
-    let stderr = if result.stderr.len() > 4_000 {
-        format!("{}...[truncated]", &result.stderr[..4_000])
-    } else {
-        result.stderr.clone()
-    };
-    let exit_code = result.exit.exit_code;
-    let ok = !result.timed_out && exit_code == Some(0);
-    let summary = json!({
-        "exit_code": exit_code,
-        "timed_out": result.timed_out,
-        "duration_ms": result.duration_ms,
-        "truncated": result.truncated,
-        "log_stream_id": result.log_stream_id.to_string(),
-        "stdout_bytes": result.stdout.len(),
-        "stderr_bytes": result.stderr.len(),
-    });
-    let text = format!(
-        "exit={:?} timed_out={} duration_ms={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        exit_code, result.timed_out, result.duration_ms, stdout, stderr
-    );
-    Ok(ToolOutcome {
-        disposition: if ok {
-            ToolExecutionDisposition::Succeeded
-        } else {
-            ToolExecutionDisposition::Failed
-        },
-        parts: vec![ToolResultPart::Text { text }],
-        summary,
-        error_code: if ok {
-            None
-        } else if result.timed_out {
-            Some("COMMAND_TIMEOUT".into())
-        } else {
-            Some("COMMAND_FAILED".into())
-        },
-        finish_summary: None,
-        wait: None,
-    })
+    bash_outcome(
+        command,
+        result.exit.exit_code,
+        result.timed_out,
+        result.duration_ms,
+        result.truncated,
+        &result.stdout,
+        &result.stderr,
+        None,
+    )
 }
 
-async fn tool_job(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
+/// async bash mode: a finite background Job. Requires a bound Runtime because
+/// the background-job machinery (log stream, Turn waiting) lives there.
+async fn tool_bash_async(
+    ctx: &ToolContext<'_>,
+    command: &str,
+    input: &Value,
+) -> Result<ToolOutcome, SupervisorError> {
     use crate::modules::runtime::interface::{
         ExecutionEnvironment, ExecutionSpec, JobSpec, NetworkPolicy, ValidatedCommand,
     };
     use crate::platform::id::JobId;
     use std::collections::BTreeMap;
 
-    let command = input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("command required")))?;
-    if command.trim().is_empty() {
-        return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
-    }
+    let Some(runtime) = ctx.runtime else {
+        return Ok(fail_text(
+            "bash async mode requires a bound runtime; use mode=sync instead",
+            "RUNTIME_UNAVAILABLE",
+        ));
+    };
     let runtime_proj = ensure_session_runtime(ctx).await?;
-    let runtime = require_runtime(ctx)?;
     let timeout = timeout_ms(input, 300_000).min(3_600_000);
     let execution = ExecutionSpec::new(
         runtime_proj.id,
@@ -1025,6 +1317,7 @@ async fn tool_job(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, S
         "status": format!("{:?}", job.status).to_ascii_lowercase(),
         "log_stream_id": job.log_stream_id.to_string(),
         "command_summary": job.command_summary,
+        "mode": "async",
     });
     Ok(ToolOutcome {
         disposition: ToolExecutionDisposition::Waiting,
@@ -1038,93 +1331,118 @@ async fn tool_job(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, S
     })
 }
 
-async fn tool_service(
-    ctx: &ToolContext<'_>,
-    input: &Value,
+/// Local fallback for sync bash when no Runtime is bound. Windows uses Git
+/// Bash (`bash -c`), other platforms use `/bin/sh -c`.
+async fn run_local_sync(
+    _ctx: &ToolContext<'_>,
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    timeout_ms: u64,
 ) -> Result<ToolOutcome, SupervisorError> {
-    use crate::modules::runtime::interface::{
-        ExecutionEnvironment, ExecutionSpec, NetworkPolicy, ServiceImpact, ServiceSpec,
-        ValidatedCommand,
+    use std::time::Duration;
+    let Some(program) = bash_program() else {
+        let detail = if cfg!(windows) {
+            "Git Bash is not installed or could not be located"
+        } else {
+            "/bin/bash is not available"
+        };
+        return Ok(fail_text(detail, "BASH_UNAVAILABLE"));
     };
-    use crate::platform::id::ServiceId;
-    use std::collections::BTreeMap;
-
-    let command = input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("command required")))?;
-    if command.trim().is_empty() {
-        return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.arg("-c").arg(command);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
     }
-    let impact = match input.get("impact").and_then(|v| v.as_str()).unwrap_or("") {
-        "read_only" => ServiceImpact::ReadOnly,
-        "ignored_output" => ServiceImpact::IgnoredOutput,
-        "source_writing" => ServiceImpact::SourceWriting,
-        other => {
+    let started = std::time::Instant::now();
+    let output = tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output()).await;
+    let (timed_out, exit_code, stdout, stderr) = match output {
+        Ok(Ok(out)) => {
+            let stdout = decode_process_output(&out.stdout, 1024 * 1024);
+            let stderr = decode_process_output(&out.stderr, 1024 * 1024);
+            (false, out.status.code(), stdout.text, stderr.text)
+        }
+        Ok(Err(e)) => {
             return Ok(fail_text(
-                &format!("impact must be read_only|ignored_output|source_writing, got {other:?}"),
-                "VALIDATION_FAILED",
+                &format!("failed to run command: {e}"),
+                "COMMAND_FAILED",
             ));
         }
+        Err(_) => (true, None, String::new(), String::new()),
     };
-
-    let runtime_proj = ensure_session_runtime(ctx).await?;
-    let runtime = require_runtime(ctx)?;
-    // Services are long-lived; use a high timeout as a safety ceiling only.
-    let timeout = timeout_ms(input, 3_600_000).min(86_400_000);
-    let execution = ExecutionSpec::new(
-        runtime_proj.id,
-        working_directory(input)?,
-        ValidatedCommand::shell(command)
-            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("command: {e}")))?,
-        ExecutionEnvironment::new(BTreeMap::new(), vec![])
-            .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("env: {e}")))?,
-        default_limits(timeout),
-        NetworkPolicy::DenyAll,
+    let duration_ms = started.elapsed().as_millis() as u64;
+    bash_outcome(
+        command,
+        exit_code,
+        timed_out,
+        duration_ms,
+        false,
+        &stdout,
+        &stderr,
+        None,
     )
-    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("execution: {e}")))?;
-    let service_id = ServiceId::new();
-    let spec = ServiceSpec::new(
-        service_id,
-        ctx.session_id,
-        ctx.tool_call_id,
-        impact,
-        execution,
-    )
-    .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("service spec: {e}")))?;
+}
 
-    let service = runtime
-        .start_service(spec)
-        .await
-        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("start_service: {e}")))?;
-
-    let _ = sqlx::query("UPDATE tool_calls SET service_id = ? WHERE id = ?")
-        .bind(service.id.to_string())
-        .bind(ctx.tool_call_id.to_string())
-        .execute(ctx.pool)
-        .await;
-
+/// Build a ToolOutcome from a completed (sync) bash run. Shared by the
+/// Runtime path and the local fallback.
+#[allow(clippy::too_many_arguments)]
+fn bash_outcome(
+    command: &str,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    duration_ms: u64,
+    truncated: bool,
+    stdout: &str,
+    stderr: &str,
+    _log_stream_id: Option<String>,
+) -> Result<ToolOutcome, SupervisorError> {
+    let (stdout_out, stdout_truncated) = truncate_tool_text(stdout, 8_000);
+    let (stderr_out, stderr_truncated) = truncate_tool_text(stderr, 4_000);
+    let ok = !timed_out && exit_code == Some(0);
     let summary = json!({
-        "service_id": service.id.to_string(),
-        "status": format!("{:?}", service.status).to_ascii_lowercase(),
-        "impact": format!("{:?}", impact).to_ascii_lowercase(),
-        "log_stream_id": service.log_stream_id.to_string(),
-        "command_summary": service.command_summary,
+        "command": command,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_ms": duration_ms,
+        "truncated": truncated || stdout_truncated || stderr_truncated,
+        "stdout": stdout_out,
+        "stderr": stderr_out,
+        "stdout_bytes": stdout.len(),
+        "stderr_bytes": stderr.len(),
+        "mode": "sync",
     });
-    // Services do not block the Turn: they are Session-owned and outlive a Turn.
+    let text = format!(
+        "exit={:?} timed_out={} duration_ms={}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        exit_code, timed_out, duration_ms, stdout_out, stderr_out
+    );
     Ok(ToolOutcome {
-        disposition: ToolExecutionDisposition::Succeeded,
-        parts: vec![ToolResultPart::Text {
-            text: format!(
-                "service {} started ({}, impact={:?})",
-                service.id, service.command_summary, impact
-            ),
-        }],
+        disposition: if ok {
+            ToolExecutionDisposition::Succeeded
+        } else {
+            ToolExecutionDisposition::Failed
+        },
+        parts: vec![ToolResultPart::Text { text }],
         summary,
-        error_code: None,
+        error_code: if ok {
+            None
+        } else if timed_out {
+            Some("COMMAND_TIMEOUT".into())
+        } else {
+            Some("COMMAND_FAILED".into())
+        },
         finish_summary: None,
         wait: None,
     })
+}
+
+fn truncate_tool_text(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}...[truncated]", &text[..end]), true)
 }
 
 async fn tool_delegate_cli(
@@ -1251,14 +1569,107 @@ async fn tool_delegate_cli(
     })
 }
 
-async fn tool_update_plan(
+/// Read the accumulated output of a background job (bash async or delegate_cli)
+/// by its job_id. The job keeps running; this only reads what it has produced.
+async fn tool_read_output(
     ctx: &ToolContext<'_>,
     input: &Value,
 ) -> Result<ToolOutcome, SupervisorError> {
+    use crate::modules::runtime::interface::{LogChannel, LogCursor};
+    use crate::platform::id::JobId;
+    use std::str::FromStr;
+
+    let Some(runtime) = ctx.runtime else {
+        return Ok(fail_text(
+            "read_output requires a bound runtime",
+            "RUNTIME_UNAVAILABLE",
+        ));
+    };
+    let raw_id = input
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("job_id required")))?;
+    let job_id = JobId::from_str(raw_id)
+        .map_err(|_| SupervisorError::Internal(anyhow::anyhow!("invalid job_id")))?;
+    let job = runtime
+        .job(job_id)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("read_output job: {e}")))?;
+    let range = runtime
+        .log_range(job.log_stream_id, LogCursor::ZERO, 256 * 1024)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("read_output log: {e}")))?;
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    for chunk in &range.chunks {
+        match chunk.channel {
+            LogChannel::Stdout | LogChannel::System => stdout.push_str(&chunk.text),
+            LogChannel::Stderr => stderr.push_str(&chunk.text),
+        }
+    }
+    let status = format!("{:?}", job.status).to_ascii_lowercase();
+    let summary = json!({
+        "job_id": raw_id,
+        "status": status,
+        "stdout_bytes": stdout.len(),
+        "stderr_bytes": stderr.len(),
+        "done": job.status.is_terminal(),
+    });
+    let text = format!(
+        "job {} (status={})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        raw_id, status, stdout, stderr
+    );
+    Ok(ToolOutcome {
+        disposition: ToolExecutionDisposition::Succeeded,
+        parts: vec![ToolResultPart::Text { text }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait: None,
+    })
+}
+
+/// Terminate a background job (bash async or delegate_cli) by its job_id.
+async fn tool_stop(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
+    use crate::platform::id::JobId;
+    use std::str::FromStr;
+
+    let Some(runtime) = ctx.runtime else {
+        return Ok(fail_text(
+            "stop requires a bound runtime",
+            "RUNTIME_UNAVAILABLE",
+        ));
+    };
+    let raw_id = input
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SupervisorError::Internal(anyhow::anyhow!("job_id required")))?;
+    let job_id = JobId::from_str(raw_id)
+        .map_err(|_| SupervisorError::Internal(anyhow::anyhow!("invalid job_id")))?;
+    let job = runtime
+        .cancel_job(job_id)
+        .await
+        .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("stop: {e}")))?;
+    let status = format!("{:?}", job.status).to_ascii_lowercase();
+    let summary = json!({"job_id": raw_id, "status": status});
+    Ok(ToolOutcome {
+        disposition: ToolExecutionDisposition::Succeeded,
+        parts: vec![ToolResultPart::Text {
+            text: format!("stopped job {raw_id} (status={status})"),
+        }],
+        summary,
+        error_code: None,
+        finish_summary: None,
+        wait: None,
+    })
+}
+
+async fn tool_todo(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, SupervisorError> {
     use crate::platform::clock::{Clock, SystemClock, format_utc};
     use crate::platform::id::TimelineItemId;
 
-    let plan = input.get("plan").cloned().unwrap_or(json!({}));
+    let todos = input.get("todos").cloned().unwrap_or(json!([]));
     let evidence = input.get("evidence").cloned().unwrap_or(json!([]));
     let now = format_utc(SystemClock.now());
     let plan_id = format!("pln_{}", TimelineItemId::new());
@@ -1276,7 +1687,7 @@ async fn tool_update_plan(
     .bind(&plan_id)
     .bind(ctx.turn_id.to_string())
     .bind(next_seq)
-    .bind(plan.to_string())
+    .bind(todos.to_string())
     .bind(evidence.to_string())
     .bind(&now)
     .execute(ctx.pool)
@@ -1387,4 +1798,59 @@ async fn tool_ask_user(
         finish_summary: None,
         wait: Some(TurnWait::ask(request)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{attach_tool_display, truncate_tool_text};
+    use crate::modules::supervisor::{
+        registry::available_tools,
+        types::{ToolExecutionDisposition, ToolOutcome, ToolResultPart},
+    };
+
+    #[test]
+    fn tool_text_truncation_preserves_utf8() {
+        let (text, truncated) = truncate_tool_text("你好世界", 5);
+        assert!(truncated);
+        assert_eq!(text, "你...[truncated]");
+    }
+
+    #[test]
+    fn every_registered_tool_gets_a_versioned_display() {
+        let input = json!({
+            "path": "src/main.rs",
+            "command": "echo hello",
+            "cli": "codex",
+            "job_id": "job-1",
+            "prompt": "Continue?",
+            "attachment_id": "attachment-1",
+        });
+        for tool in available_tools(true, true) {
+            let mut outcome = ToolOutcome {
+                disposition: ToolExecutionDisposition::Succeeded,
+                parts: vec![ToolResultPart::Text { text: "ok".into() }],
+                summary: json!({"stdout": "ok", "mode": "sync"}),
+                error_code: None,
+                finish_summary: None,
+                wait: None,
+            };
+            attach_tool_display(tool.name, &input, &mut outcome);
+            let display = &outcome.summary["display"];
+            assert_eq!(display["version"], 1, "{} display version", tool.name);
+            assert!(
+                display["title"]
+                    .as_str()
+                    .is_some_and(|title| !title.is_empty()),
+                "{} display title",
+                tool.name
+            );
+            assert!(
+                display["body"]["kind"].is_string(),
+                "{} display body",
+                tool.name
+            );
+        }
+    }
 }

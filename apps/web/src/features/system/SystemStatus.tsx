@@ -5,7 +5,7 @@ import Database from "lucide-solid/icons/database";
 import Radio from "lucide-solid/icons/radio";
 import Server from "lucide-solid/icons/server";
 import { For, Match, Switch } from "solid-js";
-import { ErrorBlock } from "../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../components/ui/notifications";
 import { useSystemInfo } from "../../lib/queries";
 import "./system.css";
 
@@ -14,6 +14,11 @@ export function SystemStatus() {
 
   return (
     <section class="panel" aria-labelledby="system-title">
+      <NotificationEvent
+        message={system.isError ? "System status unavailable" : null}
+        variant="danger"
+        action={{ label: "Retry", onClick: () => void system.refetch() }}
+      />
       <div class="panel-heading">
         <h2 id="system-title">System</h2>
         <p>Deployment status and capabilities</p>
@@ -24,9 +29,6 @@ export function SystemStatus() {
           <p class="surface-note" role="status" aria-label="Loading...">
             Loading...
           </p>
-        </Match>
-        <Match when={system.isError}>
-          <ErrorBlock message="System status unavailable" retry={() => void system.refetch()} />
         </Match>
         <Match when={system.data}>
           {(response) => {

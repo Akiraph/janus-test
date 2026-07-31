@@ -117,10 +117,22 @@ pub enum ModelStreamEvent {
         tool_calls: Vec<CompletedToolCall>,
         /// Final assistant text assembled from deltas (for Round commit).
         text: String,
+        reasoning: String,
     },
     Failed {
         attempt_id: String,
         code: String,
         detail: String,
+    },
+    /// Emitted just before an in-Round retry. `attempt` is the retry index the
+    /// model_attempts ledger is about to record (1-based; `MAX_ATTEMPTS_PER_CANDIDATE`),
+    /// and `detail` is the human-facing failure reason for the attempt that just
+    /// failed. The model stream publisher forwards it as `model.attempt_retrying`
+    /// so the UI can render `Reconnecting ({attempt}/5): {detail}`.
+    Retrying {
+        attempt_id: String,
+        attempt: usize,
+        detail: String,
+        retry_after_ms: u64,
     },
 }

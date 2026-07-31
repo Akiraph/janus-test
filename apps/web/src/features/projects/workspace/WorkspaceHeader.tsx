@@ -3,7 +3,7 @@ import ArrowLeft from "lucide-solid/icons/arrow-left";
 import GitBranch from "lucide-solid/icons/git-branch";
 import { Show } from "solid-js";
 import { Badge } from "../../../components/ui/Badge";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../../components/ui/notifications";
 import type { ProjectView } from "../../../lib/api";
 
 interface WorkspaceHeaderProps {
@@ -16,6 +16,17 @@ interface WorkspaceHeaderProps {
 export function WorkspaceHeader(props: WorkspaceHeaderProps) {
   return (
     <header class="workspace-topbar">
+      <NotificationEvent
+        message={
+          props.error
+            ? props.error instanceof Error
+              ? props.error.message
+              : "Project not found"
+            : null
+        }
+        variant="danger"
+        action={{ label: "Retry", onClick: props.onRetry }}
+      />
       <A class="project-back" href="/">
         <ArrowLeft size={16} />
         Exit
@@ -23,22 +34,12 @@ export function WorkspaceHeader(props: WorkspaceHeaderProps) {
       <Show
         when={props.project}
         fallback={
-          <Show
-            when={!props.loading}
-            fallback={
-              <div class="workspace-title-row" aria-busy="true">
-                <div class="workspace-name">
-                  <span>Workspace:</span>
-                  <h1 id="project-title">...</h1>
-                </div>
-              </div>
-            }
-          >
-            <ErrorBlock
-              message={props.error instanceof Error ? props.error.message : "Project not found"}
-              retry={props.onRetry}
-            />
-          </Show>
+          <div class="workspace-title-row" aria-busy={props.loading}>
+            <div class="workspace-name">
+              <span>Workspace:</span>
+              <h1 id="project-title">{props.loading ? "..." : "Unavailable"}</h1>
+            </div>
+          </div>
         }
       >
         {(project) => (

@@ -28,6 +28,18 @@ export function NotificationContainer() {
               <div class="ui-notification" data-variant={item.variant} role="status">
                 <Icon size={18} class="ui-notification__icon" />
                 <span class="ui-notification-message">{item.message}</span>
+                {item.action ? (
+                  <button
+                    type="button"
+                    class="ui-notification-action"
+                    onClick={() => {
+                      store.dismiss(item.id);
+                      item.action?.onClick();
+                    }}
+                  >
+                    {item.action.label}
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   class="ui-notification-close"

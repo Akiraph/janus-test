@@ -247,7 +247,24 @@ impl RuntimeInterface {
             && existing.id == spec.id()
             && existing.status == RuntimeStatus::Ready
         {
-            return Ok(existing);
+            let handle = self.executor.ensure_runtime(spec).await?;
+            let stored_nonce = self.runtime_nonce(existing.id).await?;
+            if stored_nonce == handle.executor_nonce {
+                return Ok(existing);
+            }
+            sqlx::query(
+                "UPDATE runtimes SET executor_identity = ?, executor_nonce = ?, version = ?, \
+                 updated_at = ? WHERE id = ? AND status = 'ready'",
+            )
+            .bind(handle.executor_identity)
+            .bind(handle.executor_nonce)
+            .bind(new_version())
+            .bind(format_utc(SystemClock.now()))
+            .bind(existing.id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(storage_error)?;
+            return self.runtime(existing.id).await;
         }
         let now = format_utc(SystemClock.now());
         let capabilities = RuntimeCapabilityEvaluator::effective(

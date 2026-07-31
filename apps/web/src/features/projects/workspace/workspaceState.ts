@@ -18,7 +18,7 @@ export interface SessionDocument {
   kind: "session";
   sessionId: string;
   title: string;
-  subView: "main" | "diff";
+  subView: "main" | "diff" | "async";
 }
 
 export type WorkspaceDocument = FileDocument | SessionDocument;

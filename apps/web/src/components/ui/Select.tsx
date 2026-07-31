@@ -20,7 +20,7 @@ interface SelectProps {
 /**
  * Lightweight custom dropdown. Native <select> styling varies across platforms
  * and cannot match the ui-input look, so we render a trigger button + a portal
- * list positioned beneath it. The list closes on outside pointerdown or scroll.
+ * list positioned beneath it. The list closes on outside pointerdown.
  *
  * Open on pointerdown (not click) so the menu appears on press, not mouseup —
  * that single frame difference is what makes it feel "attached" to the hand.
@@ -105,7 +105,12 @@ export function Select(props: SelectProps) {
         triggerRef?.focus();
       }
     };
-    const onScroll = () => closeList();
+    const onScroll = (event: Event) => {
+      const target = event.target;
+      if (target instanceof Node && listRef?.contains(target)) return;
+      position();
+      requestAnimationFrame(refine);
+    };
     const onResize = () => closeList();
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("keydown", onKeyDown);

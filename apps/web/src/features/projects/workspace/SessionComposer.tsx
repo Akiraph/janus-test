@@ -2,9 +2,9 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import Paperclip from "lucide-solid/icons/paperclip";
 import Send from "lucide-solid/icons/send";
 import X from "lucide-solid/icons/x";
-import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Show, untrack } from "solid-js";
 import { Button } from "../../../components/ui/Button";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { useNotifications } from "../../../components/ui/notifications";
 import { Select, type SelectOption } from "../../../components/ui/Select";
 import type {
   AttachmentView,
@@ -36,7 +36,6 @@ interface SessionComposerProps {
   onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
 }
 
-const DEFAULT_MODEL = "";
 const REASONING_OPTIONS: readonly SelectOption[] = [
   { value: "none", label: "No reasoning" },
   { value: "low", label: "Low" },
@@ -47,11 +46,11 @@ const REASONING_OPTIONS: readonly SelectOption[] = [
 ];
 
 export function SessionComposer(props: SessionComposerProps) {
+  const { notify } = useNotifications();
   const [draft, setDraft] = createSignal("");
   const [submitting, setSubmitting] = createSignal(false);
-  const [error, setError] = createSignal("");
   const [receipt, setReceipt] = createSignal<SessionMessageReceipt | null>(null);
-  const [modelValue, setModelValue] = createSignal(DEFAULT_MODEL);
+  const [modelValue, setModelValue] = createSignal("");
   const [reasoningEffort, setReasoningEffort] = createSignal<ReasoningEffort>("none");
   const [attachments, setAttachments] = createSignal<AttachmentView[]>([]);
   const [uploading, setUploading] = createSignal(false);
@@ -67,28 +66,33 @@ export function SessionComposer(props: SessionComposerProps) {
           .filter((model) => model.enabled)
           .map((model) => ({
             value: modelKey(provider.id, model.upstream_model_id),
-            label: `${model.display_name} / ${provider.display_name}`,
+            label: `${provider.display_name}/${model.display_name}`,
             providerId: provider.id,
             providerKind: provider.kind,
             upstreamModelId: model.upstream_model_id,
           })),
       ),
   );
-  const modelOptions = createMemo<readonly SelectOption[]>(() => [
-    { value: DEFAULT_MODEL, label: "Project default" },
-    ...availableModels(),
-  ]);
+  const modelOptions = createMemo<readonly SelectOption[]>(() => availableModels());
   const selectedModel = createMemo(() =>
     availableModels().find((model) => model.value === modelValue()),
   );
   const supportsReasoning = createMemo(() => selectedModel()?.providerKind !== "anthropic");
 
   createEffect(() => {
+    const models = availableModels();
     const preference = props.modelPreference;
-    setModelValue(
-      preference ? modelKey(preference.provider_id, preference.upstream_model_id) : DEFAULT_MODEL,
-    );
-    setReasoningEffort(preference?.reasoning_effort ?? "none");
+    const preferred = preference
+      ? modelKey(preference.provider_id, preference.upstream_model_id)
+      : null;
+    const current = untrack(modelValue);
+    if (preferred && models.some((model) => model.value === preferred)) {
+      setModelValue(preferred);
+      setReasoningEffort(preference?.reasoning_effort ?? "none");
+    } else if (!models.some((model) => model.value === current)) {
+      setModelValue(models[0]?.value ?? "");
+      setReasoningEffort("none");
+    }
   });
 
   createEffect(() => {
@@ -120,7 +124,6 @@ export function SessionComposer(props: SessionComposerProps) {
     if (!canSubmit()) return;
 
     setSubmitting(true);
-    setError("");
     setReceipt(null);
     try {
       const result = await props.onSubmit(
@@ -133,7 +136,9 @@ export function SessionComposer(props: SessionComposerProps) {
       setReceipt(result);
       if (textarea) textarea.style.height = "auto";
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Message was not accepted");
+      notify(cause instanceof Error ? cause.message : "Message was not accepted", {
+        variant: "danger",
+      });
     } finally {
       setSubmitting(false);
     }
@@ -145,21 +150,25 @@ export function SessionComposer(props: SessionComposerProps) {
     const maxFileBytes = props.limits?.max_file_bytes ?? 20 * 1024 * 1024;
     const selected = Array.from(files).slice(0, Math.max(0, maxAttachments - attachments().length));
     if (selected.length < files.length) {
-      setError(`A message supports at most ${maxAttachments} attachments`);
+      notify(`A message supports at most ${maxAttachments} attachments`, { variant: "warning" });
     }
     setUploading(true);
     setReceipt(null);
     try {
       for (const file of selected) {
         if (file.size > maxFileBytes) {
-          setError(`${file.name} exceeds the ${formatBytes(maxFileBytes)} attachment limit`);
+          notify(`${file.name} exceeds the ${formatBytes(maxFileBytes)} attachment limit`, {
+            variant: "warning",
+          });
           continue;
         }
         try {
           const attachment = await props.onUploadAttachment(props.sessionId, file);
           setAttachments((current) => [...current, attachment]);
         } catch (cause) {
-          setError(cause instanceof Error ? cause.message : `${file.name} could not be uploaded`);
+          notify(cause instanceof Error ? cause.message : `${file.name} could not be uploaded`, {
+            variant: "danger",
+          });
         }
       }
     } finally {
@@ -173,7 +182,9 @@ export function SessionComposer(props: SessionComposerProps) {
       await props.onDeleteAttachment(props.sessionId, attachment.id);
       setAttachments((current) => current.filter((value) => value.id !== attachment.id));
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Attachment could not be removed");
+      notify(cause instanceof Error ? cause.message : "Attachment could not be removed", {
+        variant: "danger",
+      });
     }
   }
 
@@ -207,9 +218,6 @@ export function SessionComposer(props: SessionComposerProps) {
         void submit();
       }}
     >
-      <Show when={error()}>
-        <ErrorBlock variant="inline" message={error()} class="session-composer__error" />
-      </Show>
       <Show when={receipt()?.route === "queued"}>
         <p class="session-composer__status" role="status">
           Message queued

@@ -1,5 +1,5 @@
 import { createSignal, For, Show } from "solid-js";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../../components/ui/notifications";
 import type { SessionDiffFile } from "./sessionDiff";
 
 interface SessionDiffViewProps {
@@ -12,17 +12,17 @@ interface SessionDiffViewProps {
 export function SessionDiffView(props: SessionDiffViewProps) {
   return (
     <section class="session-diff" aria-label="Session changes">
+      <NotificationEvent
+        message={props.error}
+        variant="danger"
+        action={{ label: "Retry", onClick: props.onRetry }}
+      />
       <p class="session-diff__summary">Changes against main</p>
-      <Show
-        when={!props.error}
-        fallback={<ErrorBlock message={props.error ?? "Diff failed"} retry={props.onRetry} />}
-      >
-        <Show when={!props.loading} fallback={<p class="muted">Loading changes...</p>}>
-          <Show when={props.files.length > 0} fallback={<p class="muted">No changes</p>}>
-            <ul class="session-diff__files">
-              <For each={props.files}>{(file) => <SessionDiffFileRow file={file} />}</For>
-            </ul>
-          </Show>
+      <Show when={!props.loading} fallback={<p class="muted">Loading changes...</p>}>
+        <Show when={props.files.length > 0} fallback={<p class="muted">No changes</p>}>
+          <ul class="session-diff__files">
+            <For each={props.files}>{(file) => <SessionDiffFileRow file={file} />}</For>
+          </ul>
         </Show>
       </Show>
     </section>

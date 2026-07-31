@@ -1,19 +1,23 @@
+import ChevronRight from "lucide-solid/icons/chevron-right";
 import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
-import { createEffect, For, Show } from "solid-js";
-import { Badge } from "../../../components/ui/Badge";
+import { createEffect, createMemo, For, type JSX, Show } from "solid-js";
 import { EmptyState } from "../../../components/ui/EmptyState";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../../components/ui/notifications";
 import type {
   AttachmentView,
   ContextUsageView,
   ProviderView,
   PublicLimits,
   SessionModelPreference,
+  TurnSummary,
 } from "../../../lib/api";
+import { retryState } from "../../../lib/modelRetryState";
+import { MarkdownOutput } from "./MarkdownOutput";
+import { rowOpenState, toggleRowOpen } from "./rowOpenState";
 import { AskCard, JobCard, ModelCard, PlanCard, ServiceCard } from "./SessionCards";
 import { SessionComposer, type SessionMessageReceipt } from "./SessionComposer";
-import type { SessionTimelineItem } from "./sessionTimeline";
+import { formatThoughtDuration, type SessionTimelineItem, type ToolView } from "./sessionTimeline";
 
 interface SessionConversationProps {
   items: readonly SessionTimelineItem[];
@@ -25,6 +29,9 @@ interface SessionConversationProps {
   limits: PublicLimits | undefined;
   modelPreference: SessionModelPreference | null;
   providers: readonly ProviderView[];
+  turn: TurnSummary | null;
+  provisionalText: string;
+  provisionalReasoning: string;
   sessionId: string;
   onRetry: () => void;
   onSubmit: (
@@ -43,7 +50,9 @@ export function SessionConversation(props: SessionConversationProps) {
 
   createEffect(() => {
     const count = props.items.length;
-    if (count > 0 && followLatest && scroller) {
+    const provisionalLength = props.provisionalText.length;
+    const reasoningLength = props.provisionalReasoning.length;
+    if ((count > 0 || provisionalLength > 0 || reasoningLength > 0) && followLatest && scroller) {
       requestAnimationFrame(() => {
         if (scroller && followLatest) scroller.scrollTop = scroller.scrollHeight;
       });
@@ -52,6 +61,11 @@ export function SessionConversation(props: SessionConversationProps) {
 
   return (
     <section class="session-conversation" aria-label="Conversation">
+      <NotificationEvent
+        message={props.error}
+        variant="danger"
+        action={{ label: "Retry", onClick: props.onRetry }}
+      />
       <div
         class="session-conversation__timeline"
         ref={scroller}
@@ -63,45 +77,60 @@ export function SessionConversation(props: SessionConversationProps) {
         }}
       >
         <Show
-          when={!props.error}
+          when={props.items.length > 0}
           fallback={
-            <ErrorBlock message={props.error ?? "Conversation failed"} retry={props.onRetry} />
+            <Show
+              when={props.loading}
+              fallback={
+                <EmptyState
+                  icon={MessageSquare}
+                  title="Start a conversation"
+                  description="Send a message to begin."
+                />
+              }
+            >
+              <div
+                class="session-conversation__loading"
+                role="status"
+                aria-label="Loading conversation"
+              >
+                <Loader2 size={16} class="ui-spinner" />
+              </div>
+            </Show>
           }
         >
-          <Show
-            when={props.items.length > 0}
-            fallback={
-              <Show
-                when={props.loading}
-                fallback={
-                  <EmptyState
-                    icon={MessageSquare}
-                    title="Start a conversation"
-                    description="Send a message to begin."
-                  />
-                }
-              >
-                <div
-                  class="session-conversation__loading"
-                  role="status"
-                  aria-label="Loading conversation"
+          <div class="session-conversation__items">
+            <For each={props.items}>
+              {(item, index) => (
+                <ConversationEntry
+                  item={item}
+                  items={props.items}
+                  index={index}
+                  {...(props.onAnswer ? { onAnswer: props.onAnswer } : {})}
+                />
+              )}
+            </For>
+            <Show when={props.provisionalReasoning}>
+              {(reasoning) => (
+                <EventRow
+                  itemId={`thinking:provisional:${props.turn?.id ?? "live"}`}
+                  title="Thinking..."
+                  trailingChevron
+                  tone="muted"
+                  pulse
+                  autoOpen
                 >
-                  <Loader2 size={16} class="ui-spinner" />
-                </div>
-              </Show>
-            }
-          >
-            <div class="session-conversation__items">
-              <For each={props.items}>
-                {(item) => (
-                  <SessionTimelineEntry
-                    item={item}
-                    {...(props.onAnswer ? { onAnswer: props.onAnswer } : {})}
-                  />
-                )}
-              </For>
-            </div>
-          </Show>
+                  <div class="session-event__body-markdown">
+                    <MarkdownOutput text={reasoning()} plain />
+                  </div>
+                </EventRow>
+              )}
+            </Show>
+            <Show when={props.provisionalText}>
+              {(text) => <AssistantOutput text={text()} provisional />}
+            </Show>
+            <TurnStatusOutput turn={props.turn} sessionId={props.sessionId} />
+          </div>
         </Show>
       </div>
 
@@ -121,8 +150,102 @@ export function SessionConversation(props: SessionConversationProps) {
   );
 }
 
-function SessionTimelineEntry(props: {
+function TurnStatusOutput(props: { turn: TurnSummary | null; sessionId: string }) {
+  const visual = createMemo(() => turnStatusVisual(props.turn, props.sessionId));
+  return (
+    <Show when={visual()}>
+      {(status) => (
+        <div
+          class="session-message session-message--status"
+          role={status().tone === "danger" ? "alert" : "status"}
+        >
+          <span
+            class="session-message__dot"
+            data-tone={status().tone}
+            data-pulse={status().pulse ? "true" : undefined}
+            aria-hidden="true"
+          />
+          <div class="session-message__body" data-tone={status().tone}>
+            {status().text}
+          </div>
+        </div>
+      )}
+    </Show>
+  );
+}
+
+interface TurnStatusVisual {
+  text: string;
+  tone: "muted" | "warning" | "danger";
+  pulse: boolean;
+}
+
+/**
+ * The single persistent status row that lives in the conversation stream. It
+ * renders turn progress as a dot + label and is the *only* place failure
+ * reasons surface (BUG 3 + BUG 4):
+ * - live model retries → `Reconnecting (X/5): reason` (dot pulses), fed by
+ *   `model.attempt_retrying` SSE events via `retryState`, falling back to the
+ *   durable `turn.model_attempt` projection captured by polling.
+ * - terminal failure → `Failed: reason`, reading `completion_reason`.
+ * - terminal success → once reported by the timeline, the row fades out
+ *   (there is nothing actionable to say once work is done and durable).
+ */
+function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStatusVisual | null {
+  if (!turn) return null;
+  const live = retryState(sessionId, turn.id);
+  const retry =
+    live ??
+    (turn.model_attempt && turn.model_attempt.attempt > 0
+      ? {
+          attempt: turn.model_attempt.attempt,
+          maxAttempts: 5,
+          detail: turn.model_attempt.detail ?? "model unavailable",
+        }
+      : null);
+
+  switch (turn.status) {
+    case "queued":
+      return { text: "Queued...", tone: "muted", pulse: true };
+    case "running": {
+      if (retry) {
+        return {
+          text: `Reconnecting (${retry.attempt}/${retry.maxAttempts}): ${retry.detail}`,
+          tone: "warning",
+          pulse: true,
+        };
+      }
+      return { text: "Working...", tone: "muted", pulse: true };
+    }
+    case "waiting_for_job":
+      return { text: "Waiting for a job to finish...", tone: "warning", pulse: true };
+    case "waiting_for_ask":
+      return { text: "Waiting for your answer...", tone: "warning", pulse: true };
+    case "waiting_for_model":
+      return {
+        text: turn.completion_reason || "Waiting for the model...",
+        tone: "warning",
+        pulse: true,
+      };
+    case "canceling":
+      return { text: "Canceling...", tone: "warning", pulse: true };
+    case "failed":
+      return {
+        text: turn.completion_reason || "Turn failed.",
+        tone: "danger",
+        pulse: false,
+      };
+    case "canceled":
+      return { text: turn.cancellation_reason || "Canceled.", tone: "muted", pulse: false };
+    default:
+      return null;
+  }
+}
+
+function ConversationEntry(props: {
   item: SessionTimelineItem;
+  items: readonly SessionTimelineItem[];
+  index: () => number;
   onAnswer?: (askId: string, answer: string) => Promise<void>;
 }) {
   switch (props.item.type) {
@@ -143,13 +266,32 @@ function SessionTimelineEntry(props: {
           </div>
         </div>
       );
-    case "assistant":
+    case "assistant": {
+      const item = props.item;
       return (
-        <div class="session-message session-message--assistant">
-          <span class="session-message__dot" aria-hidden="true" />
-          <div class="session-message__body">{props.item.text}</div>
-        </div>
+        <>
+          <Show when={item.reasoning}>
+            {(reasoning) => {
+              const tail = formatThoughtDuration(item.durationMs);
+              return (
+                <EventRow
+                  itemId={`thinking:${item.id}`}
+                  title={tail ? `Thought ${tail}` : "Thought"}
+                  trailingChevron
+                  tone="muted"
+                  autoOpen={!hasFollowUpActivity(props.items, props.index())}
+                >
+                  <div class="session-event__body-markdown">
+                    <MarkdownOutput text={reasoning()} plain={false} />
+                  </div>
+                </EventRow>
+              );
+            }}
+          </Show>
+          <AssistantOutput text={item.text} />
+        </>
       );
+    }
     case "steer":
       return (
         <div class="session-message session-message--steer" role="note" aria-label="Steer">
@@ -162,13 +304,18 @@ function SessionTimelineEntry(props: {
       );
     case "tool":
       return (
-        <article class="session-message session-message--tool" aria-label={props.item.toolName}>
-          <header>
-            <code>{props.item.toolName}</code>
-            <Badge>{props.item.toolStatus}</Badge>
-          </header>
-          <pre>{JSON.stringify(props.item.summary, null, 2)}</pre>
-        </article>
+        <EventRow
+          itemId={`tool:${props.item.id}`}
+          title={props.item.view.title}
+          tone={toolDotTone(props.item.view)}
+          pulse={props.item.view.status === "running"}
+          autoOpen={false}
+          expandable={props.item.view.expandable}
+          lowNoise={props.item.view.lowNoise}
+          ariaLabel={props.item.view.title}
+        >
+          <ToolBody view={props.item.view} />
+        </EventRow>
       );
     case "plan":
       return <PlanCard item={props.item} />;
@@ -190,4 +337,173 @@ function SessionTimelineEntry(props: {
         </article>
       );
   }
+}
+
+function toolDotTone(view: ToolView): "muted" | "warning" | "danger" | "success" {
+  switch (view.status) {
+    case "success":
+      return "success";
+    case "failure":
+      return "danger";
+    case "running":
+      return "muted";
+  }
+}
+
+/** A timeline row that collapses to a one-line summary and expands to reveal a
+ * body. One renderer serves both tool calls and thinking rows (BUG 1+2+6):
+ * they share a status dot, a verb-style title, and expand/collapse affordance.
+ * The collapse state is keyed by `itemId` in `rowOpenState`, so it survives
+ * `<For>` re-mounts when the timeline query is invalidated mid-turn. The
+ * chevron sits on the right for thinking rows (`trailingChevron`) to match the
+ * requested `Thought >` alignment and on the left for tool rows. */
+function EventRow(props: {
+  itemId: string;
+  title: string;
+  tone: "muted" | "warning" | "danger" | "success";
+  pulse?: boolean;
+  expandable?: boolean;
+  autoOpen: boolean;
+  trailingChevron?: boolean;
+  lowNoise?: boolean;
+  ariaLabel?: string;
+  children?: JSX.Element;
+}) {
+  const expandable = () => (props.expandable ?? true) && props.children != null;
+  const open = rowOpenState(props.itemId, props.autoOpen);
+  const onToggle = () => {
+    if (expandable()) toggleRowOpen(props.itemId, open());
+  };
+  return (
+    <article
+      class={`session-event${props.lowNoise ? " session-event--low-noise" : ""}${
+        props.trailingChevron ? " session-event--trailing" : ""
+      }`}
+      aria-label={props.ariaLabel ?? props.title}
+    >
+      <button
+        type="button"
+        class="session-event__summary"
+        aria-expanded={expandable() ? open() : undefined}
+        onClick={onToggle}
+        disabled={!expandable()}
+      >
+        <span
+          class="session-event__dot"
+          data-tone={props.tone}
+          data-pulse={props.pulse ? "true" : undefined}
+          aria-hidden="true"
+        />
+        <span class="session-event__title">{props.title}</span>
+        <Show when={expandable()}>
+          <ChevronRight
+            size={12}
+            class="session-event__chevron"
+            classList={{ "session-event__chevron--open": open() }}
+          />
+        </Show>
+      </button>
+      <Show when={expandable() && open()}>{props.children}</Show>
+    </article>
+  );
+}
+
+function ToolBody(props: { view: ToolView }) {
+  const body = props.view.body;
+  switch (body.kind) {
+    case "none":
+      return null;
+    case "patch":
+      return <DiffBody patch={body.patch} />;
+    case "text":
+      return <pre class="session-event__terminal">{body.text}</pre>;
+    case "structured":
+      return <pre class="session-event__terminal">{JSON.stringify(body.value, null, 2)}</pre>;
+    case "error":
+      return (
+        <div class="session-event__body">
+          <pre class="session-event__terminal session-event__terminal--err">{body.detail}</pre>
+          <span class="session-event__exit">{body.code}</span>
+        </div>
+      );
+    case "command_output":
+      return (
+        <div class="session-event__body">
+          <Show when={body.stdout}>
+            <pre class="session-event__terminal">{body.stdout}</pre>
+          </Show>
+          <Show when={body.stderr}>
+            <pre class="session-event__terminal session-event__terminal--err">{body.stderr}</pre>
+          </Show>
+          <Show when={body.truncated}>
+            <span class="session-event__exit">Output truncated</span>
+          </Show>
+          <Show when={body.exitCode !== null}>
+            <span class="session-event__exit">exit {body.exitCode}</span>
+          </Show>
+        </div>
+      );
+  }
+}
+
+function DiffBody(props: { patch: string }) {
+  const lines = createMemo(() => props.patch.split("\n"));
+  return (
+    <pre class="session-event__diff">
+      <For each={lines()}>
+        {(raw) => {
+          const kind =
+            raw.startsWith("+++") || raw.startsWith("---")
+              ? "context"
+              : raw.startsWith("@@")
+                ? "hunk"
+                : raw.startsWith("+")
+                  ? "add"
+                  : raw.startsWith("-")
+                    ? "delete"
+                    : "context";
+          return (
+            <code class={`session-event__diff-line`} data-kind={kind}>
+              {raw || " "}
+            </code>
+          );
+        }}
+      </For>
+    </pre>
+  );
+}
+
+/**
+ * True when there is at least one later timeline item in the same turn beyond
+ * the assistant thought — i.e. a tool call or a follow-up reply followed it.
+ * Such thoughts collapse (legacy Janus: "Thinking" while streaming, the
+ * thought auto-collapses once the next round's activity begins).
+ */
+function hasFollowUpActivity(items: readonly SessionTimelineItem[], index: number): boolean {
+  for (let later = index + 1; later < items.length; later += 1) {
+    const item = items[later];
+    if (!item) continue;
+    if (item.type === "tool" || item.type === "assistant") return true;
+  }
+  return false;
+}
+
+function AssistantOutput(props: { text: string; provisional?: boolean }) {
+  return (
+    <div
+      class="session-message session-message--assistant"
+      data-provisional={props.provisional ? "true" : undefined}
+    >
+      <span
+        class="session-message__dot"
+        data-pulse={props.provisional ? "true" : undefined}
+        aria-hidden="true"
+      />
+      <div class="session-message__body">
+        <Show when={props.text}>
+          {(text) => <MarkdownOutput text={text()} plain={props.provisional} />}
+        </Show>
+      </div>
+    </div>
+  );
 }

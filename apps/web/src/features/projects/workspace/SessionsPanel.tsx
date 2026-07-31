@@ -7,7 +7,7 @@ import Trash2 from "lucide-solid/icons/trash-2";
 import { createSignal, For, Show } from "solid-js";
 import { Alt } from "../../../components/ui/Alt";
 import { EmptyState } from "../../../components/ui/EmptyState";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { useNotifications } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../../lib/api";
 import { createSession, deleteSession, getSession, waitForOperation } from "../../../lib/api";
@@ -28,9 +28,9 @@ interface SessionsPanelProps {
 export function SessionsPanel(props: SessionsPanelProps) {
   const sessions = useSessions(props.projectId);
   const queryClient = useQueryClient();
+  const notify = useNotifications().notify;
   const [creating, setCreating] = createSignal(false);
   const [deletingId, setDeletingId] = createSignal<string | null>(null);
-  const [actionError, setActionError] = createSignal("");
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
 
   async function onCreate() {
@@ -38,7 +38,6 @@ export function SessionsPanel(props: SessionsPanelProps) {
     if (!id || creating()) return;
     if (props.projectReady && !props.projectReady()) return;
     setCreating(true);
-    setActionError("");
     try {
       const accepted = await createSession(id, { title: "New session" }, crypto.randomUUID());
       const completed = await waitForOperation(accepted.id);
@@ -61,7 +60,11 @@ export function SessionsPanel(props: SessionsPanelProps) {
       void sessions.refetch();
       props.onOpenSession(session.id, session.title);
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : "Failed to create session");
+      // Session create/delete are sidebar actions — failures surface as a
+      // transient toast, not a red block that occupies the session list.
+      notify(error instanceof Error ? error.message : "Failed to create session", {
+        variant: "danger",
+      });
     } finally {
       setCreating(false);
     }
@@ -70,14 +73,15 @@ export function SessionsPanel(props: SessionsPanelProps) {
   async function onDelete(session: SessionSummary) {
     if (deletingId()) return;
     setDeletingId(session.id);
-    setActionError("");
     try {
       const accepted = await deleteSession(session.id, session.version, crypto.randomUUID());
       await waitForOperation(accepted.id);
       props.onSessionDeleted?.(session.id);
       void sessions.refetch();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : "Failed to delete session");
+      notify(error instanceof Error ? error.message : "Failed to delete session", {
+        variant: "danger",
+      });
     } finally {
       setDeletingId(null);
     }
@@ -99,12 +103,6 @@ export function SessionsPanel(props: SessionsPanelProps) {
           </Show>
         </button>
       </div>
-
-      <Show when={actionError()}>
-        <div class="sessions-panel__error">
-          <ErrorBlock message={actionError()} />
-        </div>
-      </Show>
 
       <div class="ide-scroll-host sessions-panel__scroll">
         <div class="ide-sidebar-scroll sessions-panel__list" ref={setScrollHost}>

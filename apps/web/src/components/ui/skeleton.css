@@ -10,8 +10,6 @@
   height: 42px;
 }
 
-/* --- ErrorBlock --- */
-
 @keyframes skeleton {
   from {
     background-position: 100% 0;

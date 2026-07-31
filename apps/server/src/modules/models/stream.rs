@@ -1,5 +1,7 @@
 //! Stream completion entry + attempt/usage ledger (M3 Stage 3).
 
+use std::future::Future;
+
 use chrono::Utc;
 use futures_util::StreamExt;
 
@@ -10,6 +12,8 @@ use super::interface::{ModelsError, ModelsInterface, ProviderKind};
 use super::openai_chat::{OpenaiChatAssembler, build_chat_body};
 use super::sse::SseParser;
 use super::stream_types::{ModelRequest, ModelStreamEvent};
+
+const MAX_PROVIDER_ERROR_BYTES: usize = 8 * 1024;
 
 fn key_aad(owner_id: &str, id: &str) -> String {
     format!("v1/{owner_id}/model_providers/{id}/api_key")
@@ -27,6 +31,19 @@ impl ModelsInterface {
         &self,
         req: ModelRequest,
     ) -> Result<Vec<ModelStreamEvent>, ModelsError> {
+        let mut ignore_event = |_| std::future::ready(());
+        self.stream_completion_with(req, &mut ignore_event).await
+    }
+
+    pub async fn stream_completion_with<F, Fut>(
+        &self,
+        req: ModelRequest,
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, ModelsError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let row = self
             .provider_row_public(&req.owner_id, &req.provider_id)
             .await?;
@@ -57,11 +74,11 @@ impl ModelsInterface {
 
         let result = match kind {
             ProviderKind::OpenaiChat | ProviderKind::OpenaiResponses => {
-                self.stream_openai_chat(&req, &row.base_url, key.as_ref(), &attempt_id)
+                self.stream_openai_chat(&req, &row.base_url, key.as_ref(), &attempt_id, on_event)
                     .await
             }
             ProviderKind::Anthropic => {
-                self.stream_anthropic(&req, &row.base_url, key.as_ref(), &attempt_id)
+                self.stream_anthropic(&req, &row.base_url, key.as_ref(), &attempt_id, on_event)
                     .await
             }
         };
@@ -104,6 +121,7 @@ impl ModelsInterface {
                     code: "PROVIDER_STREAM_FAILED".into(),
                     detail: detail.clone(),
                 };
+                on_event(failed.clone()).await;
                 self.finalize_attempt(
                     &attempt_id,
                     "failed",
@@ -118,13 +136,18 @@ impl ModelsInterface {
         }
     }
 
-    async fn stream_openai_chat(
+    async fn stream_openai_chat<F, Fut>(
         &self,
         req: &ModelRequest,
         base_url: &str,
         key: Option<&Secret>,
         attempt_id: &str,
-    ) -> Result<Vec<ModelStreamEvent>, ModelsError> {
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, ModelsError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let url = append_path_segment(base_url, "chat/completions")?;
         let body = build_chat_body(req);
         let mut request = self
@@ -143,22 +166,27 @@ impl ModelsInterface {
         })?;
         let status = response.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Ok(vec![ModelStreamEvent::Failed {
+            let failed = ModelStreamEvent::Failed {
                 attempt_id: attempt_id.to_owned(),
                 code: "PROVIDER_AUTH_FAILED".into(),
                 detail: "provider rejected credentials".into(),
-            }]);
+            };
+            on_event(failed.clone()).await;
+            return Ok(vec![failed]);
         }
         if !status.is_success() {
-            return Ok(vec![ModelStreamEvent::Failed {
+            let detail = provider_http_error(response, status.as_u16(), key).await;
+            let failed = ModelStreamEvent::Failed {
                 attempt_id: attempt_id.to_owned(),
                 code: "PROVIDER_STREAM_FAILED".into(),
-                detail: format!("provider HTTP {}", status.as_u16()),
-            }]);
+                detail,
+            };
+            on_event(failed.clone()).await;
+            return Ok(vec![failed]);
         }
 
         let mut parser = SseParser::new();
-        let mut assembler = OpenaiChatAssembler::default();
+        let mut assembler = OpenaiChatAssembler::for_tools(&req.tools);
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
@@ -169,20 +197,30 @@ impl ModelsInterface {
                 let more = assembler
                     .ingest_data(attempt_id, &data)
                     .map_err(|e| ModelsError::Internal(anyhow::anyhow!(e)))?;
-                events.extend(more);
+                for event in more {
+                    on_event(event.clone()).await;
+                    events.push(event);
+                }
             }
         }
-        events.push(assembler.finish(attempt_id));
+        let completed = assembler.finish(attempt_id);
+        on_event(completed.clone()).await;
+        events.push(completed);
         Ok(events)
     }
 
-    async fn stream_anthropic(
+    async fn stream_anthropic<F, Fut>(
         &self,
         req: &ModelRequest,
         base_url: &str,
         key: Option<&Secret>,
         attempt_id: &str,
-    ) -> Result<Vec<ModelStreamEvent>, ModelsError> {
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, ModelsError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let url = append_path_segment(base_url, "v1/messages")?;
         // base_url for Anthropic often already ends with /v1 — handle both.
         let url = if base_url.trim_end_matches('/').ends_with("/v1") {
@@ -209,18 +247,23 @@ impl ModelsInterface {
         })?;
         let status = response.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Ok(vec![ModelStreamEvent::Failed {
+            let failed = ModelStreamEvent::Failed {
                 attempt_id: attempt_id.to_owned(),
                 code: "PROVIDER_AUTH_FAILED".into(),
                 detail: "provider rejected credentials".into(),
-            }]);
+            };
+            on_event(failed.clone()).await;
+            return Ok(vec![failed]);
         }
         if !status.is_success() {
-            return Ok(vec![ModelStreamEvent::Failed {
+            let detail = provider_http_error(response, status.as_u16(), key).await;
+            let failed = ModelStreamEvent::Failed {
                 attempt_id: attempt_id.to_owned(),
                 code: "PROVIDER_STREAM_FAILED".into(),
-                detail: format!("provider HTTP {}", status.as_u16()),
-            }]);
+                detail,
+            };
+            on_event(failed.clone()).await;
+            return Ok(vec![failed]);
         }
 
         let mut parser = SseParser::new();
@@ -235,11 +278,62 @@ impl ModelsInterface {
                 let more = assembler
                     .ingest(attempt_id, &ev, &data)
                     .map_err(|e| ModelsError::Internal(anyhow::anyhow!(e)))?;
-                events.extend(more);
+                for event in more {
+                    on_event(event.clone()).await;
+                    events.push(event);
+                }
             }
         }
-        events.push(assembler.finish(attempt_id));
+        let completed = assembler.finish(attempt_id);
+        on_event(completed.clone()).await;
+        events.push(completed);
         Ok(events)
+    }
+}
+
+async fn provider_http_error(
+    response: reqwest::Response,
+    status: u16,
+    key: Option<&Secret>,
+) -> String {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_PROVIDER_ERROR_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|body| {
+            body.pointer("/error/message")
+                .or_else(|| body.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(|message| sanitize_provider_message(message, key))
+        })
+        .filter(|message| !message.is_empty());
+    match message {
+        Some(message) => format!("provider HTTP {status}: {message}"),
+        None => format!("provider HTTP {status}"),
+    }
+}
+
+fn sanitize_provider_message(message: &str, key: Option<&Secret>) -> String {
+    let message = message
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .take(512)
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    match key.map(Secret::expose).filter(|key| !key.is_empty()) {
+        Some(key) => message.replace(key, "[redacted]"),
+        None => message,
     }
 }
 

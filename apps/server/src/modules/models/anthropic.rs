@@ -272,6 +272,7 @@ impl AnthropicAssembler {
             stop_reason: self.stop_reason.clone(),
             tool_calls,
             text: self.text.clone(),
+            reasoning: String::new(),
         }
     }
 }

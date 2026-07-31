@@ -1,11 +1,13 @@
 //! OpenAI Chat Completions streaming adapter (SSE).
 
+use std::collections::HashMap;
+
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde_json::{Value, json};
 
 use super::stream_types::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
-    StreamChannel, TokenUsage, ToolCallDelta,
+    StreamChannel, TokenUsage, ToolCallDelta, ToolSpec,
 };
 
 pub fn build_chat_body(req: &ModelRequest) -> Value {
@@ -31,7 +33,7 @@ pub fn build_chat_body(req: &ModelRequest) -> Value {
                 json!({
                     "type": "function",
                     "function": {
-                        "name": t.name,
+                        "name": openai_tool_name(&t.name),
                         "description": t.description,
                         "parameters": t.parameters,
                     }
@@ -77,7 +79,7 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
                         "id": call.id,
                         "type": "function",
                         "function": {
-                            "name": call.name,
+                            "name": openai_tool_name(&call.name),
                             "arguments": call.arguments_json,
                         },
                     }))
@@ -112,7 +114,7 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
                     "id": call.id,
                     "type": "function",
                     "function": {
-                        "name": call.name,
+                        "name": openai_tool_name(&call.name),
                         "arguments": call.arguments_json,
                     },
                 }))
@@ -126,13 +128,25 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
 #[derive(Default)]
 pub struct OpenaiChatAssembler {
     pub text: String,
+    pub reasoning: String,
     pub tool_args: Vec<(Option<String>, Option<String>, String)>, // id, name, args
     pub seq: u64,
     pub usage: Option<TokenUsage>,
     pub finish_reason: Option<String>,
+    tool_names: HashMap<String, String>,
 }
 
 impl OpenaiChatAssembler {
+    pub fn for_tools(tools: &[ToolSpec]) -> Self {
+        Self {
+            tool_names: tools
+                .iter()
+                .map(|tool| (openai_tool_name(&tool.name), tool.name.clone()))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     pub fn ingest_data(
         &mut self,
         attempt_id: &str,
@@ -169,6 +183,21 @@ impl OpenaiChatAssembler {
                 self.finish_reason = Some(fr.to_owned());
             }
             let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+            if let Some(reasoning) = ["reasoning_content", "reasoning", "thinking"]
+                .into_iter()
+                .find_map(|key| delta.get(key).and_then(Value::as_str))
+                .filter(|value| !value.is_empty())
+            {
+                self.reasoning.push_str(reasoning);
+                self.seq += 1;
+                out.push(ModelStreamEvent::Delta {
+                    attempt_id: attempt_id.to_owned(),
+                    sequence: self.seq,
+                    channel: StreamChannel::ReasoningSummary,
+                    text: reasoning.to_owned(),
+                    provisional: true,
+                });
+            }
             if let Some(content) = delta.get("content").and_then(|c| c.as_str())
                 && !content.is_empty()
             {
@@ -235,7 +264,12 @@ impl OpenaiChatAssembler {
             .iter()
             .enumerate()
             .filter_map(|(i, (id, name, args))| {
-                let name = name.clone()?;
+                let wire_name = name.as_ref()?;
+                let name = self
+                    .tool_names
+                    .get(wire_name)
+                    .cloned()
+                    .unwrap_or_else(|| wire_name.clone());
                 Some(CompletedToolCall {
                     id: id.clone().unwrap_or_else(|| format!("call_{i}")),
                     name,
@@ -256,6 +290,19 @@ impl OpenaiChatAssembler {
             stop_reason: self.finish_reason.clone(),
             tool_calls,
             text: self.text.clone(),
+            reasoning: self.reasoning.clone(),
         }
     }
+}
+
+fn openai_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }

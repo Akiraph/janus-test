@@ -21,10 +21,10 @@ pub use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, AskAnswerResult, AskSummary, AttachmentResource,
     AttachmentView, CancelResult, ContextMessage, CreatedTurnInput, ExecutionTurn,
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES, MessageRoute, MessageRouteResult,
-    QueuedTurnCandidate, ReasoningEffort, RecordAskAnswer, RecordedTurnInput, RecoveredTurn,
-    SessionCommandState, SessionModelPreference, SessionSummary, SessionsError, SteerResult,
-    TerminalSettlement, TimelineItemView, TimelinePage, TurnBlockerOutcome, TurnBlockers,
-    TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
+    ModelAttemptStatus, QueuedTurnCandidate, ReasoningEffort, RecordAskAnswer, RecordedTurnInput,
+    RecoveredTurn, SessionCommandState, SessionModelPreference, SessionSummary, SessionsError,
+    SteerResult, TerminalSettlement, TimelineItemView, TimelinePage, TurnBlockerOutcome,
+    TurnBlockers, TurnModelAttempt, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
 };
 
 #[derive(Clone)]
@@ -724,6 +724,7 @@ impl SessionsInterface {
         .await?
         .ok_or(SessionsError::NotFound)?;
         let model_snapshot_json: String = row.try_get("model_snapshot_json")?;
+        let model_attempt = self.latest_model_attempt_for_turn(turn_id).await?;
         Ok(TurnSummary {
             id: row.try_get("id")?,
             session_id: row.try_get("session_id")?,
@@ -736,10 +737,54 @@ impl SessionsInterface {
             handoff_to_turn_id: row.try_get("handoff_to_turn_id")?,
             cancellation_reason: row.try_get("cancellation_reason")?,
             completion_reason: row.try_get("completion_reason")?,
+            model_attempt,
             version: row.try_get("version")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
+    }
+
+    /// Newest `model_attempts` row for any Round of this Turn. Drives the
+    /// `Reconnecting (X/5): reason` status row: a `running` attempt with a
+    /// non-zero `attempt_number` means a retry is in flight; a `failed` attempt
+    /// exposes its normalized detail.
+    async fn latest_model_attempt_for_turn(
+        &self,
+        turn_id: TurnId,
+    ) -> Result<Option<TurnModelAttempt>, SessionsError> {
+        let row = sqlx::query(
+            "SELECT attempt.attempt_number, attempt.status, attempt.normalized_error_json \
+             FROM model_attempts AS attempt \
+             JOIN rounds AS round ON round.id = attempt.round_id \
+             WHERE round.turn_id = ? \
+             ORDER BY attempt.created_at DESC, attempt.id DESC \
+             LIMIT 1",
+        )
+        .bind(turn_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status_text: String = row.try_get("status")?;
+        let status = parse_model_attempt_status(&status_text)?;
+        let attempt_number: i64 = row.try_get("attempt_number")?;
+        let error_json: Option<String> = row.try_get("normalized_error_json")?;
+        let detail = error_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| {
+                value
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|detail| !detail.is_empty());
+        Ok(Some(TurnModelAttempt {
+            attempt: attempt_number,
+            status,
+            detail,
+        }))
     }
 
     async fn row_to_summary(
@@ -808,4 +853,17 @@ fn attachment_resource(row: sqlx::sqlite::SqliteRow) -> Result<AttachmentResourc
         byte_size,
         blob_sha: row.try_get("blob_sha")?,
     })
+}
+
+fn parse_model_attempt_status(raw: &str) -> Result<ModelAttemptStatus, SessionsError> {
+    match raw {
+        "running" => Ok(ModelAttemptStatus::Running),
+        "succeeded" => Ok(ModelAttemptStatus::Succeeded),
+        "failed" => Ok(ModelAttemptStatus::Failed),
+        "canceled" => Ok(ModelAttemptStatus::Canceled),
+        "interrupted" => Ok(ModelAttemptStatus::Interrupted),
+        other => Err(SessionsError::Internal(anyhow::anyhow!(
+            "unknown model_attempts status {other}"
+        ))),
+    }
 }

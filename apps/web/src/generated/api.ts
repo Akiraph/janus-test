@@ -1497,6 +1497,7 @@ export interface components {
         handoff_to_turn_id?: string | null;
         id: string;
         input_message_id?: string | null;
+        model_attempt?: null | components["schemas"]["TurnModelAttempt"];
         model_snapshot?: null | components["schemas"]["TurnModelSnapshot"];
         predecessor_turn_id?: string | null;
         /** Format: int64 */
@@ -1813,6 +1814,8 @@ export interface components {
       session_version: string;
       turn_id: string;
     };
+    /** @enum {string} */
+    ModelAttemptStatus: "running" | "succeeded" | "failed" | "canceled" | "interrupted";
     MoveFileInput: {
       expected_main_revision?: string | null;
       from: string;
@@ -2140,6 +2143,23 @@ export interface components {
       newest_cursor?: string | null;
       oldest_cursor?: string | null;
     };
+    /**
+     * @description The most recent model attempt for this Turn's active Round, projected onto
+     *     `TurnSummary` so the UI can render the live retry counter
+     *     ("Reconnecting (X/5): reason") even when the SSE event that announced it has
+     *     already been consumed. Absent when the Turn has had no attempts yet.
+     */
+    TurnModelAttempt: {
+      /**
+       * Format: int64
+       * @description 1-based retry index surfaced to the UI (0 = the initial attempt, not a
+       *     retry). Matches the `attempt` field of `model.attempt_retrying` events.
+       */
+      attempt: number;
+      /** @description Normalized failure detail for a `failed` attempt; null otherwise. */
+      detail?: string | null;
+      status: components["schemas"]["ModelAttemptStatus"];
+    };
     TurnModelSnapshot: {
       /** Format: int32 */
       context_limit: number;
@@ -2159,6 +2179,7 @@ export interface components {
       handoff_to_turn_id?: string | null;
       id: string;
       input_message_id?: string | null;
+      model_attempt?: null | components["schemas"]["TurnModelAttempt"];
       model_snapshot?: null | components["schemas"]["TurnModelSnapshot"];
       predecessor_turn_id?: string | null;
       /** Format: int64 */

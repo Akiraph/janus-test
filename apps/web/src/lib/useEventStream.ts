@@ -1,16 +1,14 @@
 import { useQueryClient } from "@tanstack/solid-query";
 import { createSignal, onCleanup, onMount } from "solid-js";
+import { ingestRetryEvent } from "./modelRetryState";
+import { ingestModelStreamEvent } from "./modelStream";
 
 export type ConnectionState = "connecting" | "live" | "reconnecting" | "offline";
 
 interface EventEnvelopeLike {
   event_type?: string;
   resource?: { kind?: string; id?: string } | null;
-  payload?: {
-    operation_id?: string;
-    project_id?: string;
-    target_id?: string;
-  } | null;
+  payload?: Record<string, unknown> | null;
 }
 
 export function useEventStream() {
@@ -25,6 +23,16 @@ export function useEventStream() {
     const resourceId = envelope.resource?.id;
     const resourceKind = envelope.resource?.kind;
     const payload = envelope.payload ?? {};
+
+    if (type === "model.stream_delta") {
+      ingestModelStreamEvent(type, payload);
+      return;
+    }
+
+    if (type === "model.attempt_retrying") {
+      ingestRetryEvent(type, payload);
+      return;
+    }
 
     if (type === "model_config.changed") {
       void queryClient.invalidateQueries({ queryKey: ["model-providers"] });
@@ -87,7 +95,6 @@ export function useEventStream() {
       type === "turn.status_changed" ||
       type === "timeline.item_created" ||
       type === "timeline.item_updated" ||
-      type === "model.stream_delta" ||
       type === "model.attempt_changed" ||
       type === "tool_call.created" ||
       type === "tool_call.changed" ||

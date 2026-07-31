@@ -5,7 +5,7 @@ import ShieldCheck from "lucide-solid/icons/shield-check";
 import type { Component } from "solid-js";
 import { createSignal, For, Show } from "solid-js";
 import { Button } from "../../components/ui/Button";
-import { ErrorBlock } from "../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../components/ui/notifications";
 import {
   initializeComplete,
   initializeOptions,
@@ -80,9 +80,7 @@ export function SetupView() {
               required
             />
           </label>
-          <Show when={error()}>
-            <ErrorBlock variant="inline" message={error()} />
-          </Show>
+          <NotificationEvent message={error()} variant="danger" />
           <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
             <KeyRound size={17} />
             {busy() ? "Waiting for passkey..." : "Create owner passkey"}
@@ -144,9 +142,7 @@ export function LoginView() {
       subtitle="Use a passkey to unlock your workspace."
     >
       <div class="auth-form">
-        <Show when={error()}>
-          <ErrorBlock variant="inline" message={error()} />
-        </Show>
+        <NotificationEvent message={error()} variant="danger" />
         <Button
           variant="primary"
           class="auth-submit"

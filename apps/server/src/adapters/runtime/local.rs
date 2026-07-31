@@ -24,6 +24,7 @@ use crate::{
     platform::{
         id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
         secret::random_token,
+        shell::{bash_program, decode_process_output},
     },
 };
 
@@ -357,6 +358,12 @@ impl RuntimeExecutor for LocalExecutor {
                     "LocalExecutor requires a local Runtime spec".into(),
                 ));
             }
+            if let Some(existing) = self.inner.runtimes.read().await.get(&spec.id()).cloned() {
+                return Ok(ExecutorRuntimeHandle {
+                    executor_identity: format!("local:{}", spec.id()),
+                    executor_nonce: existing.nonce,
+                });
+            }
             let workspace_root = tokio::fs::canonicalize(spec.workspace_root())
                 .await
                 .map_err(|_| RuntimeError::InvalidSpec("workspace root does not exist".into()))?;
@@ -441,19 +448,19 @@ impl RuntimeExecutor for LocalExecutor {
             let stdout = join_output(stdout_task).await;
             let stderr = join_output(stderr_task).await;
             let stream = self.inner.logs.close(log_stream_id).await?;
+            let stdout = decode_process_output(&stdout, OUTPUT_SUMMARY_BYTES);
+            let stderr = decode_process_output(&stderr, OUTPUT_SUMMARY_BYTES);
             Ok(ExecutionResult {
                 mode: ExecutionMode::Sync,
                 exit: exit_summary(status.as_ref()),
-                stdout: bounded_text(&stdout),
-                stderr: bounded_text(&stderr),
+                stdout: stdout.text,
+                stderr: stderr.text,
                 log_stream_id,
                 output_cursor: stream.next_cursor,
                 duration_ms: elapsed_millis(started),
                 usage: ResourceUsage::default(),
                 timed_out,
-                truncated: stream.truncated
-                    || stdout.len() > OUTPUT_SUMMARY_BYTES
-                    || stderr.len() > OUTPUT_SUMMARY_BYTES,
+                truncated: stream.truncated || stdout.truncated || stderr.truncated,
             })
         })
     }
@@ -898,7 +905,7 @@ where
 fn terminal_command(size: TerminalSize) -> Command {
     #[cfg(windows)]
     {
-        let program = which_bash().unwrap_or_else(|| {
+        let program = bash_program().unwrap_or_else(|| {
             tracing::warn!("Git Bash could not be located; Terminal backend will refuse to spawn");
             PathBuf::from("bash")
         });
@@ -911,43 +918,14 @@ fn terminal_command(size: TerminalSize) -> Command {
     }
     #[cfg(not(windows))]
     {
-        let mut command = Command::new("/bin/bash");
+        let mut command =
+            Command::new(bash_program().unwrap_or_else(|| PathBuf::from("/bin/bash")));
         command.args(["--login", "-i"]);
         command.env("COLUMNS", size.cols.to_string());
         command.env("LINES", size.rows.to_string());
         command.env("TERM", "dumb");
         command
     }
-}
-
-#[cfg(windows)]
-fn which_bash() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&path) {
-            let candidate = directory.join("bash.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    let output = std::process::Command::new("git")
-        .arg("--exec-path")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    for ancestor in exec_path.ancestors() {
-        for relative in ["bin/bash.exe", "usr/bin/bash.exe"] {
-            let candidate = ancestor.join(relative);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 fn spawn_output_reader<R>(
@@ -1192,10 +1170,6 @@ fn exit_summary(status: Option<&std::process::ExitStatus>) -> ExitSummary {
             .filter(|value| value.code().is_none())
             .map(|_| "terminated".into()),
     }
-}
-
-fn bounded_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&bytes[..bytes.len().min(OUTPUT_SUMMARY_BYTES)]).into_owned()
 }
 
 fn elapsed_millis(started: Instant) -> u64 {

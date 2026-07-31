@@ -113,12 +113,13 @@ impl TurnRunner {
                 let execution = match self.supervisor.execute_turn(turn_id).await {
                     Ok(execution) => execution,
                     Err(execution_error) => {
+                        // Surface the real cause, not a generic label: the failure
+                        // reason becomes `completion_reason` on the Turn, which the
+                        // UI status row shows verbatim (BUG 3).
+                        let reason = execution_error.to_string();
                         warn!(%execution_error, %turn_id, "settling unexpected Supervisor failure");
                         self.supervisor
-                            .settle_execution_failure(
-                                turn_id,
-                                "unexpected supervisor execution error",
-                            )
+                            .settle_execution_failure(turn_id, &reason)
                             .await?;
                         return Err(execution_error.into());
                     }

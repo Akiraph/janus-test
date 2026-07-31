@@ -1,7 +1,7 @@
 import ChevronRight from "lucide-solid/icons/chevron-right";
 import FileCode2 from "lucide-solid/icons/file-code-2";
 import { createEffect, createMemo, createSignal, For, Show, untrack } from "solid-js";
-import { ErrorBlock } from "../../../components/ui/ErrorBlock";
+import { NotificationEvent } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { FileTreeView } from "../../../lib/api";
 import { listFileTree } from "../../../lib/api";
@@ -106,42 +106,44 @@ export function FileTreePanel(props: FileTreePanelProps) {
 
   return (
     <section class="ide-sidebar-panel" aria-label="Explorer">
+      <NotificationEvent
+        message={errors()[""]}
+        variant="danger"
+        action={{ label: "Retry", onClick: () => void loadPath("", true) }}
+      />
       <div class="ide-sidebar-header">Explorer</div>
       <div class="ide-scroll-host">
         <div class="ide-tree ide-sidebar-scroll" ref={setScrollHost}>
-          <Show when={children()[""] !== undefined} fallback={<p class="surface-note">Loading…</p>}>
-            <Show
-              when={!errors()[""]}
-              fallback={
-                <ErrorBlock
-                  message={errors()[""] ?? "Tree failed"}
-                  retry={() => void loadPath("", true)}
-                />
-              }
-            >
-              <Show
-                when={(children()[""]?.length ?? 0) > 0}
-                fallback={<p class="surface-note">Empty repository</p>}
-              >
-                <ul class="ide-tree-list">
-                  <For each={children()[""] ?? []}>
-                    {(entry) => (
-                      <TreeNode
-                        entry={entry}
-                        depth={0}
-                        expanded={expanded()}
-                        childrenMap={children()}
-                        loading={loading()}
-                        errors={errors()}
-                        activePath={props.activePath()}
-                        onToggle={toggleDir}
-                        onOpenFile={props.onOpenFile}
-                        onRetry={(path) => void loadPath(path, true)}
-                      />
-                    )}
-                  </For>
-                </ul>
+          <Show
+            when={children()[""] !== undefined}
+            fallback={
+              <Show when={!errors()[""]}>
+                <p class="surface-note">Loading…</p>
               </Show>
+            }
+          >
+            <Show
+              when={(children()[""]?.length ?? 0) > 0}
+              fallback={<p class="surface-note">Empty repository</p>}
+            >
+              <ul class="ide-tree-list">
+                <For each={children()[""] ?? []}>
+                  {(entry) => (
+                    <TreeNode
+                      entry={entry}
+                      depth={0}
+                      expanded={expanded()}
+                      childrenMap={children()}
+                      loading={loading()}
+                      errors={errors()}
+                      activePath={props.activePath()}
+                      onToggle={toggleDir}
+                      onOpenFile={props.onOpenFile}
+                      onRetry={(path) => void loadPath(path, true)}
+                    />
+                  )}
+                </For>
+              </ul>
             </Show>
           </Show>
         </div>

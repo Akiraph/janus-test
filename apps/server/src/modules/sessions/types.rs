@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::modules::workspace_sync::interface::WorkspaceSyncError;
-use crate::platform::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId};
+use crate::platform::id::{AskId, AttachmentId, ProjectId, RoundId, SessionId, TurnId};
 
 pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: u64 = 25 * 1024 * 1024;
@@ -290,6 +290,31 @@ impl TurnModelSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAttemptStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+/// The most recent model attempt for this Turn's active Round, projected onto
+/// `TurnSummary` so the UI can render the live retry counter
+/// ("Reconnecting (X/5): reason") even when the SSE event that announced it has
+/// already been consumed. Absent when the Turn has had no attempts yet.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TurnModelAttempt {
+    /// 1-based retry index surfaced to the UI (0 = the initial attempt, not a
+    /// retry). Matches the `attempt` field of `model.attempt_retrying` events.
+    pub attempt: i64,
+    pub status: ModelAttemptStatus,
+    /// Normalized failure detail for a `failed` attempt; null otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TurnSummary {
     pub id: String,
@@ -303,6 +328,8 @@ pub struct TurnSummary {
     pub handoff_to_turn_id: Option<String>,
     pub cancellation_reason: Option<String>,
     pub completion_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_attempt: Option<TurnModelAttempt>,
     pub version: String,
     pub created_at: String,
     pub updated_at: String,
@@ -451,7 +478,14 @@ pub struct RecordAskAnswer<'a> {
 pub struct AppendAssistantMessage<'a> {
     pub session_id: SessionId,
     pub turn_id: TurnId,
+    pub round_id: RoundId,
     pub text: &'a str,
+    pub reasoning: &'a str,
+    /// Wall-clock ms the round spent producing this assistant message (from
+    /// round creation to acceptance). `None` only when the start stamp could not
+    /// be parsed. Surfaced in the timeline item projection so the UI can render
+    /// "Thought for {duration}".
+    pub duration_ms: Option<i64>,
     pub tool_calls: &'a serde_json::Value,
     pub actor: &'a serde_json::Value,
     pub now: &'a str,

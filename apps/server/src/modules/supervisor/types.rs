@@ -92,6 +92,40 @@ pub struct ToolOutcome {
     pub wait: Option<TurnWait>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDisplay {
+    pub version: u16,
+    pub title: String,
+    pub status: String,
+    pub body: ToolDisplayBody,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolDisplayBody {
+    None,
+    Text {
+        text: String,
+    },
+    Structured {
+        value: serde_json::Value,
+    },
+    Patch {
+        patch: String,
+    },
+    CommandOutput {
+        command: String,
+        stdout: String,
+        stderr: String,
+        exit_code: Option<i32>,
+        truncated: bool,
+    },
+    Error {
+        code: String,
+        detail: String,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExecutionDisposition {
     Succeeded,

@@ -82,7 +82,16 @@ pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<()>
             std::fs::copy(&source, &target)
                 .with_context(|| format!("copy managed path {} into Session", path))?;
         } else if source_metadata.is_dir() {
-            bail!("managed directory path is unsupported: {path}");
+            // Git may collapse a fully-untracked subtree into a single
+            // directory entry (a trailing-slash path). Recursively mirror the
+            // subtree rather than bailing — keeps Session seeding resilient
+            // to any leftover untracked dir regardless of .gitignore state.
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            remove_path(&target)?;
+            copy_dir_tree(&source, &target)
+                .with_context(|| format!("copy managed tree {} into Session", path))?;
         }
     }
     Ok(())
@@ -316,7 +325,18 @@ fn git_text(root: &Path, args: &[&str]) -> anyhow::Result<String> {
 }
 
 fn git_paths(root: &Path, args: &[&str]) -> anyhow::Result<BTreeSet<String>> {
-    let output = git_output(root, args)?;
+    // Janus creates `.janus-dev/` inside a project's Main clone to hold its own
+    // workspaces (other Sessions' worktrees, etc.). On Windows `git ls-files
+    // --others` collapses a fully-untracked subtree into a single directory
+    // entry (trailing slash), which downstream `seed`/`read_manifest_file` then
+    // treat as a file and bail on. Globally exclude `.janus-dev/` so a project
+    // repo that imports Janus itself doesn't poison every new Session.
+    let exclude_janus_dev = args.contains(&"--exclude-standard");
+    let mut effective: Vec<&str> = args.to_vec();
+    if exclude_janus_dev {
+        effective.push("--exclude=.janus-dev/");
+    }
+    let output = git_output(root, &effective)?;
     output
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
@@ -383,6 +403,29 @@ fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
         symlink_dir(link, target)?;
     } else {
         symlink_file(link, target)?;
+    }
+    Ok(())
+}
+
+/// Recursively mirror a directory subtree from `source` to `target`. Symlinks
+/// are reproduced as symlinks (via `copy_symlink`); plain files are byte-copied;
+/// nested directories recurse. `target` is wiped first so the mirror is exact.
+fn copy_dir_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let name = entry.file_name();
+        let to = target.join(&name);
+        let metadata = entry.metadata()?;
+        if metadata.file_type().is_symlink() {
+            copy_symlink(&from, &to)?;
+        } else if metadata.is_file() {
+            remove_path(&to)?;
+            std::fs::copy(&from, &to)?;
+        } else if metadata.is_dir() {
+            copy_dir_tree(&from, &to)?;
+        }
     }
     Ok(())
 }

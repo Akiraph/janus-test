@@ -75,10 +75,21 @@ test("a browser message completes through the live supervisor", async ({ page })
 
   const composer = page.getByPlaceholder(/Send a message/i);
   await expect(composer).toBeVisible();
-  await composer.fill("Complete this through the live supervisor");
+  await composer.fill("你好");
   await page.getByRole("button", { name: "Send message" }).click();
 
-  await expect(page.getByText("Complete this through the live supervisor")).toBeVisible();
+  const userBubble = page.locator(".session-message__bubble").filter({ hasText: "你好" }).last();
+  await expect(userBubble).toBeVisible();
+  const bubbleBox = await userBubble.boundingBox();
+  expect(bubbleBox?.width).toBeGreaterThan(bubbleBox?.height ?? Number.POSITIVE_INFINITY);
+
+  // Streaming provisional text renders as plain text (not parsed as markdown
+  // while deltas arrive), then settles to the durable markdown once the Round
+  // completes. The durable assistant message contains the heading + list item,
+  // so "Live fixture reply" is the stable visible signal across both phases.
+  await expect(page.getByText("Working...", { exact: true })).toBeVisible({
+    timeout: 10_000,
+  });
   await expect(page.getByText("Live fixture reply")).toBeVisible({ timeout: 30_000 });
 
   const session = await page.request.get(`/api/v1/sessions/${live.sessionId}`);

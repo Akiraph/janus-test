@@ -22,15 +22,48 @@ export interface TimelineAttachment {
   byteSize: number;
 }
 
+export type ToolStatus = "success" | "failure" | "running";
+
+export type ToolDisplayBody =
+  | { kind: "none" }
+  | { kind: "text"; text: string }
+  | { kind: "structured"; value: unknown }
+  | { kind: "patch"; patch: string }
+  | {
+      kind: "command_output";
+      command: string;
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+      truncated: boolean;
+    }
+  | { kind: "error"; code: string; detail: string };
+
+export interface ToolView {
+  title: string;
+  status: ToolStatus;
+  body: ToolDisplayBody;
+  expandable: boolean;
+  lowNoise: boolean;
+}
+
 export type SessionTimelineItem =
   | (TimelineItemBase & { type: "user"; text: string; attachments: TimelineAttachment[] })
-  | (TimelineItemBase & { type: "assistant"; text: string })
+  | (TimelineItemBase & {
+      type: "assistant";
+      text: string;
+      reasoning: string;
+      roundId: string | null;
+      /** Wall-clock ms the bound round spent producing this message. */
+      durationMs: number | null;
+    })
   | (TimelineItemBase & { type: "steer"; text: string })
   | (TimelineItemBase & {
       type: "tool";
       toolName: string;
       toolStatus: string;
       summary: unknown;
+      view: ToolView;
     })
   | (TimelineItemBase & {
       type: "plan";
@@ -99,7 +132,14 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
         attachments: decodeAttachments(projection.attachments),
       };
     case "assistant_message":
-      return { ...base, type: "assistant", text: text(projection.text) };
+      return {
+        ...base,
+        type: "assistant",
+        text: text(projection.text),
+        reasoning: text(projection.reasoning),
+        roundId: optionalText(projection.round_id),
+        durationMs: typeof projection.duration_ms === "number" ? projection.duration_ms : null,
+      };
     case "steer":
       return { ...base, type: "steer", text: text(projection.text) };
   }
@@ -184,22 +224,92 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
   }
 
   if (item.kind === "tool_call") {
+    const view = parseToolView(summary);
     return {
       ...base,
       type: "tool",
       toolName: text(projection.tool_name, "Tool"),
       toolStatus: toolStatus(projection, item.status),
       summary: projection.summary ?? {},
+      view,
     };
   }
 
   return { ...base, type: "unknown", raw: item.projection };
 }
 
-function isPlan(kind: string, toolName: string): boolean {
-  return kind === "plan" || kind === "plan_version" || toolName === "update_plan";
+function normalizeToolStatus(raw: string): ToolStatus {
+  const lower = raw.toLowerCase();
+  if (lower === "failed" || lower === "failure" || lower === "error") return "failure";
+  if (lower === "running" || lower === "requested" || lower === "pending") return "running";
+  return "success";
 }
 
+function parseToolView(summary: Projection): ToolView {
+  const display = asRecord(summary.display);
+  const title = text(display.title).trim();
+  const version = display.version;
+  if (version !== 1 || !title) {
+    return {
+      title: "Invalid Tool output",
+      status: "failure",
+      body: {
+        kind: "error",
+        code: "INVALID_TOOL_DISPLAY",
+        detail: "The Tool result does not contain a supported display projection.",
+      },
+      expandable: true,
+      lowNoise: false,
+    };
+  }
+  const body = decodeToolDisplayBody(display.body);
+  return {
+    title,
+    status: normalizeToolStatus(text(display.status)),
+    body,
+    expandable: body.kind !== "none",
+    lowNoise: false,
+  };
+}
+
+function decodeToolDisplayBody(value: unknown): ToolDisplayBody {
+  const body = asRecord(value);
+  switch (body.kind) {
+    case "none":
+      return { kind: "none" };
+    case "text":
+      return { kind: "text", text: text(body.text) };
+    case "structured":
+      return { kind: "structured", value: body.value };
+    case "patch":
+      return { kind: "patch", patch: text(body.patch) };
+    case "command_output":
+      return {
+        kind: "command_output",
+        command: text(body.command),
+        stdout: text(body.stdout),
+        stderr: text(body.stderr),
+        exitCode: typeof body.exit_code === "number" ? body.exit_code : null,
+        truncated: body.truncated === true,
+      };
+    case "error":
+      return {
+        kind: "error",
+        code: text(body.code, "TOOL_EXECUTION_FAILED"),
+        detail: text(body.detail, "Tool execution failed"),
+      };
+    default:
+      return {
+        kind: "error",
+        code: "INVALID_TOOL_DISPLAY_BODY",
+        detail: "The Tool result body is not supported.",
+      };
+  }
+}
+
+function isPlan(kind: string, toolName: string): boolean {
+  return kind === "plan" || kind === "plan_version" || toolName === "todo";
+}
 function isAsk(kind: string, toolName: string): boolean {
   return kind === "ask" || toolName === "ask_user" || toolName === "ask";
 }
@@ -300,4 +410,20 @@ function stringList(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map((choice) => (typeof choice === "string" ? choice : String(choice))).filter(Boolean)
     : [];
+}
+
+/**
+ * Human-readable "thinking time" for an assistant message, e.g. "for 4s",
+ * "for 1m 12s". Rendered in the Thought row title as "Thought for {duration}".
+ * - <3000ms → "for a while" (too short to be meaningful as a stopwatch).
+ * - null/missing → "" (caller shows just "Thought" with no trailing duration).
+ */
+export function formatThoughtDuration(durationMs: number | null | undefined): string {
+  if (durationMs == null || !Number.isFinite(durationMs) || durationMs < 0) return "";
+  if (durationMs < 3000) return "for a while";
+  const totalSeconds = Math.round(durationMs / 1000);
+  if (totalSeconds < 60) return `for ${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return seconds === 0 ? `for ${minutes}m` : `for ${minutes}m ${seconds}s`;
 }

@@ -1,8 +1,10 @@
 //! Turn execution loop (M3 Stage 4).
 
+use std::future::Future;
+
 use crate::modules::models::interface::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
-    ModelsInterface, ToolSpec,
+    ModelsInterface, StreamChannel, ToolSpec,
 };
 use crate::modules::projects::interface::ProjectsInterface;
 use crate::modules::runtime::interface::{JobProjection, JobStatus};
@@ -23,9 +25,11 @@ use sqlx::{SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
 use super::context::SYSTEM_PROMPT;
-use super::registry::{SCHEMA_VERSION, registry};
-use super::retry::{FaultClass, MAX_ATTEMPTS_PER_CANDIDATE, RetryDecision, classify};
-use super::tools::{ToolContext, execute_tool, read_attachment_bytes, supported_image_mime};
+use super::registry::{SCHEMA_VERSION, available_tools};
+use super::retry::{FaultClass, MAX_ATTEMPTS_PER_CANDIDATE, classify, classify_fault};
+use super::tools::{
+    ToolContext, attach_tool_display, execute_tool, read_attachment_bytes, supported_image_mime,
+};
 pub use super::types::{
     AskAnswer, AskAnswerDisposition, AskClosure, AskMode, AskRequest, AskStatus, CompletionSummary,
     ExpiredAsk, SupervisorError, ToolCallSettlement, ToolCallStatus, ToolExecutionDisposition,
@@ -165,7 +169,16 @@ impl SupervisorInterface {
             );
         }
 
-        let tools: Vec<ToolSpec> = registry()
+        let has_runtime = self.runtime.is_some();
+        let has_attachments = !self
+            .sessions
+            .list_attachments(session_id)
+            .await
+            .map_err(|error| {
+                SupervisorError::Internal(anyhow::anyhow!("list attachments: {error}"))
+            })?
+            .is_empty();
+        let tools: Vec<ToolSpec> = available_tools(has_runtime, has_attachments)
             .into_iter()
             .map(|t| ToolSpec {
                 name: t.name.into(),
@@ -207,6 +220,10 @@ impl SupervisorInterface {
 
             let round_id = RoundId::new();
             let now = format_utc(SystemClock.now());
+            // The round start timestamp; threaded through to the assistant_message
+            // projection so the UI can render "Thought for {duration}" — the only
+            // place upstream "thinking time" becomes user-visible.
+            let round_started_at = now.clone();
             let version = format!("v_{}", RoundId::new());
             let mut work = self.unit_of_work.begin().await?;
             if !self
@@ -265,39 +282,95 @@ impl SupervisorInterface {
                 turn_id: Some(turn_id.to_string()),
             };
 
-            let events = self.try_round_stream(req).await?;
+            let stream_events = self.events.clone();
+            let stream_actor = actor.clone();
+            let stream_project_id = turn.project_id.to_string();
+            let stream_session_id = session_id.to_string();
+            let stream_turn_id = turn_id.to_string();
+            let stream_round_id = round_id.to_string();
+            let mut publish_stream_event = move |event: ModelStreamEvent| {
+                let events = stream_events.clone();
+                let actor = stream_actor.clone();
+                let project_id = stream_project_id.clone();
+                let session_id = stream_session_id.clone();
+                let turn_id = stream_turn_id.clone();
+                let round_id = stream_round_id.clone();
+                async move {
+                    match event {
+                        ModelStreamEvent::Delta {
+                            attempt_id,
+                            sequence,
+                            channel,
+                            text,
+                            provisional,
+                        } => {
+                            let channel = match channel {
+                                StreamChannel::Text => "text",
+                                StreamChannel::ReasoningSummary => "reasoning_summary",
+                                StreamChannel::ToolCallPreview => "tool_call_preview",
+                            };
+                            let _ = events
+                                .append(NewEvent {
+                                    event_type: "model.stream_delta".into(),
+                                    actor,
+                                    resource: Some(json!({"kind": "round", "id": round_id})),
+                                    correlation_id: CorrelationId::new().to_string(),
+                                    causation_id: None,
+                                    payload: json!({
+                                        "project_id": project_id,
+                                        "session_id": session_id,
+                                        "turn_id": turn_id,
+                                        "round_id": round_id,
+                                        "attempt_id": attempt_id,
+                                        "sequence": sequence,
+                                        "channel": channel,
+                                        "delta": text,
+                                        "provisional": provisional,
+                                    }),
+                                })
+                                .await;
+                        }
+                        ModelStreamEvent::Retrying {
+                            attempt_id,
+                            attempt,
+                            detail,
+                            retry_after_ms,
+                        } => {
+                            let _ = events
+                                .append(NewEvent {
+                                    event_type: "model.attempt_retrying".into(),
+                                    actor,
+                                    resource: Some(json!({"kind": "turn", "id": turn_id})),
+                                    correlation_id: CorrelationId::new().to_string(),
+                                    causation_id: None,
+                                    payload: json!({
+                                        "project_id": project_id,
+                                        "session_id": session_id,
+                                        "turn_id": turn_id,
+                                        "round_id": round_id,
+                                        "attempt_id": attempt_id,
+                                        "attempt": attempt,
+                                        "max_attempts": MAX_ATTEMPTS_PER_CANDIDATE - 1,
+                                        "detail": detail,
+                                        "retry_after_ms": retry_after_ms,
+                                    }),
+                                })
+                                .await;
+                        }
+                        // Completed/Failed tool-call deltas and terminal Completed
+                        // do not need a live SSE frame — the next turn.status_changed
+                        // / timeline.item_created event carries the durable result.
+                        ModelStreamEvent::ToolCallDelta { .. }
+                        | ModelStreamEvent::Completed { .. }
+                        | ModelStreamEvent::Failed { .. } => {}
+                    }
+                }
+            };
+            let events = self
+                .try_round_stream(req, &mut publish_stream_event)
+                .await?;
             if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
                 return Ok(TurnExecutionOutcome::default());
-            }
-            // Emit provisional deltas as public events (best-effort).
-            for ev in &events {
-                if let ModelStreamEvent::Delta {
-                    attempt_id,
-                    sequence,
-                    text,
-                    provisional,
-                    ..
-                } = ev
-                {
-                    let _ = self
-                        .events
-                        .append(NewEvent {
-                            event_type: "model.stream_delta".into(),
-                            actor: actor.clone(),
-                            resource: Some(json!({"kind": "round", "id": round_id.to_string()})),
-                            correlation_id: CorrelationId::new().to_string(),
-                            causation_id: None,
-                            payload: json!({
-                                "round_id": round_id.to_string(),
-                                "attempt_id": attempt_id,
-                                "sequence": sequence,
-                                "channel": "text",
-                                "delta": text,
-                                "provisional": provisional,
-                            }),
-                        })
-                        .await;
-                }
             }
 
             let completed = events.iter().find_map(|e| match e {
@@ -307,17 +380,20 @@ impl SupervisorInterface {
                     stop_reason,
                     tool_calls,
                     text,
+                    reasoning,
                 } => Some((
                     attempt_id.clone(),
                     usage.clone(),
                     stop_reason.clone(),
                     tool_calls.clone(),
                     text.clone(),
+                    reasoning.clone(),
                 )),
                 _ => None,
             });
 
-            let Some((attempt_id, usage, stop_reason, tool_calls, text)) = completed else {
+            let Some((attempt_id, usage, stop_reason, tool_calls, text, reasoning)) = completed
+            else {
                 // Failed stream — no tool execution. Retryable provider faults
                 // park the Turn in `waiting_for_model` so the user/UI can call
                 // retry-model; deterministic faults fail the Turn immediately.
@@ -332,8 +408,8 @@ impl SupervisorInterface {
                     .unwrap_or_else(|| "stream failed".into());
                 self.fail_round(session_id, turn_id, &round_id, &detail)
                     .await?;
-                let decision = classify_failed(&events).expect("Failed event present");
-                if decision.class == FaultClass::Transient {
+                let class = classify_failed(&events).expect("Failed event present");
+                if class == FaultClass::Transient {
                     self.enter_waiting_for_model(session_id, turn_id, &detail)
                         .await?;
                 } else {
@@ -347,11 +423,13 @@ impl SupervisorInterface {
                     session_id,
                     turn_id,
                     &round_id,
+                    round_started_at.as_str(),
                     &attempt_id,
                     usage.input_tokens as i64,
                     usage.output_tokens as i64,
                     stop_reason.as_deref(),
                     &text,
+                    &reasoning,
                     &tool_calls,
                     &actor,
                 )
@@ -447,11 +525,11 @@ impl SupervisorInterface {
     }
 }
 
-/// Inspect the streamed events and return a `RetryDecision` only if the stream
-/// ended in `Failed` (no `Completed`). Used both by `try_round_stream`'s inner
-/// loop and by the Round-level posture: a `Transient` final failure parks the
-/// Turn on `waiting_for_model`; `Config`/`Fatal` fail it.
-fn classify_failed(events: &[ModelStreamEvent]) -> Option<RetryDecision> {
+/// Inspect the streamed events and return the fault class only when the stream
+/// ended in `Failed` (no `Completed`). Used by the Round-level posture: a
+/// `Transient` final failure (retries exhausted) parks the Turn on
+/// `waiting_for_model` so the UI can surface the reason; `Config` fails it.
+fn classify_failed(events: &[ModelStreamEvent]) -> Option<FaultClass> {
     let failed = events.iter().rev().find_map(|e| match e {
         ModelStreamEvent::Failed {
             code,
@@ -460,14 +538,7 @@ fn classify_failed(events: &[ModelStreamEvent]) -> Option<RetryDecision> {
         } => Some((code.clone(), detail.clone())),
         _ => None,
     })?;
-    // Count how many earlier Failed events preceded this one so the backoff
-    // schedule advances across retry attempts within a candidate.
-    let prior = events
-        .iter()
-        .filter(|e| matches!(e, ModelStreamEvent::Failed { .. }))
-        .count()
-        .saturating_sub(1);
-    Some(classify(&failed.0, &failed.1, prior))
+    Some(classify_fault(&failed.0, &failed.1))
 }
 
 fn tool_result_message(outcome: &ToolOutcome, provider_call_id: &str) -> (ChatMessage, Value) {
@@ -731,34 +802,61 @@ impl SupervisorInterface {
     /// durable footprint is the `model_attempts` rows the stream layer already
     /// writes. Usage from any succeeded attempt is reported by the stream layer
     /// in its `Completed` event and aggregated normally.
-    async fn try_round_stream(
+    async fn try_round_stream<F, Fut>(
         &self,
         req: ModelRequest,
-    ) -> Result<Vec<ModelStreamEvent>, SupervisorError> {
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, SupervisorError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let mut last_events: Vec<ModelStreamEvent> = Vec::new();
+        // `attempt` is the *attempt* index, 0-based: 0 is the initial attempt,
+        // 1..=5 are the retries surfaced to the UI as "Reconnecting (X/5)".
         for attempt in 0..MAX_ATTEMPTS_PER_CANDIDATE {
-            let events = self.models.stream_completion(req.clone()).await?;
-            // Success / non-retryable-fatal / non-retryable-config: stop.
-            let decision = classify_failed(&events);
-            match decision {
-                None => return Ok(events), // Completed — normal path
-                Some(d) => {
-                    last_events = events.clone();
-                    match d.class {
-                        FaultClass::Transient => {
-                            if attempt + 1 < MAX_ATTEMPTS_PER_CANDIDATE {
-                                tokio::time::sleep(d.retry_after).await;
-                                continue;
-                            }
-                            // Out of retries — bubble the Failed up so the
-                            // caller parks on waiting_for_model.
-                            return Ok(events);
-                        }
-                        FaultClass::Config | FaultClass::Fatal => {
-                            // Config/fatal faults are not retried in place.
-                            return Ok(events);
-                        }
+            let events = self
+                .models
+                .stream_completion_with(req.clone(), on_event)
+                .await?;
+            // Success / non-retryable-config: stop.
+            let failed = events.iter().rev().find_map(|e| match e {
+                ModelStreamEvent::Failed {
+                    attempt_id,
+                    code,
+                    detail,
+                } => Some((attempt_id.clone(), code.clone(), detail.clone())),
+                _ => None,
+            });
+            let Some((attempt_id, code, detail)) = failed else {
+                return Ok(events); // Completed — normal path
+            };
+            let retry_attempt = attempt + 1; // retry index the UI surfaces
+            let decision = classify(&code, &detail, retry_attempt);
+            last_events = events.clone();
+            match decision.class {
+                FaultClass::Config => {
+                    // Deterministic fault — re-sending cannot help. Bubble the
+                    // Failed up so the caller parks/fails the Turn.
+                    return Ok(events);
+                }
+                FaultClass::Transient => {
+                    if retry_attempt >= MAX_ATTEMPTS_PER_CANDIDATE {
+                        // Out of retries — bubble the Failed up so the caller
+                        // parks on waiting_for_model with the reason.
+                        return Ok(events);
                     }
+                    // Surface the retry to the UI *before* sleeping, so the
+                    // status row reads "Reconnecting ({retry_attempt}/5): {detail}"
+                    // while the backoff elapses — not only after it.
+                    let retrying = ModelStreamEvent::Retrying {
+                        attempt_id: attempt_id.clone(),
+                        attempt: retry_attempt,
+                        detail: detail.clone(),
+                        retry_after_ms: decision.retry_after.as_millis() as u64,
+                    };
+                    on_event(retrying).await;
+                    tokio::time::sleep(decision.retry_after).await;
                 }
             }
         }
@@ -853,15 +951,24 @@ impl SupervisorInterface {
         session_id: SessionId,
         turn_id: TurnId,
         round_id: &RoundId,
+        round_started_at: &str,
         attempt_id: &str,
         input_tokens: i64,
         output_tokens: i64,
         stop_reason: Option<&str>,
         text: &str,
+        reasoning: &str,
         tool_calls: &[CompletedToolCall],
         actor: &Value,
     ) -> Result<Option<Vec<AcceptedToolCall>>, SupervisorError> {
         let now = format_utc(SystemClock.now());
+        // Elapsed ms from round creation to assistant message acceptance — mirrors
+        // the user-perceived "thinking time". Falls back to None when the start
+        // stamp can't be parsed (defensive; should not happen in practice).
+        let elapsed_ms = (round_started_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .ok())
+        .map(|start| (SystemClock.now() - start).num_milliseconds().max(0));
         let mut work = self.unit_of_work.begin().await?;
         if !self
             .sessions
@@ -879,7 +986,7 @@ impl SupervisorInterface {
         .bind(input_tokens)
         .bind(output_tokens)
         .bind(stop_reason)
-        .bind(json!({"text": text}).to_string())
+        .bind(json!({"text": text, "reasoning": reasoning}).to_string())
         .bind(&now)
         .bind(round_id.to_string())
         .bind(turn_id.to_string())
@@ -897,7 +1004,10 @@ impl SupervisorInterface {
                 AppendAssistantMessage {
                     session_id,
                     turn_id,
+                    round_id: *round_id,
                     text,
+                    reasoning,
+                    duration_ms: elapsed_ms,
                     tool_calls: &declared_calls,
                     actor,
                     now: &now,
@@ -1038,11 +1148,8 @@ impl SupervisorInterface {
         actor: &Value,
     ) -> Result<ChatMessage, SupervisorError> {
         let now = format_utc(SystemClock.now());
-        let summary = json!({
-            "ok": false,
-            "skipped": true,
-            "reason": reason,
-        });
+        let input = serde_json::from_str::<Value>(&accepted.request.arguments_json)
+            .unwrap_or_else(|_| json!({}));
         let text = format!(
             "tool `{}` was not executed because {reason}",
             accepted.request.name
@@ -1054,6 +1161,21 @@ impl SupervisorInterface {
             tool_call_id: Some(accepted.request.id.clone()),
             tool_calls: Vec::new(),
         };
+        let mut outcome = ToolOutcome {
+            disposition: ToolExecutionDisposition::Failed,
+            parts: vec![ToolResultPart::Text { text: text.clone() }],
+            summary: json!({
+                "ok": false,
+                "skipped": true,
+                "reason": reason,
+                "detail": text,
+            }),
+            error_code: Some("TOOL_SKIPPED_AFTER_BLOCK".into()),
+            finish_summary: None,
+            wait: None,
+        };
+        attach_tool_display(&accepted.request.name, &input, &mut outcome);
+        let summary = outcome.summary;
         let mut work = self.unit_of_work.begin().await?;
         let changed = sqlx::query(
             "UPDATE tool_calls SET status = 'canceled', result_summary_json = ?, error_code = ?, \
@@ -1176,19 +1298,24 @@ impl SupervisorInterface {
             Err(error @ SupervisorError::Storage(_))
             | Err(error @ SupervisorError::Serde(_))
             | Err(error @ SupervisorError::Internal(_)) => return Err(error),
-            Err(error) => super::types::ToolOutcome {
-                disposition: ToolExecutionDisposition::Failed,
-                parts: vec![ToolResultPart::Text {
-                    text: error.to_string(),
-                }],
-                summary: json!({
-                    "ok": false,
-                    "error": error.to_string(),
-                }),
-                error_code: Some("TOOL_EXECUTION_FAILED".into()),
-                finish_summary: None,
-                wait: None,
-            },
+            Err(error) => {
+                let mut outcome = super::types::ToolOutcome {
+                    disposition: ToolExecutionDisposition::Failed,
+                    parts: vec![ToolResultPart::Text {
+                        text: error.to_string(),
+                    }],
+                    summary: json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                        "detail": error.to_string(),
+                    }),
+                    error_code: Some("TOOL_EXECUTION_FAILED".into()),
+                    finish_summary: None,
+                    wait: None,
+                };
+                attach_tool_display(&accepted.request.name, &input, &mut outcome);
+                outcome
+            }
         };
         let (message, durable_parts) = tool_result_message(&outcome, &accepted.request.id);
         let ended = format_utc(SystemClock.now());
@@ -1273,8 +1400,8 @@ impl SupervisorInterface {
         if !job.status.is_terminal() {
             return Ok(None);
         }
-        let row: Option<(String, Option<String>, String)> = sqlx::query_as(
-            "SELECT call.tool_name, call.provider_call_id, round.turn_id \
+        let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
+            "SELECT call.tool_name, call.provider_call_id, round.turn_id, call.input_json \
              FROM tool_calls AS call \
              JOIN rounds AS round ON round.id = call.round_id \
              WHERE call.id = ? AND call.status = 'waiting' \
@@ -1284,7 +1411,7 @@ impl SupervisorInterface {
         .bind(job.id.to_string())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((tool_name, provider_call_id, source_turn_id)) = row else {
+        let Some((tool_name, provider_call_id, source_turn_id, input_json)) = row else {
             return Ok(None);
         };
         let provider_call_id = provider_call_id.ok_or_else(|| {
@@ -1321,7 +1448,7 @@ impl SupervisorInterface {
             "log_stream_id": job.log_stream_id.to_string(),
             "command_summary": job.command_summary,
         });
-        let outcome = ToolOutcome {
+        let mut outcome = ToolOutcome {
             disposition,
             parts: vec![ToolResultPart::Text {
                 text: format!(
@@ -1332,11 +1459,14 @@ impl SupervisorInterface {
                     job.log_stream_id,
                 ),
             }],
-            summary: summary.clone(),
+            summary,
             error_code: error_code.map(str::to_owned),
             finish_summary: None,
             wait: None,
         };
+        let input = serde_json::from_str::<Value>(&input_json).unwrap_or_else(|_| json!({}));
+        attach_tool_display(&tool_name, &input, &mut outcome);
+        let summary = outcome.summary.clone();
         let (_, model_parts) = tool_result_message(&outcome, &provider_call_id);
         let changed = sqlx::query(
             "UPDATE tool_calls SET status = ?, result_summary_json = ?, error_code = ?, \
@@ -1798,8 +1928,8 @@ impl SupervisorInterface {
         ask_status: AskStatus,
         now: &str,
     ) -> Result<ToolCallSettlement, SupervisorError> {
-        let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT ask.turn_id, ask.tool_call_id, call.tool_name, call.provider_call_id \
+        let row: Option<(String, String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT ask.turn_id, ask.tool_call_id, call.tool_name, call.provider_call_id, call.input_json \
              FROM asks AS ask \
              JOIN tool_calls AS call ON call.id = ask.tool_call_id \
              JOIN rounds AS round ON round.id = call.round_id \
@@ -1810,7 +1940,8 @@ impl SupervisorInterface {
         .bind(ask_status.as_str())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((source_turn_id, tool_call_id, tool_name, provider_call_id)) = row else {
+        let Some((source_turn_id, tool_call_id, tool_name, provider_call_id, input_json)) = row
+        else {
             return Err(SupervisorError::Internal(anyhow::anyhow!(
                 "settled Ask has no matching waiting Tool Call"
             )));
@@ -1824,7 +1955,7 @@ impl SupervisorInterface {
             "ask_id": ask_id.to_string(),
             "status": ask_status.as_str(),
         });
-        let outcome = ToolOutcome {
+        let mut outcome = ToolOutcome {
             disposition: ToolExecutionDisposition::Succeeded,
             parts: vec![ToolResultPart::Text {
                 text: format!(
@@ -1832,11 +1963,14 @@ impl SupervisorInterface {
                     ask_status.as_str()
                 ),
             }],
-            summary: summary.clone(),
+            summary,
             error_code: None,
             finish_summary: None,
             wait: None,
         };
+        let input = serde_json::from_str::<Value>(&input_json).unwrap_or_else(|_| json!({}));
+        attach_tool_display(&tool_name, &input, &mut outcome);
+        let summary = outcome.summary.clone();
         let (_, model_parts) = tool_result_message(&outcome, &provider_call_id);
         let changed = sqlx::query(
             "UPDATE tool_calls SET status = ?, result_summary_json = ?, error_code = NULL, \
