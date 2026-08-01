@@ -58,6 +58,11 @@ struct ExecutedToolCall {
     message: ChatMessage,
 }
 
+enum CompleteTurnOutcome {
+    Completed,
+    WaitingForJob,
+}
+
 #[derive(Clone)]
 pub struct SupervisorInterface {
     pool: SqlitePool,
@@ -220,10 +225,6 @@ impl SupervisorInterface {
 
             let round_id = RoundId::new();
             let now = format_utc(SystemClock.now());
-            // The round start timestamp; threaded through to the assistant_message
-            // projection so the UI can render "Thought for {duration}" — the only
-            // place upstream "thinking time" becomes user-visible.
-            let round_started_at = now.clone();
             let version = format!("v_{}", RoundId::new());
             let mut work = self.unit_of_work.begin().await?;
             if !self
@@ -303,12 +304,19 @@ impl SupervisorInterface {
                             channel,
                             text,
                             provisional,
+                            usage,
                         } => {
                             let channel = match channel {
                                 StreamChannel::Text => "text",
                                 StreamChannel::ReasoningSummary => "reasoning_summary",
                                 StreamChannel::ToolCallPreview => "tool_call_preview",
                             };
+                            let usage_value = usage.as_ref().map(|u| {
+                                json!({
+                                    "input_tokens": u.input_tokens,
+                                    "output_tokens": u.output_tokens,
+                                })
+                            });
                             let _ = events
                                 .append(NewEvent {
                                     event_type: "model.stream_delta".into(),
@@ -326,6 +334,7 @@ impl SupervisorInterface {
                                         "channel": channel,
                                         "delta": text,
                                         "provisional": provisional,
+                                        "usage": usage_value,
                                     }),
                                 })
                                 .await;
@@ -381,6 +390,7 @@ impl SupervisorInterface {
                     tool_calls,
                     text,
                     reasoning,
+                    reasoning_duration_ms,
                 } => Some((
                     attempt_id.clone(),
                     usage.clone(),
@@ -388,11 +398,20 @@ impl SupervisorInterface {
                     tool_calls.clone(),
                     text.clone(),
                     reasoning.clone(),
+                    *reasoning_duration_ms,
                 )),
                 _ => None,
             });
 
-            let Some((attempt_id, usage, stop_reason, tool_calls, text, reasoning)) = completed
+            let Some((
+                attempt_id,
+                usage,
+                stop_reason,
+                tool_calls,
+                text,
+                reasoning,
+                reasoning_duration_ms,
+            )) = completed
             else {
                 // Failed stream — no tool execution. Retryable provider faults
                 // park the Turn in `waiting_for_model` so the user/UI can call
@@ -423,13 +442,13 @@ impl SupervisorInterface {
                     session_id,
                     turn_id,
                     &round_id,
-                    round_started_at.as_str(),
                     &attempt_id,
                     usage.input_tokens as i64,
                     usage.output_tokens as i64,
                     stop_reason.as_deref(),
                     &text,
                     &reasoning,
+                    reasoning_duration_ms,
                     &tool_calls,
                     &actor,
                 )
@@ -511,12 +530,16 @@ impl SupervisorInterface {
         }
 
         if finished {
-            self.complete_turn(
-                session_id,
-                turn_id,
-                finish_summary.unwrap_or_else(|| CompletionSummary::from_text("")),
-            )
-            .await?;
+            let completion = self
+                .complete_turn(
+                    session_id,
+                    turn_id,
+                    finish_summary.unwrap_or_else(|| CompletionSummary::from_text("")),
+                )
+                .await?;
+            if matches!(completion, CompleteTurnOutcome::WaitingForJob) {
+                return Ok(TurnExecutionOutcome::coordinate(TurnWait::job()));
+            }
         } else {
             self.fail_turn(session_id, turn_id, "max rounds exceeded")
                 .await?;
@@ -951,24 +974,17 @@ impl SupervisorInterface {
         session_id: SessionId,
         turn_id: TurnId,
         round_id: &RoundId,
-        round_started_at: &str,
         attempt_id: &str,
         input_tokens: i64,
         output_tokens: i64,
         stop_reason: Option<&str>,
         text: &str,
         reasoning: &str,
+        reasoning_duration_ms: Option<u64>,
         tool_calls: &[CompletedToolCall],
         actor: &Value,
     ) -> Result<Option<Vec<AcceptedToolCall>>, SupervisorError> {
         let now = format_utc(SystemClock.now());
-        // Elapsed ms from round creation to assistant message acceptance — mirrors
-        // the user-perceived "thinking time". Falls back to None when the start
-        // stamp can't be parsed (defensive; should not happen in practice).
-        let elapsed_ms = (round_started_at
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .ok())
-        .map(|start| (SystemClock.now() - start).num_milliseconds().max(0));
         let mut work = self.unit_of_work.begin().await?;
         if !self
             .sessions
@@ -1007,7 +1023,8 @@ impl SupervisorInterface {
                     round_id: *round_id,
                     text,
                     reasoning,
-                    duration_ms: elapsed_ms,
+                    duration_ms: reasoning_duration_ms
+                        .map(|duration| duration.min(i64::MAX as u64) as i64),
                     tool_calls: &declared_calls,
                     actor,
                     now: &now,
@@ -1503,7 +1520,7 @@ impl SupervisorInterface {
         session_id: SessionId,
         turn_id: TurnId,
         summary: CompletionSummary,
-    ) -> Result<(), SupervisorError> {
+    ) -> Result<CompleteTurnOutcome, SupervisorError> {
         let now = format_utc(SystemClock.now());
         let summary_value = serde_json::to_value(&summary)?;
         let mut work = self.unit_of_work.begin().await?;
@@ -1526,10 +1543,14 @@ impl SupervisorInterface {
                 })?,
             None => false,
         };
-        if unfinished_calls > 0 || unfinished_jobs {
+        if unfinished_calls > 0 {
             return Err(SupervisorError::Internal(anyhow::anyhow!(
-                "Turn completion attempted with unfinished finite work"
+                "Turn completion attempted with unfinished Tool Calls"
             )));
+        }
+        if unfinished_jobs {
+            work.rollback().await?;
+            return Ok(CompleteTurnOutcome::WaitingForJob);
         }
         let (input_tokens, output_tokens): (i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
@@ -1554,7 +1575,7 @@ impl SupervisorInterface {
             .await?;
         let Some(transition) = transition else {
             work.rollback().await?;
-            return Ok(());
+            return Ok(CompleteTurnOutcome::Completed);
         };
         work.append_event(NewEvent {
             event_type: "turn.status_changed".into(),
@@ -1574,7 +1595,7 @@ impl SupervisorInterface {
         })
         .await?;
         work.commit().await?;
-        Ok(())
+        Ok(CompleteTurnOutcome::Completed)
     }
 
     async fn fail_turn(

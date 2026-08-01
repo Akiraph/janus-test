@@ -44,13 +44,11 @@ pub struct RetryDecision {
 /// counts retries, so the retry index runs 1..=5.
 pub const MAX_ATTEMPTS_PER_CANDIDATE: usize = 6;
 
-/// Short, near-linear backoff (500ms, 1s, 1.5s, 2s, 2.5s) so a brief transport
-/// hiccup is retried within ~2s rather than the multi-second exponential of the
-/// earlier schedule. Index is the retry we are about to perform (1-based),
-/// bounded to 5.
-fn retry_backoff(attempt: usize) -> Duration {
-    let retry = attempt.clamp(1, 5) as u64;
-    Duration::from_millis(500 * retry)
+/// Fixed 10-second backoff for all transient faults so the user sees the
+/// attempt counter climb at a predictable cadence. Config faults never retry
+/// (zero backoff); the class is the only meaningful signal for them.
+fn retry_backoff(_attempt: usize) -> Duration {
+    Duration::from_secs(10)
 }
 
 /// Classify a provider fault. `attempt` is the retry index we are about to make
@@ -121,14 +119,13 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_is_transient_with_backoff() {
-        // HTTP 429 is quota/rate, which is now retried (resolves when the window
-        // resets) rather than parked. attempt=1 is the first retry.
+    fn rate_limit_is_transient_with_fixed_10s() {
+        // HTTP 429 is quota/rate, retried at a fixed 10-second interval.
         let d = classify("PROVIDER_STREAM_FAILED", "provider HTTP 429", 1);
         assert_eq!(d.class, FaultClass::Transient);
-        assert_eq!(d.retry_after, Duration::from_millis(500));
+        assert_eq!(d.retry_after, Duration::from_secs(10));
         let d2 = classify("PROVIDER_STREAM_FAILED", "provider HTTP 429", 3);
-        assert_eq!(d2.retry_after, Duration::from_millis(1500));
+        assert_eq!(d2.retry_after, Duration::from_secs(10));
     }
 
     #[test]
@@ -146,10 +143,10 @@ mod tests {
     }
 
     #[test]
-    fn backoff_is_short_and_linear() {
-        // The schedule is 500ms * retry, bounded at 5 retries (2.5s).
+    fn backoff_is_fixed_10s() {
+        // All transient faults retry at a fixed 10-second interval.
         let d = classify("PROVIDER_STREAM_FAILED", "provider HTTP 503", 9);
         assert_eq!(d.class, FaultClass::Transient);
-        assert_eq!(d.retry_after, Duration::from_millis(2500));
+        assert_eq!(d.retry_after, Duration::from_secs(10));
     }
 }

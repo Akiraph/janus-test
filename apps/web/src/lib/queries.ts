@@ -1,9 +1,10 @@
-import { createQuery } from "@tanstack/solid-query";
+import { createQuery, useQueryClient } from "@tanstack/solid-query";
 import {
   getBootstrap,
   getMe,
   getProject,
   getProviders,
+  getQueuedTurns,
   getSession,
   getSessionContext,
   getSessionDiff,
@@ -16,7 +17,9 @@ import {
   listGithubCredentials,
   listProjects,
   listSessions,
+  type SessionSummary,
 } from "./api";
+import { sessionTimelineRefetchInterval } from "./queryPolicy";
 
 export function useBootstrap() {
   return createQuery(() => ({
@@ -137,22 +140,19 @@ export function useSessionContext(sessionId: () => string | undefined) {
 }
 
 export function useSessionTimeline(sessionId: () => string | undefined) {
+  const queryClient = useQueryClient();
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["session-timeline", id],
       queryFn: () => getSessionTimeline(id as string, { limit: 100 }),
       enabled: Boolean(id),
-      // Poll only while a turn is running. Constant 1.5s polling on idle sessions
-      // was burning requests and re-suspending the main surface for no benefit.
+      // Poll only while a turn is running. Constant 3s polling on idle sessions
+      // burns requests and re-suspending the main surface for no benefit.
       refetchInterval: (query) => {
-        // Parent session query lives under ["session", id]; if we cannot see
-        // activity from the timeline alone, fall back to a slow idle poll only
-        // when the last page already has items (active conversation). Empty
-        // timelines stay quiet until the user sends a message.
         const items = query.state.data?.items ?? [];
-        if (items.length === 0) return false;
-        return 3000;
+        const session = queryClient.getQueryData<SessionSummary>(["session", id]);
+        return sessionTimelineRefetchInterval(items.length, session);
       },
     };
   });
@@ -194,6 +194,24 @@ export function useTurn(sessionId: () => string | undefined, turnId: () => strin
         }
         return false;
       },
+    };
+  });
+}
+
+export function useQueuedTurns(
+  sessionId: () => string | undefined,
+  activeTurnId: () => string | null | undefined,
+) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["queued-turns", id],
+      queryFn: () => getQueuedTurns(id as string),
+      enabled: Boolean(id),
+      // The queue only changes on send/cancel/promote, all of which emit SSE
+      // events that invalidate this query. Poll only while a turn is active
+      // as a fallback so the bar updates when promotion fires.
+      refetchInterval: activeTurnId() ? 3000 : false,
     };
   });
 }

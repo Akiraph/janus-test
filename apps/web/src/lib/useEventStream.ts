@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/solid-query";
 import { createSignal, onCleanup, onMount } from "solid-js";
-import { ingestRetryEvent } from "./modelRetryState";
+import { getLastEventCursor, setLastEventCursor } from "./eventCursor";
+import { clearRetryStateOnStreamDelta, ingestRetryEvent } from "./modelRetryState";
 import { ingestModelStreamEvent } from "./modelStream";
 
 export type ConnectionState = "connecting" | "live" | "reconnecting" | "offline";
@@ -25,6 +26,7 @@ export function useEventStream() {
     const payload = envelope.payload ?? {};
 
     if (type === "model.stream_delta") {
+      clearRetryStateOnStreamDelta(payload);
       ingestModelStreamEvent(type, payload);
       return;
     }
@@ -95,7 +97,7 @@ export function useEventStream() {
       type === "turn.status_changed" ||
       type === "timeline.item_created" ||
       type === "timeline.item_updated" ||
-      type === "model.attempt_changed" ||
+      type === "model.attempt_retrying" ||
       type === "tool_call.created" ||
       type === "tool_call.changed" ||
       type === "round.changed" ||
@@ -113,6 +115,7 @@ export function useEventStream() {
         void queryClient.invalidateQueries({ queryKey: ["session-timeline", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["session-diff", sessionId] });
         void queryClient.invalidateQueries({ queryKey: ["turn", sessionId] });
+        void queryClient.invalidateQueries({ queryKey: ["queued-turns", sessionId] });
         if (type === "context.changed") {
           void queryClient.invalidateQueries({ queryKey: ["session-context", sessionId] });
         }
@@ -159,12 +162,23 @@ export function useEventStream() {
       return;
     }
     setState(state() === "connecting" ? "connecting" : "reconnecting");
-    source = new EventSource("/api/v1/events");
+    // Resume from the last durable cursor so a reconnect (incl. after page
+    // refresh) does not replay the entire retained history. EventSource also
+    // auto-sends `Last-Event-ID` from the browser; the backend requires it to
+    // match this `after` value (CURSOR_MISMATCH otherwise), so the cursor we
+    // persisted must be the same one the browser remembers.
+    const cursor = getLastEventCursor();
+    const url = cursor ? `/api/v1/events?after=${encodeURIComponent(cursor)}` : "/api/v1/events";
+    source = new EventSource(url);
     source.addEventListener("open", () => setState("live"));
     source.addEventListener("janus", (event) => {
       void queryClient.invalidateQueries({ queryKey: ["system-info"] });
       try {
         const data = JSON.parse((event as MessageEvent).data) as EventEnvelopeLike;
+        // Advance the durable cursor from the SSE `id:` frame so the next
+        // reconnect resumes after this event.
+        const id = (event as MessageEvent).lastEventId;
+        if (id) setLastEventCursor(id);
         invalidateForEvent(data);
       } catch {
         // Keep the stream resilient; a single malformed frame must not break UI.

@@ -12,7 +12,7 @@ use crate::{
     AppState,
     application::session_flow::PostSessionMessage,
     modules::sessions::interface::{
-        AttachmentView, CancelResult, MAX_ATTACHMENT_BYTES, MessageRouteResult,
+        AttachmentView, CancelResult, MAX_ATTACHMENT_BYTES, MessageRouteResult, QueuedTurnItem,
         SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage,
         TurnSummary,
     },
@@ -435,6 +435,32 @@ pub async fn delete_attachment(
         tracing::warn!(%error, %attachment_id, "drop deleted attachment reference");
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/sessions/{id}/queued-turns",
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = DataResponse<Vec<QueuedTurnItem>>),
+        (status = 404, body = Problem)
+    )
+)]
+pub async fn queued_turns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DataResponse<Vec<QueuedTurnItem>>>, Problem> {
+    let _auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let data = state
+        .sessions()
+        .queued_turns(session_id)
+        .await
+        .map_err(sessions_problem)?;
+    Ok(Json(DataResponse { data }))
 }
 
 #[utoipa::path(

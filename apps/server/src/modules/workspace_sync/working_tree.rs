@@ -53,12 +53,16 @@ impl GitTreeState {
     }
 }
 
-pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<()> {
-    let mut changed = git_paths(main, &["diff", "--name-only", "-z", "HEAD", "--"])?;
+pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<Vec<String>> {
+    let mut changed = git_paths(
+        main,
+        &["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"],
+    )?;
     changed.extend(git_paths(
         main,
         &["ls-files", "-z", "--others", "--exclude-standard"],
     )?);
+    let changed_paths = changed.iter().cloned().collect();
     for path in changed {
         let rel = validate_workspace_path(&path)?;
         let source = main.join(&rel);
@@ -94,7 +98,7 @@ pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<()>
                 .with_context(|| format!("copy managed tree {} into Session", path))?;
         }
     }
-    Ok(())
+    Ok(changed_paths)
 }
 
 pub async fn diff_working_trees(session: &Path, main: &Path) -> anyhow::Result<DiffSummary> {
@@ -189,6 +193,37 @@ pub async fn hash_working_tree(root: &Path) -> anyhow::Result<ManifestRoot> {
     }
     let (root_hash, nodes) = tree.finish("");
     Ok(ManifestRoot { root_hash, nodes })
+}
+
+pub async fn rehash_working_tree_paths(
+    root: &Path,
+    base: &ManifestRoot,
+    changed_paths: &[String],
+) -> anyhow::Result<ManifestRoot> {
+    let mut nodes = base.nodes.clone();
+    for path in changed_paths {
+        let rel = validate_workspace_path(path)?;
+        if root.join(&rel).is_dir() {
+            return hash_working_tree(root).await;
+        }
+        nodes.remove(path);
+        if let Some((path, node)) = read_manifest_file(root, path.clone()).await? {
+            nodes.insert(path, node);
+        }
+    }
+
+    let mut tree = ManifestTree::default();
+    for (path, node) in nodes {
+        if matches!(node.kind, NodeKind::File) {
+            tree.insert(&path, node)?;
+        }
+    }
+    let (root_hash, nodes) = tree.finish("");
+    Ok(ManifestRoot { root_hash, nodes })
+}
+
+pub fn git_head(root: &Path) -> anyhow::Result<String> {
+    git_text(root, &["rev-parse", "HEAD"])
 }
 
 struct ManagedFile {

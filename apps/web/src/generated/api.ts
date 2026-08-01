@@ -868,6 +868,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/sessions/{id}/queued-turns": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["queued_turns"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/sessions/{id}/steer": {
     parameters: {
       query?: never;
@@ -1585,6 +1601,19 @@ export interface components {
         updated_at: string;
       }[];
     };
+    DataResponse_Vec_QueuedTurnItem: {
+      data: {
+        /**
+         * @description Best-effort message text extracted from the queued user message body.
+         *     Empty when there is no associated message or the body is non-textual.
+         */
+        message_text: string;
+        /** Format: int64 */
+        sequence: number;
+        turn_id: string;
+        version: string;
+      }[];
+    };
     DataResponse_Vec_SessionSummary: {
       data: {
         active_turn_id?: string | null;
@@ -1931,6 +1960,21 @@ export interface components {
       max_file_bytes: number;
       /** Format: int64 */
       max_message_bytes: number;
+    };
+    /**
+     * @description A queued Turn shown in the conversation's QueuedMessagesBar: enough to
+     *     render the message text and delete (cancel) the Turn out of order.
+     */
+    QueuedTurnItem: {
+      /**
+       * @description Best-effort message text extracted from the queued user message body.
+       *     Empty when there is no associated message or the body is non-textual.
+       */
+      message_text: string;
+      /** Format: int64 */
+      sequence: number;
+      turn_id: string;
+      version: string;
     };
     ReadyResponse: {
       database: string;
@@ -4757,6 +4801,35 @@ export interface operations {
         };
       };
       409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  queued_turns: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_QueuedTurnItem"];
+        };
+      };
+      404: {
         headers: {
           [name: string]: unknown;
         };

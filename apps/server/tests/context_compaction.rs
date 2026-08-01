@@ -5,7 +5,7 @@
 //! record are tested independently of automatic Round wiring.
 
 use janus_server::modules::supervisor::context::{
-    SYSTEM_PREFIX_VERSION, latest_compact_summary, record_context_version, schedule_compact,
+    latest_compact_summary, record_context_version, schedule_compact,
 };
 use janus_server::platform::database::Database;
 use janus_server::platform::id::SessionId;
@@ -43,17 +43,16 @@ async fn record_context_version_advances_sequence() -> anyhow::Result<()> {
     )
     .await?;
     assert_ne!(id1, id2);
-    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, system_prefix_version, estimated_input_tokens, compact_status \
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT id, estimated_input_tokens, compact_status \
          FROM context_versions WHERE session_id = ? ORDER BY sequence",
     )
     .bind(sid.to_string())
     .fetch_all(&pool)
     .await?;
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].1, SYSTEM_PREFIX_VERSION);
-    assert_eq!(rows[0].2, 100);
-    assert_eq!(rows[1].3, "not_needed");
+    assert_eq!(rows[0].1, 100);
+    assert_eq!(rows[1].2, "not_needed");
     Ok(())
 }
 

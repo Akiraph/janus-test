@@ -13,6 +13,7 @@ import type { TerminalProjection, TerminalTicket } from "../../../lib/api";
 import {
   closeTerminal,
   createTerminal,
+  getErrorMessage,
   issueTerminalTicket,
   listTerminals,
   signalTerminal,
@@ -138,7 +139,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
       ticket = await issueTerminalTicket(projection.id);
     } catch (err) {
       setStatus("error");
-      setError(err instanceof Error ? err.message : "Failed to issue terminal ticket");
+      setError(getErrorMessage(err, "Failed to issue terminal ticket"));
       return;
     }
     if (disposed) return;
@@ -177,7 +178,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
             status?: string;
           };
           if (frame.kind === "error") {
-            setError(frame.detail ?? "Terminal stream error");
+            setError(getErrorMessage(frame, "Terminal stream error"));
             setStatus("error");
             return;
           }
@@ -206,7 +207,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
     ws.addEventListener("error", () => {
       if (disposed) return;
       setStatus("error");
-      setError("Terminal connection failed");
+      setError("Terminal connection failed: the WebSocket closed before the terminal became live.");
     });
   }
 
@@ -235,7 +236,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
       await connectTo(created);
     } catch (err) {
       setStatus("error");
-      setError(err instanceof Error ? err.message : "Failed to open terminal");
+      setError(getErrorMessage(err, "Failed to open terminal"));
     }
   }
 
@@ -253,7 +254,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
     try {
       await signalTerminal(id, "ctrl_c");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Signal failed");
+      setError(getErrorMessage(err, "Signal failed"));
     }
   }
 
@@ -269,7 +270,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
       setStatus("closed");
       invalidateList();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Close failed");
+      setError(getErrorMessage(err, "Close failed"));
     }
   }
 

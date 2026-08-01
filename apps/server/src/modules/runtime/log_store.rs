@@ -185,7 +185,9 @@ impl LogStore {
             .rows_affected()
             == 0
         {
-            return Err(RuntimeError::RuntimeUnavailable);
+            return Err(RuntimeError::unavailable(format!(
+                "log stream {id} does not exist"
+            )));
         }
         self.projection_unlocked(id).await
     }
@@ -285,7 +287,7 @@ impl LogStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_error)?
-        .ok_or(RuntimeError::RuntimeUnavailable)
+        .ok_or_else(|| RuntimeError::unavailable(format!("log stream {id} does not exist")))
     }
 }
 
@@ -494,8 +496,8 @@ fn to_i64(value: u64) -> Result<i64, RuntimeError> {
         .map_err(|_| RuntimeError::InvalidSpec("log cursor exceeds SQLite range".into()))
 }
 
-fn storage_error(_error: impl Into<anyhow::Error>) -> RuntimeError {
-    RuntimeError::RuntimeUnavailable
+fn storage_error(error: impl Into<anyhow::Error>) -> RuntimeError {
+    RuntimeError::unavailable(format!("log storage failure: {}", error.into()))
 }
 
 #[cfg(test)]

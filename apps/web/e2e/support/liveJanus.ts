@@ -7,35 +7,25 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CONTROL_ORIGIN = "http://127.0.0.1:4317";
-const FINISH_STREAM = [
-  'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Live fixture reply"}}]}',
-  "",
-  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_f","type":"function","function":{"name":"finish","arguments":""}}]}}]}',
-  "",
-  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"summary\\":\\"fixture complete\\"}"}}]}}]}',
-  "",
-  'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}',
-  "",
-  "data: [DONE]",
-  "",
-  "",
-].join("\n");
 
-const DELAYED_MARKDOWN_START =
-  'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"## Live stream"}}]}\n\n';
-const DELAYED_MARKDOWN_END = [
-  'data: {"choices":[{"index":0,"delta":{"content":"\n\n- Live fixture reply"}}]}',
-  "",
-  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_f","type":"function","function":{"name":"finish","arguments":""}}]}}]}',
-  "",
-  'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"summary\\":\\"fixture complete\\"}"}}]}}]}',
-  "",
-  'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":9,"completion_tokens":4}}',
-  "",
-  "data: [DONE]",
-  "",
-  "",
-].join("\n");
+function jsonSseFrame(value: unknown): string {
+  return `data: ${JSON.stringify(value)}\n\n`;
+}
+
+const COMPLETED_FRAME = {
+  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  usage: { prompt_tokens: 9, completion_tokens: 4 },
+};
+const FINISH_STREAM = `${jsonSseFrame({
+  choices: [{ index: 0, delta: { role: "assistant", content: "Live fixture reply" } }],
+})}${jsonSseFrame(COMPLETED_FRAME)}data: [DONE]\n\n`;
+
+const DELAYED_MARKDOWN_START = jsonSseFrame({
+  choices: [{ index: 0, delta: { role: "assistant", content: "## Live stream" } }],
+});
+const DELAYED_MARKDOWN_END = `${jsonSseFrame({
+  choices: [{ index: 0, delta: { content: "\n\n- Live fixture reply" } }],
+})}${jsonSseFrame(COMPLETED_FRAME)}data: [DONE]\n\n`;
 
 function toolStream(callId: string, name: string, argumentsValue: unknown): string {
   const frames = [
@@ -79,7 +69,7 @@ function toolStream(callId: string, name: string, argumentsValue: unknown): stri
       usage: { prompt_tokens: 9, completion_tokens: 4 },
     },
   ];
-  return `${frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("")}data: [DONE]\n\n`;
+  return `${frames.map(jsonSseFrame).join("")}data: [DONE]\n\n`;
 }
 
 type DataResponse<T> = { data: T };
@@ -310,26 +300,26 @@ async function startProvider(): Promise<{
       let stream = FINISH_STREAM;
       if (latestUser.includes("[fixture:attachments]")) {
         const attachmentIds = uuids(latestUser);
-        if (!calledTools.includes("attachment.list")) {
-          stream = toolStream(callId, "attachment.list", {});
-        } else if (!calledTools.includes("attachment.read") && attachmentIds[0]) {
-          stream = toolStream(callId, "attachment.read", {
+        if (!calledTools.includes("attachment_list")) {
+          stream = toolStream(callId, "attachment_list", {});
+        } else if (!calledTools.includes("attachment_read") && attachmentIds[0]) {
+          stream = toolStream(callId, "attachment_read", {
             attachment_id: attachmentIds[0],
           });
-        } else if (!calledTools.includes("attachment.save") && attachmentIds[1]) {
-          stream = toolStream(callId, "attachment.save", {
+        } else if (!calledTools.includes("attachment_save") && attachmentIds[1]) {
+          stream = toolStream(callId, "attachment_save", {
             attachment_id: attachmentIds[1],
             path: "assets/logo.bin",
           });
         }
       } else if (latestUser.includes("[fixture:attachment-reuse]")) {
         const attachmentId = uuids(latestToolContent(payload))[0];
-        if (!calledTools.includes("attachment.list")) {
-          stream = toolStream(callId, "attachment.list", {});
-        } else if (!calledTools.includes("attachment.read") && attachmentId) {
-          stream = toolStream(callId, "attachment.read", { attachment_id: attachmentId });
+        if (!calledTools.includes("attachment_list")) {
+          stream = toolStream(callId, "attachment_list", {});
+        } else if (!calledTools.includes("attachment_read") && attachmentId) {
+          stream = toolStream(callId, "attachment_read", { attachment_id: attachmentId });
         }
-      } else if (latestUser.includes("[fixture:ask-expire]")) {
+      } else if (latestUser.includes("[fixture:ask-expire]") && !calledTools.includes("ask_user")) {
         stream = toolStream(callId, "ask_user", {
           prompt: "Use the fixture default",
           mode: "best_effort",
@@ -337,27 +327,30 @@ async function startProvider(): Promise<{
           expires_in_ms: 100,
         });
       } else if (
-        latestUser.includes("[fixture:ask]") ||
-        latestUser.includes("[fixture:restart-ask]")
+        (latestUser.includes("[fixture:ask]") || latestUser.includes("[fixture:restart-ask]")) &&
+        !calledTools.includes("ask_user")
       ) {
         stream = toolStream(callId, "ask_user", {
           prompt: "Choose the fixture answer",
           mode: "blocking",
           choices: ["fixture answer"],
         });
-      } else if (latestUser.includes("[fixture:cancel-job]")) {
-        stream = toolStream(callId, "job", {
+      } else if (latestUser.includes("[fixture:cancel-job]") && !calledTools.includes("bash")) {
+        stream = toolStream(callId, "bash", {
           command: fixtureSleepCommand(30),
+          mode: "async",
           timeout_ms: 60_000,
         });
       } else if (latestUser.includes("[fixture:job-resume]") && !hasToolResult) {
-        stream = toolStream(callId, "job", {
+        stream = toolStream(callId, "bash", {
           command: fixtureSleepCommand(1),
+          mode: "async",
           timeout_ms: 30_000,
         });
-      } else if (latestUser.includes("[fixture:handoff-job]")) {
-        stream = toolStream(callId, "job", {
+      } else if (latestUser.includes("[fixture:handoff-job]") && !calledTools.includes("bash")) {
+        stream = toolStream(callId, "bash", {
           command: fixtureSleepCommand(3),
+          mode: "async",
           timeout_ms: 30_000,
         });
       }

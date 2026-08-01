@@ -34,6 +34,8 @@ export type ContextUsageView = components["schemas"]["ContextUsageView"];
 export type AttachmentView = components["schemas"]["AttachmentView"];
 export type PublicLimits = components["schemas"]["PublicLimits"];
 export type MessageRouteResult = components["schemas"]["MessageRouteResult"];
+export type CancelResult = components["schemas"]["CancelResult"];
+export type QueuedTurnItem = components["schemas"]["QueuedTurnItem"];
 export type TimelinePage = components["schemas"]["TimelinePage"];
 export type TimelineItemView = components["schemas"]["TimelineItemView"];
 export type TurnSummary = components["schemas"]["TurnSummary"];
@@ -50,12 +52,54 @@ let csrfToken: string | undefined;
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code: string | null;
+  readonly requestId: string | null;
 
-  constructor(status: number, message: string) {
+  constructor(
+    status: number,
+    message: string,
+    details: {
+      code?: string | null | undefined;
+      requestId?: string | null | undefined;
+    } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = details.code ?? null;
+    this.requestId = details.requestId ?? null;
   }
+}
+
+/** Return the most useful detail available from an API, query, or thrown value. */
+export function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError) {
+    const detail = error.message.trim();
+    const metadata = [
+      error.code,
+      error.requestId ? `request ${error.requestId}` : null,
+    ].filter((value): value is string => Boolean(value));
+    if (detail && metadata.length > 0) {
+      return `${detail} (${metadata.join(", ")})`;
+    }
+    if (detail) return detail;
+    if (metadata.length > 0) return metadata.join(", ");
+    return fallback;
+  }
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error.trim();
+  if (isRecord(error)) {
+    const nested = isRecord(error.error) ? error.error : null;
+    for (const value of [error.detail, error.message, error.title, error.code]) {
+      if (typeof value === "string" && value.trim()) return value;
+    }
+    if (nested) {
+      for (const value of [nested.detail, nested.message, nested.title, nested.code]) {
+        if (typeof value === "string" && value.trim()) return value;
+      }
+    }
+  }
+  return fallback;
 }
 
 export async function getBootstrap(): Promise<BootstrapResponse> {
@@ -291,6 +335,34 @@ export async function postSessionMessage(
     await requestJson<{ data: MessageRouteResult }>(
       `/api/v1/sessions/${id}/messages`,
       { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function cancelTurn(
+  sessionId: string,
+  turnId: string,
+  expectedSessionVersion: string,
+  reason = "user_cancel",
+): Promise<CancelResult> {
+  return (
+    await requestJson<{ data: CancelResult }>(
+      `/api/v1/sessions/${sessionId}/turns/${turnId}/cancel`,
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_session_version: expectedSessionVersion, reason }),
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getQueuedTurns(sessionId: string): Promise<QueuedTurnItem[]> {
+  return (
+    await requestJson<{ data: QueuedTurnItem[] }>(
+      `/api/v1/sessions/${sessionId}/queued-turns`,
+      {},
       isDataResponse,
     )
   ).data;
@@ -805,11 +877,13 @@ async function requestJson<T>(
 
 async function toApiError(response: Response): Promise<ApiError> {
   const value = (await response.json().catch(() => undefined)) as
-    | { detail?: string; code?: string }
+    | { detail?: string; title?: string; code?: string; request_id?: string | null }
     | undefined;
+  const message = value?.detail ?? value?.title ?? value?.code;
   return new ApiError(
     response.status,
-    value?.detail ?? value?.code ?? `Janus returned ${response.status}`,
+    message ?? `Janus returned ${response.status}`,
+    { code: value?.code, requestId: value?.request_id },
   );
 }
 
@@ -826,11 +900,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function operationFailureMessage(problem: unknown): string {
-  if (!isRecord(problem)) return "Operation failed";
-  for (const key of ["detail", "title", "code"] as const) {
-    if (typeof problem[key] === "string") return problem[key];
-  }
-  return "Operation failed";
+  return getErrorMessage(problem, "Operation failed");
 }
 
 function isBootstrapResponse(value: unknown): value is BootstrapResponse {

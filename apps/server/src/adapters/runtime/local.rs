@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, Instant},
@@ -24,7 +24,7 @@ use crate::{
     platform::{
         id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
         secret::random_token,
-        shell::{bash_program, decode_process_output},
+        shell::{bash_program, bash_search_path, decode_process_output},
     },
 };
 
@@ -68,6 +68,7 @@ enum ProcessCommand {
 struct PreparedCommand {
     command: Command,
     secret_values: Vec<String>,
+    process_group_marker: Option<PathBuf>,
 }
 
 impl LocalExecutor {
@@ -90,7 +91,7 @@ impl LocalExecutor {
             .await
             .get(&id)
             .cloned()
-            .ok_or(RuntimeError::RuntimeUnavailable)
+            .ok_or_else(|| RuntimeError::unavailable(format!("runtime handle {id} was not found")))
     }
 
     async fn prepare(
@@ -107,7 +108,9 @@ impl LocalExecutor {
             .join(spec.working_directory().as_str());
         let canonical_workspace = tokio::fs::canonicalize(&runtime.workspace_root)
             .await
-            .map_err(|_| RuntimeError::RuntimeUnavailable)?;
+            .map_err(|error| {
+                RuntimeError::unavailable(format!("workspace is unavailable: {error}"))
+            })?;
         let canonical_working = tokio::fs::canonicalize(&working_directory)
             .await
             .map_err(|_| RuntimeError::InvalidSpec("working directory does not exist".into()))?;
@@ -117,6 +120,20 @@ impl LocalExecutor {
             ));
         }
 
+        let process_group_marker_name =
+            if cfg!(windows) && matches!(spec.command().kind(), CommandKind::Shell) {
+                Some(format!(".janus-runtime-{}.pid", random_token(12)))
+            } else {
+                None
+            };
+        let command_input = if process_group_marker_name.is_some() {
+            format!(
+                "printf '%s\\n' \"$$\" > \"$JANUS_RUNTIME_PID_FILE\"; {}",
+                spec.command().input()
+            )
+        } else {
+            spec.command().input().to_owned()
+        };
         let mut command = match spec.command().kind() {
             CommandKind::Shell => {
                 if mode == ExecutionMode::Sync
@@ -124,14 +141,14 @@ impl LocalExecutor {
                 {
                     return Err(RuntimeError::CommandForbidden);
                 }
-                shell_command(spec.command().input())
+                shell_command(&command_input)
             }
             CommandKind::DelegatedCli { cli, session_id } => {
                 delegated_cli_command(*cli, *session_id, spec.command().input())
             }
         };
         command
-            .current_dir(canonical_working)
+            .current_dir(&canonical_working)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -149,9 +166,14 @@ impl LocalExecutor {
         for value in spec.environment().secrets() {
             command.env(value.name(), value.value().expose());
         }
+        if let Some(marker) = process_group_marker_name.as_deref() {
+            command.env("JANUS_RUNTIME_PID_FILE", marker);
+        }
         Ok(PreparedCommand {
             command,
             secret_values,
+            process_group_marker: process_group_marker_name
+                .map(|marker| canonical_working.join(marker)),
         })
     }
 
@@ -163,20 +185,24 @@ impl LocalExecutor {
     ) -> Result<ManagedProcess, RuntimeError> {
         let runtime = self.runtime(spec.runtime_id()).await?;
         let mut prepared = self.prepare(spec, mode).await?;
+        let process_group_marker = prepared.process_group_marker.clone();
         let started = Instant::now();
-        let mut child = prepared
-            .command
-            .spawn()
-            .map_err(|_| RuntimeError::RuntimeUnavailable)?;
-        let pid = child.id().ok_or(RuntimeError::RuntimeUnavailable)?;
+        let mut child = prepared.command.spawn().map_err(|error| {
+            RuntimeError::unavailable(format!("failed to spawn shell: {error}"))
+        })?;
+        let process_group_id = read_process_group_id(process_group_marker.as_deref()).await;
+        remove_process_group_marker(process_group_marker.as_deref()).await;
+        let pid = child
+            .id()
+            .ok_or_else(|| RuntimeError::unavailable("spawned shell has no process id"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or(RuntimeError::RuntimeUnavailable)?;
+            .ok_or_else(|| RuntimeError::unavailable("shell stdout pipe was not available"))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or(RuntimeError::RuntimeUnavailable)?;
+            .ok_or_else(|| RuntimeError::unavailable("shell stderr pipe was not available"))?;
         let stdin = child.stdin.take();
         let stdout_task = spawn_output_reader(
             stdout,
@@ -207,6 +233,7 @@ impl LocalExecutor {
             logs,
             log_stream_id,
             pid,
+            process_group_id,
             started,
         ));
         Ok(ManagedProcess {
@@ -227,10 +254,9 @@ impl LocalExecutor {
             if let Some(value) = completion.borrow().clone() {
                 return Ok(value);
             }
-            completion
-                .changed()
-                .await
-                .map_err(|_| RuntimeError::RuntimeUnavailable)?;
+            completion.changed().await.map_err(|error| {
+                RuntimeError::unavailable(format!("runtime completion channel failed: {error}"))
+            })?;
         }
     }
 
@@ -245,7 +271,9 @@ impl LocalExecutor {
                 .control
                 .send(ProcessCommand::Terminate(sent))
                 .await
-                .map_err(|_| RuntimeError::RuntimeUnavailable)?;
+                .map_err(|error| {
+                    RuntimeError::unavailable(format!("runtime control channel failed: {error}"))
+                })?;
             let _ = received.await;
         }
         Self::wait_managed(process, expected_nonce).await
@@ -260,7 +288,9 @@ impl LocalExecutor {
         let working_directory = runtime.workspace_root.join(spec.working_directory.as_str());
         let canonical_workspace = tokio::fs::canonicalize(&runtime.workspace_root)
             .await
-            .map_err(|_| RuntimeError::RuntimeUnavailable)?;
+            .map_err(|error| {
+                RuntimeError::unavailable(format!("workspace is unavailable: {error}"))
+            })?;
         let canonical_working = tokio::fs::canonicalize(&working_directory)
             .await
             .map_err(|_| RuntimeError::InvalidSpec("working directory does not exist".into()))?;
@@ -296,17 +326,19 @@ impl LocalExecutor {
 
         let mut child = command.spawn().map_err(|error| {
             tracing::warn!(%error, "terminal shell spawn failed");
-            RuntimeError::RuntimeUnavailable
+            RuntimeError::unavailable(format!("failed to spawn terminal shell: {error}"))
         })?;
-        let pid = child.id().ok_or(RuntimeError::RuntimeUnavailable)?;
+        let pid = child
+            .id()
+            .ok_or_else(|| RuntimeError::unavailable("terminal shell has no process id"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or(RuntimeError::RuntimeUnavailable)?;
+            .ok_or_else(|| RuntimeError::unavailable("terminal stdout pipe was not available"))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or(RuntimeError::RuntimeUnavailable)?;
+            .ok_or_else(|| RuntimeError::unavailable("terminal stderr pipe was not available"))?;
         let stdin = child.stdin.take();
         let stdout_task = spawn_terminal_reader(
             stdout,
@@ -336,6 +368,7 @@ impl LocalExecutor {
             logs,
             scrollback_stream_id,
             pid,
+            None,
             started,
         ));
         Ok(ManagedProcess {
@@ -402,20 +435,24 @@ impl RuntimeExecutor for LocalExecutor {
     ) -> BoxFuture<'a, Result<ExecutionResult, RuntimeError>> {
         Box::pin(async move {
             let mut prepared = self.prepare(&spec, ExecutionMode::Sync).await?;
+            let process_group_marker = prepared.process_group_marker.clone();
             let started = Instant::now();
-            let mut child = prepared
-                .command
-                .spawn()
-                .map_err(|_| RuntimeError::RuntimeUnavailable)?;
-            let pid = child.id().ok_or(RuntimeError::RuntimeUnavailable)?;
+            let mut child = prepared.command.spawn().map_err(|error| {
+                RuntimeError::unavailable(format!("failed to spawn sync shell: {error}"))
+            })?;
+            let process_group_id = read_process_group_id(process_group_marker.as_deref()).await;
+            remove_process_group_marker(process_group_marker.as_deref()).await;
+            let pid = child
+                .id()
+                .ok_or_else(|| RuntimeError::unavailable("sync shell has no process id"))?;
             let stdout = child
                 .stdout
                 .take()
-                .ok_or(RuntimeError::RuntimeUnavailable)?;
+                .ok_or_else(|| RuntimeError::unavailable("sync stdout pipe was not available"))?;
             let stderr = child
                 .stderr
                 .take()
-                .ok_or(RuntimeError::RuntimeUnavailable)?;
+                .ok_or_else(|| RuntimeError::unavailable("sync stderr pipe was not available"))?;
             drop(child.stdin.take());
             let stdout_task = spawn_output_reader(
                 stdout,
@@ -438,12 +475,12 @@ impl RuntimeExecutor for LocalExecutor {
                 Ok(Ok(status)) => (Some(status), false),
                 Ok(Err(_)) => (None, false),
                 Err(_) => {
-                    terminate_process_tree(&mut child, pid).await;
+                    terminate_process_tree(&mut child, pid, process_group_id).await;
                     (child.wait().await.ok(), true)
                 }
             };
             if !timed_out {
-                cleanup_descendants(pid).await;
+                cleanup_descendants(pid, process_group_id).await;
             }
             let stdout = join_output(stdout_task).await;
             let stderr = join_output(stderr_task).await;
@@ -767,6 +804,7 @@ async fn manage_process(
     logs: LogStore,
     log_stream_id: LogStreamId,
     pid: u32,
+    process_group_id: Option<u32>,
     started: Instant,
 ) {
     let status = loop {
@@ -782,7 +820,7 @@ async fn manage_process(
                     let _ = response.send(result);
                 }
                 Some(ProcessCommand::Terminate(response)) => {
-                    terminate_process_tree(&mut child, pid).await;
+                    terminate_process_tree(&mut child, pid, process_group_id).await;
                     let _ = response.send(());
                 }
                 Some(ProcessCommand::Interrupt(response)) => {
@@ -800,7 +838,7 @@ async fn manage_process(
             }
         }
     };
-    cleanup_descendants(pid).await;
+    cleanup_descendants(pid, process_group_id).await;
     let _ = join_output(stdout_task).await;
     let _ = join_output(stderr_task).await;
     let _ = logs.close(log_stream_id).await;
@@ -826,6 +864,7 @@ async fn manage_terminal(
     logs: LogStore,
     scrollback_stream_id: LogStreamId,
     pid: u32,
+    process_group_id: Option<u32>,
     started: Instant,
 ) {
     let status = loop {
@@ -849,14 +888,14 @@ async fn manage_terminal(
                     let _ = response.send(result);
                 }
                 Some(ProcessCommand::Terminate(response)) => {
-                    terminate_process_tree(&mut child, pid).await;
+                    terminate_process_tree(&mut child, pid, process_group_id).await;
                     let _ = response.send(());
                 }
                 None => {}
             }
         }
     };
-    cleanup_descendants(pid).await;
+    cleanup_descendants(pid, process_group_id).await;
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     let _ = logs.close(scrollback_stream_id).await;
@@ -899,8 +938,8 @@ where
 }
 
 /// Build the interactive shell command for a Terminal. On Windows this prefers
-/// git's bundled `bash.exe` (found on `PATH`); there is no ConPTY fallback and
-/// no PowerShell Terminal backend. On Unix this is `/bin/bash`. The shell runs
+/// Git for Windows' bundled `bash.exe`; there is no ConPTY fallback and no
+/// PowerShell Terminal backend. On Unix this is `/bin/bash`. The shell runs
 /// interactively so readline can interpret `Ctrl-C` bytes even without a tty.
 fn terminal_command(size: TerminalSize) -> Command {
     #[cfg(windows)]
@@ -981,19 +1020,48 @@ fn ensure_nonce(process: &ManagedProcess, expected: &str) -> Result<(), RuntimeE
     }
 }
 
+async fn read_process_group_id(path: Option<&Path>) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let path = path?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(value) = tokio::fs::read_to_string(path).await
+                && let Ok(id) = value.trim().parse::<u32>()
+            {
+                return Some(id);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+async fn remove_process_group_marker(path: Option<&Path>) {
+    #[cfg(windows)]
+    if let Some(path) = path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+}
+
 fn shell_command(script: &str) -> Command {
     #[cfg(windows)]
     {
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ]);
+        // Supervisor Bash and Runtime shell commands must have the same
+        // language semantics. Resolving the bundled executable also works
+        // when Git for Windows is installed outside PATH.
+        let program = bash_program().unwrap_or_else(|| PathBuf::from("bash"));
+        let mut command = Command::new(program);
+        command.args(["--login", "-c", script]);
         command
     }
     #[cfg(not(windows))]
@@ -1051,6 +1119,9 @@ fn apply_minimal_environment(command: &mut Command) {
             command.env(key, value);
         }
     }
+    if let Some(path) = bash_search_path() {
+        command.env("PATH", path);
+    }
     command.env("GIT_OPTIONAL_LOCKS", "0");
 }
 
@@ -1099,7 +1170,8 @@ fn has_forbidden_background_syntax(script: &str) -> bool {
 }
 
 #[cfg(windows)]
-async fn terminate_process_tree(child: &mut Child, pid: u32) {
+async fn terminate_process_tree(child: &mut Child, pid: u32, process_group_id: Option<u32>) {
+    kill_msys_process_group(process_group_id).await;
     let _ = tokio::time::timeout(
         PROCESS_TERMINATION_TIMEOUT,
         Command::new("taskkill.exe")
@@ -1114,15 +1186,19 @@ async fn terminate_process_tree(child: &mut Child, pid: u32) {
 }
 
 #[cfg(not(windows))]
-async fn terminate_process_tree(child: &mut Child, pid: u32) {
-    cleanup_descendants(pid).await;
+async fn terminate_process_tree(child: &mut Child, pid: u32, process_group_id: Option<u32>) {
+    cleanup_descendants(pid, process_group_id).await;
     let _ = child.start_kill();
     let _ = tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, child.wait()).await;
-    cleanup_descendants(pid).await;
+    cleanup_descendants(pid, process_group_id).await;
 }
 
 #[cfg(windows)]
-async fn cleanup_descendants(pid: u32) {
+async fn cleanup_descendants(pid: u32, process_group_id: Option<u32>) {
+    if process_group_id.is_some() {
+        kill_msys_process_group(process_group_id).await;
+        return;
+    }
     let script = format!(
         "$root={pid}; $all=@(Get-CimInstance Win32_Process); $ids=@($root); \
          do {{ $next=@($all | Where-Object {{ $ids -contains $_.ParentProcessId }} | \
@@ -1148,8 +1224,28 @@ async fn cleanup_descendants(pid: u32) {
     .await;
 }
 
+#[cfg(windows)]
+async fn kill_msys_process_group(process_group_id: Option<u32>) {
+    let Some(process_group_id) = process_group_id else {
+        return;
+    };
+    let Some(program) = bash_program() else {
+        return;
+    };
+    let command = format!("kill -KILL -- -{process_group_id}");
+    let _ = tokio::time::timeout(
+        Duration::from_millis(500),
+        Command::new(program)
+            .args(["--login", "-c", &command])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+}
+
 #[cfg(not(windows))]
-async fn cleanup_descendants(pid: u32) {
+async fn cleanup_descendants(pid: u32, _process_group_id: Option<u32>) {
     let _ = tokio::time::timeout(
         PROCESS_TERMINATION_TIMEOUT,
         Command::new("pkill")
@@ -1357,27 +1453,12 @@ mod tests {
         )
     }
 
-    #[cfg(windows)]
-    fn success_script() -> &'static str {
-        "Write-Output 'local-ok'"
-    }
-    #[cfg(not(windows))]
     fn success_script() -> &'static str {
         "printf 'local-ok\\n'"
     }
-    #[cfg(windows)]
     fn failure_script() -> &'static str {
-        "Write-Error 'failed'; exit 7"
+        "printf 'failed\\n'; exit 7"
     }
-    #[cfg(not(windows))]
-    fn failure_script() -> &'static str {
-        "printf 'failed\\n' >&2; exit 7"
-    }
-    #[cfg(windows)]
-    fn sleep_script() -> &'static str {
-        "Start-Sleep -Seconds 5"
-    }
-    #[cfg(not(windows))]
     fn sleep_script() -> &'static str {
         "sleep 5"
     }
@@ -1390,28 +1471,19 @@ mod tests {
         "sleep 5 &"
     }
 
-    #[cfg(windows)]
-    fn descendant_script() -> &'static str {
-        "$child = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-Command', \
-         'Start-Sleep -Seconds 30') -PassThru; Write-Output $child.Id; Wait-Process -Id $child.Id"
-    }
-    #[cfg(not(windows))]
     fn descendant_script() -> &'static str {
         "sleep 30 & child=$!; printf '%s\\n' \"$child\"; wait \"$child\""
     }
 
     #[cfg(windows)]
     async fn process_exists(pid: u32) -> bool {
-        Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!(
-                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }}; exit 1"
-                ),
-            ])
+        let Some(program) = crate::platform::shell::bash_program() else {
+            return false;
+        };
+        // Git Bash reports MSYS PIDs, which are not the same namespace as
+        // Windows process IDs. Use Bash's built-in probe in that namespace.
+        Command::new(program)
+            .args(["--login", "-c", &format!("kill -0 {pid}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()

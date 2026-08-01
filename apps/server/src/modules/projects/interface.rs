@@ -11,14 +11,14 @@
 //! interfaces so a process restart cannot silently drop a half-done clone.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use utoipa::ToSchema;
 
-use crate::adapters::git::{
-    DiffView, GitCredential, GitError, GitRunner, GitStatus, SystemGit, UpdateConflictPath,
-    UpdateOutcome, apply_conflict_choice, complete_fast_forward,
+use crate::modules::projects::git::{
+    DiffView, GitCredential, GitError, GitRunner, GitStatus, UpdateConflictPath, UpdateOutcome,
 };
 use crate::modules::runtime::interface::{
     CapabilityReason, CapabilityState, DelegatedCliKind, ExecutorKind, NetworkPolicy,
@@ -458,7 +458,7 @@ pub struct ProjectsInterface {
     operations: OperationInterface,
     workspace_sync: WorkspaceSyncInterface,
     workspaces_root: std::path::PathBuf,
-    git: SystemGit,
+    git: Arc<dyn GitRunner>,
 }
 
 #[derive(FromRow)]
@@ -537,6 +537,7 @@ impl ProjectsInterface {
         workspace_sync: WorkspaceSyncInterface,
         events: EventStore,
         data_root: &std::path::Path,
+        git: Arc<dyn GitRunner>,
     ) -> Self {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Self {
@@ -546,7 +547,7 @@ impl ProjectsInterface {
             cipher,
             operations,
             workspace_sync,
-            git: SystemGit,
+            git,
         }
     }
 
@@ -1636,14 +1637,10 @@ impl ProjectsInterface {
         };
 
         let dest = self.main_repo_dir(project_id);
-        let clone_result = GitRunner::clone(
-            &self.git,
-            &row.repo_url,
-            row.repo_branch.as_deref(),
-            &dest,
-            &credential,
-        )
-        .await;
+        let clone_result = self
+            .git
+            .clone(&row.repo_url, row.repo_branch.as_deref(), &dest, &credential)
+            .await;
         if let Err(error) = clone_result {
             self.mark_project_state(project_id, "error", Some(error.to_string()))
                 .await?;
@@ -2516,15 +2513,16 @@ impl ProjectsInterface {
             } else {
                 None
             };
-            apply_conflict_choice(
-                &dir,
-                &path_row.path,
-                choice,
-                path_row.remote_hash.as_deref(),
-                path_row.main_hash.as_deref(),
-                edited_bytes.as_deref(),
-            )
-            .await?;
+            self.git
+                .apply_conflict_choice(
+                    &dir,
+                    &path_row.path,
+                    choice,
+                    path_row.remote_hash.as_deref(),
+                    path_row.main_hash.as_deref(),
+                    edited_bytes.as_deref(),
+                )
+                .await?;
         }
 
         // Determine remote/branch from the operation conditions when possible;
@@ -2532,7 +2530,9 @@ impl ProjectsInterface {
         let project = self.fetch_project(owner_id, project_id).await?;
         let remote = "origin";
         let branch = project.repo_branch.as_deref().unwrap_or("main");
-        complete_fast_forward(&dir, remote, branch).await?;
+        self.git
+            .complete_fast_forward(&dir, remote, branch)
+            .await?;
         self.refresh_git_state(
             owner_id,
             project_id,

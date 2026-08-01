@@ -31,7 +31,7 @@ pub const EVENT_REGISTRY: &[(&str, u16, &str)] = &[
     ("checkpoint.created", 1, "sessions"),
     // models
     ("model.stream_delta", 1, "models"),
-    ("model.attempt_changed", 1, "models"),
+    ("model.attempt_retrying", 1, "models"),
     // supervisor
     ("round.changed", 1, "supervisor"),
     ("tool_call.created", 1, "supervisor"),

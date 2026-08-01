@@ -50,7 +50,7 @@ pub use problem::Problem;
         sessions::list_sessions, sessions::create_session, sessions::get_session,
         sessions::delete_session, sessions::post_message, sessions::upload_attachment,
         sessions::delete_attachment, sessions::session_context, sessions::timeline,
-        sessions::get_turn, sessions::session_diff, sessions::steer, sessions::cancel_turn,
+        sessions::queued_turns, sessions::get_turn, sessions::session_diff, sessions::steer, sessions::cancel_turn,
         sessions::answer_ask, sessions::retry_model,
         terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
         terminal::resize_terminal, terminal::signal_terminal, terminal::close_terminal,
@@ -134,6 +134,7 @@ pub use problem::Problem;
         crate::modules::sessions::interface::SessionModelPreference,
         crate::modules::sessions::interface::ReasoningEffort,
         crate::modules::sessions::interface::AttachmentView,
+        crate::modules::sessions::interface::QueuedTurnItem,
         crate::modules::supervisor::interface::ContextUsageView,
         sessions::CreateSessionRequest,
         sessions::PostMessageRequest,
@@ -318,6 +319,10 @@ pub fn router(state: AppState) -> Router {
             get(sessions::session_context),
         )
         .route("/api/v1/sessions/{id}/timeline", get(sessions::timeline))
+        .route(
+            "/api/v1/sessions/{id}/queued-turns",
+            get(sessions::queued_turns),
+        )
         .route(
             "/api/v1/sessions/{id}/turns/{turn_id}",
             get(sessions::get_turn),

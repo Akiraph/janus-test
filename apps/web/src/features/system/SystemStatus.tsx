@@ -6,6 +6,7 @@ import Radio from "lucide-solid/icons/radio";
 import Server from "lucide-solid/icons/server";
 import { For, Match, Switch } from "solid-js";
 import { NotificationEvent } from "../../components/ui/notifications";
+import { getErrorMessage } from "../../lib/api";
 import { useSystemInfo } from "../../lib/queries";
 import "./system.css";
 
@@ -15,7 +16,7 @@ export function SystemStatus() {
   return (
     <section class="panel" aria-labelledby="system-title">
       <NotificationEvent
-        message={system.isError ? "System status unavailable" : null}
+        message={system.isError ? getErrorMessage(system.error, "System status unavailable") : null}
         variant="danger"
         action={{ label: "Retry", onClick: () => void system.refetch() }}
       />

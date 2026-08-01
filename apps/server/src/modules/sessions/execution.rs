@@ -1389,9 +1389,9 @@ impl SessionsInterface {
         now: &str,
     ) -> Result<Option<TurnTransition>, SessionsError> {
         let row = sqlx::query(
-            "SELECT turn.status, session.version FROM turns AS turn \
+            "SELECT turn.status, session.version, session.active_turn_id FROM turns AS turn \
              JOIN sessions AS session ON session.id = turn.session_id \
-             WHERE turn.id = ? AND turn.session_id = ? AND session.active_turn_id = turn.id",
+             WHERE turn.id = ? AND turn.session_id = ?",
         )
         .bind(turn_id.to_string())
         .bind(session_id.to_string())
@@ -1411,6 +1411,54 @@ impl SessionsInterface {
             .try_get::<String, _>("status")?
             .parse::<TurnStatus>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        if from_status == TurnStatus::Queued {
+            if !from_status.can_transition_to(TurnStatus::Canceled) {
+                return Err(SessionsError::Internal(anyhow::anyhow!(
+                    "invalid queued Turn transition: {} -> {}",
+                    from_status.as_str(),
+                    TurnStatus::Canceled.as_str()
+                )));
+            }
+            let changed = sqlx::query(
+                "UPDATE turns SET status = 'canceled', cancellation_reason = ?, updated_at = ? \
+                 WHERE id = ? AND session_id = ? AND status = 'queued'",
+            )
+            .bind(reason)
+            .bind(now)
+            .bind(turn_id.to_string())
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+            if changed.rows_affected() != 1 {
+                return Ok(None);
+            }
+            let session_version = format!("v_{}", SessionId::new());
+            let session_changed = sqlx::query(
+                "UPDATE sessions SET version = ?, updated_at = ?, last_activity_at = ? \
+                 WHERE id = ? AND version = ?",
+            )
+            .bind(&session_version)
+            .bind(now)
+            .bind(now)
+            .bind(session_id.to_string())
+            .bind(expected_version)
+            .execute(&mut *tx)
+            .await?;
+            if session_changed.rows_affected() != 1 {
+                return Err(SessionsError::Internal(anyhow::anyhow!(
+                    "Session changed while canceling queued Turn"
+                )));
+            }
+            return Ok(Some(TurnTransition {
+                from_status,
+                to_status: TurnStatus::Canceled,
+                session_version,
+            }));
+        }
+        let active_turn_id: Option<String> = row.try_get("active_turn_id")?;
+        if active_turn_id.as_deref() != Some(turn_id.to_string().as_str()) {
+            return Ok(None);
+        }
         if !from_status.can_transition_to(TurnStatus::Canceling) {
             return Ok(None);
         }

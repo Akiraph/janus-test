@@ -6,7 +6,7 @@ import { produce } from "solid-js/store";
 import { Button } from "../../../components/ui/Button";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { NotificationEvent, useNotifications } from "../../../components/ui/notifications";
-import { getFileContentText, getFileMeta, saveFileText } from "../../../lib/api";
+import { getErrorMessage, getFileContentText, getFileMeta, saveFileText } from "../../../lib/api";
 import type { FileDocument } from "./workspaceState";
 import "./files.css";
 
@@ -76,7 +76,7 @@ export function FileEditor(props: FileEditorProps) {
       props.onPatch(
         produce((tab) => {
           tab.loading = false;
-          tab.loadError = error instanceof Error ? error.message : "Failed to load file";
+          tab.loadError = getErrorMessage(error, "Failed to load file");
         }),
       );
     }
@@ -108,7 +108,7 @@ export function FileEditor(props: FileEditorProps) {
       notify("File saved", { variant: "success" });
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Save failed";
+      const message = getErrorMessage(error, "Save failed");
       props.onPatch((item) => {
         item.loadError = message;
       });

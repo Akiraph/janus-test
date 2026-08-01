@@ -21,10 +21,11 @@ pub use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, AskAnswerResult, AskSummary, AttachmentResource,
     AttachmentView, CancelResult, ContextMessage, CreatedTurnInput, ExecutionTurn,
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES, MessageRoute, MessageRouteResult,
-    ModelAttemptStatus, QueuedTurnCandidate, ReasoningEffort, RecordAskAnswer, RecordedTurnInput,
-    RecoveredTurn, SessionCommandState, SessionModelPreference, SessionSummary, SessionsError,
-    SteerResult, TerminalSettlement, TimelineItemView, TimelinePage, TurnBlockerOutcome,
-    TurnBlockers, TurnModelAttempt, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
+    ModelAttemptStatus, QueuedTurnCandidate, QueuedTurnItem, ReasoningEffort, RecordAskAnswer,
+    RecordedTurnInput, RecoveredTurn, SessionCommandState, SessionModelPreference, SessionSummary,
+    SessionsError, SteerResult, TerminalSettlement, TimelineItemView, TimelinePage,
+    TurnBlockerOutcome, TurnBlockers, TurnModelAttempt, TurnModelSnapshot, TurnStatus, TurnSummary,
+    TurnTransition,
 };
 
 #[derive(Clone)]
@@ -553,10 +554,9 @@ impl SessionsInterface {
         Ok(result)
     }
 
-    /// Cancel: drive `running | waiting_for_* -> canceling`. Final state
-    /// (`canceled` vs `interrupted`) is set by the supervisor/runtime after
-    /// finite resources settle; sessions only records the transition to
-    /// `canceling` here.
+    /// Cancel an active or queued Turn. Active Turns first enter `canceling`
+    /// and are settled by the supervisor/runtime; queued Turns have no owned
+    /// resources and move directly to terminal `canceled`.
     pub async fn cancel_turn(
         &self,
         session_id: SessionId,
@@ -588,10 +588,12 @@ impl SessionsInterface {
             correlation_id: CorrelationId::new().to_string(),
             causation_id: None,
             payload: json!({
+                "session_id": session_id.to_string(),
                 "turn_id": turn_id.to_string(),
                 "from": transition.from_status.as_str(),
                 "to": transition.to_status.as_str(),
                 "reason": reason,
+                "session_version": transition.session_version,
             }),
         })
         .await?;
@@ -742,6 +744,75 @@ impl SessionsInterface {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
+    }
+
+    /// Queued Turns for the conversation's QueuedMessagesBar. Each row pairs a
+    /// queued turn with its user message text so the bar can render a
+    /// preview and a delete (cancel) affordance. Cheap index seek on
+    /// `(session_id, status='queued')`; no projection walk.
+    pub async fn queued_turns(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<QueuedTurnItem>, SessionsError> {
+        let _ = self.get_session(session_id).await?;
+        let rows = sqlx::query(
+            "SELECT turn.id AS turn_id, turn.sequence, turn.version, \
+                    COALESCE(message.body_json, '') AS body_json \
+             FROM turns AS turn \
+             LEFT JOIN messages AS message ON message.id = turn.input_message_id \
+             WHERE turn.session_id = ? AND turn.status = 'queued' \
+             ORDER BY turn.sequence ASC",
+        )
+        .bind(session_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let turn_id: String = row.try_get("turn_id")?;
+            let sequence: i64 = row.try_get("sequence")?;
+            let version: String = row.try_get("version")?;
+            let body_json: String = row.try_get("body_json")?;
+            items.push(QueuedTurnItem {
+                turn_id,
+                sequence,
+                version,
+                message_text: Self::extract_message_text(&body_json),
+            });
+        }
+        Ok(items)
+    }
+
+    /// Best-effort extraction of user-facing text from a message body_json.
+    /// Handles both the flat `{"text": "..."}` form and the parts-based
+    /// `{"parts": [{"type": "text", "text": "..."}]}` form used by the
+    /// answer/steer code paths.
+    fn extract_message_text(body_json: &str) -> String {
+        if body_json.is_empty() {
+            return String::new();
+        }
+        let Ok(val) = serde_json::from_str::<Value>(body_json) else {
+            return String::new();
+        };
+        if let Some(t) = val.get("text").and_then(Value::as_str) {
+            return t.to_owned();
+        }
+        if let Some(parts) = val.get("parts").and_then(Value::as_array) {
+            let text: String = parts
+                .iter()
+                .filter_map(|p| {
+                    if p.get("type").and_then(Value::as_str) == Some("text") {
+                        p.get("text").and_then(Value::as_str).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        String::new()
     }
 
     /// Newest `model_attempts` row for any Round of this Turn. Drives the

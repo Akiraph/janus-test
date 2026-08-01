@@ -839,8 +839,8 @@ impl AppState {
         Ok(())
     }
 
-    /// Accept Cancel, bound-cancel finite Jobs owned by the Turn, then settle the
-    /// Turn as `canceled` or `interrupted`. Only `canceled` advances the queue.
+    /// Cancel a queued Turn immediately, or accept Cancel for an active Turn,
+    /// bound-cancel its finite Jobs, then settle it as `canceled`/`interrupted`.
     pub async fn cancel_active_turn(
         &self,
         session_id: SessionId,

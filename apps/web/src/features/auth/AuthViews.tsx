@@ -14,6 +14,7 @@ import {
   recoveryComplete,
   recoveryExchange,
   recoveryOptions,
+  getErrorMessage,
 } from "../../lib/api";
 import { authenticationOptions, credentialPayload, registrationOptions } from "../../lib/webauthn";
 import "./auth.css";
@@ -42,7 +43,7 @@ export function SetupView() {
       await queryClient.invalidateQueries({ queryKey: ["bootstrap"] });
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(value instanceof Error ? value.message : "Initialization failed.");
+      setError(getErrorMessage(value, "Initialization failed."));
     } finally {
       setBusy(false);
     }
@@ -110,7 +111,7 @@ export function LoginView() {
       await loginComplete(options.ceremony_id, credentialPayload(credential));
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(value instanceof Error ? value.message : "Login failed.");
+      setError(getErrorMessage(value, "Login failed."));
     } finally {
       setBusy(false);
     }
@@ -130,7 +131,7 @@ export function LoginView() {
       await recoveryComplete(options.ceremony_id, credentialPayload(credential));
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(value instanceof Error ? value.message : "Recovery failed.");
+      setError(getErrorMessage(value, "Recovery failed."));
     } finally {
       setBusy(false);
     }

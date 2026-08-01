@@ -210,7 +210,7 @@ impl ModelsInterface {
             unit_of_work,
             cipher,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(8))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         })

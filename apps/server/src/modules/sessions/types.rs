@@ -109,7 +109,7 @@ impl TurnStatus {
 
     pub const fn can_transition_to(self, target: Self) -> bool {
         match self {
-            Self::Queued => matches!(target, Self::Running),
+            Self::Queued => matches!(target, Self::Running | Self::Canceled),
             Self::Running => matches!(
                 target,
                 Self::WaitingForJob
@@ -447,6 +447,18 @@ pub struct QueuedTurnCandidate {
     pub turn_id: TurnId,
     pub session_id: SessionId,
     pub model_snapshot: Option<TurnModelSnapshot>,
+}
+
+/// A queued Turn shown in the conversation's QueuedMessagesBar: enough to
+/// render the message text and delete (cancel) the Turn out of order.
+#[derive(Debug, Clone, sqlx::FromRow, ToSchema, Serialize)]
+pub struct QueuedTurnItem {
+    pub turn_id: String,
+    pub sequence: i64,
+    pub version: String,
+    /// Best-effort message text extracted from the queued user message body.
+    /// Empty when there is no associated message or the body is non-textual.
+    pub message_text: String,
 }
 
 #[derive(Debug, Clone)]

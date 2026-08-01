@@ -12,7 +12,7 @@ use crate::modules::workspace_sync::interface::{
 use crate::platform::id::{AskId, AttachmentId, SessionId, ToolCallId, TurnId};
 use crate::platform::managed_storage::BlobStore;
 use crate::platform::path::PathError;
-use crate::platform::shell::{bash_program, decode_process_output};
+use crate::platform::shell::{bash_program, bash_search_path, decode_process_output};
 
 use super::paths::resolve_session_path;
 use super::registry::{is_forbidden_tool, is_registered};
@@ -123,24 +123,10 @@ fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolD
             .to_owned()
     };
     let status = outcome.disposition.as_str().to_owned();
-    if outcome.disposition == ToolExecutionDisposition::Failed {
-        let code = outcome
-            .error_code
-            .clone()
-            .unwrap_or_else(|| "TOOL_EXECUTION_FAILED".into());
-        let detail = summary
-            .and_then(|value| value.get("detail").or_else(|| value.get("error")))
-            .and_then(Value::as_str)
-            .unwrap_or("Tool execution failed")
-            .to_owned();
-        return ToolDisplay {
-            version: 1,
-            title: format!("{} failed", display_tool_name(name)),
-            status,
-            body: ToolDisplayBody::Error { code, detail },
-        };
-    }
 
+    // Build the target-specific title first (e.g. "Read src/main.rs"),
+    // then append " failed" for failures so the user always sees what was
+    // being attempted and the target, not just a generic "Tool failed".
     let (title, body) = match name {
         "bash" => {
             let command = {
@@ -248,6 +234,32 @@ fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolD
             result_body(outcome),
         ),
     };
+
+    // For failed tools, keep the target-specific title and body so the user
+    // sees what was attempted. The status dot (danger) is the only failure
+    // signal — the title does NOT append " failed" to avoid redundancy.
+    if outcome.disposition == ToolExecutionDisposition::Failed {
+        let code = outcome
+            .error_code
+            .clone()
+            .unwrap_or_else(|| "TOOL_EXECUTION_FAILED".into());
+        let detail = summary
+            .and_then(|value| value.get("detail").or_else(|| value.get("error")))
+            .and_then(Value::as_str)
+            .unwrap_or("Tool execution failed")
+            .to_owned();
+        return ToolDisplay {
+            version: 1,
+            title: if title.trim().is_empty() {
+                format!("Used {}", display_tool_name(name))
+            } else {
+                title
+            },
+            status,
+            body: ToolDisplayBody::Error { code, detail },
+        };
+    }
+
     ToolDisplay {
         version: 1,
         title: if title.trim().is_empty() {
@@ -1242,10 +1254,27 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
     )
     .map_err(|e| SupervisorError::Internal(anyhow::anyhow!("execution: {e}")))?;
 
-    let result = runtime
-        .execute_sync(spec)
-        .await
-        .map_err(SupervisorError::Runtime)?;
+    let result = match runtime.execute_sync(spec).await {
+        Ok(result) => result,
+        Err(error) if error.retryable() => {
+            tracing::warn!(
+                %error,
+                "Runtime sync execution unavailable; using local Git Bash fallback"
+            );
+            let repo = session_repo(ctx.workspace, ctx.session_id)?;
+            let raw_cwd = input
+                .get("working_directory")
+                .and_then(|value| value.as_str())
+                .unwrap_or(".");
+            let abs_cwd = if raw_cwd == "." {
+                repo
+            } else {
+                repo.join(raw_cwd)
+            };
+            return run_local_sync(ctx, command, Some(&abs_cwd), timeout).await;
+        }
+        Err(error) => return Err(SupervisorError::Runtime(error)),
+    };
 
     bash_outcome(
         command,
@@ -1349,7 +1378,10 @@ async fn run_local_sync(
         return Ok(fail_text(detail, "BASH_UNAVAILABLE"));
     };
     let mut cmd = tokio::process::Command::new(program);
-    cmd.arg("-c").arg(command);
+    cmd.args(["--login", "-c", command]);
+    if let Some(path) = bash_search_path() {
+        cmd.env("PATH", path);
+    }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

@@ -54,7 +54,7 @@ export type SessionTimelineItem =
       text: string;
       reasoning: string;
       roundId: string | null;
-      /** Wall-clock ms the bound round spent producing this message. */
+      /** Wall-clock ms from the first reasoning delta to answer/tool output. */
       durationMs: number | null;
     })
   | (TimelineItemBase & { type: "steer"; text: string })
@@ -224,7 +224,7 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
   }
 
   if (item.kind === "tool_call") {
-    const view = parseToolView(summary);
+    const view = parseToolView(summary, toolName);
     return {
       ...base,
       type: "tool",
@@ -245,7 +245,7 @@ function normalizeToolStatus(raw: string): ToolStatus {
   return "success";
 }
 
-function parseToolView(summary: Projection): ToolView {
+function parseToolView(summary: Projection, toolName: string): ToolView {
   const display = asRecord(summary.display);
   const title = text(display.title).trim();
   const version = display.version;
@@ -268,8 +268,13 @@ function parseToolView(summary: Projection): ToolView {
     status: normalizeToolStatus(text(display.status)),
     body,
     expandable: body.kind !== "none",
-    lowNoise: false,
+    lowNoise: lowNoiseTool(toolName),
   };
+}
+
+/** Low-noise read-only tools whose consecutive calls compress into a summary. */
+function lowNoiseTool(toolName: string): boolean {
+  return toolName === "read" || toolName === "bash";
 }
 
 function decodeToolDisplayBody(value: unknown): ToolDisplayBody {
@@ -413,7 +418,7 @@ function stringList(value: unknown): string[] {
 }
 
 /**
- * Human-readable "thinking time" for an assistant message, e.g. "for 4s",
+ * Human-readable reasoning time for an assistant message, e.g. "for 4s",
  * "for 1m 12s". Rendered in the Thought row title as "Thought for {duration}".
  * - <3000ms → "for a while" (too short to be meaningful as a stopwatch).
  * - null/missing → "" (caller shows just "Thought" with no trailing duration).

@@ -5,9 +5,7 @@ use std::{
 
 use tracing::{debug, error, warn};
 
-use crate::modules::models::interface::{
-    ModelPreference, ModelsError, ModelsInterface, ProviderKind,
-};
+use crate::modules::models::interface::{ModelPreference, ModelsError, ModelsInterface};
 use crate::modules::projects::interface::{ProjectsError, ProjectsInterface};
 use crate::modules::runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
 use crate::modules::sessions::interface::{
@@ -202,13 +200,6 @@ impl TurnRunner {
             if preference.reasoning_effort == ReasoningEffort::None {
                 map.remove("reasoning_effort");
             } else {
-                let kind = self
-                    .models
-                    .provider_kind_in_tx(tx, &model.provider_id)
-                    .await?;
-                if kind == ProviderKind::Anthropic {
-                    return Err(TurnExecutionError::InvalidModelPreference);
-                }
                 map.insert(
                     "reasoning_effort".into(),
                     serde_json::Value::String(preference.reasoning_effort.as_str().to_owned()),

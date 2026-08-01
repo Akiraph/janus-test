@@ -6,7 +6,11 @@
 //!
 //! Apply/Sync execution, three-way merge, and external file watchers remain M4/M5.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 use anyhow::anyhow;
 use serde::Serialize;
@@ -23,10 +27,13 @@ use crate::platform::{
 use super::diff::DiffSummary;
 use super::manifest::{ManifestRoot, collect_manifest as walk_manifest};
 use super::session_copy::{
-    create_session_worktree, main_repo_abs, remove_session_tree, session_managed_dir,
-    session_repo_abs,
+    create_session_worktree, main_repo_abs, main_worktree_is_clean, remove_session_tree,
+    session_managed_dir, session_repo_abs,
 };
-use super::working_tree::{diff_working_trees, hash_working_tree, seed_session_from_main};
+use super::working_tree::{
+    diff_working_trees, git_head, hash_working_tree, rehash_working_tree_paths,
+    seed_session_from_main,
+};
 
 /// Opaque handle for a workspace copy, stored in `workspace_copies.handle`.
 /// Main: `main:<project-id>`; Session: `session:<session-id>`.
@@ -70,6 +77,29 @@ pub struct SessionCopyResult {
 }
 
 type ExistingSessionCopy = (Option<String>, Option<String>, String, Option<String>);
+
+static HEAD_MANIFESTS: OnceLock<Mutex<HashMap<String, ManifestRoot>>> = OnceLock::new();
+
+fn cached_head_manifest(head: &str) -> Option<ManifestRoot> {
+    HEAD_MANIFESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?
+        .get(head)
+        .cloned()
+}
+
+fn cache_head_manifest(head: &str, manifest: &ManifestRoot) {
+    if let Ok(mut manifests) = HEAD_MANIFESTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        if manifests.len() >= 16 && !manifests.contains_key(head) {
+            manifests.clear();
+        }
+        manifests.insert(head.to_owned(), manifest.clone());
+    }
+}
 
 /// Agent / tool file mutation against a Session (or, later, any) copy.
 #[derive(Debug, Clone)]
@@ -296,13 +326,46 @@ impl WorkspaceSyncInterface {
         // Session copy is a git worktree of the Main clone — shared .git object
         // store, detached-HEAD checkout at Main's current tree. No file copy,
         // no re-init; the Session inherits Main's history.
-        create_session_worktree(&main_abs, &session_abs).map_err(WorkspaceSyncError::Internal)?;
-        seed_session_from_main(&main_abs, &session_abs).map_err(WorkspaceSyncError::Internal)?;
+        let main_for_copy = main_abs.clone();
+        let session_for_copy = session_abs.clone();
+        let (head, main_was_clean) = tokio::task::spawn_blocking(move || {
+            let head = git_head(&main_for_copy)?;
+            let clean = main_worktree_is_clean(&main_for_copy)?;
+            create_session_worktree(&main_for_copy, &session_for_copy)?;
+            Ok::<(String, bool), anyhow::Error>((head, clean))
+        })
+        .await
+        .map_err(|error| WorkspaceSyncError::Internal(anyhow!("workspace copy task failed: {error}")))?
+        .map_err(WorkspaceSyncError::Internal)?;
 
-        let manifest = hash_working_tree(&session_abs)
+        let base_manifest = match cached_head_manifest(&head) {
+            Some(manifest) => manifest,
+            None => {
+                let manifest = hash_working_tree(&session_abs)
+                    .await
+                    .map_err(WorkspaceSyncError::Internal)?;
+                cache_head_manifest(&head, &manifest);
+                manifest
+            }
+        };
+        let manifest = if main_was_clean {
+            base_manifest
+        } else {
+            let main_for_seed = main_abs.clone();
+            let session_for_seed = session_abs.clone();
+            let changed_paths = tokio::task::spawn_blocking(move || {
+                seed_session_from_main(&main_for_seed, &session_for_seed)
+            })
             .await
+            .map_err(|error| {
+                WorkspaceSyncError::Internal(anyhow!("workspace seed task failed: {error}"))
+            })?
             .map_err(WorkspaceSyncError::Internal)?;
-        let root_hash = manifest.root_hash.clone();
+            rehash_working_tree_paths(&session_abs, &base_manifest, &changed_paths)
+                .await
+                .map_err(WorkspaceSyncError::Internal)?
+        };
+        let root_hash = manifest.root_hash;
         let now = format_utc(SystemClock.now());
         let copy_version = format!("v_{}", RevisionId::new());
         let revision_ref = RevisionRef::new(RevisionId::new());

@@ -16,6 +16,7 @@ import type { CreateProjectInput, OperationView, ProjectView, RepoAccess } from 
 import {
   createProject,
   deleteProject,
+  getErrorMessage,
   getOperation,
   getProject,
   retryProject,
@@ -49,9 +50,7 @@ function formatActivity(iso: string): string {
 }
 
 function problemMessage(problem: unknown): string {
-  if (!problem || typeof problem !== "object") return "Operation failed";
-  const record = problem as { detail?: string; code?: string; title?: string };
-  return record.detail ?? record.title ?? record.code ?? "Operation failed";
+  return getErrorMessage(problem, "Operation failed");
 }
 
 export function ProjectsOverview() {
@@ -116,7 +115,7 @@ export function ProjectsOverview() {
         await refresh();
       } catch (error) {
         if (!cancelled) {
-          notify(error instanceof Error ? error.message : "Could not poll operation", {
+      notify(getErrorMessage(error, "Could not poll operation"), {
             variant: "danger",
           });
         }
@@ -143,7 +142,7 @@ export function ProjectsOverview() {
       notify("Retry started");
       await refresh();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Retry failed", { variant: "danger" });
+      notify(getErrorMessage(error, "Retry failed"), { variant: "danger" });
     }
   }
 
@@ -160,7 +159,7 @@ export function ProjectsOverview() {
       notify("Delete started");
       await refresh();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Delete failed", { variant: "danger" });
+      notify(getErrorMessage(error, "Delete failed"), { variant: "danger" });
     }
   }
 
@@ -169,9 +168,7 @@ export function ProjectsOverview() {
       <NotificationEvent
         message={
           projects.isError
-            ? projects.error instanceof Error
-              ? projects.error.message
-              : "Failed to load projects"
+            ? getErrorMessage(projects.error, "Failed to load projects")
             : null
         }
         variant="danger"
@@ -375,7 +372,7 @@ function CreateProjectDialog(props: CreateProjectDialogProps) {
       notify("Project creation started");
       await props.created(operation, input);
     } catch (value) {
-      setError(value instanceof Error ? value.message : "Could not create project");
+      setError(getErrorMessage(value, "Could not create project"));
     } finally {
       setSubmitting(false);
     }

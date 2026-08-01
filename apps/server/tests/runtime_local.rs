@@ -230,43 +230,18 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
     Ok(())
 }
 
-#[cfg(windows)]
-fn success_script() -> &'static str {
-    "Write-Output 'sync-ok'"
-}
-#[cfg(not(windows))]
 fn success_script() -> &'static str {
     "printf 'sync-ok\\n'"
 }
-#[cfg(windows)]
-fn stdin_script() -> &'static str {
-    "$line = [Console]::In.ReadLine(); Write-Output \"got:$line\""
-}
-#[cfg(not(windows))]
 fn stdin_script() -> &'static str {
     "read line; printf 'got:%s\\n' \"$line\""
 }
-#[cfg(windows)]
-fn short_job_script() -> &'static str {
-    "Start-Sleep -Milliseconds 100; Write-Output 'done'"
-}
-#[cfg(not(windows))]
 fn short_job_script() -> &'static str {
     "sleep 0.1; printf 'done\\n'"
 }
-#[cfg(windows)]
 fn long_job_script() -> &'static str {
-    "Start-Sleep -Seconds 30"
+    "read -r forever"
 }
-#[cfg(not(windows))]
-fn long_job_script() -> &'static str {
-    "sleep 30"
-}
-#[cfg(windows)]
 fn service_script() -> &'static str {
-    "while ($true) { Write-Output 'tick'; Start-Sleep -Milliseconds 100 }"
-}
-#[cfg(not(windows))]
-fn service_script() -> &'static str {
-    "while true; do printf 'tick\\n'; sleep 0.1; done"
+    "while true; do printf 'tick\\n'; read -r -t 1 _ || true; done"
 }

@@ -5,7 +5,7 @@ import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { NotificationEvent, useNotifications } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
-import type { GitUpdateConflictView } from "../../../lib/api";
+import { getErrorMessage, type GitUpdateConflictView } from "../../../lib/api";
 import {
   gitCommit,
   gitFetch,
@@ -84,7 +84,7 @@ export function ScmPanel(props: ScmPanelProps) {
       setSelected(new Set<string>());
       await refreshGit();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Git command failed", { variant: "danger" });
+      notify(getErrorMessage(error, "Git command failed"), { variant: "danger" });
     } finally {
       setBusy(false);
     }
@@ -105,9 +105,7 @@ export function ScmPanel(props: ScmPanelProps) {
       <NotificationEvent
         message={
           status.isError
-            ? status.error instanceof Error
-              ? status.error.message
-              : "Git status failed"
+            ? getErrorMessage(status.error, "Git status failed")
             : null
         }
         variant="danger"

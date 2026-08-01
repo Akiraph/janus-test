@@ -1,7 +1,7 @@
 import ChevronRight from "lucide-solid/icons/chevron-right";
 import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
-import { createEffect, createMemo, For, type JSX, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, type JSX, onCleanup, Show } from "solid-js";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { NotificationEvent } from "../../../components/ui/notifications";
 import type {
@@ -9,15 +9,19 @@ import type {
   ContextUsageView,
   ProviderView,
   PublicLimits,
+  QueuedTurnItem,
   SessionModelPreference,
   TurnSummary,
 } from "../../../lib/api";
 import { retryState } from "../../../lib/modelRetryState";
+import { modelStreamOutput } from "../../../lib/modelStream";
 import { MarkdownOutput } from "./MarkdownOutput";
+import { QueuedMessagesBar } from "./QueuedMessagesBar";
 import { rowOpenState, toggleRowOpen } from "./rowOpenState";
 import { AskCard, JobCard, ModelCard, PlanCard, ServiceCard } from "./SessionCards";
 import { SessionComposer, type SessionMessageReceipt } from "./SessionComposer";
 import { formatThoughtDuration, type SessionTimelineItem, type ToolView } from "./sessionTimeline";
+import { isTurnRunning } from "./turnPresentation";
 
 interface SessionConversationProps {
   items: readonly SessionTimelineItem[];
@@ -32,6 +36,7 @@ interface SessionConversationProps {
   turn: TurnSummary | null;
   provisionalText: string;
   provisionalReasoning: string;
+  provisionalRoundId: string | null;
   sessionId: string;
   onRetry: () => void;
   onSubmit: (
@@ -42,6 +47,9 @@ interface SessionConversationProps {
   onUploadAttachment: (sessionId: string, file: File) => Promise<AttachmentView>;
   onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
   onAnswer?: (askId: string, answer: string) => Promise<void>;
+  onCancel?: (() => Promise<void>) | undefined;
+  queuedTurns?: readonly QueuedTurnItem[] | undefined;
+  onQueuedTurnCancel?: ((turn: QueuedTurnItem) => Promise<void>) | undefined;
 }
 
 export function SessionConversation(props: SessionConversationProps) {
@@ -77,7 +85,12 @@ export function SessionConversation(props: SessionConversationProps) {
         }}
       >
         <Show
-          when={props.items.length > 0}
+          when={
+            props.items.length > 0 ||
+            Boolean(props.provisionalText) ||
+            Boolean(props.provisionalReasoning) ||
+            props.turn !== null
+          }
           fallback={
             <Show
               when={props.loading}
@@ -101,11 +114,9 @@ export function SessionConversation(props: SessionConversationProps) {
         >
           <div class="session-conversation__items">
             <For each={props.items}>
-              {(item, index) => (
+              {(item) => (
                 <ConversationEntry
                   item={item}
-                  items={props.items}
-                  index={index}
                   {...(props.onAnswer ? { onAnswer: props.onAnswer } : {})}
                 />
               )}
@@ -113,15 +124,15 @@ export function SessionConversation(props: SessionConversationProps) {
             <Show when={props.provisionalReasoning}>
               {(reasoning) => (
                 <EventRow
-                  itemId={`thinking:provisional:${props.turn?.id ?? "live"}`}
-                  title="Thinking..."
+                  itemId={`thinking:${props.provisionalRoundId ?? props.turn?.id ?? "live"}`}
+                  title={props.provisionalText ? "Thought" : provisionalThinkingTitle()}
                   trailingChevron
                   tone="muted"
                   pulse
-                  autoOpen
+                  autoOpen={false}
                 >
                   <div class="session-event__body-markdown">
-                    <MarkdownOutput text={reasoning()} plain />
+                    <MarkdownOutput text={reasoning()} />
                   </div>
                 </EventRow>
               )}
@@ -134,9 +145,20 @@ export function SessionConversation(props: SessionConversationProps) {
         </Show>
       </div>
 
+      <Show when={(props.queuedTurns ?? []).length > 0}>
+        <QueuedMessagesBar
+          turns={props.queuedTurns ?? []}
+          onDelete={async (turn) => {
+            if (!props.onQueuedTurnCancel) throw new Error("Queued cancellation is unavailable");
+            await props.onQueuedTurnCancel(turn);
+          }}
+        />
+      </Show>
+
       <SessionComposer
         delivery={props.delivery}
         disabled={props.composerDisabled ?? false}
+        isRunning={Boolean(props.onCancel) && isTurnRunning(props.turn)}
         contextUsage={props.contextUsage}
         limits={props.limits}
         modelPreference={props.modelPreference}
@@ -145,13 +167,35 @@ export function SessionConversation(props: SessionConversationProps) {
         onSubmit={props.onSubmit}
         onUploadAttachment={props.onUploadAttachment}
         onDeleteAttachment={props.onDeleteAttachment}
+        onCancel={props.onCancel}
       />
     </section>
   );
 }
 
 function TurnStatusOutput(props: { turn: TurnSummary | null; sessionId: string }) {
-  const visual = createMemo(() => turnStatusVisual(props.turn, props.sessionId));
+  // Tick once per second while a turn is active so the elapsed time display
+  // stays fresh without waiting for a query refetch.
+  const [tick, setTick] = createSignal(0);
+  const visual = createMemo(() => {
+    tick();
+    return turnStatusVisual(props.turn, props.sessionId);
+  });
+  createEffect(() => {
+    const turn = props.turn;
+    if (!turn) return;
+    const active = [
+      "queued",
+      "running",
+      "waiting_for_job",
+      "waiting_for_ask",
+      "waiting_for_model",
+      "canceling",
+    ].includes(turn.status);
+    if (!active) return;
+    const id = setInterval(() => setTick((n) => n + 1), 1000);
+    onCleanup(() => clearInterval(id));
+  });
   return (
     <Show when={visual()}>
       {(status) => (
@@ -176,7 +220,7 @@ function TurnStatusOutput(props: { turn: TurnSummary | null; sessionId: string }
 
 interface TurnStatusVisual {
   text: string;
-  tone: "muted" | "warning" | "danger";
+  tone: "muted" | "warning" | "danger" | "success";
   pulse: boolean;
 }
 
@@ -188,8 +232,7 @@ interface TurnStatusVisual {
  *   `model.attempt_retrying` SSE events via `retryState`, falling back to the
  *   durable `turn.model_attempt` projection captured by polling.
  * - terminal failure → `Failed: reason`, reading `completion_reason`.
- * - terminal success → once reported by the timeline, the row fades out
- *   (there is nothing actionable to say once work is done and durable).
+ * - terminal success -> keep a compact `Worked for Xs` row in the timeline.
  */
 function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStatusVisual | null {
   if (!turn) return null;
@@ -198,9 +241,11 @@ function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStat
     live ??
     (turn.model_attempt && turn.model_attempt.attempt > 0
       ? {
+          attemptId: "",
           attempt: turn.model_attempt.attempt,
           maxAttempts: 5,
           detail: turn.model_attempt.detail ?? "model unavailable",
+          retryAt: Date.now(),
         }
       : null);
 
@@ -209,13 +254,22 @@ function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStat
       return { text: "Queued...", tone: "muted", pulse: true };
     case "running": {
       if (retry) {
+        const retryInSeconds = Math.max(0, Math.ceil((retry.retryAt - Date.now()) / 1000));
         return {
-          text: `Reconnecting (${retry.attempt}/${retry.maxAttempts}): ${retry.detail}`,
+          text: `Reconnecting (${retry.attempt}/${retry.maxAttempts} \u00b7 retrying in ${retryInSeconds}s): ${retry.detail}`,
           tone: "warning",
           pulse: true,
         };
       }
-      return { text: "Working...", tone: "muted", pulse: true };
+      const elapsed = formatElapsed(Date.now() - Date.parse(turn.created_at));
+      const output = modelStreamOutput(sessionId, turn.id);
+      const tokens = formatTokens(output);
+      const thinking = formatThinkingDuration(output);
+      const parts = [`Working (${elapsed}`];
+      if (tokens) parts.push(` · ${tokens}`);
+      if (thinking) parts.push(` · ${thinking}`);
+      parts.push(")");
+      return { text: parts.join(""), tone: "muted", pulse: true };
     }
     case "waiting_for_job":
       return { text: "Waiting for a job to finish...", tone: "warning", pulse: true };
@@ -237,15 +291,65 @@ function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStat
       };
     case "canceled":
       return { text: turn.cancellation_reason || "Canceled.", tone: "muted", pulse: false };
+    case "completed":
+    case "handed_off":
+      return {
+        text: `Worked for ${formatElapsed(Date.parse(turn.updated_at) - Date.parse(turn.created_at))}`,
+        tone: "success",
+        pulse: false,
+      };
     default:
       return null;
   }
 }
 
+/** Format elapsed milliseconds as "Xs", "Xm Xs", or "Xh Xm". */
+function formatElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0s";
+  const totalSeconds = Math.floor(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+/** Format usage into a compact token display string like "↓ 4.2k · ↑ 1.3k". */
+function formatTokens(output: import("../../../lib/modelStream").ModelStreamOutput | null): string {
+  if (!output?.usage) return "";
+  const parts: string[] = [];
+  if (output.usage.outputTokens > 0) parts.push(`↓ ${formatTokenCount(output.usage.outputTokens)}`);
+  // Input tokens are only shown when they exceed the baseline (Round 2+).
+  // For now show only output to avoid confusion with cumulative input counts.
+  return parts.join(" · ");
+}
+
+/** Format a token count: <1000 as-is, >=1000 as "X.Xk". */
+function formatTokenCount(n: number): string {
+  if (n < 1000) return String(n);
+  return `${(n / 1000).toFixed(1)}k`;
+}
+
+/** Format thinking duration for the working status line. */
+function formatThinkingDuration(
+  output: import("../../../lib/modelStream").ModelStreamOutput | null,
+): string {
+  if (!output?.reasoningFirstSeenAt) return "";
+  const endedAt = output.textFirstSeenAt ?? Date.now();
+  const elapsed = Math.max(0, endedAt - output.reasoningFirstSeenAt);
+  if (elapsed < 5000) return "";
+  return `thinking for ${formatElapsed(elapsed)}`;
+}
+
+function provisionalThinkingTitle(): string {
+  // Streaming reasoning changes to "Thought" as soon as answer text arrives;
+  // the durable row adds the measured reasoning duration after the turn settles.
+  return "Thinking...";
+}
+
 function ConversationEntry(props: {
   item: SessionTimelineItem;
-  items: readonly SessionTimelineItem[];
-  index: () => number;
   onAnswer?: (askId: string, answer: string) => Promise<void>;
 }) {
   switch (props.item.type) {
@@ -275,20 +379,22 @@ function ConversationEntry(props: {
               const tail = formatThoughtDuration(item.durationMs);
               return (
                 <EventRow
-                  itemId={`thinking:${item.id}`}
+                  itemId={`thinking:${item.roundId ?? (item.turnId ? `${item.turnId}:${item.id}` : item.id)}`}
                   title={tail ? `Thought ${tail}` : "Thought"}
                   trailingChevron
                   tone="muted"
-                  autoOpen={!hasFollowUpActivity(props.items, props.index())}
+                  autoOpen={false}
                 >
                   <div class="session-event__body-markdown">
-                    <MarkdownOutput text={reasoning()} plain={false} />
+                    <MarkdownOutput text={reasoning()} />
                   </div>
                 </EventRow>
               );
             }}
           </Show>
-          <AssistantOutput text={item.text} />
+          <Show when={item.text}>
+            <AssistantOutput text={item.text} />
+          </Show>
         </>
       );
     }
@@ -473,21 +579,6 @@ function DiffBody(props: { patch: string }) {
   );
 }
 
-/**
- * True when there is at least one later timeline item in the same turn beyond
- * the assistant thought — i.e. a tool call or a follow-up reply followed it.
- * Such thoughts collapse (legacy Janus: "Thinking" while streaming, the
- * thought auto-collapses once the next round's activity begins).
- */
-function hasFollowUpActivity(items: readonly SessionTimelineItem[], index: number): boolean {
-  for (let later = index + 1; later < items.length; later += 1) {
-    const item = items[later];
-    if (!item) continue;
-    if (item.type === "tool" || item.type === "assistant") return true;
-  }
-  return false;
-}
-
 function AssistantOutput(props: { text: string; provisional?: boolean }) {
   return (
     <div
@@ -501,7 +592,7 @@ function AssistantOutput(props: { text: string; provisional?: boolean }) {
       />
       <div class="session-message__body">
         <Show when={props.text}>
-          {(text) => <MarkdownOutput text={text()} plain={props.provisional} />}
+          {(text) => <MarkdownOutput text={text()} />}
         </Show>
       </div>
     </div>

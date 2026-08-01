@@ -1,9 +1,9 @@
 //! Stage 6 context assembly + Compact scheduling.
 //!
 //! Owns the durable `context_versions` projection used by each Round. Stage 6
-//! ships the ledger side (one row per assembled context, with a stable
-//! `system_prefix_version` and `estimated_input_tokens`) and the manual
-//! `schedule_compact` path that records an immutable `compact_summaries` row.
+//! ships the ledger side (one row per assembled context, with
+//! `estimated_input_tokens`) and the manual `schedule_compact` path that
+//! records an immutable `compact_summaries` row.
 //! Real token estimating and automatic compaction scheduling are deferred (see
 //! implement.md Stage 6); the surface here lets a Round attach a context version
 //! and lets a user request a compact without rebuilding the chat history.
@@ -17,15 +17,31 @@ use crate::platform::{
     id::{CompactSummaryId, ContextVersionId, SessionId},
 };
 
-/// Stable system prefix; bump when SYSTEM_PROMPT changes so old
-/// `context_versions.system_prefix_version` rows are distinguishable.
-pub const SYSTEM_PREFIX_VERSION: &str = "sys-1";
-
 /// Bytes of the durable system prefix prepended to every Turn's first Round.
-pub(crate) const SYSTEM_PROMPT: &str = "You are the Janus Supervisor coding agent. \
-You may only use registered tools on the Session workspace. \
-Call finish with the completion summary, main changes, performed and unperformed validation, and remaining risks when the user request is complete. \
-Do not attempt Apply, Sync, Git write, or Main workspace access.";
+pub(crate) const SYSTEM_PROMPT: &str = r#"Goal:
+Complete the user's request end to end, grounded in evidence from tool results and durable state.
+
+Constraints:
+- Treat tool results and durable state as authoritative.
+- Do not claim changes or validation that were not actually performed.
+
+Success criteria:
+- The requested outcome is implemented, or the exact blocker is identified.
+- Relevant validation is run when available.
+- Unperformed validation, remaining risks, and follow-up work are stated explicitly.
+
+Verification (before reporting complete):
+- Re-check the result against every constraint above.
+- Run available validation for key changes; report what was run and what was not.
+- Distinguish verified facts from inferences and unknowns.
+
+Output:
+Respond like a coding teammate, not a report: lead with the outcome, mention key files and verification when code changed, and say plainly when verification was not run. When complete, cover completed work, main file changes, validation performed, validation not performed, remaining risks or TODOs. A normal final response ends the Turn; do not call a completion tool. Do not use Markdown headings or standalone section labels — Janus does not render them well; use short paragraphs and only a few flat bullets when helpful.
+
+Stop rules:
+- Stop when success criteria are met.
+- If evidence is insufficient to support a conclusion, say so explicitly rather than guessing; ask only for information that cannot be safely discovered.
+- Do not broaden the requested scope without user authorization."#;
 
 /// Record one `context_versions` row for a Session/Turn and return its id.
 /// `estimated_input_tokens` is a coarse token estimate used to drive later
@@ -44,17 +60,16 @@ pub async fn record_context_version(
     let now = format_utc(SystemClock.now());
     sqlx::query(
         "INSERT INTO context_versions \
-         (id, session_id, turn_id, sequence, compact_summary_id, system_prefix_version, \
+         (id, session_id, turn_id, sequence, compact_summary_id, \
           estimated_input_tokens, context_limit, compact_status, selection_json, created_at) \
          VALUES (?, ?, ?, \
           (SELECT COALESCE(MAX(sequence), 0) + 1 FROM context_versions WHERE session_id = ?), \
-          NULL, ?, ?, ?, ?, ?, ?)",
+          NULL, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(session_id.to_string())
     .bind(turn_id)
     .bind(session_id.to_string())
-    .bind(SYSTEM_PREFIX_VERSION)
     .bind(estimated_input_tokens)
     .bind(context_limit)
     .bind(compact_status)

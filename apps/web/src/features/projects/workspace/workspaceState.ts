@@ -1,5 +1,5 @@
 import { createEffect, createMemo, createSignal } from "solid-js";
-import { createStore, produce } from "solid-js/store";
+import { createStore, produce, reconcile } from "solid-js/store";
 import type { FileMetaView } from "../../../lib/api";
 
 export interface FileDocument {
@@ -124,7 +124,7 @@ export function createWorkspaceState(compact: () => boolean) {
     );
     if (!removed) return;
     const remaining = documents.filter((document) => document.id !== removed.id);
-    setDocuments(remaining);
+    setDocuments(reconcile(remaining));
     if (activeDocumentId() === removed.id) {
       setActiveDocumentId(remaining.at(-1)?.id ?? null);
     }
@@ -136,7 +136,7 @@ export function createWorkspaceState(compact: () => boolean) {
     if (index < 0) return;
     const neighbor = documents[index + 1] ?? documents[index - 1] ?? null;
     const remaining = documents.filter((document) => document.id !== id);
-    setDocuments(remaining);
+    setDocuments(reconcile(remaining));
     if (activeDocumentId() === id) setActiveDocumentId(neighbor?.id ?? null);
     if (compact() && remaining.length === 0) setNavigationOpen(true);
   }
@@ -160,7 +160,7 @@ export function createWorkspaceState(compact: () => boolean) {
   }
 
   function reset() {
-    setDocuments([]);
+    setDocuments(reconcile([]));
     setActiveDocumentId(null);
     setActivity("sessions");
     setNavigationOpen(true);

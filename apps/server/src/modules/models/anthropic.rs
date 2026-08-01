@@ -115,17 +115,31 @@ pub fn build_messages_body(req: &ModelRequest) -> Value {
             .collect();
         body["tools"] = Value::Array(tools);
     }
+
+    // Map reasoning_effort to Anthropic thinking + output_config
+    if let Some(reasoning_effort) = req
+        .parameters
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        && reasoning_effort != "none"
+    {
+        body["thinking"] = json!({"type": "adaptive"});
+        body["output_config"] = json!({"effort": reasoning_effort});
+    }
+
     body
 }
 
 #[derive(Default)]
 pub struct AnthropicAssembler {
     pub text: String,
+    pub reasoning: String,
     /// index -> (id, name, partial json)
     pub tool_args: Vec<(String, String, String)>,
     pub seq: u64,
     pub usage: Option<TokenUsage>,
     pub stop_reason: Option<String>,
+    pub reasoning_duration_ms: Option<u64>,
 }
 
 impl AnthropicAssembler {
@@ -154,6 +168,20 @@ impl AnthropicAssembler {
                             channel: StreamChannel::Text,
                             text: text.to_owned(),
                             provisional: true,
+                            usage: None,
+                        });
+                    }
+                } else if dtype == "thinking_delta" {
+                    if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
+                        self.reasoning.push_str(text);
+                        self.seq += 1;
+                        out.push(ModelStreamEvent::Delta {
+                            attempt_id: attempt_id.to_owned(),
+                            sequence: self.seq,
+                            channel: StreamChannel::ReasoningSummary,
+                            text: text.to_owned(),
+                            provisional: true,
+                            usage: None,
                         });
                     }
                 } else if dtype == "input_json_delta" {
@@ -209,6 +237,9 @@ impl AnthropicAssembler {
                         provisional: true,
                     });
                 }
+                // "thinking" blocks are acknowledged but no initialization needed —
+                // the reasoning accumulator is shared and will be populated by
+                // subsequent "thinking_delta" events.
             }
             "message_delta" => {
                 if let Some(usage) = v.get("usage") {
@@ -217,9 +248,20 @@ impl AnthropicAssembler {
                         .and_then(|x| x.as_u64())
                         .unwrap_or(0);
                     let input = self.usage.as_ref().map(|u| u.input_tokens).unwrap_or(0);
-                    self.usage = Some(TokenUsage {
+                    let usage = TokenUsage {
                         input_tokens: input,
                         output_tokens: out_tok,
+                    };
+                    self.usage = Some(usage.clone());
+                    // Emit a usage-only delta so the UI can show live output token count.
+                    self.seq += 1;
+                    out.push(ModelStreamEvent::Delta {
+                        attempt_id: attempt_id.to_owned(),
+                        sequence: self.seq,
+                        channel: StreamChannel::Text,
+                        text: String::new(),
+                        provisional: true,
+                        usage: Some(usage),
                     });
                 }
                 if let Some(sr) = v
@@ -232,7 +274,7 @@ impl AnthropicAssembler {
             }
             "message_start" => {
                 if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
-                    self.usage = Some(TokenUsage {
+                    let usage = TokenUsage {
                         input_tokens: usage
                             .get("input_tokens")
                             .and_then(|x| x.as_u64())
@@ -241,6 +283,17 @@ impl AnthropicAssembler {
                             .get("output_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0),
+                    };
+                    self.usage = Some(usage.clone());
+                    // Emit a usage-only delta so the UI can show baseline input token count.
+                    self.seq += 1;
+                    out.push(ModelStreamEvent::Delta {
+                        attempt_id: attempt_id.to_owned(),
+                        sequence: self.seq,
+                        channel: StreamChannel::Text,
+                        text: String::new(),
+                        provisional: true,
+                        usage: Some(usage),
                     });
                 }
             }
@@ -272,7 +325,8 @@ impl AnthropicAssembler {
             stop_reason: self.stop_reason.clone(),
             tool_calls,
             text: self.text.clone(),
-            reasoning: String::new(),
+            reasoning: self.reasoning.clone(),
+            reasoning_duration_ms: self.reasoning_duration_ms,
         }
     }
 }

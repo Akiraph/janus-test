@@ -1,4 +1,5 @@
-//! GitRunner seam: a controlled system-`git` process adapter.
+//! GitRunner adapter: the system-`git` implementation of the port defined in
+//! `modules::projects::git`.
 //!
 //! `ARC-004` and the GitRunner seam: projects/workspace-sync drive clone,
 //! status, diff, index and remote operations through this thin process layer.
@@ -6,229 +7,30 @@
 //! temporary Git repositories with the same adapter rather than rewriting Git
 //! in memory. Only crash-simulation tests use a fake runner.
 //!
-//! Commands run with `GIT_OPTIONAL_LOCKS=0` and read-only arguments so `status`
-//! does not try to refresh the index and fail when a reader races a writer.
+//! The DTOs and `GitRunner` trait are owned by the domain (`modules::projects::
+//! git`); this module re-exports them so existing call sites keep compiling and
+//! implements the system adapter against them. Commands run with
+//! `GIT_OPTIONAL_LOCKS=0` and read-only arguments so `status` does not try to
+//! refresh the index and fail when a reader races a writer.
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use futures_util::future::BoxFuture;
 use tokio::process::Command;
 
 use rand::RngCore;
 
-/// Normalized Git failure for the GitRunner seam. Callers map these to the
-/// stable `GIT_*` Problem codes (`docs/08-events-and-errors.md`).
-#[derive(Debug, Clone, Error, Serialize, Deserialize)]
-pub enum GitError {
-    #[error("git authentication failed")]
-    AuthFailed,
-    #[error("git remote is unreachable")]
-    RemoteUnavailable,
-    #[error("git non-fast-forward")]
-    NonFastForward,
-    #[error("git index is not empty")]
-    IndexNotEmpty,
-    #[error("git histories diverged")]
-    Diverged,
-    #[error("git checkout would overwrite local changes")]
-    CheckoutConflict,
-    #[error("git update produced a three-way content conflict: {paths:?}")]
-    UpdateConflict { paths: Vec<String> },
-    #[error("git process failed: {0}")]
-    CommandFailed(String),
-    #[error("git output was not valid UTF-8 or unexpected: {0}")]
-    BadOutput(String),
-}
+pub use crate::modules::projects::git::{
+    DiffView, GitCredential, GitError, GitLogEntry, GitRunner, GitStatus, UpdateConflictPath,
+    UpdateOutcome,
+};
 
-impl GitError {
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::AuthFailed => "GIT_AUTH_FAILED",
-            Self::RemoteUnavailable => "GIT_REMOTE_UNAVAILABLE",
-            Self::NonFastForward => "GIT_NON_FAST_FORWARD",
-            Self::IndexNotEmpty => "GIT_INDEX_NOT_EMPTY",
-            Self::Diverged => "GIT_DIVERGED",
-            Self::CheckoutConflict => "GIT_CHECKOUT_CONFLICT",
-            Self::UpdateConflict { .. } => "GIT_UPDATE_CONFLICT",
-            Self::CommandFailed(_) | Self::BadOutput(_) => "INTERNAL_ERROR",
-        }
-    }
-}
-
-/// A Git credential passed to clone/fetch/push. PATs are injected via a
-/// short-lived `GIT_ASKPASS` helper so the secret never lands in git config.
-#[derive(Debug, Clone)]
-pub enum GitCredential {
-    None,
-    /// `(username, password)` for HTTPS basic auth. The password is the PAT.
-    HttpsBasic {
-        username: String,
-        password: String,
-    },
-}
-
-/// Three-layer status projection (`WS-GIT-01`, HTTP API `git/status`).
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct GitStatus {
-    pub head_sha: Option<String>,
-    pub branch: Option<String>,
-    pub ahead: u32,
-    pub behind: u32,
-    pub working: Vec<String>,
-    pub index: Vec<String>,
-    pub untracked: Vec<String>,
-}
-
-/// One diff view among the three supported by `GET /git/diff`.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffView {
-    WorkingVsIndex,
-    IndexVsHead,
-    WorkingVsHead,
-}
-
-impl DiffView {
-    fn args(self) -> &'static [&'static str] {
-        match self {
-            Self::WorkingVsIndex => &["diff"],
-            Self::IndexVsHead => &["diff", "--cached"],
-            Self::WorkingVsHead => &["diff", "HEAD"],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct GitLogEntry {
-    pub sha: String,
-    pub parents: Vec<String>,
-    pub author: String,
-    pub committed_at: String,
-    pub message: String,
-    pub changed_files: u64,
-    pub insertions: u64,
-    pub deletions: u64,
-}
-
-/// One path that collides between local working-tree edits and the incoming
-/// remote update. Used to persist a Git Update Conflict without writing markers.
-#[derive(Debug, Clone, Serialize)]
-pub struct UpdateConflictPath {
-    pub path: String,
-    pub kind: String,
-    pub base_hash: Option<String>,
-    pub remote_hash: Option<String>,
-    pub main_hash: Option<String>,
-}
-
-/// Result of a three-way `update`: fast-forward, a stable non-conflict failure,
-/// or a content conflict that records the affected paths (`WS-GIT-04`).
-#[derive(Debug, Clone)]
-pub enum UpdateOutcome {
-    /// HEAD advanced to the remote tip; working-tree-only edits were preserved.
-    FastForward {
-        new_head: String,
-        base_tree: String,
-        remote_tree: String,
-    },
-    Failed(GitError),
-    /// Main was left completely unchanged. Caller persists the conflict rows.
-    Conflict {
-        paths: Vec<UpdateConflictPath>,
-        base_tree: String,
-        remote_tree: String,
-        main_tree: String,
-        head_sha: String,
-        remote_sha: String,
-    },
-}
-
-/// The GitRunner seam. The system implementation shells out to `git`; tests can
-/// substitute a fake for crash simulation only.
-pub trait GitRunner: Send + Sync {
-    fn clone(
-        &self,
-        url: &str,
-        branch: Option<&str>,
-        into: &Path,
-        credential: &GitCredential,
-    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
-
-    fn status(
-        &self,
-        repo: &Path,
-    ) -> impl std::future::Future<Output = Result<GitStatus, GitError>> + Send;
-
-    fn diff(
-        &self,
-        repo: &Path,
-        view: DiffView,
-    ) -> impl std::future::Future<Output = Result<String, GitError>> + Send;
-
-    fn log(
-        &self,
-        repo: &Path,
-        limit: u32,
-    ) -> impl std::future::Future<Output = Result<Vec<GitLogEntry>, GitError>> + Send;
-
-    fn branches(
-        &self,
-        repo: &Path,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, GitError>> + Send;
-
-    fn remotes(
-        &self,
-        repo: &Path,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, GitError>> + Send;
-
-    fn fetch(
-        &self,
-        repo: &Path,
-        remote: &str,
-        credential: &GitCredential,
-    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
-
-    fn stage(
-        &self,
-        repo: &Path,
-        paths: &[String],
-    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
-
-    fn unstage(
-        &self,
-        repo: &Path,
-        paths: &[String],
-    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
-
-    fn commit(
-        &self,
-        repo: &Path,
-        message: &str,
-    ) -> impl std::future::Future<Output = Result<String, GitError>> + Send;
-
-    fn push(
-        &self,
-        repo: &Path,
-        remote: &str,
-        branch: &str,
-        credential: &GitCredential,
-    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
-
-    fn update(
-        &self,
-        repo: &Path,
-        remote: &str,
-        branch: &str,
-        credential: &GitCredential,
-    ) -> impl std::future::Future<Output = Result<UpdateOutcome, GitError>> + Send;
-
-    fn checkout(
-        &self,
-        repo: &Path,
-        branch: &str,
-    ) -> impl std::future::Future<Output = Result<(), GitError>> + Send;
+/// Convenience constructor for wiring the system adapter through the
+/// `Arc<dyn GitRunner>` port at the composition root.
+pub fn system_runner() -> Arc<dyn GitRunner> {
+    Arc::new(SystemGit)
 }
 
 /// System `git` process implementation of `GitRunner`.
@@ -314,270 +116,254 @@ fn classify_failure(stderr: &str) -> GitError {
 }
 
 impl GitRunner for SystemGit {
-    async fn clone(
-        &self,
-        url: &str,
-        branch: Option<&str>,
-        into: &Path,
-        credential: &GitCredential,
-    ) -> Result<(), GitError> {
-        let parent = into
-            .parent()
-            .ok_or_else(|| GitError::BadOutput("clone target has no parent dir".into()))?;
-        std::fs::create_dir_all(parent).ok();
-        let mut command = Command::new("git");
-        command
-            .current_dir(parent)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .arg("clone")
-            .arg("--quiet");
-        if let Some(branch) = branch {
-            command.arg("--branch").arg(branch);
-        }
-        command.arg(url).arg(into.file_name().unwrap_or_default());
-        let askpass = Self::apply_credential(&mut command, credential)?;
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = command
-            .output()
-            .await
-            .map_err(|e| GitError::CommandFailed(e.to_string()))?;
-        if let Some(script) = askpass {
-            let _ = std::fs::remove_file(script);
-        }
-        if output.status.success() {
+    fn clone<'a>(
+        &'a self,
+        url: &'a str,
+        branch: Option<&'a str>,
+        into: &'a Path,
+        credential: &'a GitCredential,
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            let parent = into
+                .parent()
+                .ok_or_else(|| GitError::BadOutput("clone target has no parent dir".into()))?;
+            std::fs::create_dir_all(parent).ok();
+            let mut command = Command::new("git");
+            command
+                .current_dir(parent)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .arg("clone")
+                .arg("--quiet");
+            if let Some(branch) = branch {
+                command.arg("--branch").arg(branch);
+            }
+            command.arg(url).arg(into.file_name().unwrap_or_default());
+            let askpass = Self::apply_credential(&mut command, credential)?;
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = command
+                .output()
+                .await
+                .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+            if let Some(script) = askpass {
+                let _ = std::fs::remove_file(script);
+            }
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(classify_failure(&String::from_utf8_lossy(&output.stderr)))
+            }
+        })
+    }
+
+    fn status<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<GitStatus, GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command
+                .arg("status")
+                .arg("--porcelain=v2")
+                .arg("--branch");
+            let output = Self::run(&mut command).await?;
+            Ok(parse_porcelain_v2(&output))
+        })
+    }
+
+    fn diff<'a>(
+        &'a self,
+        repo: &'a Path,
+        view: DiffView,
+    ) -> BoxFuture<'a, Result<String, GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.args(view.args()).arg("--no-color");
+            Self::run(&mut command).await
+        })
+    }
+
+    fn log<'a>(
+        &'a self,
+        repo: &'a Path,
+        limit: u32,
+    ) -> BoxFuture<'a, Result<Vec<GitLogEntry>, GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command
+                .arg("log")
+                .arg(format!("-n{limit}"))
+                .arg("--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s")
+                .arg("--numstat");
+            let output = Self::run(&mut command).await?;
+            Ok(parse_git_log(&output))
+        })
+    }
+
+    fn branches<'a>(
+        &'a self,
+        repo: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<String>, GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command
+                .arg("for-each-ref")
+                .arg("--format=%(refname:short)")
+                .arg("refs/heads/");
+            let output = Self::run(&mut command).await?;
+            Ok(output.lines().map(str::to_owned).collect())
+        })
+    }
+
+    fn remotes<'a>(
+        &'a self,
+        repo: &'a Path,
+    ) -> BoxFuture<'a, Result<Vec<String>, GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.arg("remote");
+            let output = Self::run(&mut command).await?;
+            Ok(output.lines().map(str::to_owned).collect())
+        })
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        repo: &'a Path,
+        remote: &'a str,
+        credential: &'a GitCredential,
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.arg("fetch").arg("--quiet").arg(remote);
+            let askpass = Self::apply_credential(&mut command, credential)?;
+            let result = Self::run(&mut command).await;
+            if let Some(script) = askpass {
+                let _ = std::fs::remove_file(script);
+            }
+            result?;
             Ok(())
-        } else {
-            Err(classify_failure(&String::from_utf8_lossy(&output.stderr)))
-        }
+        })
     }
 
-    async fn status(&self, repo: &Path) -> Result<GitStatus, GitError> {
-        let mut command = Self::base(repo);
-        command.arg("status").arg("--porcelain=v2").arg("--branch");
-        let output = Self::run(&mut command).await?;
-        Ok(parse_porcelain_v2(&output))
+    fn stage<'a>(
+        &'a self,
+        repo: &'a Path,
+        paths: &'a [String],
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.arg("add").arg("--");
+            for path in paths {
+                command.arg(path);
+            }
+            Self::run(&mut command).await?;
+            Ok(())
+        })
     }
 
-    async fn diff(&self, repo: &Path, view: DiffView) -> Result<String, GitError> {
-        let mut command = Self::base(repo);
-        command.args(view.args()).arg("--no-color");
-        Self::run(&mut command).await
+    fn unstage<'a>(
+        &'a self,
+        repo: &'a Path,
+        paths: &'a [String],
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.arg("reset").arg("HEAD").arg("--");
+            for path in paths {
+                command.arg(path);
+            }
+            Self::run(&mut command).await?;
+            Ok(())
+        })
     }
 
-    async fn log(&self, repo: &Path, limit: u32) -> Result<Vec<GitLogEntry>, GitError> {
-        let mut command = Self::base(repo);
-        command
-            .arg("log")
-            .arg(format!("-n{limit}"))
-            .arg("--format=%x1e%H%x1f%P%x1f%an%x1f%aI%x1f%s")
-            .arg("--numstat");
-        let output = Self::run(&mut command).await?;
-        Ok(parse_git_log(&output))
+    fn commit<'a>(
+        &'a self,
+        repo: &'a Path,
+        message: &'a str,
+    ) -> BoxFuture<'a, Result<String, GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.arg("commit").arg("--quiet").arg("-m").arg(message);
+            Self::run(&mut command).await?;
+            // Return the new HEAD sha.
+            let mut rev = Self::base(repo);
+            rev.arg("rev-parse").arg("HEAD");
+            Self::run(&mut rev).await.map(|s| s.trim().to_owned())
+        })
     }
 
-    async fn branches(&self, repo: &Path) -> Result<Vec<String>, GitError> {
-        let mut command = Self::base(repo);
-        command
-            .arg("for-each-ref")
-            .arg("--format=%(refname:short)")
-            .arg("refs/heads/");
-        let output = Self::run(&mut command).await?;
-        Ok(output.lines().map(str::to_owned).collect())
+    fn push<'a>(
+        &'a self,
+        repo: &'a Path,
+        remote: &'a str,
+        branch: &'a str,
+        credential: &'a GitCredential,
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command
+                .arg("push")
+                .arg("--quiet")
+                .arg(remote)
+                .arg(format!("refs/heads/{branch}:refs/heads/{branch}"));
+            let askpass = Self::apply_credential(&mut command, credential)?;
+            let result = Self::run(&mut command).await;
+            if let Some(script) = askpass {
+                let _ = std::fs::remove_file(script);
+            }
+            result?;
+            Ok(())
+        })
     }
 
-    async fn remotes(&self, repo: &Path) -> Result<Vec<String>, GitError> {
-        let mut command = Self::base(repo);
-        command.arg("remote");
-        let output = Self::run(&mut command).await?;
-        Ok(output.lines().map(str::to_owned).collect())
-    }
+    fn update<'a>(
+        &'a self,
+        repo: &'a Path,
+        remote: &'a str,
+        branch: &'a str,
+        credential: &'a GitCredential,
+    ) -> BoxFuture<'a, Result<UpdateOutcome, GitError>> {
+        Box::pin(async move {
+            // Fetch first (does not touch Main working tree).
+            self.fetch(repo, remote, credential).await?;
 
-    async fn fetch(
-        &self,
-        repo: &Path,
-        remote: &str,
-        credential: &GitCredential,
-    ) -> Result<(), GitError> {
-        let mut command = Self::base(repo);
-        command.arg("fetch").arg("--quiet").arg(remote);
-        let askpass = Self::apply_credential(&mut command, credential)?;
-        let result = Self::run(&mut command).await;
-        if let Some(script) = askpass {
-            let _ = std::fs::remove_file(script);
-        }
-        result?;
-        Ok(())
-    }
+            // Fast-forward only when the index is empty; otherwise return a stable
+            // error and leave Main unchanged (`WS-GIT-04`).
+            let status = self.status(repo).await?;
+            if !status.index.is_empty() {
+                return Ok(UpdateOutcome::Failed(GitError::IndexNotEmpty));
+            }
 
-    async fn stage(&self, repo: &Path, paths: &[String]) -> Result<(), GitError> {
-        let mut command = Self::base(repo);
-        command.arg("add").arg("--");
-        for path in paths {
-            command.arg(path);
-        }
-        Self::run(&mut command).await?;
-        Ok(())
-    }
+            let upstream = format!("{remote}/{branch}");
+            let head_sha = rev_parse(repo, "HEAD").await?;
+            let remote_sha = rev_parse(repo, &upstream).await?;
+            let base_sha = match merge_base(repo, "HEAD", &upstream).await {
+                Ok(sha) => sha,
+                Err(_) => {
+                    return Ok(UpdateOutcome::Failed(GitError::Diverged));
+                }
+            };
 
-    async fn unstage(&self, repo: &Path, paths: &[String]) -> Result<(), GitError> {
-        let mut command = Self::base(repo);
-        command.arg("reset").arg("HEAD").arg("--");
-        for path in paths {
-            command.arg(path);
-        }
-        Self::run(&mut command).await?;
-        Ok(())
-    }
-
-    async fn commit(&self, repo: &Path, message: &str) -> Result<String, GitError> {
-        let mut command = Self::base(repo);
-        command.arg("commit").arg("--quiet").arg("-m").arg(message);
-        Self::run(&mut command).await?;
-        // Return the new HEAD sha.
-        let mut rev = Self::base(repo);
-        rev.arg("rev-parse").arg("HEAD");
-        Self::run(&mut rev).await.map(|s| s.trim().to_owned())
-    }
-
-    async fn push(
-        &self,
-        repo: &Path,
-        remote: &str,
-        branch: &str,
-        credential: &GitCredential,
-    ) -> Result<(), GitError> {
-        let mut command = Self::base(repo);
-        command
-            .arg("push")
-            .arg("--quiet")
-            .arg(remote)
-            .arg(format!("refs/heads/{branch}:refs/heads/{branch}"));
-        let askpass = Self::apply_credential(&mut command, credential)?;
-        let result = Self::run(&mut command).await;
-        if let Some(script) = askpass {
-            let _ = std::fs::remove_file(script);
-        }
-        result?;
-        Ok(())
-    }
-
-    async fn update(
-        &self,
-        repo: &Path,
-        remote: &str,
-        branch: &str,
-        credential: &GitCredential,
-    ) -> Result<UpdateOutcome, GitError> {
-        // Fetch first (does not touch Main working tree).
-        self.fetch(repo, remote, credential).await?;
-
-        // Fast-forward only when the index is empty; otherwise return a stable
-        // error and leave Main unchanged (`WS-GIT-04`).
-        let status = self.status(repo).await?;
-        if !status.index.is_empty() {
-            return Ok(UpdateOutcome::Failed(GitError::IndexNotEmpty));
-        }
-
-        let upstream = format!("{remote}/{branch}");
-        let head_sha = rev_parse(repo, "HEAD").await?;
-        let remote_sha = rev_parse(repo, &upstream).await?;
-        let base_sha = match merge_base(repo, "HEAD", &upstream).await {
-            Ok(sha) => sha,
-            Err(_) => {
+            if base_sha == remote_sha {
+                // Remote is behind or equal to HEAD: nothing to update.
+                return Ok(UpdateOutcome::FastForward {
+                    new_head: head_sha.clone(),
+                    base_tree: head_sha.clone(),
+                    remote_tree: remote_sha,
+                });
+            }
+            if base_sha != head_sha {
+                // Local history diverged from the remote branch.
                 return Ok(UpdateOutcome::Failed(GitError::Diverged));
             }
-        };
 
-        if base_sha == remote_sha {
-            // Remote is behind or equal to HEAD: nothing to update.
-            return Ok(UpdateOutcome::FastForward {
-                new_head: head_sha.clone(),
-                base_tree: head_sha.clone(),
-                remote_tree: remote_sha,
-            });
-        }
-        if base_sha != head_sha {
-            // Local history diverged from the remote branch.
-            return Ok(UpdateOutcome::Failed(GitError::Diverged));
-        }
-
-        // Compute path-level conflicts between working tree edits and the
-        // incoming remote tree *before* mutating HEAD. If anything collides,
-        // leave HEAD/index/working tree completely unchanged.
-        let conflict_paths =
-            compute_update_conflicts(repo, &base_sha, &remote_sha, &head_sha).await?;
-        if !conflict_paths.is_empty() {
-            return Ok(UpdateOutcome::Conflict {
-                paths: conflict_paths,
-                base_tree: base_sha,
-                remote_tree: remote_sha.clone(),
-                main_tree: head_sha.clone(),
-                head_sha,
-                remote_sha,
-            });
-        }
-
-        // No path conflicts: advance HEAD with --ff-only. Working-tree-only
-        // edits on non-conflicting paths are preserved by git.
-        let mut ff = Self::base(repo);
-        ff.arg("merge")
-            .arg("--ff-only")
-            .arg("--no-edit")
-            .arg(&upstream);
-        let output = ff
-            .output()
-            .await
-            .map_err(|e| GitError::CommandFailed(e.to_string()))?;
-        if output.status.success() {
-            return Ok(UpdateOutcome::FastForward {
-                new_head: remote_sha.clone(),
-                base_tree: base_sha,
-                remote_tree: remote_sha,
-            });
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        // If git refused because local edits would be overwritten, recompute
-        // path conflicts and surface them instead of a bare checkout error.
-        let lower = stderr.to_ascii_lowercase();
-        if lower.contains("overwritten") || lower.contains("conflict") {
-            let mut conflict_paths =
+            // Compute path-level conflicts between working tree edits and the
+            // incoming remote tree *before* mutating HEAD. If anything collides,
+            // leave HEAD/index/working tree completely unchanged.
+            let conflict_paths =
                 compute_update_conflicts(repo, &base_sha, &remote_sha, &head_sha).await?;
-            if conflict_paths.is_empty() {
-                // Last-resort: parse "would be overwritten by merge:\n\t<path>" lines.
-                for line in stderr.lines() {
-                    let path = line.trim().trim_start_matches('\t');
-                    if path.is_empty()
-                        || path.contains(' ')
-                        || path.contains(':')
-                        || path.starts_with("error")
-                        || path.starts_with("Updating")
-                        || path.starts_with("hint")
-                    {
-                        continue;
-                    }
-                    if path.contains('/') || path.contains('.') {
-                        let base_hash = blob_hash_at(repo, &base_sha, path).await.ok().flatten();
-                        let remote_hash =
-                            blob_hash_at(repo, &remote_sha, path).await.ok().flatten();
-                        let main_hash = working_blob_hash(repo, path)
-                            .await
-                            .ok()
-                            .flatten()
-                            .or(blob_hash_at(repo, &head_sha, path).await.ok().flatten());
-                        conflict_paths.push(UpdateConflictPath {
-                            path: path.to_owned(),
-                            kind: "text".into(),
-                            base_hash,
-                            remote_hash,
-                            main_hash,
-                        });
-                    }
-                }
-            }
             if !conflict_paths.is_empty() {
                 return Ok(UpdateOutcome::Conflict {
                     paths: conflict_paths,
@@ -588,15 +374,122 @@ impl GitRunner for SystemGit {
                     remote_sha,
                 });
             }
-        }
-        Ok(UpdateOutcome::Failed(classify_failure(&stderr)))
+
+            // No path conflicts: advance HEAD with --ff-only. Working-tree-only
+            // edits on non-conflicting paths are preserved by git.
+            let mut ff = Self::base(repo);
+            ff.arg("merge")
+                .arg("--ff-only")
+                .arg("--no-edit")
+                .arg(&upstream);
+            let output = ff
+                .output()
+                .await
+                .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+            if output.status.success() {
+                return Ok(UpdateOutcome::FastForward {
+                    new_head: remote_sha.clone(),
+                    base_tree: base_sha,
+                    remote_tree: remote_sha,
+                });
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            // If git refused because local edits would be overwritten, recompute
+            // path conflicts and surface them instead of a bare checkout error.
+            let lower = stderr.to_ascii_lowercase();
+            if lower.contains("overwritten") || lower.contains("conflict") {
+                let mut conflict_paths =
+                    compute_update_conflicts(repo, &base_sha, &remote_sha, &head_sha).await?;
+                if conflict_paths.is_empty() {
+                    // Last-resort: parse "would be overwritten by merge:\n\t<path>" lines.
+                    for line in stderr.lines() {
+                        let path = line.trim().trim_start_matches('\t');
+                        if path.is_empty()
+                            || path.contains(' ')
+                            || path.contains(':')
+                            || path.starts_with("error")
+                            || path.starts_with("Updating")
+                            || path.starts_with("hint")
+                        {
+                            continue;
+                        }
+                        if path.contains('/') || path.contains('.') {
+                            let base_hash =
+                                blob_hash_at(repo, &base_sha, path).await.ok().flatten();
+                            let remote_hash =
+                                blob_hash_at(repo, &remote_sha, path).await.ok().flatten();
+                            let main_hash = working_blob_hash(repo, path)
+                                .await
+                                .ok()
+                                .flatten()
+                                .or(blob_hash_at(repo, &head_sha, path).await.ok().flatten());
+                            conflict_paths.push(UpdateConflictPath {
+                                path: path.to_owned(),
+                                kind: "text".into(),
+                                base_hash,
+                                remote_hash,
+                                main_hash,
+                            });
+                        }
+                    }
+                }
+                if !conflict_paths.is_empty() {
+                    return Ok(UpdateOutcome::Conflict {
+                        paths: conflict_paths,
+                        base_tree: base_sha,
+                        remote_tree: remote_sha.clone(),
+                        main_tree: head_sha.clone(),
+                        head_sha,
+                        remote_sha,
+                    });
+                }
+            }
+            Ok(UpdateOutcome::Failed(classify_failure(&stderr)))
+        })
     }
 
-    async fn checkout(&self, repo: &Path, branch: &str) -> Result<(), GitError> {
-        let mut command = Self::base(repo);
-        command.arg("checkout").arg("--quiet").arg(branch);
-        Self::run(&mut command).await?;
-        Ok(())
+    fn checkout<'a>(
+        &'a self,
+        repo: &'a Path,
+        branch: &'a str,
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            let mut command = Self::base(repo);
+            command.arg("checkout").arg("--quiet").arg(branch);
+            Self::run(&mut command).await?;
+            Ok(())
+        })
+    }
+
+    fn apply_conflict_choice<'a>(
+        &'a self,
+        repo: &'a Path,
+        path: &'a str,
+        choice: &'a str,
+        remote_hash: Option<&'a str>,
+        main_hash: Option<&'a str>,
+        edited_bytes: Option<&'a [u8]>,
+    ) -> BoxFuture<'a, Result<(), GitError>> {
+        Box::pin(async move {
+            apply_conflict_choice(
+                repo,
+                path,
+                choice,
+                remote_hash,
+                main_hash,
+                edited_bytes,
+            )
+            .await
+        })
+    }
+
+    fn complete_fast_forward<'a>(
+        &'a self,
+        repo: &'a Path,
+        remote: &'a str,
+        branch: &'a str,
+    ) -> BoxFuture<'a, Result<String, GitError>> {
+        Box::pin(async move { complete_fast_forward(repo, remote, branch).await })
     }
 }
 

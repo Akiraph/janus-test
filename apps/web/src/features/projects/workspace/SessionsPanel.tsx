@@ -4,14 +4,24 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
 import Plus from "lucide-solid/icons/plus";
 import Trash2 from "lucide-solid/icons/trash-2";
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Alt } from "../../../components/ui/Alt";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { useNotifications } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../../lib/api";
-import { createSession, deleteSession, getSession, waitForOperation } from "../../../lib/api";
+import {
+  createSession,
+  deleteSession,
+  getErrorMessage,
+  getSession,
+  waitForOperation,
+} from "../../../lib/api";
 import { useSessions } from "../../../lib/queries";
+import {
+  broadcastSessionListChanged,
+  subscribeSessionListChanged,
+} from "../../../lib/tabBroadcast";
 import "./sessions-panel.css";
 
 interface SessionsPanelProps {
@@ -33,6 +43,53 @@ export function SessionsPanel(props: SessionsPanelProps) {
   const [deletingId, setDeletingId] = createSignal<string | null>(null);
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
 
+  function finishCreation(operationId: string, projectId: string, sessionId: string) {
+    void (async () => {
+      try {
+        const completed = await waitForOperation(operationId, 30_000);
+        const durableSessionId = completed.target_id ?? sessionId;
+        const session = await getSession(durableSessionId);
+        queryClient.setQueryData(["session", session.id], session);
+        queryClient.setQueryData(["session-timeline", session.id], {
+          items: [],
+          has_older: false,
+          has_newer: false,
+          oldest_cursor: null,
+          newest_cursor: null,
+        });
+        queryClient.setQueryData<SessionSummary[]>(["sessions", projectId], (prev) => {
+          const list = prev ?? [];
+          if (list.some((candidate) => candidate.id === session.id)) {
+            return list.map((candidate) => (candidate.id === session.id ? session : candidate));
+          }
+          return [session, ...list];
+        });
+        void queryClient.invalidateQueries({ queryKey: ["session-context", session.id] });
+        broadcastSessionListChanged(projectId);
+      } catch (error) {
+        queryClient.removeQueries({ queryKey: ["session", sessionId] });
+        queryClient.setQueryData<SessionSummary[]>(["sessions", projectId], (prev) =>
+          (prev ?? []).filter((candidate) => candidate.id !== sessionId),
+        );
+        props.onSessionDeleted?.(sessionId);
+        notify(getErrorMessage(error, "Failed to create session"), {
+          variant: "danger",
+        });
+      } finally {
+        void sessions.refetch();
+      }
+    })();
+  }
+
+  // Cross-tab session list synchronization: when another tab creates or
+  // deletes a session, invalidate our list so the sidebar stays current.
+  onMount(() => {
+    const unsub = subscribeSessionListChanged(props.projectId() ?? "", () => {
+      void sessions.refetch();
+    });
+    onCleanup(unsub);
+  });
+
   async function onCreate() {
     const id = props.projectId();
     if (!id || creating()) return;
@@ -40,29 +97,43 @@ export function SessionsPanel(props: SessionsPanelProps) {
     setCreating(true);
     try {
       const accepted = await createSession(id, { title: "New session" }, crypto.randomUUID());
-      const completed = await waitForOperation(accepted.id);
-      const sessionId = completed.target_id ?? accepted.target_id;
-      if (!sessionId) throw new Error("Session creation completed without a Session id");
-      const session = await getSession(sessionId);
-      queryClient.setQueryData(["session", session.id], session);
-      queryClient.setQueryData(["session-timeline", session.id], {
+      const sessionId = accepted.target_id;
+      if (!sessionId) throw new Error("Session creation was accepted without a Session id");
+      const now = new Date().toISOString();
+      const optimisticSession: SessionSummary = {
+        id: sessionId,
+        kind: "session",
+        project_id: id,
+        title: "New session",
+        state: "creating",
+        active_turn_id: null,
+        version: "",
+        source_main_revision_id: "",
+        workspace_handle: "",
+        workspace_revision: null,
+        model_preference: null,
+        created_at: now,
+        updated_at: now,
+        last_activity_at: now,
+      };
+      queryClient.setQueryData<SessionSummary>(["session", sessionId], optimisticSession);
+      queryClient.setQueryData<SessionSummary[]>(["sessions", id], (prev) => [
+        optimisticSession,
+        ...(prev ?? []).filter((candidate) => candidate.id !== sessionId),
+      ]);
+      queryClient.setQueryData(["session-timeline", sessionId], {
         items: [],
         has_older: false,
         has_newer: false,
         oldest_cursor: null,
         newest_cursor: null,
       });
-      queryClient.setQueryData<SessionSummary[]>(["sessions", id], (prev) => {
-        const list = prev ?? [];
-        if (list.some((s) => s.id === session.id)) return list;
-        return [session, ...list];
-      });
-      void sessions.refetch();
-      props.onOpenSession(session.id, session.title);
+      props.onOpenSession(sessionId, "New session");
+      finishCreation(accepted.id, id, sessionId);
     } catch (error) {
       // Session create/delete are sidebar actions — failures surface as a
       // transient toast, not a red block that occupies the session list.
-      notify(error instanceof Error ? error.message : "Failed to create session", {
+        notify(getErrorMessage(error, "Failed to create session"), {
         variant: "danger",
       });
     } finally {
@@ -75,11 +146,26 @@ export function SessionsPanel(props: SessionsPanelProps) {
     setDeletingId(session.id);
     try {
       const accepted = await deleteSession(session.id, session.version, crypto.randomUUID());
-      await waitForOperation(accepted.id);
       props.onSessionDeleted?.(session.id);
-      void sessions.refetch();
+      queryClient.setQueryData<SessionSummary[]>(["sessions", session.project_id], (prev) =>
+        (prev ?? []).filter((candidate) => candidate.id !== session.id),
+      );
+      setDeletingId(null);
+      void (async () => {
+        try {
+          await waitForOperation(accepted.id, 30_000);
+          queryClient.removeQueries({ queryKey: ["session", session.id] });
+          broadcastSessionListChanged(session.project_id);
+        } catch (error) {
+          notify(getErrorMessage(error, "Failed to delete session"), {
+            variant: "danger",
+          });
+        } finally {
+          void sessions.refetch();
+        }
+      })();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Failed to delete session", {
+        notify(getErrorMessage(error, "Failed to delete session"), {
         variant: "danger",
       });
     } finally {
@@ -153,7 +239,10 @@ function SessionRow(props: {
   return (
     <div
       class="sessions-panel__item"
-      classList={{ "sessions-panel__item--active": props.active() }}
+      classList={{
+        "sessions-panel__item--active": props.active(),
+        "sessions-panel__item--creating": props.session.state === "creating",
+      }}
       title={props.session.title ?? "Untitled session"}
     >
       <button type="button" class="sessions-panel__select" onClick={props.onOpen}>
@@ -173,7 +262,7 @@ function SessionRow(props: {
         class="sessions-panel__action"
         title="Delete session"
         aria-label={`Delete session ${props.session.title ?? props.session.id}`}
-        disabled={props.deleting()}
+        disabled={props.deleting() || props.session.state === "creating"}
         onClick={(event) => {
           event.stopPropagation();
           props.onDelete();
@@ -194,6 +283,8 @@ function createStatusInfo(state: string): {
   spinning: boolean;
 } {
   switch (state) {
+    case "creating":
+      return { icon: null, label: "Creating...", spinning: true };
     case "active":
       return { icon: null, label: "Active (turn running)", spinning: true };
     case "deleting":

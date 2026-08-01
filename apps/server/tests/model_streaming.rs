@@ -191,12 +191,24 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
                 text, provisional, ..
             } => {
                 assert!(*provisional);
-                Some(text.as_str())
+                (!text.is_empty()).then_some(text.as_str())
             }
             _ => None,
         })
         .collect();
     assert_eq!(text_deltas, ["Hel", "lo"]);
+    let usage_deltas: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            ModelStreamEvent::Delta {
+                usage: Some(usage), ..
+            } => Some(usage),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(usage_deltas.len(), 1);
+    assert_eq!(usage_deltas[0].input_tokens, 3);
+    assert_eq!(usage_deltas[0].output_tokens, 2);
     match events.last() {
         Some(ModelStreamEvent::Completed {
             text,
@@ -348,14 +360,18 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
         .await?;
     assert_eq!(ledger, 0);
 
-    // Secret must not appear in error detail strings we store.
+    // The upstream error message is surfaced (sanitized of secrets), but the
+    // raw API key must never appear in the stored error detail.
     let err: Option<String> =
         sqlx::query_scalar("SELECT normalized_error_json FROM model_attempts LIMIT 1")
             .fetch_one(_db.pool())
             .await?;
     let err = err.unwrap_or_default();
-    assert!(!err.contains("sk-bad"));
-    assert!(!err.contains("bad key")); // raw upstream body not stored
+    assert!(!err.contains("sk-bad"), "secret leaked into error detail: {err}");
+    assert!(
+        err.contains("bad key"),
+        "upstream error message should be surfaced: {err}"
+    );
 
     Ok(())
 }
@@ -377,7 +393,7 @@ async fn openai_assembler_unit_parse() {
             r#"{"choices":[{"delta":{"content":"B"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
         )
         .expect("test value");
-    assert_eq!(e2.len(), 1);
+    assert_eq!(e2.len(), 2);
     match a.finish("att-1") {
         ModelStreamEvent::Completed { text, usage, .. } => {
             assert_eq!(text, "AB");

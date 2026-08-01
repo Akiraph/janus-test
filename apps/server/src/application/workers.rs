@@ -104,25 +104,35 @@ async fn run_once(state: &AppState) -> anyhow::Result<()> {
         else {
             continue;
         };
-        let outcome = dispatch(state, kind, &claimed.payload).await;
-        match outcome {
-            Ok(()) => {
-                state
-                    .operations()
-                    .complete_work(&claimed.id, &claimed.nonce)
-                    .await?;
+        let worker_state = state.clone();
+        let worker_kind = (*kind).to_owned();
+        tokio::spawn(async move {
+            let outcome = dispatch(&worker_state, &worker_kind, &claimed.payload).await;
+            match outcome {
+                Ok(()) => {
+                    if let Err(error) = worker_state
+                        .operations()
+                        .complete_work(&claimed.id, &claimed.nonce)
+                        .await
+                    {
+                        warn!(%error, kind = %worker_kind, "complete work item failed");
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, kind = %worker_kind, "work item failed");
+                    // Non-fatal errors stay claimable for retry; fatal ones are
+                    // marked dead so a poison item does not loop forever.
+                    let dead = is_fatal(&error);
+                    if let Err(fail_error) = worker_state
+                        .operations()
+                        .fail_work(&claimed.id, &claimed.nonce, dead)
+                        .await
+                    {
+                        warn!(%fail_error, kind = %worker_kind, "fail work item update failed");
+                    }
+                }
             }
-            Err(error) => {
-                warn!(%error, kind, "work item failed");
-                // Non-fatal errors stay claimable for retry; fatal ones are
-                // marked dead so a poison item does not loop forever.
-                let dead = is_fatal(&error);
-                state
-                    .operations()
-                    .fail_work(&claimed.id, &claimed.nonce, dead)
-                    .await?;
-            }
-        }
+        });
     }
     Ok(())
 }

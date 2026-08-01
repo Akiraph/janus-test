@@ -1,5 +1,7 @@
 //! Model streaming request/response types (M3 Stage 3).
 
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -72,6 +74,48 @@ pub enum StreamChannel {
     ToolCallPreview,
 }
 
+/// Measures the model reasoning interval independently from answer/tool
+/// output. Provider adapters observe deltas before awaiting event persistence.
+#[derive(Debug, Default)]
+pub struct StreamTiming {
+    reasoning_started_at: Option<Instant>,
+    output_started_at: Option<Instant>,
+}
+
+impl StreamTiming {
+    pub fn observe(&mut self, event: &ModelStreamEvent) {
+        let now = Instant::now();
+        match event {
+            ModelStreamEvent::Delta {
+                channel: StreamChannel::ReasoningSummary,
+                text,
+                ..
+            } if !text.is_empty() => {
+                self.reasoning_started_at.get_or_insert(now);
+            }
+            ModelStreamEvent::Delta {
+                channel: StreamChannel::Text,
+                text,
+                ..
+            } if !text.is_empty() => {
+                if self.reasoning_started_at.is_some() {
+                    self.output_started_at.get_or_insert(now);
+                }
+            }
+            ModelStreamEvent::ToolCallDelta { .. } if self.reasoning_started_at.is_some() => {
+                self.output_started_at.get_or_insert(now);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn reasoning_duration_ms(&self) -> Option<u64> {
+        let started = self.reasoning_started_at?;
+        let ended = self.output_started_at.unwrap_or_else(Instant::now);
+        u64::try_from(ended.saturating_duration_since(started).as_millis()).ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallDelta {
     pub index: u32,
@@ -103,6 +147,12 @@ pub enum ModelStreamEvent {
         channel: StreamChannel,
         text: String,
         provisional: bool,
+        /// Provider usage snapshot carried alongside a delta so the UI can
+        /// render a live `Working (↓ Xk · ↑ Xk)` line. Absent until the
+        /// provider reports usage (Anthropic `message_start`/`message_delta`,
+        /// OpenAI final chunk).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
     ToolCallDelta {
         attempt_id: String,
@@ -118,6 +168,9 @@ pub enum ModelStreamEvent {
         /// Final assistant text assembled from deltas (for Round commit).
         text: String,
         reasoning: String,
+        /// Time from the first reasoning delta to the first answer/tool delta.
+        /// If there is no answer/tool delta, this ends at stream completion.
+        reasoning_duration_ms: Option<u64>,
     },
     Failed {
         attempt_id: String,
@@ -135,4 +188,45 @@ pub enum ModelStreamEvent {
         detail: String,
         retry_after_ms: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{thread, time::Duration};
+
+    use super::{ModelStreamEvent, StreamChannel, StreamTiming};
+
+    fn delta(channel: StreamChannel, text: &str) -> ModelStreamEvent {
+        ModelStreamEvent::Delta {
+            attempt_id: "attempt".into(),
+            sequence: 0,
+            channel,
+            text: text.into(),
+            provisional: true,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn reasoning_duration_stops_at_first_answer_delta() {
+        let mut timing = StreamTiming::default();
+        timing.observe(&delta(StreamChannel::ReasoningSummary, "thought"));
+        timing.observe(&delta(StreamChannel::Text, "answer"));
+        let measured = timing
+            .reasoning_duration_ms()
+            .expect("reasoning should have a duration after an answer delta");
+
+        thread::sleep(Duration::from_millis(5));
+        assert_eq!(timing.reasoning_duration_ms(), Some(measured));
+
+        timing.observe(&delta(StreamChannel::Text, " more answer"));
+        assert_eq!(timing.reasoning_duration_ms(), Some(measured));
+    }
+
+    #[test]
+    fn reasoning_duration_is_absent_without_reasoning() {
+        let mut timing = StreamTiming::default();
+        timing.observe(&delta(StreamChannel::Text, "answer"));
+        assert_eq!(timing.reasoning_duration_ms(), None);
+    }
 }

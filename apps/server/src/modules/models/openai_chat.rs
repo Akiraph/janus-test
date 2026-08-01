@@ -133,6 +133,7 @@ pub struct OpenaiChatAssembler {
     pub seq: u64,
     pub usage: Option<TokenUsage>,
     pub finish_reason: Option<String>,
+    pub reasoning_duration_ms: Option<u64>,
     tool_names: HashMap<String, String>,
 }
 
@@ -159,7 +160,7 @@ impl OpenaiChatAssembler {
         let mut out = Vec::new();
 
         if let Some(usage) = v.get("usage") {
-            self.usage = Some(TokenUsage {
+            let usage = TokenUsage {
                 input_tokens: usage
                     .get("prompt_tokens")
                     .and_then(|x| x.as_u64())
@@ -168,6 +169,17 @@ impl OpenaiChatAssembler {
                     .get("completion_tokens")
                     .and_then(|x| x.as_u64())
                     .unwrap_or(0),
+            };
+            self.usage = Some(usage.clone());
+            // Emit a usage-only delta so the UI can show live token counts.
+            self.seq += 1;
+            out.push(ModelStreamEvent::Delta {
+                attempt_id: attempt_id.to_owned(),
+                sequence: self.seq,
+                channel: StreamChannel::Text,
+                text: String::new(),
+                provisional: true,
+                usage: Some(usage),
             });
         }
 
@@ -196,6 +208,7 @@ impl OpenaiChatAssembler {
                     channel: StreamChannel::ReasoningSummary,
                     text: reasoning.to_owned(),
                     provisional: true,
+                    usage: None,
                 });
             }
             if let Some(content) = delta.get("content").and_then(|c| c.as_str())
@@ -209,6 +222,7 @@ impl OpenaiChatAssembler {
                     channel: StreamChannel::Text,
                     text: content.to_owned(),
                     provisional: true,
+                    usage: None,
                 });
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -291,6 +305,7 @@ impl OpenaiChatAssembler {
             tool_calls,
             text: self.text.clone(),
             reasoning: self.reasoning.clone(),
+            reasoning_duration_ms: self.reasoning_duration_ms,
         }
     }
 }

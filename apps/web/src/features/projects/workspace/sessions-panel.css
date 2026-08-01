@@ -86,6 +86,9 @@
 .sessions-panel__item--active .sessions-panel__status {
   color: var(--success);
 }
+.sessions-panel__item--creating .sessions-panel__status {
+  color: var(--warning);
+}
 
 /* The list row's selectable area — fills the space between the status dot and
    the trailing action. Owns the status dot + title together, so clicking either
@@ -144,9 +147,6 @@
 .sessions-panel__action:disabled {
   opacity: 0.4;
   cursor: progress;
-}
-.sessions-panel__item--active .sessions-panel__status .ui-spinner {
-  color: var(--warning);
 }
 .sessions-panel__hint,
 .sessions-panel__error {

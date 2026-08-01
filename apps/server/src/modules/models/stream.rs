@@ -11,7 +11,7 @@ use super::anthropic::{AnthropicAssembler, build_messages_body};
 use super::interface::{ModelsError, ModelsInterface, ProviderKind};
 use super::openai_chat::{OpenaiChatAssembler, build_chat_body};
 use super::sse::SseParser;
-use super::stream_types::{ModelRequest, ModelStreamEvent};
+use super::stream_types::{ModelRequest, ModelStreamEvent, StreamTiming};
 
 const MAX_PROVIDER_ERROR_BYTES: usize = 8 * 1024;
 
@@ -114,7 +114,7 @@ impl ModelsInterface {
                 Ok(events)
             }
             Err(e) => {
-                let detail = e.to_string();
+                let detail = stream_error_detail(&e);
                 // Never log secrets — detail comes from our mapping, not raw headers.
                 let failed = ModelStreamEvent::Failed {
                     attempt_id: attempt_id.clone(),
@@ -166,10 +166,13 @@ impl ModelsInterface {
         })?;
         let status = response.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
+            // Surface the upstream's own error body (sanitized) instead of a
+            // hard-coded string, so the user sees why the call was rejected.
+            let detail = provider_http_error(response, status.as_u16(), key).await;
             let failed = ModelStreamEvent::Failed {
                 attempt_id: attempt_id.to_owned(),
                 code: "PROVIDER_AUTH_FAILED".into(),
-                detail: "provider rejected credentials".into(),
+                detail,
             };
             on_event(failed.clone()).await;
             return Ok(vec![failed]);
@@ -187,6 +190,7 @@ impl ModelsInterface {
 
         let mut parser = SseParser::new();
         let mut assembler = OpenaiChatAssembler::for_tools(&req.tools);
+        let mut timing = StreamTiming::default();
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
@@ -198,11 +202,13 @@ impl ModelsInterface {
                     .ingest_data(attempt_id, &data)
                     .map_err(|e| ModelsError::Internal(anyhow::anyhow!(e)))?;
                 for event in more {
+                    timing.observe(&event);
                     on_event(event.clone()).await;
                     events.push(event);
                 }
             }
         }
+        assembler.reasoning_duration_ms = timing.reasoning_duration_ms();
         let completed = assembler.finish(attempt_id);
         on_event(completed.clone()).await;
         events.push(completed);
@@ -247,10 +253,13 @@ impl ModelsInterface {
         })?;
         let status = response.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
+            // Surface the upstream's own error body (sanitized) instead of a
+            // hard-coded string, so the user sees why the call was rejected.
+            let detail = provider_http_error(response, status.as_u16(), key).await;
             let failed = ModelStreamEvent::Failed {
                 attempt_id: attempt_id.to_owned(),
                 code: "PROVIDER_AUTH_FAILED".into(),
-                detail: "provider rejected credentials".into(),
+                detail,
             };
             on_event(failed.clone()).await;
             return Ok(vec![failed]);
@@ -268,6 +277,7 @@ impl ModelsInterface {
 
         let mut parser = SseParser::new();
         let mut assembler = AnthropicAssembler::default();
+        let mut timing = StreamTiming::default();
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
         while let Some(chunk) = body.next().await {
@@ -279,11 +289,13 @@ impl ModelsInterface {
                     .ingest(attempt_id, &ev, &data)
                     .map_err(|e| ModelsError::Internal(anyhow::anyhow!(e)))?;
                 for event in more {
+                    timing.observe(&event);
                     on_event(event.clone()).await;
                     events.push(event);
                 }
             }
         }
+        assembler.reasoning_duration_ms = timing.reasoning_duration_ms();
         let completed = assembler.finish(attempt_id);
         on_event(completed.clone()).await;
         events.push(completed);
@@ -344,6 +356,13 @@ fn classify_reqwest(err: &reqwest::Error) -> String {
         "connect".into()
     } else {
         "transport".into()
+    }
+}
+
+fn stream_error_detail(error: &ModelsError) -> String {
+    match error {
+        ModelsError::Internal(source) => format!("{source:#}"),
+        _ => error.to_string(),
     }
 }
 

@@ -13,7 +13,13 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { NotificationEvent, useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
 import type { EmbeddedModelInput, ProviderInput, ProviderView } from "../../lib/api";
-import { createProvider, deleteProvider, probeProvider, updateProvider } from "../../lib/api";
+import {
+  createProvider,
+  deleteProvider,
+  getErrorMessage,
+  probeProvider,
+  updateProvider,
+} from "../../lib/api";
 import { useProviders } from "../../lib/queries";
 import "./models.css";
 
@@ -68,7 +74,7 @@ export function ModelsSettings() {
       notify("Provider deleted", { variant: "success" });
       await refresh();
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Delete failed", { variant: "danger" });
+      notify(getErrorMessage(error, "Delete failed"), { variant: "danger" });
     }
   }
 
@@ -77,7 +83,7 @@ export function ModelsSettings() {
       const result = await probeProvider(id);
       notify(`${result.status}: ${result.detail}`);
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Probe failed", { variant: "danger" });
+      notify(getErrorMessage(error, "Probe failed"), { variant: "danger" });
     }
   }
 
@@ -354,7 +360,7 @@ function ProviderForm(props: ProviderFormProps) {
       }
       await props.saved();
     } catch (value) {
-      setError(value instanceof Error ? value.message : "Provider could not be saved");
+      setError(getErrorMessage(value, "Provider could not be saved"));
     } finally {
       setSubmitting(false);
     }

@@ -1356,6 +1356,8 @@ pub enum RuntimeError {
     NetworkPolicyDenied,
     #[error("the runtime is unavailable")]
     RuntimeUnavailable,
+    #[error("the runtime is unavailable: {0}")]
+    RuntimeUnavailableDetail(String),
     #[error("job {0} can no longer be controlled")]
     JobLost(JobId),
     #[error("service {0} can no longer be controlled")]
@@ -1375,7 +1377,9 @@ impl RuntimeError {
             Self::ResourceBusy => RuntimeErrorCode::ResourceBusy,
             Self::CommandForbidden => RuntimeErrorCode::CommandForbidden,
             Self::NetworkPolicyDenied => RuntimeErrorCode::NetworkPolicyDenied,
-            Self::RuntimeUnavailable => RuntimeErrorCode::RuntimeUnavailable,
+            Self::RuntimeUnavailable | Self::RuntimeUnavailableDetail(_) => {
+                RuntimeErrorCode::RuntimeUnavailable
+            }
             Self::JobLost(_) => RuntimeErrorCode::JobLost,
             Self::ServiceLost(_) => RuntimeErrorCode::ServiceLost,
             Self::TerminalTicketInvalid => RuntimeErrorCode::TerminalTicketInvalid,
@@ -1385,6 +1389,13 @@ impl RuntimeError {
     }
 
     pub const fn retryable(&self) -> bool {
-        matches!(self, Self::ResourceBusy | Self::RuntimeUnavailable)
+        matches!(
+            self,
+            Self::ResourceBusy | Self::RuntimeUnavailable | Self::RuntimeUnavailableDetail(_)
+        )
+    }
+
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self::RuntimeUnavailableDetail(detail.into())
     }
 }

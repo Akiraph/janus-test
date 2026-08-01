@@ -19,7 +19,7 @@ use crate::modules::runtime::interface::{
 };
 use crate::modules::sessions::interface::{SessionsError, SessionsInterface, TurnStatus};
 use crate::modules::supervisor::interface::{SupervisorError, SupervisorInterface};
-use crate::modules::workspace_sync::interface::{WorkspaceHandle, WorkspaceSyncError};
+use crate::modules::workspace_sync::interface::WorkspaceSyncError;
 use crate::platform::{
     events::NewEvent,
     id::{CorrelationId, ProjectId, SessionId},
@@ -372,10 +372,6 @@ async fn execute_session_creation(
             .await?;
     }
 
-    let main_revision = state
-        .workspace_sync()
-        .current_revision(&WorkspaceHandle::main(project_id))
-        .await?;
     let workspace_step = state
         .operations()
         .begin_step(
@@ -389,7 +385,7 @@ async fn execute_session_creation(
         .ensure_session_copy(
             project_id,
             session_id,
-            Some(&main_revision),
+            None,
             input.actor.clone(),
         )
         .await?;

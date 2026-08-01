@@ -72,6 +72,7 @@ impl AppState {
             workspace_sync.clone(),
             events.clone(),
             &config.data_root,
+            adapters::git::system_runner(),
         );
         let runtime_logs =
             modules::runtime::interface::LogStore::new(pool.clone(), &config.data_root);

@@ -124,6 +124,18 @@ pub fn create_session_worktree(main_repo: &Path, session_repo: &Path) -> anyhow:
     Ok(())
 }
 
+pub fn main_worktree_is_clean(main_repo: &Path) -> anyhow::Result<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(main_repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("git status failed with status {}", output.status);
+    }
+    Ok(output.stdout.is_empty())
+}
+
 /// Remove the Session workspace tree.
 ///
 /// Tries `git worktree remove` first (run from the worktree itself — any

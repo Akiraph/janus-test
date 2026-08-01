@@ -700,10 +700,7 @@
 }
 
 /* === Tool rows (aligned with legacy Janus supervisor workflow) === */
-/* === Event row (unified tool-call + thinking renderer) ===
- * Tool rows keep the chevron on the left, immediately after the title; thinking
- * rows (`--trailing`) push the chevron to the far right so the title reads
- * "Thought >" right-aligned, matching the product spec. */
+/* === Event row (unified tool-call + thinking renderer) === */
 .session-event {
   display: block;
 }
@@ -770,7 +767,7 @@
 }
 
 .session-event--trailing .session-event__title {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
 }
 
 .session-event__chevron {
@@ -779,9 +776,19 @@
   transition: transform var(--dur-fast) var(--easing);
 }
 
-/* Pull the chevron to the far right on thinking rows. */
 .session-event--trailing .session-event__chevron {
-  margin-left: auto;
+  margin-left: 0;
+}
+
+.session-event--trailing .session-event__body {
+  margin-left: 0;
+  padding-left: calc(var(--space-2) + 7px + var(--space-2));
+  border-left: 0;
+}
+
+.session-event--trailing .session-event__body-markdown {
+  margin-left: 0;
+  padding-left: calc(var(--space-2) + 7px + var(--space-2));
 }
 
 .session-event__chevron--open {
@@ -945,4 +952,62 @@
   margin: 0;
   color: var(--text-muted);
   font-size: var(--text-sm);
+}
+
+/* Queued messages bar ---------------------------------------------------
+ * Renders between the timeline and the composer when the user has sent
+ * messages while a turn is active. Each row shows the truncated message
+ * text and a delete (X) button so the user can cancel a queued turn. */
+.queued-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px var(--space-2);
+  border-top: 1px solid var(--border);
+}
+
+.queued-bar__label {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.queued-bar__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queued-bar__text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.queued-bar__delete {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  border-radius: 3px;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--easing),
+    background var(--dur-fast) var(--easing);
+}
+
+.queued-bar__delete:hover {
+  color: var(--danger);
+  background: var(--danger-soft);
 }

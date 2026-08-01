@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Response, test } from "@playwright/test";
 import { type LiveJanusEnvironment, startLiveJanus } from "./support/liveJanus";
 
 type DataResponse<T> = { data: T };
@@ -87,14 +87,18 @@ test("a browser message completes through the live supervisor", async ({ page })
   // while deltas arrive), then settles to the durable markdown once the Round
   // completes. The durable assistant message contains the heading + list item,
   // so "Live fixture reply" is the stable visible signal across both phases.
-  await expect(page.getByText("Working...", { exact: true })).toBeVisible({
-    timeout: 10_000,
-  });
+  await expect(page.locator(".session-message--status")).toContainText(
+    /^(Working \(|Reconnecting \()/,
+    { timeout: 10_000 },
+  );
   await expect(page.getByText("Live fixture reply")).toBeVisible({ timeout: 30_000 });
 
-  const session = await page.request.get(`/api/v1/sessions/${live.sessionId}`);
-  expect(session.ok()).toBe(true);
-  expect((await session.json()).data.state).toBe("ready");
+  const settledSession = await waitFor(
+    () => readSession(),
+    (session) => session.state === "ready",
+    "Session to settle after visible provisional output",
+  );
+  expect(settledSession.active_turn_id).toBeNull();
 
   const timeline = await page.request.get(`/api/v1/sessions/${live.sessionId}/timeline`);
   expect(timeline.ok()).toBe(true);
@@ -105,6 +109,110 @@ test("a browser message completes through the live supervisor", async ({ page })
       expect.objectContaining({ kind: "assistant_message" }),
     ]),
   );
+});
+
+test("browser queue management preserves the active Turn and keeps Cancel usable", async ({
+  page,
+}) => {
+  test.setTimeout(90_000);
+  await page.goto(`/projects/${live.projectId}?view=sessions`, {
+    waitUntil: "domcontentloaded",
+  });
+  await page.getByRole("button", { name: live.sessionTitle, exact: true }).click();
+
+  const composer = page.locator(".session-composer__input");
+  await composer.fill("[fixture:ask] Hold the active Turn for browser queue testing");
+  await page.getByRole("button", { name: "Send message" }).click();
+  const activeSession = await waitFor(
+    () => readSession(),
+    (session) => Boolean(session.active_turn_id),
+    "Session to acquire an active Turn",
+  );
+  const activeTurnId = activeSession.active_turn_id as string;
+  await waitForTurn(activeTurnId, "waiting_for_ask", 20_000);
+
+  const cancel = page.getByRole("button", { name: "Cancel turn" });
+  await expect(cancel).toBeVisible();
+  await composer.fill("queued browser follow-up");
+  await expect(cancel).toHaveCount(0);
+
+  await page.context().setOffline(true);
+  const versionBump = postMessage("queued version-race sentinel");
+  const removedVersionBump = live.cli<DataResponse<CancelResult>>([
+    "sessions",
+    "cancel",
+    live.sessionId,
+    versionBump.turn_id,
+    versionBump.session_version,
+    "--reason",
+    "force browser version refresh",
+  ]);
+  expect(removedVersionBump.data.to_status).toBe("canceled");
+
+  const isQueuedFollowUpResponse = (response: Response) => {
+    const request = response.request();
+    if (
+      request.method() !== "POST" ||
+      !response.url().endsWith(`/api/v1/sessions/${live.sessionId}/messages`)
+    ) {
+      return false;
+    }
+    return (
+      (request.postDataJSON() as { content?: unknown } | null)?.content ===
+      "queued browser follow-up"
+    );
+  };
+  const queuedResponseStatuses: number[] = [];
+  page.on("response", (response) => {
+    if (isQueuedFollowUpResponse(response)) queuedResponseStatuses.push(response.status());
+  });
+  const queuedResponsePromise = page.waitForResponse(
+    (response) => isQueuedFollowUpResponse(response) && response.status() === 200,
+  );
+  await page.evaluate(() => {
+    window.addEventListener(
+      "online",
+      () =>
+        document.querySelector<HTMLButtonElement>('button[aria-label="Queue message"]')?.click(),
+      { once: true },
+    );
+  });
+  await page.context().setOffline(false);
+  const queuedResponse = await queuedResponsePromise;
+  expect(queuedResponse.status(), await queuedResponse.text()).toBe(200);
+  expect(queuedResponseStatuses).toEqual([412, 200]);
+
+  const queuedBar = page.getByRole("status", { name: "Queued messages" });
+  await expect(queuedBar.getByText("1 queued message", { exact: true })).toBeVisible();
+  await expect(queuedBar.getByText("queued browser follow-up", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Remove queued message" }).click();
+  await expect(queuedBar.getByText("queued browser follow-up", { exact: true })).toHaveCount(0);
+  await waitFor(
+    () => live.request<DataResponse<unknown[]>>(`/api/v1/sessions/${live.sessionId}/queued-turns`),
+    (response) => response.data.length === 0,
+    "queued Turn removal",
+  );
+  expect((await readTurn(activeTurnId)).status).toBe("waiting_for_ask");
+
+  await page.locator('input[type="file"]').setInputFiles([
+    {
+      name: "queue-only.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("attachment-only queued message"),
+    },
+  ]);
+  await expect(page.getByRole("button", { name: "Queue message" })).toBeVisible();
+  await expect(cancel).toHaveCount(0);
+  await page.getByRole("button", { name: "Remove queue-only.txt" }).click();
+  await expect(cancel).toBeVisible();
+  await cancel.click();
+  await waitForTurn(activeTurnId, "canceled", 20_000);
+  await waitFor(
+    () => readSession(),
+    (session) => session.active_turn_id === null,
+    "Session to release the canceled Turn",
+  );
+  await expect(cancel).toHaveCount(0);
 });
 
 test("Session attachments remain reusable and can become workspace files", async ({
@@ -140,7 +248,7 @@ test("Session attachments remain reusable and can become workspace files", async
   await page.getByRole("button", { name: "Send message" }).click();
   await waitFor(
     () => readTimeline(),
-    (timeline) => JSON.stringify(timeline).includes('"tool_name":"attachment.save"'),
+    (timeline) => JSON.stringify(timeline).includes('"tool_name":"attachment_save"'),
     "attachment save tool",
     30_000,
   );
@@ -151,7 +259,7 @@ test("Session attachments remain reusable and can become workspace files", async
   const reused = postMessage("[fixture:attachment-reuse] Read a previous Session attachment");
   await waitForTurn(reused.turn_id, "completed", 30_000);
   const attachmentReads = JSON.stringify(await readTimeline()).match(
-    /"tool_name":"attachment\.read"/g,
+    /"tool_name":"attachment_read"/g,
   );
   expect(attachmentReads?.length).toBeGreaterThanOrEqual(2);
 });
@@ -270,10 +378,18 @@ test("blocking Ask answers once and duplicate delivery is idempotent", async () 
 
   const timeline = await waitFor(
     () => readTimeline(),
-    (page) => findStringProperty(page, "ask_id") !== undefined,
+    (page) =>
+      page.items.some(
+        (item) =>
+          item.turn_id === routed.turn_id &&
+          findStringProperty(item.projection, "ask_id") !== undefined,
+      ),
     "blocking Ask projection",
   );
-  const askId = findStringProperty(timeline, "ask_id");
+  const askId = timeline.items
+    .filter((item) => item.turn_id === routed.turn_id)
+    .map((item) => findStringProperty(item.projection, "ask_id"))
+    .find((value) => value !== undefined);
   expect(askId).toBeTruthy();
 
   live.cli(["sessions", "answer-ask", askId as string, "fixture answer"]);
@@ -300,7 +416,8 @@ test("best-effort Ask expires to its default and resumes", async () => {
   test.setTimeout(60_000);
   const routed = postMessage("[fixture:ask-expire] Use the default");
   await waitForTurn(routed.turn_id, "completed", 20_000);
-  expect(JSON.stringify(await readTimeline())).toContain("fixture expiry default");
+  const turnItems = (await readTimeline()).items.filter((item) => item.turn_id === routed.turn_id);
+  expect(JSON.stringify(turnItems)).toContain("fixture expiry default");
 });
 
 test("a completed Job settles its Tool Call and resumes exactly once", async () => {
@@ -317,7 +434,7 @@ test("a completed Job settles its Tool Call and resumes exactly once", async () 
     kind: "tool_call",
     status: "succeeded",
     summary: expect.objectContaining({ status: "succeeded" }),
-    tool_name: "job",
+    tool_name: "bash",
   });
   expect(live.providerRequestCount()).toBe(beforeRequests + 2);
 });
@@ -348,7 +465,7 @@ test("Handoff transfers a running Job and completes the successor", async () => 
     kind: "tool_call",
     status: "succeeded",
     summary: expect.objectContaining({ status: "succeeded" }),
-    tool_name: "job",
+    tool_name: "bash",
   });
   expect(live.providerRequestCount()).toBe(beforeRequests + 3);
 });

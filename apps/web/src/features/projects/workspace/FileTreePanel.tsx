@@ -4,7 +4,7 @@ import { createEffect, createMemo, createSignal, For, Show, untrack } from "soli
 import { NotificationEvent } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { FileTreeView } from "../../../lib/api";
-import { listFileTree } from "../../../lib/api";
+import { getErrorMessage, listFileTree } from "../../../lib/api";
 import { basename, sortTreeEntries } from "./utils";
 import "./files.css";
 
@@ -40,7 +40,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
     } catch (error) {
       setErrors((current) => ({
         ...current,
-        [path]: error instanceof Error ? error.message : "Failed to load directory",
+        [path]: getErrorMessage(error, "Failed to load directory"),
       }));
     } finally {
       setLoading((current) => {

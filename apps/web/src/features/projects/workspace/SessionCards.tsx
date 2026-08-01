@@ -7,6 +7,7 @@ import Server from "lucide-solid/icons/server";
 import { createSignal, For, Show } from "solid-js";
 import { Badge, type BadgeVariant } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
+import { getErrorMessage } from "../../../lib/api";
 import type { SessionTimelineItem } from "./sessionTimeline";
 
 type PlanItem = Extract<SessionTimelineItem, { type: "plan" }>;
@@ -61,7 +62,7 @@ export function AskCard(props: {
       await props.onAnswer(askId, text);
       setDraft("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "Answer was not accepted");
+      setError(getErrorMessage(cause, "Answer was not accepted"));
     } finally {
       setSubmitting(false);
     }

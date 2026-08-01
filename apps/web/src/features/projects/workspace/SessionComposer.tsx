@@ -1,6 +1,7 @@
 import Loader2 from "lucide-solid/icons/loader-2";
 import Paperclip from "lucide-solid/icons/paperclip";
 import Send from "lucide-solid/icons/send";
+import Square from "lucide-solid/icons/square";
 import X from "lucide-solid/icons/x";
 import { createEffect, createMemo, createSignal, For, Show, untrack } from "solid-js";
 import { Button } from "../../../components/ui/Button";
@@ -14,14 +15,19 @@ import type {
   ReasoningEffort,
   SessionModelPreference,
 } from "../../../lib/api";
+import { getErrorMessage } from "../../../lib/api";
 
 export interface SessionMessageReceipt {
   route: string;
+  turnId: string;
 }
 
 interface SessionComposerProps {
   delivery: "send" | "queue";
   disabled?: boolean;
+  /** True when a Turn is actively running (queued or executing). When true
+   * the primary action becomes Cancel (stop) instead of Send. */
+  isRunning?: boolean;
   contextUsage: ContextUsageView | null;
   limits: PublicLimits | undefined;
   modelPreference: SessionModelPreference | null;
@@ -34,6 +40,7 @@ interface SessionComposerProps {
   ) => Promise<SessionMessageReceipt>;
   onUploadAttachment: (sessionId: string, file: File) => Promise<AttachmentView>;
   onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
+  onCancel?: (() => Promise<void>) | undefined;
 }
 
 const REASONING_OPTIONS: readonly SelectOption[] = [
@@ -54,6 +61,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const [reasoningEffort, setReasoningEffort] = createSignal<ReasoningEffort>("none");
   const [attachments, setAttachments] = createSignal<AttachmentView[]>([]);
   const [uploading, setUploading] = createSignal(false);
+  const [canceling, setCanceling] = createSignal(false);
   let textarea: HTMLTextAreaElement | undefined;
   let fileInput: HTMLInputElement | undefined;
   let attachmentSessionId = props.sessionId;
@@ -77,7 +85,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const selectedModel = createMemo(() =>
     availableModels().find((model) => model.value === modelValue()),
   );
-  const supportsReasoning = createMemo(() => selectedModel()?.providerKind !== "anthropic");
+  const supportsReasoning = () => true; // Let backend decide; API will error if unsupported
 
   createEffect(() => {
     const models = availableModels();
@@ -106,11 +114,8 @@ export function SessionComposer(props: SessionComposerProps) {
     attachmentSessionId = sessionId;
   });
 
-  const canSubmit = () =>
-    !props.disabled &&
-    !submitting() &&
-    !uploading() &&
-    (Boolean(draft().trim()) || attachments().length > 0);
+  const hasContent = () => Boolean(draft().trim()) || attachments().length > 0;
+  const canSubmit = () => !props.disabled && !submitting() && !uploading() && hasContent();
   const actionLabel = () => (props.delivery === "queue" ? "Queue message" : "Send message");
 
   function resize() {
@@ -136,7 +141,7 @@ export function SessionComposer(props: SessionComposerProps) {
       setReceipt(result);
       if (textarea) textarea.style.height = "auto";
     } catch (cause) {
-      notify(cause instanceof Error ? cause.message : "Message was not accepted", {
+      notify(getErrorMessage(cause, "Message was not accepted"), {
         variant: "danger",
       });
     } finally {
@@ -166,7 +171,7 @@ export function SessionComposer(props: SessionComposerProps) {
           const attachment = await props.onUploadAttachment(props.sessionId, file);
           setAttachments((current) => [...current, attachment]);
         } catch (cause) {
-          notify(cause instanceof Error ? cause.message : `${file.name} could not be uploaded`, {
+          notify(getErrorMessage(cause, `${file.name} could not be uploaded`), {
             variant: "danger",
           });
         }
@@ -177,12 +182,27 @@ export function SessionComposer(props: SessionComposerProps) {
     }
   }
 
+  async function cancel() {
+    if (!props.onCancel || canceling()) return;
+    setCanceling(true);
+    setReceipt(null);
+    try {
+      await props.onCancel();
+    } catch (cause) {
+      notify(getErrorMessage(cause, "Turn cancellation was not accepted"), {
+        variant: "danger",
+      });
+    } finally {
+      setCanceling(false);
+    }
+  }
+
   async function removeAttachment(attachment: AttachmentView) {
     try {
       await props.onDeleteAttachment(props.sessionId, attachment.id);
       setAttachments((current) => current.filter((value) => value.id !== attachment.id));
     } catch (cause) {
-      notify(cause instanceof Error ? cause.message : "Attachment could not be removed", {
+      notify(getErrorMessage(cause, "Attachment could not be removed"), {
         variant: "danger",
       });
     }
@@ -251,7 +271,7 @@ export function SessionComposer(props: SessionComposerProps) {
         rows={1}
         placeholder={props.delivery === "queue" ? "Queue a message..." : "Send a message..."}
         value={draft()}
-        disabled={props.disabled || submitting()}
+        disabled={submitting()}
         onInput={(event) => {
           setDraft(event.currentTarget.value);
           setReceipt(null);
@@ -299,12 +319,6 @@ export function SessionComposer(props: SessionComposerProps) {
             disabled={submitting() || Boolean(props.disabled)}
             onChange={(value) => {
               setModelValue(value);
-              if (
-                availableModels().find((model) => model.value === value)?.providerKind ===
-                "anthropic"
-              ) {
-                setReasoningEffort("none");
-              }
             }}
           />
           <Select
@@ -324,18 +338,37 @@ export function SessionComposer(props: SessionComposerProps) {
             {props.delivery === "queue" ? "Next turn" : "Current session"}
           </span>
         </div>
-        <Button
-          type="submit"
-          variant="primary"
-          size="sm"
-          iconOnly
-          disabled={!canSubmit()}
-          aria-label={submitting() ? `${actionLabel()} in progress` : actionLabel()}
+        <Show
+          when={props.isRunning && !hasContent()}
+          fallback={
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              iconOnly
+              disabled={!canSubmit()}
+              aria-label={submitting() ? `${actionLabel()} in progress` : actionLabel()}
+            >
+              <Show when={submitting()} fallback={<Send size={16} />}>
+                <Loader2 size={16} class="ui-spinner" />
+              </Show>
+            </Button>
+          }
         >
-          <Show when={submitting()} fallback={<Send size={16} />}>
-            <Loader2 size={16} class="ui-spinner" />
-          </Show>
-        </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            iconOnly
+            disabled={submitting() || canceling()}
+            aria-label={canceling() ? "Canceling turn" : "Cancel turn"}
+            onClick={() => void cancel()}
+          >
+            <Show when={canceling()} fallback={<Square size={16} />}>
+              <Loader2 size={16} class="ui-spinner" />
+            </Show>
+          </Button>
+        </Show>
       </div>
     </form>
   );
