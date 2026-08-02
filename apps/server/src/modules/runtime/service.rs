@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
+use janus_infrastructure::clock::{format_utc, now_utc, now_utc_str};
 use serde_json::json;
 use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
@@ -16,10 +17,11 @@ use super::{
     log_store::LogStore,
 };
 use crate::platform::{
-    clock::{Clock, SystemClock, format_utc},
-    events::{EventStore, NewEvent},
     id::{JobId, LogStreamId, ProjectId, RuntimeId, ServiceId, TerminalId, TurnId},
     secret::{purpose_hash, random_token},
+};
+use janus_infrastructure::{
+    events::{EventStore, NewEvent},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 
@@ -259,14 +261,14 @@ impl RuntimeInterface {
             .bind(handle.executor_identity)
             .bind(handle.executor_nonce)
             .bind(new_version())
-            .bind(format_utc(SystemClock.now()))
+            .bind(now_utc_str())
             .bind(existing.id.to_string())
             .execute(&self.pool)
             .await
             .map_err(storage_error)?;
             return self.runtime(existing.id).await;
         }
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let capabilities = RuntimeCapabilityEvaluator::effective(
             &DeploymentCapabilityProbe::detect(),
             EffectiveCapabilityConfig {
@@ -308,7 +310,7 @@ impl RuntimeInterface {
                 .bind(handle.executor_identity)
                 .bind(handle.executor_nonce)
                 .bind(new_version())
-                .bind(format_utc(SystemClock.now()))
+                .bind(now_utc_str())
                 .bind(spec.id().to_string())
                 .execute(&self.pool)
                 .await
@@ -322,8 +324,8 @@ impl RuntimeInterface {
                 )
                 .bind(error.code().as_str())
                 .bind(new_version())
-                .bind(format_utc(SystemClock.now()))
-                .bind(format_utc(SystemClock.now()))
+                .bind(now_utc_str())
+                .bind(now_utc_str())
                 .bind(spec.id().to_string())
                 .execute(&self.pool)
                 .await;
@@ -334,7 +336,7 @@ impl RuntimeInterface {
 
     pub async fn stop_runtime(&self, id: RuntimeId) -> Result<RuntimeProjection, RuntimeError> {
         let nonce = self.runtime_nonce(id).await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         sqlx::query(
             "UPDATE runtimes SET status = 'stopping', version = ?, updated_at = ? \
              WHERE id = ? AND status IN ('starting', 'ready')",
@@ -383,7 +385,7 @@ impl RuntimeInterface {
             .logs
             .create(super::interface::LogOwnerKind::Job, &spec.id.to_string())
             .await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let cli = match spec.execution.command().kind() {
             super::interface::CommandKind::DelegatedCli { cli, session_id } => (
                 Some(delegated_cli_str(*cli)),
@@ -432,7 +434,7 @@ impl RuntimeInterface {
         match self.executor.start_job(spec, log.id).await {
             Ok(handle) if handle.executor_nonce == runtime_nonce => {
                 let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-                let started_at = format_utc(SystemClock.now());
+                let started_at = now_utc_str();
                 let changed = sqlx::query(
                     "UPDATE jobs SET executor_process_identity = ?, status = 'running', \
                      version = ?, started_at = ? WHERE id = ? AND status = 'queued' \
@@ -489,7 +491,7 @@ impl RuntimeInterface {
              WHERE id = ? AND status IN ('queued', 'running') \
                AND cancellation_requested_at IS NULL",
         )
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(new_version())
         .bind(id.to_string())
         .execute(&self.pool)
@@ -533,7 +535,7 @@ impl RuntimeInterface {
                 &spec.id.to_string(),
             )
             .await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         sqlx::query(
             "INSERT INTO services \
              (id, runtime_id, session_id, initiated_by_tool_call_id, impact, command_summary, \
@@ -828,7 +830,7 @@ impl RuntimeInterface {
                 &spec.id.to_string(),
             )
             .await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         sqlx::query(
             "INSERT INTO terminals \
              (id, runtime_id, owner_kind, owner_id, executor_nonce, cols, rows, \
@@ -859,7 +861,7 @@ impl RuntimeInterface {
                 )
                 .bind(&handle.process_identity)
                 .bind(new_version())
-                .bind(format_utc(SystemClock.now()))
+                .bind(now_utc_str())
                 .bind(terminal_id.to_string())
                 .execute(work.connection())
                 .await
@@ -949,7 +951,7 @@ impl RuntimeInterface {
         let id = TerminalId::new().to_string();
         let token = random_token(32);
         let token_hash = purpose_hash("terminal-ticket", &token);
-        let now = SystemClock.now();
+        let now = now_utc();
         let expires_at = format_utc(now + TICKET_TTL);
         sqlx::query(
             "INSERT INTO runtime_access_tickets \
@@ -992,7 +994,7 @@ impl RuntimeInterface {
         .await
         .map_err(storage_error)?
         .ok_or(RuntimeError::TerminalTicketInvalid)?;
-        let now = SystemClock.now();
+        let now = now_utc();
         if row.consumed_at.is_some() || row.revoked_at.is_some() {
             return Err(RuntimeError::TerminalTicketInvalid);
         }
@@ -1044,7 +1046,7 @@ impl RuntimeInterface {
         .bind(i64::from(size.cols))
         .bind(i64::from(size.rows))
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(work.connection())
         .await
@@ -1070,7 +1072,7 @@ impl RuntimeInterface {
              WHERE id = ? AND status IN ('starting', 'running')",
         )
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(&self.pool)
         .await
@@ -1109,8 +1111,8 @@ impl RuntimeInterface {
         .bind(terminal_status_str(status))
         .bind(serde_json::to_string(&completion.exit).map_err(storage_error)?)
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(work.connection())
         .await
@@ -1132,8 +1134,8 @@ impl RuntimeInterface {
         )
         .bind(json!({"exit_code": null, "signal": "start_failed"}).to_string())
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(&self.pool)
         .await
@@ -1195,7 +1197,7 @@ impl RuntimeInterface {
     }
 
     pub async fn recover_uncertain(&self) -> Result<(), RuntimeError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
         self.recover_uncertain_in_tx(&mut tx, &now).await?;
         tx.commit().await.map_err(storage_error)
@@ -1289,7 +1291,7 @@ impl RuntimeInterface {
         .bind(serde_json::to_string(&completion.exit).map_err(storage_error)?)
         .bind(serde_json::to_string(&completion.usage).map_err(storage_error)?)
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(work.connection())
         .await
@@ -1333,7 +1335,7 @@ impl RuntimeInterface {
         .bind(service_status_str(status))
         .bind(serde_json::to_string(&completion.exit).map_err(storage_error)?)
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(work.connection())
         .await
@@ -1512,7 +1514,7 @@ impl RuntimeInterface {
         )
         .bind(json!({"exit_code": null, "signal": reason}).to_string())
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(work.connection())
         .await
@@ -1536,7 +1538,7 @@ impl RuntimeInterface {
         )
         .bind(json!({"exit_code": null, "signal": "start_failed"}).to_string())
         .bind(new_version())
-        .bind(format_utc(SystemClock.now()))
+        .bind(now_utc_str())
         .bind(id.to_string())
         .execute(&self.pool)
         .await

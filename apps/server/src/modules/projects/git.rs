@@ -153,10 +153,7 @@ pub trait GitRunner: Send + Sync {
         credential: &'a GitCredential,
     ) -> BoxFuture<'a, Result<(), GitError>>;
 
-    fn status<'a>(
-        &'a self,
-        repo: &'a Path,
-    ) -> BoxFuture<'a, Result<GitStatus, GitError>>;
+    fn status<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<GitStatus, GitError>>;
 
     fn diff<'a>(
         &'a self,
@@ -170,15 +167,9 @@ pub trait GitRunner: Send + Sync {
         limit: u32,
     ) -> BoxFuture<'a, Result<Vec<GitLogEntry>, GitError>>;
 
-    fn branches<'a>(
-        &'a self,
-        repo: &'a Path,
-    ) -> BoxFuture<'a, Result<Vec<String>, GitError>>;
+    fn branches<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<Vec<String>, GitError>>;
 
-    fn remotes<'a>(
-        &'a self,
-        repo: &'a Path,
-    ) -> BoxFuture<'a, Result<Vec<String>, GitError>>;
+    fn remotes<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<Vec<String>, GitError>>;
 
     fn fetch<'a>(
         &'a self,

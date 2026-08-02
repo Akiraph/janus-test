@@ -2,7 +2,7 @@
 //!
 //! Lives in `application` because it must update more than one module's owned
 //! tables in one SQLite transaction. Sessions owns turns/sessions/checkpoints;
-//! supervisor owns asks; runtime owns jobs. This module opens one transaction
+//! execution owns asks; runtime owns jobs. This module opens one transaction
 //! against the shared pool and drives each owner's `*_in_tx` primitive inside
 //! it, then commits and schedules further work only after commit.
 //!
@@ -13,17 +13,20 @@ use std::collections::HashMap;
 use serde_json::json;
 
 use crate::AppState;
-use crate::application::turn_execution::{ToolResultRecord, TurnExecutionError};
+use crate::application::execution::{ToolResultRecord, TurnExecutionError};
+use crate::modules::execution::interface::{
+    AskAnswerDisposition, AskClosure, ContextUsageView, ExecutionError,
+};
 use crate::modules::runtime::interface::JobStatus;
 use crate::modules::sessions::interface::{
     CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionModelPreference,
-    SessionsError, TurnStatus,
+    SessionsError, TurnStatus, TurnSummary,
 };
-use crate::modules::supervisor::interface::{AskAnswerDisposition, AskClosure, SupervisorError};
-use crate::platform::clock::{Clock, SystemClock, format_utc};
-use crate::platform::events::NewEvent;
-use crate::platform::id::{AskId, AttachmentId, CorrelationId, ProjectId, SessionId, TurnId};
-use crate::platform::unit_of_work::UnitOfWorkTransaction;
+use crate::platform::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId};
+use janus_infrastructure::clock::now_utc_str;
+use janus_infrastructure::events::NewEvent;
+use janus_infrastructure::id::CorrelationId;
+use janus_infrastructure::unit_of_work::UnitOfWorkTransaction;
 
 struct SessionInput<'a> {
     owner_id: &'a str,
@@ -66,7 +69,7 @@ impl AppState {
             .sessions()
             .current_workspace_revision(session_id)
             .await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work().begin().await?;
         let result = self
             .route_session_input_in_tx(
@@ -85,8 +88,44 @@ impl AppState {
                 },
             )
             .await?;
+        let scheduled_turn = matches!(result.route.as_str(), "started" | "handed_off")
+            .then(|| {
+                result
+                    .turn_id
+                    .parse::<TurnId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
+            })
+            .transpose()?;
         work.commit().await?;
+        if let Some(turn_id) = scheduled_turn {
+            self.execution_coordinator().schedule(turn_id);
+        }
         Ok(result)
+    }
+
+    pub async fn session_context_usage(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ContextUsageView>, SessionsError> {
+        self.sessions().get_session(session_id).await?;
+        self.execution()
+            .latest_context_usage(session_id)
+            .await
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
+    }
+
+    pub async fn turn_summary(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<TurnSummary, SessionsError> {
+        let mut data = self.sessions().get_turn(session_id, turn_id).await?;
+        data.model_attempt = self
+            .execution()
+            .latest_model_attempt_for_turn(turn_id)
+            .await
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        Ok(data)
     }
 
     async fn route_session_input_in_tx(
@@ -147,7 +186,7 @@ impl AppState {
             .map(serde_json::from_str::<SessionModelPreference>)
             .transpose()?;
         let model_snapshot = self
-            .turn_runner()
+            .execution_coordinator()
             .resolve_model_snapshot_in_tx(
                 work.connection(),
                 project_id,
@@ -196,7 +235,7 @@ impl AppState {
                 let predecessor_id: TurnId = predecessor.parse().map_err(|_| {
                     SessionsError::Internal(anyhow::anyhow!("invalid predecessor Turn id"))
                 })?;
-                self.turn_runner()
+                self.execution_coordinator()
                     .settle_terminal_jobs_for_turn_in_tx(work, predecessor_id, now)
                     .await
                     .map_err(|error| {
@@ -217,7 +256,7 @@ impl AppState {
                 if !handed_off {
                     return Err(SessionsError::HandoffNotApplicable);
                 }
-                self.supervisor()
+                self.execution()
                     .close_open_asks_in_tx(
                         work.connection(),
                         predecessor_id,
@@ -297,7 +336,7 @@ impl AppState {
         if let Some(predecessor) = predecessor {
             events.push(NewEvent {
                 event_type: "turn.status_changed".into(),
-                actor: json!({"kind": "supervisor"}),
+                actor: json!({"kind": "execution"}),
                 resource: Some(json!({"kind": "turn", "id": predecessor})),
                 correlation_id: correlation_id.clone(),
                 causation_id: None,
@@ -371,7 +410,7 @@ impl AppState {
     // Ask creation / answer / expiry
     // ------------------------------------------------------------------
 
-    /// Answer an open Ask. One shared transaction writes the answer (supervisor
+    /// Answer an open Ask. One shared transaction writes the answer (execution
     /// owns `asks`) then resumes the Turn to `running` (sessions owns `turns`).
     /// If the Ask's Turn is no longer `waiting_for_ask` (already terminal /
     /// handed off / canceled), this is a LATE answer: the coordinator opens a
@@ -386,18 +425,18 @@ impl AppState {
         answer: &serde_json::Value,
         actor: serde_json::Value,
     ) -> Result<(TurnId, String, String), SessionsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work().begin().await?;
         let answered = self
-            .supervisor()
+            .execution()
             .answer_ask_in_tx(work.connection(), ask_id, answer, &now)
             .await
             .map_err(|error| match error {
-                SupervisorError::AskNotFound => SessionsError::AskNotFound,
+                ExecutionError::AskNotFound => SessionsError::AskNotFound,
                 error => SessionsError::Internal(anyhow::anyhow!("answer Ask: {error}")),
             })?;
         let outcome = self
-            .turn_runner()
+            .execution_coordinator()
             .inspect_and_reconcile_turn_blockers_in_tx(work.connection(), answered.turn_id, &now)
             .await
             .map_err(|error| {
@@ -405,7 +444,7 @@ impl AppState {
             })?;
         let correlation_id = CorrelationId::new().to_string();
         if let Some(settlement) = &answered.tool_call {
-            self.turn_runner()
+            self.execution_coordinator()
                 .record_tool_result_in_tx(
                     &mut work,
                     ToolResultRecord {
@@ -606,7 +645,7 @@ impl AppState {
         };
         work.commit().await?;
         if let Some(turn_id) = schedule {
-            self.turn_runner().schedule(turn_id);
+            self.execution_coordinator().schedule(turn_id);
         }
         Ok(response)
     }
@@ -615,10 +654,10 @@ impl AppState {
     /// resuming the controlling Turn if it is still `waiting_for_ask`. Called by
     /// a periodic sweeper (and at startup). Stale notifications are harmless.
     pub async fn expire_asks(&self, _owner_id: &str) -> Result<u64, SessionsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work().begin().await?;
         let expired = self
-            .supervisor()
+            .execution()
             .expire_due_asks_in_tx(work.connection(), &now, 100)
             .await
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!("expire Asks: {error}")))?;
@@ -626,12 +665,12 @@ impl AppState {
         for ask in &expired {
             by_turn.entry(ask.turn_id).or_default().push(ask);
         }
-        let actor = json!({"kind": "supervisor"});
+        let actor = json!({"kind": "execution"});
         let correlation_id = CorrelationId::new().to_string();
         let mut schedule = Vec::new();
         for (turn_id, asks) in by_turn {
             let outcome = self
-                .turn_runner()
+                .execution_coordinator()
                 .inspect_and_reconcile_turn_blockers_in_tx(work.connection(), turn_id, &now)
                 .await
                 .map_err(|error| {
@@ -645,7 +684,7 @@ impl AppState {
                     TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
                 );
             for ask in asks {
-                self.turn_runner()
+                self.execution_coordinator()
                     .record_tool_result_in_tx(
                         &mut work,
                         ToolResultRecord {
@@ -729,7 +768,7 @@ impl AppState {
         }
         work.commit().await?;
         for turn_id in schedule {
-            self.turn_runner().schedule(turn_id);
+            self.execution_coordinator().schedule(turn_id);
         }
         Ok(expired.len() as u64)
     }
@@ -770,22 +809,20 @@ impl AppState {
         uncertain: bool,
         actor: serde_json::Value,
     ) -> Result<(), SessionsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work().begin().await?;
-        self.turn_runner()
+        self.execution_coordinator()
             .settle_terminal_jobs_for_turn_in_tx(&mut work, turn_id, &now)
             .await
             .map_err(|error| {
                 SessionsError::Internal(anyhow::anyhow!("settle canceled Turn Jobs: {error}"))
             })?;
         let round_ids = self
-            .supervisor()
+            .execution()
             .cancel_execution_in_tx(work.connection(), turn_id, &now)
             .await
             .map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!(
-                    "cancel Supervisor execution ledger: {error}"
-                ))
+                SessionsError::Internal(anyhow::anyhow!("cancel execution ledger: {error}"))
             })?;
         self.models()
             .cancel_running_attempts_for_rounds_in_tx(work.connection(), &round_ids, &now)
@@ -834,7 +871,7 @@ impl AppState {
         if transition.is_some_and(|transition| transition.to_status == TurnStatus::Canceled) {
             // Terminal canceled Turns advance the FIFO queue through the runner
             // without re-entering model execution for the canceled Turn.
-            self.turn_runner().schedule(turn_id);
+            self.execution_coordinator().schedule(turn_id);
         }
         Ok(())
     }
@@ -962,17 +999,17 @@ impl AppState {
     /// the application Turn runner. Returns whether a runnable wake was scheduled.
     pub async fn retry_waiting_model(&self, turn_id: TurnId) -> Result<bool, SessionsError> {
         let runnable =
-            self.supervisor()
+            self.execution()
                 .retry_model(turn_id)
                 .await
                 .map_err(|error| match error {
-                    SupervisorError::TurnNotFound => SessionsError::NotFound,
+                    ExecutionError::TurnNotFound => SessionsError::NotFound,
                     error => {
                         SessionsError::Internal(anyhow::anyhow!("retry waiting model: {error}"))
                     }
                 })?;
         if runnable {
-            self.turn_runner().schedule(turn_id);
+            self.execution_coordinator().schedule(turn_id);
         }
         Ok(runnable)
     }

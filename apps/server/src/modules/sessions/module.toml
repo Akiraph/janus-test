@@ -19,6 +19,6 @@ publishes = [
   "timeline.item_updated",
   "checkpoint.created",
 ]
-allowed_module_dependencies = ["workspace-sync"]
+allowed_module_dependencies = ["workspace"]
 specs = []
 tests = []

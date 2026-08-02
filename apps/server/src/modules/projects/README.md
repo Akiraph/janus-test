@@ -1,19 +1,5 @@
-# projects
+# 项目
 
-Owns Projects, Main Workspace handle, GitHub PAT credentials, user Git
-operations, and Git Update Conflicts; it does not own Session workspaces, the
-three-way merge algorithm body (delegates to system `git`), or Content Revision
-storage (that lives in workspace-sync).
+Project 能力负责项目元数据、凭据、Runtime 配置和出站策略。Git 状态与操作会迁到 Source Control，文件字节、修订和工作区副本会迁到 Workspace；新代码不要把这些责任继续塞回 Project。
 
-Tables owned (migration `0004_projects_git.sql`): `projects`,
-`github_credentials`, `project_git_state`, `git_update_conflicts`,
-`git_update_conflict_paths`.
-
-Events published: `project.changed`, `project.main_revision_changed`,
-`git.state_changed`, `git.update_conflict_changed`. See `docs/08-events-and-errors.md`.
-
-Allowed Module dependency: `workspace-sync` (for Main Workspace handle and
-atomic content writes). PATs reuse the M1 `SecretCipher` pipeline.
-
-Test entry: `cargo test --workspace` integration tests + `janus-test` public
-Project/Git commands (see `docs/07-http-api.md`).
+项目只提供公开查询和命令给工作流使用，不替其他能力直接写表。删除项目时由工作流先清理 Runtime 资源，再清理项目自身状态。

@@ -1,6 +1,7 @@
 //! Public identity Module boundary.
 
 use chrono::{DateTime, Duration, Utc};
+use janus_infrastructure::clock::{format_utc, now_utc_str};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, SqlitePool};
@@ -18,7 +19,6 @@ use webauthn_rs::{
 use crate::{
     config::Config,
     platform::{
-        clock::format_utc,
         id::{OwnerId, PasskeyId, TenantId},
         secret::{purpose_hash, random_token},
     },
@@ -225,7 +225,7 @@ impl IdentityInterface {
             "SELECT COUNT(*) FROM initialization_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
         )
         .bind(&token_hash)
-        .bind(format_utc(Utc::now()))
+        .bind(now_utc_str())
         .fetch_one(&self.pool)
         .await?;
         if valid != 1 {
@@ -484,7 +484,7 @@ impl IdentityInterface {
     pub async fn logout(&self, auth: &AuthContext) -> Result<(), IdentityError> {
         if let Some(session_id) = &auth.session_id {
             sqlx::query("UPDATE login_sessions SET revoked_at = ? WHERE id = ?")
-                .bind(format_utc(Utc::now()))
+                .bind(now_utc_str())
                 .bind(session_id)
                 .execute(&self.pool)
                 .await?;
@@ -606,7 +606,7 @@ impl IdentityInterface {
             return Err(IdentityError::LastPasskey);
         }
         let changed = sqlx::query("UPDATE passkeys SET revoked_at = ? WHERE id = ? AND owner_id = ? AND revoked_at IS NULL")
-            .bind(format_utc(Utc::now()))
+            .bind(now_utc_str())
             .bind(id)
             .bind(&auth.owner_id)
             .execute(&mut *transaction)
@@ -678,7 +678,7 @@ impl IdentityInterface {
         name: &str,
     ) -> Result<CeremonyOptions, IdentityError> {
         let row=sqlx::query_as::<_,(String,String,String)>("SELECT r.id,o.id,o.display_name FROM recovery_states r JOIN owners o ON o.id=r.owner_id WHERE r.token_hash=? AND r.used_at IS NULL AND r.expires_at>?")
-            .bind(purpose_hash("recovery-state",recovery_token)).bind(format_utc(Utc::now())).fetch_optional(&self.pool).await?.ok_or(IdentityError::InvalidRecoveryCode)?;
+            .bind(purpose_hash("recovery-state",recovery_token)).bind(now_utc_str()).fetch_optional(&self.pool).await?.ok_or(IdentityError::InvalidRecoveryCode)?;
         let credentials = sqlx::query_as::<_, (String,)>(
             "SELECT credential_json FROM passkeys WHERE owner_id=? AND revoked_at IS NULL",
         )
@@ -817,7 +817,7 @@ impl IdentityInterface {
     }
 
     async fn take_ceremony(&self, id: &str, kind: &str) -> Result<String, IdentityError> {
-        let now = format_utc(Utc::now());
+        let now = now_utc_str();
         let mut transaction = self.pool.begin().await?;
         let state = sqlx::query_scalar::<_, String>(
             "SELECT state_json FROM ceremonies WHERE id = ? AND kind = ? AND consumed_at IS NULL AND expires_at > ?",
@@ -854,7 +854,7 @@ impl IdentityInterface {
         if self.initialization_state().await? == InitializationState::Initialized {
             return Ok(());
         }
-        let now = format_utc(Utc::now());
+        let now = now_utc_str();
         let tenant_id = TenantId::new().to_string();
         let owner_id = OwnerId::new().to_string();
         let mut transaction = self.pool.begin().await?;

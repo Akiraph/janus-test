@@ -1,23 +1,5 @@
-# models
+# 模型
 
-Owns model providers, normalized model execution, usage ledger, retries, and
-failover configuration. It does **not** own Session history or Turn state machines.
+模型能力负责 Provider 协议、模型配置、一次请求的 Attempt、用量以及 Provider 级重试和故障转移。它输出窄的模型调用结果，不拥有 Session 历史、Turn 状态或工具执行。
 
-## M3 ownership
-
-| Kind | Names |
-| --- | --- |
-| Tables | `model_providers`, `models`, `model_failover` (M1); `model_attempts`, `model_usage_ledger` (migration `0009_models_rounds.sql`) |
-| Events | `model_config.changed`, `model.stream_delta`, `model.attempt_changed` |
-| IDs | `ProviderId`, `ModelId` (config); `AttemptId` (execution) |
-
-## Dependencies
-
-No Module dependencies. Uses platform cipher / events only.
-
-## Notes
-
-- M3 adapters: OpenAI-compatible (chat/responses) + Anthropic real protocol streams.
-- Provider server-side thread/session ids are transport-only and are not recovery keys.
-- Token usage is written to `model_usage_ledger` per attempt; failover rows are not
-  written in M3.
+模型适配器只处理外部协议；执行是否等待、重试、失败还是完成，由 Execution 决定。现有重试分类仍有一部分留在执行模块实现中，迁移时应移动到 Model 的 Provider 尝试边界，不要继续复制新的重试分支。

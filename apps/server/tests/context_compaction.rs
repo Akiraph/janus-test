@@ -4,17 +4,17 @@
 //! supports compaction. The manual `schedule_compact` path and context-version
 //! record are tested independently of automatic Round wiring.
 
-use janus_server::modules::supervisor::context::{
+use janus_infrastructure::database::Database;
+use janus_server::modules::execution::context::{
     latest_compact_summary, record_context_version, schedule_compact,
 };
-use janus_server::platform::database::Database;
 use janus_server::platform::id::SessionId;
 use serde_json::json;
 use tempfile::TempDir;
 
 async fn boot() -> anyhow::Result<(TempDir, sqlx::SqlitePool)> {
     let temp = TempDir::new()?;
-    let db = Database::open(temp.path()).await?;
+    let db = Database::open(temp.path(), janus_server::migrator()).await?;
     Ok((temp, db.pool().clone()))
 }
 

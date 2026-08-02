@@ -1,0 +1,21 @@
+name = "execution"
+public_root = "interface.rs"
+owned_tables = [
+  "rounds",
+  "tool_calls",
+  "asks",
+  "plan_versions",
+  "compact_summaries",
+  "context_versions",
+  "stream_diagnostics",
+]
+publishes = [
+  "round.changed",
+  "tool_call.created",
+  "tool_call.changed",
+  "ask.changed",
+  "context.changed",
+]
+allowed_module_dependencies = ["models", "projects", "runtime", "sessions", "workspace"]
+specs = []
+tests = []

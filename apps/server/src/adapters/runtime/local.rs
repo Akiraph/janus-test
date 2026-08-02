@@ -302,7 +302,7 @@ impl LocalExecutor {
 
         // Terminal backends intentionally bypass sync-background-command policy:
         // a Terminal is a long-lived interactive shell where backgrounded jobs
-        // and `&` are expected user input, not Supervisor Bash.
+        // and `&` are expected user input, not Execution Bash.
         let mut command = terminal_command(spec.size);
         command
             .current_dir(canonical_working)
@@ -1056,7 +1056,7 @@ async fn remove_process_group_marker(path: Option<&Path>) {
 fn shell_command(script: &str) -> Command {
     #[cfg(windows)]
     {
-        // Supervisor Bash and Runtime shell commands must have the same
+        // Execution Bash and Runtime shell commands must have the same
         // language semantics. Resolving the bundled executable also works
         // when Git for Windows is installed outside PATH.
         let program = bash_program().unwrap_or_else(|| PathBuf::from("bash"));
@@ -1286,11 +1286,9 @@ mod tests {
             LogOwnerKind, LogStore, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
             RuntimeError, RuntimeExecutor, RuntimeSpec, ValidatedCommand,
         },
-        platform::{
-            database::Database,
-            id::{JobId, SessionId, ToolCallId, TurnId},
-        },
+        platform::id::{JobId, SessionId, ToolCallId, TurnId},
     };
+    use janus_infrastructure::database::Database;
 
     fn limits(timeout_ms: u64) -> ResourceLimits {
         ResourceLimits {
@@ -1308,7 +1306,7 @@ mod tests {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
-        let database = Database::open(&temp.path().join("data")).await?;
+        let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
         let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
         let runtime_id = crate::platform::id::RuntimeId::new();
@@ -1373,7 +1371,7 @@ mod tests {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
-        let database = Database::open(&temp.path().join("data")).await?;
+        let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
         let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
         let runtime_id = crate::platform::id::RuntimeId::new();

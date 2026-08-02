@@ -1,11 +1,6 @@
 use anyhow::Context;
-use janus_server::{
-    AppState,
-    application::workers,
-    config::Config,
-    platform::{events::NewEvent, id::CorrelationId, operations::OperationStatus},
-    router,
-};
+use janus_infrastructure::{events::NewEvent, id::CorrelationId, operations::OperationStatus};
+use janus_server::{AppState, application::workers, config::Config, router};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -41,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     // objects from a crashed write, and mark operations left `running` by a
     // prior process as `needs_attention` so a client can re-issue them rather
     // than the control plane guessing whether a half-done clone happened.
-    // Runtime + supervisor recovery already ran inside AppState::initialize.
+    // Runtime + execution recovery already ran inside AppState::initialize.
     if let Err(error) = state.blobs().clean_incoming().await {
         warn!(%error, "clean incoming objects on startup");
     }

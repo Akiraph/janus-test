@@ -13,35 +13,43 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use utoipa::ToSchema;
 
-use crate::modules::projects::git::{
-    DiffView, GitCredential, GitError, GitRunner, GitStatus, UpdateConflictPath, UpdateOutcome,
+pub use super::git::{
+    DiffView, GitCredential, GitError, GitLogEntry, GitRunner, GitStatus, UpdateConflictPath,
+    UpdateOutcome,
+};
+use crate::application::operation_kinds::{
+    KIND_CLONE, KIND_DELETE_PROJECT, KIND_GIT_FETCH, KIND_GIT_PUSH, KIND_GIT_UPDATE,
 };
 use crate::modules::runtime::interface::{
     CapabilityReason, CapabilityState, DelegatedCliKind, ExecutorKind, NetworkPolicy,
     ResourceLimits,
 };
-use crate::modules::workspace_sync::interface::{
-    RevisionRef, WorkspaceHandle, WorkspaceSyncError, WorkspaceSyncInterface,
-};
 use crate::platform::{
-    clock::{Clock, SystemClock, format_utc},
-    events::{EventStore, NewEvent},
     id::{
-        CliConfigId, CorrelationId, EgressRuleId, GitUpdateConflictId, GithubCredentialId,
-        ProjectId, RuntimeSecretId,
+        CliConfigId, EgressRuleId, GitUpdateConflictId, GithubCredentialId, ProjectId,
+        RuntimeSecretId,
     },
-    operations::{
-        CreateOperation, CreateWork, IdempotencyOutcome, IdempotencyRequest, KIND_GIT_UPDATE,
-        OperationInterface, OperationStatus, OperationView,
-    },
-    path::{PathError, validate_workspace_path},
     secret::{Secret, SecretCipher, fingerprint},
+};
+use janus_infrastructure::{
+    events::{EventStore, NewEvent},
+    id::CorrelationId,
+    operations::{
+        CreateOperation, CreateWork, IdempotencyOutcome, IdempotencyRequest, OperationInterface,
+        OperationStatus, OperationView,
+    },
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
+use janus_workspace::interface::{
+    DeleteFileInput, FileMetaView, FileTreeView, MoveFileInput, RevisionRef, SaveTextInput,
+    WorkspaceError, WorkspaceHandle, WorkspaceInterface,
+};
+use janus_workspace::path::{PathError, validate_workspace_path};
 
 const REPO_KIND_PUBLIC: &str = "public_https";
 const REPO_KIND_GITHUB_PRIVATE: &str = "github_private";
@@ -278,50 +286,12 @@ pub struct CredentialProbeResult {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct SaveTextInput {
-    pub path: String,
-    pub content: String,
-    pub expected_main_revision: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct MoveFileInput {
-    pub from: String,
-    pub to: String,
-    pub expected_main_revision: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct DeleteFileInput {
-    pub path: String,
-    #[serde(default)]
-    pub recursive: bool,
-    pub expected_main_revision: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct FileTreeView {
-    pub path: String,
-    pub kind: String,
-    pub size: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RetryProjectInput {
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
     pub github_credential_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct FileMetaView {
-    pub path: String,
-    pub size: u64,
-    pub editable: bool,
-    pub mime: Option<String>,
-    pub main_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -399,9 +369,9 @@ pub enum ProjectsError {
     #[error("git operation failed: {0}")]
     Git(GitError),
     #[error("workspace sync error: {0}")]
-    WorkspaceSync(#[from] WorkspaceSyncError),
+    Workspace(#[from] WorkspaceError),
     #[error("operation error: {0}")]
-    Operation(#[from] crate::platform::operations::OperationError),
+    Operation(#[from] janus_infrastructure::operations::OperationError),
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
     #[error("serialization error: {0}")]
@@ -437,10 +407,8 @@ impl ProjectsError {
             Self::InvalidPath(_) => "INVALID_PATH",
             Self::NotEditable(_) => "FILE_NOT_EDITABLE",
             Self::Git(git) => git.code(),
-            Self::WorkspaceSync(WorkspaceSyncError::RevisionMismatch { .. }) => {
-                "RESOURCE_VERSION_MISMATCH"
-            }
-            Self::WorkspaceSync(_) => "INTERNAL_ERROR",
+            Self::Workspace(WorkspaceError::RevisionMismatch { .. }) => "RESOURCE_VERSION_MISMATCH",
+            Self::Workspace(_) => "INTERNAL_ERROR",
             Self::Operation(_)
             | Self::Storage(_)
             | Self::Serde(_)
@@ -456,7 +424,7 @@ pub struct ProjectsInterface {
     unit_of_work: UnitOfWork,
     cipher: SecretCipher,
     operations: OperationInterface,
-    workspace_sync: WorkspaceSyncInterface,
+    workspace: WorkspaceInterface,
     workspaces_root: std::path::PathBuf,
     git: Arc<dyn GitRunner>,
 }
@@ -534,7 +502,7 @@ impl ProjectsInterface {
         pool: SqlitePool,
         cipher: SecretCipher,
         operations: OperationInterface,
-        workspace_sync: WorkspaceSyncInterface,
+        workspace: WorkspaceInterface,
         events: EventStore,
         data_root: &std::path::Path,
         git: Arc<dyn GitRunner>,
@@ -546,7 +514,7 @@ impl ProjectsInterface {
             unit_of_work,
             cipher,
             operations,
-            workspace_sync,
+            workspace,
             git,
         }
     }
@@ -650,7 +618,7 @@ impl ProjectsInterface {
             _ => {}
         }
 
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let created_at = current.map_or_else(|| now.clone(), |(_, value)| value);
         let version = format!("v_{}", ProjectId::new());
         sqlx::query(
@@ -715,7 +683,7 @@ impl ProjectsInterface {
         .bind(&input.name)
         .fetch_optional(&self.pool)
         .await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let (id, created_at) =
             existing.unwrap_or_else(|| (RuntimeSecretId::new().to_string(), now.clone()));
         let encrypted = self.cipher.encrypt(
@@ -775,7 +743,7 @@ impl ProjectsInterface {
     ) -> Result<Vec<ProjectEgressRuleView>, ProjectsError> {
         self.ensure_project_owner(owner_id, project_id).await?;
         let rules = validate_egress_rules(rules)?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM project_egress_rules WHERE project_id = ?")
             .bind(project_id)
@@ -850,7 +818,7 @@ impl ProjectsInterface {
         .bind(kind)
         .fetch_optional(&self.pool)
         .await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let (id, created_at) =
             existing.unwrap_or_else(|| (CliConfigId::new().to_string(), now.clone()));
         let version = format!("v_{}", CliConfigId::new());
@@ -941,10 +909,10 @@ impl ProjectsInterface {
         let mut work = self.unit_of_work.begin().await?;
         let created = self
             .operations
-            .create_with_work_in_tx(
+            .create_in_tx(
                 &mut work,
                 CreateOperation {
-                    kind: crate::platform::operations::KIND_CLONE,
+                    kind: KIND_CLONE,
                     actor: serde_json::json!({"kind": "owner", "id": owner_id}),
                     target_kind: "project",
                     target_id: Some(&project_id),
@@ -952,8 +920,8 @@ impl ProjectsInterface {
                     correlation_id,
                     idempotency,
                 },
-                CreateWork {
-                    handler_kind: crate::platform::operations::KIND_CLONE,
+                Some(CreateWork {
+                    handler_kind: KIND_CLONE,
                     payload: serde_json::json!({
                         "project_id": project_id,
                         "url": input.repository.url,
@@ -961,7 +929,7 @@ impl ProjectsInterface {
                         "access": input.repository.access.as_str(),
                         "github_credential_id": input.repository.github_credential_id,
                     }),
-                },
+                }),
             )
             .await?;
 
@@ -976,7 +944,7 @@ impl ProjectsInterface {
             return Ok((view, created.operation));
         }
 
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
         sqlx::query("INSERT INTO projects (id, owner_id, tenant_id, name, state, repo_access, repo_url, repo_branch, github_credential_id, default_model_id, main_workspace_handle, clone_error, version, created_at, updated_at, last_activity_at) VALUES (?, ?, ?, ?, 'creating', ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)")
             .bind(provisional_id.to_string())
@@ -1059,7 +1027,7 @@ impl ProjectsInterface {
         let main_revision = match &row.main_workspace_handle {
             Some(handle) => {
                 let handle = WorkspaceHandle(handle.clone());
-                self.workspace_sync
+                self.workspace
                     .current_revision(&handle)
                     .await
                     .map(|r| r.0)
@@ -1119,7 +1087,7 @@ impl ProjectsInterface {
         default_model_id: Option<Option<&str>>,
         correlation_id: &str,
     ) -> Result<ProjectView, ProjectsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let new_version = format!("v_{}", ProjectId::new());
         let mut work = self.unit_of_work.begin().await?;
         let changed = if let Some(model) = default_model_id {
@@ -1174,16 +1142,16 @@ impl ProjectsInterface {
         correlation_id: CorrelationId,
         idempotency: IdempotencyRequest,
     ) -> Result<OperationView, ProjectsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let new_version = format!("v_{}", ProjectId::new());
         let event_correlation_id = correlation_id.to_string();
         let mut work = self.unit_of_work.begin().await?;
         let created = self
             .operations
-            .create_with_work_in_tx(
+            .create_in_tx(
                 &mut work,
                 CreateOperation {
-                    kind: crate::platform::operations::KIND_DELETE_PROJECT,
+                    kind: KIND_DELETE_PROJECT,
                     actor: serde_json::json!({"kind": "owner", "id": owner_id}),
                     target_kind: "project",
                     target_id: Some(id),
@@ -1191,10 +1159,10 @@ impl ProjectsInterface {
                     correlation_id,
                     idempotency: Some(idempotency),
                 },
-                CreateWork {
-                    handler_kind: crate::platform::operations::KIND_DELETE_PROJECT,
+                Some(CreateWork {
+                    handler_kind: KIND_DELETE_PROJECT,
                     payload: serde_json::json!({"project_id": id}),
-                },
+                }),
             )
             .await?;
         if !matches!(created.outcome, IdempotencyOutcome::New) {
@@ -1244,7 +1212,7 @@ impl ProjectsInterface {
                 row.state
             )));
         }
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let new_version = format!("v_{}", ProjectId::new());
         let branch = input.branch.or(row.repo_branch);
         let cred = input.github_credential_id.or(row.github_credential_id);
@@ -1267,10 +1235,10 @@ impl ProjectsInterface {
         }
         let created = self
             .operations
-            .create_with_work_in_tx(
+            .create_in_tx(
                 &mut work,
                 CreateOperation {
-                    kind: crate::platform::operations::KIND_CLONE,
+                    kind: KIND_CLONE,
                     actor: serde_json::json!({"kind": "owner", "id": owner_id}),
                     target_kind: "project",
                     target_id: Some(id),
@@ -1278,8 +1246,8 @@ impl ProjectsInterface {
                     correlation_id,
                     idempotency: None,
                 },
-                CreateWork {
-                    handler_kind: crate::platform::operations::KIND_CLONE,
+                Some(CreateWork {
+                    handler_kind: KIND_CLONE,
                     payload: serde_json::json!({
                         "project_id": id,
                         "url": row.repo_url,
@@ -1287,7 +1255,7 @@ impl ProjectsInterface {
                         "access": row.repo_access,
                         "github_credential_id": cred,
                     }),
-                },
+                }),
             )
             .await?;
         self.append_project_changed_in_tx(
@@ -1329,7 +1297,7 @@ impl ProjectsInterface {
             return Err(ProjectsError::Validation("name is required".into()));
         }
         let id = GithubCredentialId::new();
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", GithubCredentialId::new());
         let (ciphertext, fingerprint) = self.encrypt_pat(owner_id, &id.to_string(), input.pat)?;
         let mut work = self.unit_of_work.begin().await?;
@@ -1385,7 +1353,7 @@ impl ProjectsInterface {
                 current: existing.version,
             });
         }
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let new_version = format!("v_{}", GithubCredentialId::new());
         let name = input
             .name
@@ -1637,10 +1605,14 @@ impl ProjectsInterface {
         };
 
         let dest = self.main_repo_dir(project_id);
-        let clone_result = self
-            .git
-            .clone(&row.repo_url, row.repo_branch.as_deref(), &dest, &credential)
-            .await;
+        let clone_result = GitRunner::clone(
+            self.git.as_ref(),
+            &row.repo_url,
+            row.repo_branch.as_deref(),
+            &dest,
+            &credential,
+        )
+        .await;
         if let Err(error) = clone_result {
             self.mark_project_state(project_id, "error", Some(error.to_string()))
                 .await?;
@@ -1654,7 +1626,7 @@ impl ProjectsInterface {
             .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("bad project id")))?;
         let managed_dir = format!("workspaces/main/{project_id}/repo");
         let revision = self
-            .workspace_sync
+            .workspace
             .ensure_main_copy(
                 project_id_typed,
                 &managed_dir,
@@ -1699,7 +1671,7 @@ impl ProjectsInterface {
         state: &str,
         error: Option<String>,
     ) -> Result<(), ProjectsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
         sqlx::query("UPDATE projects SET state = ?, clone_error = ?, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
             .bind(state)
@@ -1719,7 +1691,7 @@ impl ProjectsInterface {
         revision: String,
     ) -> Result<(), ProjectsError> {
         let handle = format!("main:{project_id}");
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE projects SET state = 'ready', clone_error = NULL, main_workspace_handle = ?, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
@@ -1731,7 +1703,7 @@ impl ProjectsInterface {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        let _ = revision; // emitted via workspace_sync events in later milestones
+        let _ = revision; // emitted via workspace events in later milestones
         Ok(())
     }
 
@@ -1777,7 +1749,7 @@ impl ProjectsInterface {
         let editable = size <= 10 * 1024 * 1024 && is_utf8_text_file(&abs).await;
         let mime = guess_mime(&abs);
         let revision = self
-            .workspace_sync
+            .workspace
             .current_revision(
                 &self.main_handle(
                     row.id
@@ -1835,7 +1807,7 @@ impl ProjectsInterface {
             .as_ref()
             .map(|r| RevisionRef(r.clone()));
         if let Some(expected_ref) = expected.as_ref() {
-            let current = self.workspace_sync.current_revision(&handle).await?;
+            let current = self.workspace.current_revision(&handle).await?;
             if current.0 != expected_ref.0 {
                 return Err(ProjectsError::RevisionMismatch {
                     expected: expected_ref.0.clone(),
@@ -1865,7 +1837,7 @@ impl ProjectsInterface {
         // fail-closed on identity over silent ABA.)
         let mut work = self.unit_of_work.begin().await?;
         let new_revision = self
-            .workspace_sync
+            .workspace
             .bump_revision_in_tx(
                 work.connection(),
                 &handle,
@@ -1961,7 +1933,7 @@ impl ProjectsInterface {
             .map_err(|e| ProjectsError::Internal(anyhow::anyhow!("move failed: {e}")))?;
         let mut work = self.unit_of_work.begin().await?;
         let new_revision = self
-            .workspace_sync
+            .workspace
             .bump_revision_in_tx(
                 work.connection(),
                 &handle,
@@ -2019,7 +1991,7 @@ impl ProjectsInterface {
         }
         let mut work = self.unit_of_work.begin().await?;
         let new_revision = self
-            .workspace_sync
+            .workspace
             .bump_revision_in_tx(
                 work.connection(),
                 &handle,
@@ -2105,15 +2077,18 @@ impl ProjectsInterface {
         let credential = self.credential_for_project(owner_id, project_id).await?;
         let created = self
             .operations
-            .create(CreateOperation {
-                kind: crate::platform::operations::KIND_GIT_FETCH,
-                actor: serde_json::json!({"kind": "owner", "id": owner_id}),
-                target_kind: "project",
-                target_id: Some(project_id),
-                conditions: serde_json::json!({"project_id": project_id, "remote": remote}),
-                correlation_id,
-                idempotency: None,
-            })
+            .create(
+                CreateOperation {
+                    kind: KIND_GIT_FETCH,
+                    actor: serde_json::json!({"kind": "owner", "id": owner_id}),
+                    target_kind: "project",
+                    target_id: Some(project_id),
+                    conditions: serde_json::json!({"project_id": project_id, "remote": remote}),
+                    correlation_id,
+                    idempotency: None,
+                },
+                None,
+            )
             .await?;
         let dir = self.main_repo_dir(project_id);
         if let Err(error) = self.git.fetch(&dir, remote, &credential).await {
@@ -2192,14 +2167,14 @@ impl ProjectsInterface {
         let created = self
             .operations
             .create(CreateOperation {
-                kind: crate::platform::operations::KIND_GIT_PUSH,
+                kind: KIND_GIT_PUSH,
                 actor: serde_json::json!({"kind": "owner", "id": owner_id}),
                 target_kind: "project",
                 target_id: Some(project_id),
                 conditions: serde_json::json!({"project_id": project_id, "remote": remote, "branch": branch}),
                 correlation_id,
                 idempotency: None,
-            })
+            }, None)
             .await?;
         // Push executes inline (short) when possible; the Operation records it.
         let dir = self.main_repo_dir(project_id);
@@ -2243,19 +2218,22 @@ impl ProjectsInterface {
         let credential = self.credential_for_project(owner_id, project_id).await?;
         let created = self
             .operations
-            .create(CreateOperation {
-                kind: KIND_GIT_UPDATE,
-                actor: serde_json::json!({"kind": "owner", "id": owner_id}),
-                target_kind: "project",
-                target_id: Some(project_id),
-                conditions: serde_json::json!({
-                    "project_id": project_id,
-                    "remote": input.remote,
-                    "branch": input.branch,
-                }),
-                correlation_id,
-                idempotency: None,
-            })
+            .create(
+                CreateOperation {
+                    kind: KIND_GIT_UPDATE,
+                    actor: serde_json::json!({"kind": "owner", "id": owner_id}),
+                    target_kind: "project",
+                    target_id: Some(project_id),
+                    conditions: serde_json::json!({
+                        "project_id": project_id,
+                        "remote": input.remote,
+                        "branch": input.branch,
+                    }),
+                    correlation_id,
+                    idempotency: None,
+                },
+                None,
+            )
             .await?;
         let dir = self.main_repo_dir(project_id);
         let outcome = self
@@ -2269,7 +2247,7 @@ impl ProjectsInterface {
                 // Bump content revision so Diff consumers refresh.
                 if let Ok(handle) = self.main_handle_for(project_id).await {
                     let _ = self
-                        .workspace_sync
+                        .workspace
                         .bump_revision(
                             &handle,
                             None,
@@ -2411,7 +2389,7 @@ impl ProjectsInterface {
         }
 
         // Save each path choice.
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         for path in &input.paths {
             if !matches!(
                 path.choice.as_str(),
@@ -2530,9 +2508,7 @@ impl ProjectsInterface {
         let project = self.fetch_project(owner_id, project_id).await?;
         let remote = "origin";
         let branch = project.repo_branch.as_deref().unwrap_or("main");
-        self.git
-            .complete_fast_forward(&dir, remote, branch)
-            .await?;
+        self.git.complete_fast_forward(&dir, remote, branch).await?;
         self.refresh_git_state(
             owner_id,
             project_id,
@@ -2542,7 +2518,7 @@ impl ProjectsInterface {
         .await?;
         if let Ok(handle) = self.main_handle_for(project_id).await {
             let _ = self
-                .workspace_sync
+                .workspace
                 .bump_revision(
                     &handle,
                     None,
@@ -2605,7 +2581,7 @@ impl ProjectsInterface {
     ) -> Result<(), ProjectsError> {
         let dir = self.main_repo_dir(project_id);
         let status = self.git.status(&dir).await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
         let mut work = self.unit_of_work.begin().await?;
         sqlx::query(
@@ -2662,7 +2638,7 @@ impl ProjectsInterface {
         paths: &[UpdateConflictPath],
     ) -> Result<String, ProjectsError> {
         let conflict_id = GitUpdateConflictId::new().to_string();
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", GitUpdateConflictId::new());
         // Supersede any previous open conflict for this project.
         sqlx::query(

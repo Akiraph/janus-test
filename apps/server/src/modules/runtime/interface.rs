@@ -5,14 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::Utc;
 use futures_util::future::BoxFuture;
+use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::platform::{
-    clock::format_utc,
     id::{
         CliSessionId, JobId, LogStreamId, ProjectId, RuntimeId, RuntimePortId, ServiceId,
         SessionId, TerminalId, ToolCallId, TurnId,
@@ -159,7 +158,7 @@ impl DeploymentCapabilityProbe {
             browser_available: false,
             claude_code_available: command_available("claude"),
             codex_available: command_available("codex"),
-            checked_at: format_utc(Utc::now()),
+            checked_at: now_utc_str(),
         }
     }
 }

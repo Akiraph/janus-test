@@ -1,11 +1,11 @@
+use janus_infrastructure::clock::now_utc_str;
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection};
 
-use crate::modules::workspace_sync::interface::WorkspaceHandle;
-use crate::platform::{
-    clock::{Clock, SystemClock, format_utc},
-    id::{AttachmentId, CheckpointId, MessageId, SessionId, TimelineItemId, TurnId},
+use crate::platform::id::{
+    AttachmentId, CheckpointId, MessageId, SessionId, TimelineItemId, TurnId,
 };
+use janus_workspace::interface::WorkspaceHandle;
 
 use super::interface::SessionsInterface;
 use super::types::{
@@ -312,7 +312,7 @@ impl SessionsInterface {
     ) -> Result<String, SessionsError> {
         let session = self.get_session(session_id).await?;
         Ok(self
-            .workspace_sync
+            .workspace
             .current_revision(&WorkspaceHandle(session.workspace_handle))
             .await?
             .0)
@@ -1700,6 +1700,6 @@ impl SessionsInterface {
     }
 
     pub fn now(&self) -> String {
-        format_utc(SystemClock.now())
+        now_utc_str()
     }
 }

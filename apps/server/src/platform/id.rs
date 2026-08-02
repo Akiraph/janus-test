@@ -39,10 +39,6 @@ macro_rules! typed_id {
     };
 }
 
-typed_id!(EventId);
-typed_id!(RequestId);
-typed_id!(CorrelationId);
-typed_id!(CausationId);
 typed_id!(TenantId);
 typed_id!(ActorId);
 typed_id!(OwnerId);
@@ -50,12 +46,10 @@ typed_id!(PasskeyId);
 typed_id!(ProviderId);
 typed_id!(ModelId);
 typed_id!(ProjectId);
-typed_id!(OperationId);
-typed_id!(WorkItemId);
 typed_id!(GithubCredentialId);
 typed_id!(RevisionId);
 typed_id!(GitUpdateConflictId);
-// Session, Turn, Supervisor, Models, and Runtime identity surface.
+// Session, Turn, Execution, Models, and Runtime identity surface.
 typed_id!(SessionId);
 typed_id!(TurnId);
 typed_id!(MessageId);
@@ -82,25 +76,3 @@ typed_id!(AskId);
 typed_id!(PlanVersionId);
 typed_id!(ContextVersionId);
 typed_id!(CompactSummaryId);
-
-/// Lowercase hex SHA-256 of a content-addressed blob. Not a UUID: the value is
-/// derived from the bytes, so it is constructed from a string, not generated.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(transparent)]
-pub struct BlobSha(String);
-
-impl BlobSha {
-    pub fn from_hex(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for BlobSha {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}

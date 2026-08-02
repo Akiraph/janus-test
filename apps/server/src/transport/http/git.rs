@@ -23,7 +23,6 @@ use crate::{
     modules::projects::interface::{
         GitUpdateConflictView, GitUpdateInput, ProjectsError, ResolveGitUpdateConflictInput,
     },
-    platform::id::CorrelationId,
     transport::http::{
         auth::{authenticate, authorized},
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -31,6 +30,7 @@ use crate::{
         problem::Problem,
     },
 };
+use janus_infrastructure::id::CorrelationId;
 
 // ----- Transport DTOs (adapters::git types do not derive ToSchema) --------
 
@@ -323,7 +323,7 @@ pub async fn git_remotes(
     params(("id" = String, Path, description = "Project id")),
     request_body = GitFetchRequest,
     responses(
-        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 202, body = DataResponse<janus_infrastructure::operations::OperationView>),
         (status = 401, body = Problem),
         (status = 404, body = Problem),
         (status = 409, body = Problem),
@@ -338,7 +338,7 @@ pub async fn git_fetch(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::platform::operations::OperationView>>,
+        Json<DataResponse<janus_infrastructure::operations::OperationView>>,
     ),
     Problem,
 > {
@@ -458,7 +458,7 @@ pub async fn git_commit(
     params(("id" = String, Path, description = "Project id")),
     request_body = GitPushRequest,
     responses(
-        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 202, body = DataResponse<janus_infrastructure::operations::OperationView>),
         (status = 401, body = Problem),
         (status = 404, body = Problem),
         (status = 409, body = Problem),
@@ -473,7 +473,7 @@ pub async fn git_push(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::platform::operations::OperationView>>,
+        Json<DataResponse<janus_infrastructure::operations::OperationView>>,
     ),
     Problem,
 > {
@@ -516,7 +516,7 @@ pub async fn git_push(
     params(("id" = String, Path, description = "Project id")),
     request_body = GitUpdateRequest,
     responses(
-        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 202, body = DataResponse<janus_infrastructure::operations::OperationView>),
         (status = 401, body = Problem),
         (status = 404, body = Problem),
         (status = 409, body = Problem),
@@ -531,7 +531,7 @@ pub async fn git_update(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::platform::operations::OperationView>>,
+        Json<DataResponse<janus_infrastructure::operations::OperationView>>,
     ),
     Problem,
 > {

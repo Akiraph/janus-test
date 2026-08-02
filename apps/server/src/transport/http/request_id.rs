@@ -1,7 +1,7 @@
 use axum::{body::Body, extract::Request, middleware::Next, response::Response};
 use http::{HeaderValue, header::HeaderName};
 
-use crate::platform::id::RequestId;
+use janus_infrastructure::id::RequestId;
 
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 

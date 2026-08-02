@@ -1,7 +1,12 @@
 use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
 
 use anyhow::Context;
+use janus_infrastructure::{
+    database::Database, events::EventStore, managed_storage::BlobStore,
+    operations::OperationInterface,
+};
 use janus_server::{
+    adapters::git::system_runner,
     config::RunMode,
     modules::{
         models::interface::{
@@ -16,13 +21,10 @@ use janus_server::{
             DeploymentCapabilityProbe, EffectiveCapabilityConfig, ExecutorKind, NetworkPolicy,
             ResourceLimits, RuntimeCapabilityEvaluator, RuntimeCapabilityId,
         },
-        workspace_sync::interface::WorkspaceSyncInterface,
     },
-    platform::{
-        database::Database, events::EventStore, managed_storage::BlobStore,
-        operations::OperationInterface, secret::SecretCipher,
-    },
+    platform::secret::SecretCipher,
 };
+use janus_workspace::interface::WorkspaceInterface;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -44,12 +46,12 @@ struct Fx {
 impl Fx {
     async fn new() -> anyhow::Result<Self> {
         let temp = TempDir::new()?;
-        let database = Database::open(temp.path()).await?;
+        let database = Database::open(temp.path(), janus_server::migrator()).await?;
         let pool = database.pool().clone();
         seed_owner_and_project(&pool).await?;
         let cipher = SecretCipher::load(temp.path(), RunMode::Development)?;
         let blobs = BlobStore::new(pool.clone(), temp.path())?;
-        let workspace = WorkspaceSyncInterface::new(pool.clone(), temp.path(), blobs);
+        let workspace = WorkspaceInterface::new(pool.clone(), temp.path(), blobs);
         let events = EventStore::new(pool.clone());
         let projects = ProjectsInterface::new(
             pool.clone(),
@@ -58,6 +60,7 @@ impl Fx {
             workspace,
             events,
             temp.path(),
+            system_runner(),
         );
         let models = ModelsInterface::new(pool.clone(), cipher, EventStore::new(pool.clone()))?;
         Ok(Self {
@@ -382,7 +385,7 @@ async fn populated_previous_schema_migrates_active_work_without_replay() -> anyh
         .max_connections(1)
         .connect_with(options)
         .await?;
-    let migrator = sqlx::migrate!("./migrations");
+    let migrator = janus_server::migrator();
     let previous = sqlx::migrate::Migrator {
         migrations: Cow::Owned(
             migrator
@@ -522,7 +525,7 @@ async fn runtime_scope_migration_preserves_children_and_scope_uniqueness() -> an
         .max_connections(1)
         .connect_with(options)
         .await?;
-    let migrator = sqlx::migrate!("./migrations");
+    let migrator = janus_server::migrator();
     let previous = sqlx::migrate::Migrator {
         migrations: Cow::Owned(
             migrator

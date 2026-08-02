@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc};
 
+use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::sync::Mutex;
@@ -7,10 +8,7 @@ use tokio::sync::Mutex;
 use super::interface::{
     LogChannel, LogChunk, LogCursor, LogOwnerKind, LogRange, LogStreamProjection, RuntimeError,
 };
-use crate::platform::{
-    clock::{Clock, SystemClock, format_utc},
-    id::LogStreamId,
-};
+use crate::platform::id::LogStreamId;
 
 const CHUNK_BYTES: usize = 64 * 1024;
 const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -89,7 +87,7 @@ impl LogStore {
         tokio::fs::create_dir_all(self.root.join(&relative_path))
             .await
             .map_err(storage_error)?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         sqlx::query(
             "INSERT INTO log_streams \
              (id, owner_kind, owner_id, relative_path, first_cursor, next_cursor, retained_bytes, \
@@ -155,7 +153,7 @@ impl LogStore {
             .saturating_add(u64::try_from(input.len()).unwrap_or(u64::MAX));
         let (first_cursor, retained_bytes, truncated) =
             enforce_retention(&directory, cursor, total_bytes, retention).await?;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         sqlx::query(
             "UPDATE log_streams SET first_cursor = ?, next_cursor = ?, retained_bytes = ?, \
              total_bytes = ?, truncated = ?, updated_at = ? WHERE id = ?",
@@ -175,7 +173,7 @@ impl LogStore {
 
     pub async fn close(&self, id: LogStreamId) -> Result<LogStreamProjection, RuntimeError> {
         let _guard = self.gate.lock().await;
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         if sqlx::query("UPDATE log_streams SET closed = 1, updated_at = ? WHERE id = ?")
             .bind(now)
             .bind(id.to_string())
@@ -507,13 +505,14 @@ mod tests {
     use super::{LogRetention, LogStore};
     use crate::{
         modules::runtime::interface::{LogChannel, LogCursor, LogOwnerKind},
-        platform::{database::Database, id::JobId},
+        platform::id::JobId,
     };
+    use janus_infrastructure::database::Database;
 
     #[tokio::test]
     async fn redacts_closes_and_retains_head_marker_and_tail() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let database = Database::open(temp.path()).await?;
+        let database = Database::open(temp.path(), crate::migrator()).await?;
         let store = LogStore::new(database.pool().clone(), temp.path());
         let stream = store
             .create(LogOwnerKind::Job, &JobId::new().to_string())
@@ -577,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn unicode_retention_and_cursor_ranges_use_utf8_boundaries() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let database = Database::open(temp.path()).await?;
+        let database = Database::open(temp.path(), crate::migrator()).await?;
         let store = LogStore::new(database.pool().clone(), temp.path());
         let retention = LogRetention {
             raw_limit_bytes: 47,

@@ -2,10 +2,10 @@
 
 use std::future::Future;
 
-use chrono::Utc;
 use futures_util::StreamExt;
+use janus_infrastructure::clock::now_utc_str;
 
-use crate::platform::{clock::format_utc, id::AttemptId, secret::Secret};
+use crate::platform::{id::AttemptId, secret::Secret};
 
 use super::anthropic::{AnthropicAssembler, build_messages_body};
 use super::interface::{ModelsError, ModelsInterface, ProviderKind};
@@ -62,7 +62,7 @@ impl ModelsInterface {
             .map_err(ModelsError::Internal)?;
 
         let attempt_id = AttemptId::new().to_string();
-        let started = format_utc(Utc::now());
+        let started = now_utc_str();
         self.insert_attempt_running(
             &attempt_id,
             req.round_id.as_deref().unwrap_or("round-unset"),

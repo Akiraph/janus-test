@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::modules::workspace_sync::interface::WorkspaceSyncError;
 use crate::platform::id::{AskId, AttachmentId, ProjectId, RoundId, SessionId, TurnId};
+use janus_workspace::interface::WorkspaceError;
 
 pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: u64 = 25 * 1024 * 1024;
@@ -43,7 +43,7 @@ pub enum SessionsError {
     #[error("validation failed: {0}")]
     Validation(String),
     #[error("workspace error: {0}")]
-    Workspace(#[from] WorkspaceSyncError),
+    Workspace(#[from] WorkspaceError),
     #[error("storage error: {0}")]
     Storage(#[from] sqlx::Error),
     #[error("serialization error: {0}")]
@@ -521,7 +521,7 @@ pub struct SteerResult {
     pub session_version: String,
 }
 
-/// Blocking vs best-effort Ask (M4 Ask flow). Supervisor creates the Ask row;
+/// Blocking vs best-effort Ask (M4 Ask flow). Execution creates the Ask row;
 /// Sessions owns the answer/expiry write that resumes the Turn.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AskSummary {

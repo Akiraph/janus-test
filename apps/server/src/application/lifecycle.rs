@@ -12,23 +12,25 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::AppState;
+use crate::application::operation_kinds::{KIND_CREATE_SESSION, KIND_DELETE_SESSION};
+use crate::modules::execution::interface::{ExecutionError, ExecutionInterface};
 use crate::modules::models::interface::{ModelsError, ModelsInterface};
 use crate::modules::projects::interface::ProjectsError;
 use crate::modules::runtime::interface::{
     JobStatus, RuntimeError, RuntimeInterface, RuntimeScope, ServiceStatus, TerminalStatus,
 };
 use crate::modules::sessions::interface::{SessionsError, SessionsInterface, TurnStatus};
-use crate::modules::supervisor::interface::{SupervisorError, SupervisorInterface};
-use crate::modules::workspace_sync::interface::WorkspaceSyncError;
-use crate::platform::{
+use crate::platform::id::{ProjectId, SessionId};
+use janus_infrastructure::{
     events::NewEvent,
-    id::{CorrelationId, ProjectId, SessionId},
+    id::CorrelationId,
     operations::{
-        CreateOperation, CreateWork, IdempotencyRequest, KIND_CREATE_SESSION, KIND_DELETE_SESSION,
-        OperationError, OperationInterface, OperationStatus, OperationView, StepState,
+        CreateOperation, CreateWork, IdempotencyRequest, OperationError, OperationInterface,
+        OperationStatus, OperationView, StepState,
     },
     unit_of_work::UnitOfWork,
 };
+use janus_workspace::interface::WorkspaceError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionLifecycleError {
@@ -43,9 +45,9 @@ pub enum SessionLifecycleError {
     #[error(transparent)]
     Sessions(#[from] SessionsError),
     #[error(transparent)]
-    Supervisor(#[from] SupervisorError),
+    Execution(#[from] ExecutionError),
     #[error(transparent)]
-    Workspace(#[from] WorkspaceSyncError),
+    Workspace(#[from] WorkspaceError),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]
@@ -63,9 +65,7 @@ impl SessionLifecycleError {
             Self::Sessions(SessionsError::NotFound) => "SESSION_NOT_FOUND",
             Self::Sessions(SessionsError::VersionMismatch { .. }) => "RESOURCE_VERSION_MISMATCH",
             Self::Runtime(error) => error.code().as_str(),
-            Self::Workspace(WorkspaceSyncError::RevisionMismatch { .. }) => {
-                "RESOURCE_VERSION_MISMATCH"
-            }
+            Self::Workspace(WorkspaceError::RevisionMismatch { .. }) => "RESOURCE_VERSION_MISMATCH",
             Self::InvalidWork(_) => "INVALID_WORK_ITEM",
             _ => "INTERNAL_ERROR",
         }
@@ -103,7 +103,7 @@ pub(crate) async fn recover_execution_state(
     models: &ModelsInterface,
     runtime: &RuntimeInterface,
     sessions: &SessionsInterface,
-    supervisor: &SupervisorInterface,
+    execution: &ExecutionInterface,
 ) -> anyhow::Result<usize> {
     let now = sessions.now();
     let mut work = unit_of_work.begin().await?;
@@ -113,7 +113,7 @@ pub(crate) async fn recover_execution_state(
     models
         .interrupt_running_attempts_in_tx(work.connection(), &now)
         .await?;
-    supervisor
+    execution
         .interrupt_execution_in_tx(work.connection(), &now)
         .await?;
     let recovered = sessions
@@ -175,7 +175,7 @@ pub async fn request_session_creation(
     let session_id = SessionId::new();
     let created = state
         .operations()
-        .create_with_work(
+        .create(
             CreateOperation {
                 kind: KIND_CREATE_SESSION,
                 actor: actor.clone(),
@@ -189,7 +189,7 @@ pub async fn request_session_creation(
                 correlation_id,
                 idempotency: Some(idempotency),
             },
-            CreateWork {
+            Some(CreateWork {
                 handler_kind: KIND_CREATE_SESSION,
                 payload: json!({
                     "session_id": session_id,
@@ -198,7 +198,7 @@ pub async fn request_session_creation(
                     "title": title,
                     "actor": actor,
                 }),
-            },
+            }),
         )
         .await?;
     Ok(created.operation)
@@ -214,7 +214,7 @@ pub async fn request_session_deletion(
 ) -> Result<OperationView, SessionLifecycleError> {
     let created = state
         .operations()
-        .create_with_work(
+        .create(
             CreateOperation {
                 kind: KIND_DELETE_SESSION,
                 actor: actor.clone(),
@@ -227,14 +227,14 @@ pub async fn request_session_deletion(
                 correlation_id,
                 idempotency: Some(idempotency),
             },
-            CreateWork {
+            Some(CreateWork {
                 handler_kind: KIND_DELETE_SESSION,
                 payload: json!({
                     "session_id": session_id,
                     "expected_version": expected_version,
                     "actor": actor,
                 }),
-            },
+            }),
         )
         .await?;
     Ok(created.operation)
@@ -381,13 +381,8 @@ async fn execute_session_creation(
         )
         .await?;
     let copy = state
-        .workspace_sync()
-        .ensure_session_copy(
-            project_id,
-            session_id,
-            None,
-            input.actor.clone(),
-        )
+        .workspace()
+        .ensure_session_copy(project_id, session_id, None, input.actor.clone())
         .await?;
     if matches!(workspace_step, StepState::Running) {
         state
@@ -521,10 +516,7 @@ async fn execute_session_deletion_steps(
         &step_key("delete_workspace"),
         step_input(),
         async {
-            state
-                .workspace_sync()
-                .delete_session_copy(session_id)
-                .await?;
+            state.workspace().delete_session_copy(session_id).await?;
             Ok(())
         },
     )
@@ -610,7 +602,7 @@ async fn delete_session_records(
         return Ok(());
     };
     let round_ids = state
-        .supervisor()
+        .execution()
         .round_ids_for_turns_in_tx(work.connection(), &plan.turn_ids)
         .await?;
     let attempt_ids = state
@@ -622,7 +614,7 @@ async fn delete_session_records(
         .delete_session_resources_in_tx(work.connection(), session_id)
         .await?;
     state
-        .supervisor()
+        .execution()
         .delete_session_execution_in_tx(work.connection(), session_id, &plan.turn_ids, &attempt_ids)
         .await?;
     state

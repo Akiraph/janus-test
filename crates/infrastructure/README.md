@@ -1,0 +1,37 @@
+# Infrastructure
+
+## Mission
+
+`janus-infrastructure` gives capability modules and the server composition root durable technical primitives for a local, single-owner deployment: typed identifiers, UTC values, SQLite access, transactional writes, public event replay, resumable operations, and content-addressed bytes. It preserves storage and recovery semantics without knowing what a project, session, turn, or work kind means.
+
+## Observable behavior
+
+- A data root is exclusive. A second process fails during startup instead of sharing database files and recovery responsibility.
+- Public events can be replayed from a cursor. A subscriber notification is only a wake-up hint and is sent after commit, so consumers must poll to repair missed notifications.
+- Operation creation can replay an identical request, reject an idempotency key reused with a different digest, and expose leases and steps for recovery. It never performs the external side effect.
+- Blob writes make the object available before registering its logical reference. A crash may leave an incoming temporary file or an object without a database reference; cleanup may remove only incoming files, while committed-object collection belongs elsewhere.
+
+## Invariants
+
+- This crate depends only downward on generic technical libraries. It must not depend on server, deployment policy, or capability modules.
+- The server composition root supplies migration order. Infrastructure may run that migrator, but it does not own the migration set or decide schema evolution.
+- Event notifications follow commit. A rollback must never wake a consumer as if an event had become visible.
+- An idempotency key with the same request digest reuses the stored operation; a different digest is an error, never an overwrite.
+- A lease nonce is the ownership proof for completing or failing leased work. Expired leases may be reclaimed, but a stale holder may not mutate the new lease.
+- Content identity is the SHA-256 digest of bytes. Existing objects are length-checked before reuse, and committed object files are not deleted by crash cleanup.
+- Janus timestamps remain millisecond RFC 3339 values because storage ordering and public wire data cross this boundary.
+
+## Boundaries and non-goals
+
+This crate does not define work kinds, business event catalogs, capability tables, workflow orchestration, deployment secrets, process policy, or external-side-effect handlers. Public events are an outward observation channel, not a command bus. Blob reference registration is here; mark-and-sweep collection and domain manifests are not.
+
+Do not add a generic repository, service locator, or convenience coordinator here. If a rule needs business vocabulary or writes another module's state, it belongs above this crate.
+
+## Design decisions
+
+- Keep this as an independent crate so the compiler enforces the dependency ceiling; a `platform/` folder inside server would not.
+- Inject the migrator so the connection layer can remain reusable while the composition root retains ownership of the complete, ordered schema.
+- Reserve SQLite's writer lock at the start of short write transactions. Deferred transactions make contention appear later, after application code has already done work that cannot be committed safely.
+- Treat event broadcast as a post-commit wake-up, not durable delivery. The database cursor is the durable source of truth and polling repairs lost notifications.
+- Store blobs with a same-filesystem temporary file and atomic rename before committing references. This leaves a recoverable crash boundary without allowing a reference to point at a missing object.
+- Keep operation journaling separate from side effects. The journal records intent, leases, and completed steps; the owning workflow decides how to execute or recover the side effect.

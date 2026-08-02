@@ -1,0 +1,12 @@
+name = "workspace"
+public_root = "interface.rs"
+owned_tables = [
+  "workspace_copies",
+  "content_revisions",
+  "workspace_snapshots",
+  "propagation_links",
+]
+publishes = ["session.revision_changed", "workspace.diff_changed"]
+allowed_module_dependencies = []
+specs = []
+tests = []

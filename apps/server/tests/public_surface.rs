@@ -2,13 +2,13 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use futures_util::StreamExt;
+use janus_infrastructure::{
+    database::Database,
+    events::{EventEnvelope, NewEvent},
+};
 use janus_server::{
     AppState,
     config::{Config, RunMode},
-    platform::{
-        database::Database,
-        events::{EventEnvelope, NewEvent},
-    },
     router,
 };
 use reqwest::Client;
@@ -156,10 +156,14 @@ async fn event_stream_replays_committed_rows_and_validates_cursors() -> anyhow::
 #[tokio::test]
 async fn data_root_lock_is_exclusive_and_reusable_after_close() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
-    let first = Database::open(directory.path()).await?;
-    assert!(Database::open(directory.path()).await.is_err());
+    let first = Database::open(directory.path(), janus_server::migrator()).await?;
+    assert!(
+        Database::open(directory.path(), janus_server::migrator())
+            .await
+            .is_err()
+    );
     drop(first);
-    let reopened = Database::open(directory.path()).await?;
+    let reopened = Database::open(directory.path(), janus_server::migrator()).await?;
     assert!(reopened.ready().await);
     Ok(())
 }

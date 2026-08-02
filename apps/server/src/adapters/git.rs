@@ -1,14 +1,14 @@
 //! GitRunner adapter: the system-`git` implementation of the port defined in
-//! `modules::projects::git`.
+//! `modules::projects::interface`.
 //!
-//! `ARC-004` and the GitRunner seam: projects/workspace-sync drive clone,
+//! `ARC-004` and the GitRunner seam: projects/workspace drive clone,
 //! status, diff, index and remote operations through this thin process layer.
 //! Production and local both use the system Git adapter; tests use real
 //! temporary Git repositories with the same adapter rather than rewriting Git
 //! in memory. Only crash-simulation tests use a fake runner.
 //!
-//! The DTOs and `GitRunner` trait are owned by the domain (`modules::projects::
-//! git`); this module re-exports them so existing call sites keep compiling and
+//! The DTOs and `GitRunner` trait are owned by the domain interface; this module
+//! re-exports them so existing call sites keep compiling and
 //! implements the system adapter against them. Commands run with
 //! `GIT_OPTIONAL_LOCKS=0` and read-only arguments so `status` does not try to
 //! refresh the index and fail when a reader races a writer.
@@ -22,7 +22,7 @@ use tokio::process::Command;
 
 use rand::RngCore;
 
-pub use crate::modules::projects::git::{
+pub use crate::modules::projects::interface::{
     DiffView, GitCredential, GitError, GitLogEntry, GitRunner, GitStatus, UpdateConflictPath,
     UpdateOutcome,
 };
@@ -162,10 +162,7 @@ impl GitRunner for SystemGit {
     fn status<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<GitStatus, GitError>> {
         Box::pin(async move {
             let mut command = Self::base(repo);
-            command
-                .arg("status")
-                .arg("--porcelain=v2")
-                .arg("--branch");
+            command.arg("status").arg("--porcelain=v2").arg("--branch");
             let output = Self::run(&mut command).await?;
             Ok(parse_porcelain_v2(&output))
         })
@@ -200,10 +197,7 @@ impl GitRunner for SystemGit {
         })
     }
 
-    fn branches<'a>(
-        &'a self,
-        repo: &'a Path,
-    ) -> BoxFuture<'a, Result<Vec<String>, GitError>> {
+    fn branches<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<Vec<String>, GitError>> {
         Box::pin(async move {
             let mut command = Self::base(repo);
             command
@@ -215,10 +209,7 @@ impl GitRunner for SystemGit {
         })
     }
 
-    fn remotes<'a>(
-        &'a self,
-        repo: &'a Path,
-    ) -> BoxFuture<'a, Result<Vec<String>, GitError>> {
+    fn remotes<'a>(&'a self, repo: &'a Path) -> BoxFuture<'a, Result<Vec<String>, GitError>> {
         Box::pin(async move {
             let mut command = Self::base(repo);
             command.arg("remote");
@@ -471,15 +462,7 @@ impl GitRunner for SystemGit {
         edited_bytes: Option<&'a [u8]>,
     ) -> BoxFuture<'a, Result<(), GitError>> {
         Box::pin(async move {
-            apply_conflict_choice(
-                repo,
-                path,
-                choice,
-                remote_hash,
-                main_hash,
-                edited_bytes,
-            )
-            .await
+            apply_conflict_choice(repo, path, choice, remote_hash, main_hash, edited_bytes).await
         })
     }
 

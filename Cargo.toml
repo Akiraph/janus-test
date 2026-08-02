@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["apps/server", "tools/xtask", "tools/test-cli"]
+members = [
+    "apps/server",
+    "crates/infrastructure",
+    "crates/workspace",
+    "tools/xtask",
+    "tools/test-cli",
+]
 
 [workspace.package]
 edition = "2024"
@@ -35,6 +41,14 @@ uuid = { version = "1.18", features = ["serde", "v7"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.test]
+debug = 1
+incremental = true
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

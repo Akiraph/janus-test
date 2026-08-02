@@ -22,11 +22,10 @@ use utoipa::ToSchema;
 use crate::{
     AppState,
     modules::projects::interface::{
-        CreateGithubCredentialInput, CreateProjectInput, CredentialProbeResult, DeleteFileInput,
-        FileMetaView, FileTreeView, GithubCredentialView, MoveFileInput, ProjectView,
-        ProjectsError, RetryProjectInput, SaveTextInput, UpdateGithubCredentialInput,
+        CreateGithubCredentialInput, CreateProjectInput, CredentialProbeResult,
+        GithubCredentialView, ProjectView, ProjectsError, RetryProjectInput,
+        UpdateGithubCredentialInput,
     },
-    platform::id::CorrelationId,
     transport::http::{
         auth::{authenticate, authorized},
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -34,6 +33,10 @@ use crate::{
         problem::Problem,
         request_id::RequestContext,
     },
+};
+use janus_infrastructure::id::CorrelationId;
+use janus_workspace::interface::{
+    DeleteFileInput, FileMetaView, FileTreeView, MoveFileInput, RevisionRef, SaveTextInput,
 };
 
 // ----- Query and request bodies -------------------------------------------
@@ -96,7 +99,7 @@ pub async fn list_projects(
     path = "/api/v1/projects",
     request_body = CreateProjectInput,
     responses(
-        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 202, body = DataResponse<janus_infrastructure::operations::OperationView>),
         (status = 422, body = Problem),
         (status = 401, body = Problem),
         (status = 409, body = Problem)
@@ -109,7 +112,7 @@ pub async fn create_project(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::platform::operations::OperationView>>,
+        Json<DataResponse<janus_infrastructure::operations::OperationView>>,
     ),
     Problem,
 > {
@@ -211,7 +214,7 @@ pub async fn update_project(
     path = "/api/v1/projects/{id}",
     params(("id" = String, Path, description = "Project id")),
     responses(
-        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 202, body = DataResponse<janus_infrastructure::operations::OperationView>),
         (status = 401, body = Problem),
         (status = 404, body = Problem),
         (status = 428, body = Problem)
@@ -225,7 +228,7 @@ pub async fn delete_project(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::platform::operations::OperationView>>,
+        Json<DataResponse<janus_infrastructure::operations::OperationView>>,
     ),
     Problem,
 > {
@@ -262,7 +265,7 @@ pub async fn delete_project(
     params(("id" = String, Path, description = "Project id")),
     request_body = RetryProjectInput,
     responses(
-        (status = 202, body = DataResponse<crate::platform::operations::OperationView>),
+        (status = 202, body = DataResponse<janus_infrastructure::operations::OperationView>),
         (status = 401, body = Problem),
         (status = 404, body = Problem),
         (status = 409, body = Problem),
@@ -277,7 +280,7 @@ pub async fn retry_project(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::platform::operations::OperationView>>,
+        Json<DataResponse<janus_infrastructure::operations::OperationView>>,
     ),
     Problem,
 > {
@@ -524,7 +527,7 @@ pub async fn file_content(
     params(("id" = String, Path, description = "Project id")),
     request_body = SaveTextInput,
     responses(
-        (status = 200, body = DataResponse<crate::modules::workspace_sync::interface::RevisionRef>),
+        (status = 200, body = DataResponse<RevisionRef>),
         (status = 401, body = Problem),
         (status = 412, body = Problem),
         (status = 422, body = Problem)
@@ -536,7 +539,7 @@ pub async fn save_text(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(input): Json<SaveTextInput>,
-) -> Result<Json<DataResponse<crate::modules::workspace_sync::interface::RevisionRef>>, Problem> {
+) -> Result<Json<DataResponse<RevisionRef>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     let actor = serde_json::json!({ "kind": "owner", "id": auth.owner_id });
     let revision = state
@@ -583,7 +586,7 @@ pub async fn file_tree(
     params(("id" = String, Path, description = "Project id")),
     request_body = MoveFileInput,
     responses(
-        (status = 200, body = DataResponse<crate::modules::workspace_sync::interface::RevisionRef>),
+        (status = 200, body = DataResponse<RevisionRef>),
         (status = 401, body = Problem),
         (status = 412, body = Problem),
         (status = 422, body = Problem)
@@ -595,7 +598,7 @@ pub async fn move_file(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(input): Json<MoveFileInput>,
-) -> Result<Json<DataResponse<crate::modules::workspace_sync::interface::RevisionRef>>, Problem> {
+) -> Result<Json<DataResponse<RevisionRef>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     let actor = serde_json::json!({ "kind": "owner", "id": auth.owner_id });
     let revision = state
@@ -612,7 +615,7 @@ pub async fn move_file(
     params(("id" = String, Path, description = "Project id")),
     request_body = DeleteFileInput,
     responses(
-        (status = 200, body = DataResponse<crate::modules::workspace_sync::interface::RevisionRef>),
+        (status = 200, body = DataResponse<RevisionRef>),
         (status = 401, body = Problem),
         (status = 412, body = Problem),
         (status = 422, body = Problem)
@@ -624,7 +627,7 @@ pub async fn delete_file(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(input): Json<DeleteFileInput>,
-) -> Result<Json<DataResponse<crate::modules::workspace_sync::interface::RevisionRef>>, Problem> {
+) -> Result<Json<DataResponse<RevisionRef>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     let actor = serde_json::json!({ "kind": "owner", "id": auth.owner_id });
     let revision = state

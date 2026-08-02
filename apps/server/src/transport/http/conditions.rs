@@ -19,12 +19,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{Duration, Utc};
+use janus_infrastructure::clock::format_utc;
 use sha2::{Digest, Sha256};
 
-use crate::{
-    platform::{clock::format_utc, operations::IdempotencyRequest},
-    transport::http::problem::Problem,
-};
+use crate::transport::http::problem::Problem;
+use janus_infrastructure::operations::IdempotencyRequest;
 
 /// Header name for the client-generated idempotency key.
 pub const IDEMPOTENCY_KEY: &str = "idempotency-key";

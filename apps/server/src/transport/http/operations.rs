@@ -11,9 +11,9 @@ use axum::{
 
 use crate::{
     AppState,
-    platform::operations::OperationView,
     transport::http::{auth::authenticate, dto::DataResponse, problem::Problem},
 };
+use janus_infrastructure::operations::OperationView;
 
 #[utoipa::path(
     get,

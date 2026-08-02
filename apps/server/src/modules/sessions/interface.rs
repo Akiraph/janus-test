@@ -1,21 +1,22 @@
 //! Public Session lifecycle boundary (M3 Stage 2).
 //!
 //! Owns Session/Turn/Message/timeline/checkpoint projections. Does not execute
-//! model rounds (supervisor) or own workspace bytes (workspace_sync).
+//! model rounds (execution) or own workspace bytes (workspace).
 //!
-//! Stage 2 creates Turns in `running` but does not call supervisor.execute_turn
+//! Stage 2 creates Turns in `running` but does not call execution.execute_turn
 //! yet — Stage 4 wires the loop. Tests assert single-active-turn and create/delete.
 
+use janus_infrastructure::clock::now_utc_str;
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use crate::modules::workspace_sync::interface::{WorkspaceHandle, WorkspaceSyncInterface};
-use crate::platform::{
-    clock::{Clock, SystemClock, format_utc},
+use crate::platform::id::{AttachmentId, ProjectId, SessionId, TurnId, UploadId};
+use janus_infrastructure::{
     events::{EventStore, NewEvent},
-    id::{AttachmentId, CorrelationId, ProjectId, SessionId, TurnId, UploadId},
+    id::CorrelationId,
     unit_of_work::UnitOfWork,
 };
+use janus_workspace::interface::{WorkspaceHandle, WorkspaceInterface};
 
 pub use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, AskAnswerResult, AskSummary, AttachmentResource,
@@ -32,7 +33,7 @@ pub use super::types::{
 pub struct SessionsInterface {
     pub(super) pool: SqlitePool,
     pub(super) unit_of_work: UnitOfWork,
-    pub(super) workspace_sync: WorkspaceSyncInterface,
+    pub(super) workspace: WorkspaceInterface,
 }
 
 #[derive(Debug, Clone)]
@@ -56,16 +57,12 @@ pub struct SessionDeletionPlan {
 }
 
 impl SessionsInterface {
-    pub fn new(
-        pool: SqlitePool,
-        events: EventStore,
-        workspace_sync: WorkspaceSyncInterface,
-    ) -> Self {
+    pub fn new(pool: SqlitePool, events: EventStore, workspace: WorkspaceInterface) -> Self {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Self {
             pool,
             unit_of_work,
-            workspace_sync,
+            workspace,
         }
     }
 
@@ -94,7 +91,7 @@ impl SessionsInterface {
                 version,
             });
         }
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", SessionId::new());
         let title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
 
@@ -205,7 +202,7 @@ impl SessionsInterface {
         if available != 1 {
             return Err(SessionsError::NotFound);
         }
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{attachment_id}");
         let mut work = self.unit_of_work.begin().await?;
         sqlx::query(
@@ -343,7 +340,7 @@ impl SessionsInterface {
             return Err(SessionsError::ActiveTurnExists);
         }
 
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let new_version = format!("v_{}", SessionId::new());
         let title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
 
@@ -413,7 +410,7 @@ impl SessionsInterface {
                 current: current_version,
             });
         }
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let version = format!("v_{}", SessionId::new());
         sqlx::query(
             "UPDATE sessions SET state = 'deleting', version = ?, updated_at = ? WHERE id = ?",
@@ -507,7 +504,7 @@ impl SessionsInterface {
         actor: Value,
         source_ask_id: Option<&str>,
     ) -> Result<SteerResult, SessionsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
         let (result, timeline_item_id) = self
             .append_steer_in_tx(
@@ -555,7 +552,7 @@ impl SessionsInterface {
     }
 
     /// Cancel an active or queued Turn. Active Turns first enter `canceling`
-    /// and are settled by the supervisor/runtime; queued Turns have no owned
+    /// and are settled by execution/runtime; queued Turns have no owned
     /// resources and move directly to terminal `canceled`.
     pub async fn cancel_turn(
         &self,
@@ -565,7 +562,7 @@ impl SessionsInterface {
         expected_version: &str,
         actor: Value,
     ) -> Result<CancelResult, SessionsError> {
-        let now = format_utc(SystemClock.now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
         let transition = self
             .accept_cancel_in_tx(
@@ -726,7 +723,6 @@ impl SessionsInterface {
         .await?
         .ok_or(SessionsError::NotFound)?;
         let model_snapshot_json: String = row.try_get("model_snapshot_json")?;
-        let model_attempt = self.latest_model_attempt_for_turn(turn_id).await?;
         Ok(TurnSummary {
             id: row.try_get("id")?,
             session_id: row.try_get("session_id")?,
@@ -739,7 +735,7 @@ impl SessionsInterface {
             handoff_to_turn_id: row.try_get("handoff_to_turn_id")?,
             cancellation_reason: row.try_get("cancellation_reason")?,
             completion_reason: row.try_get("completion_reason")?,
-            model_attempt,
+            model_attempt: None,
             version: row.try_get("version")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -815,49 +811,6 @@ impl SessionsInterface {
         String::new()
     }
 
-    /// Newest `model_attempts` row for any Round of this Turn. Drives the
-    /// `Reconnecting (X/5): reason` status row: a `running` attempt with a
-    /// non-zero `attempt_number` means a retry is in flight; a `failed` attempt
-    /// exposes its normalized detail.
-    async fn latest_model_attempt_for_turn(
-        &self,
-        turn_id: TurnId,
-    ) -> Result<Option<TurnModelAttempt>, SessionsError> {
-        let row = sqlx::query(
-            "SELECT attempt.attempt_number, attempt.status, attempt.normalized_error_json \
-             FROM model_attempts AS attempt \
-             JOIN rounds AS round ON round.id = attempt.round_id \
-             WHERE round.turn_id = ? \
-             ORDER BY attempt.created_at DESC, attempt.id DESC \
-             LIMIT 1",
-        )
-        .bind(turn_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let status_text: String = row.try_get("status")?;
-        let status = parse_model_attempt_status(&status_text)?;
-        let attempt_number: i64 = row.try_get("attempt_number")?;
-        let error_json: Option<String> = row.try_get("normalized_error_json")?;
-        let detail = error_json
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .and_then(|value| {
-                value
-                    .get("detail")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .filter(|detail| !detail.is_empty());
-        Ok(Some(TurnModelAttempt {
-            attempt: attempt_number,
-            status,
-            detail,
-        }))
-    }
-
     async fn row_to_summary(
         &self,
         row: sqlx::sqlite::SqliteRow,
@@ -865,7 +818,7 @@ impl SessionsInterface {
         let workspace_handle: String = row.try_get("workspace_handle")?;
         let workspace_revision = {
             let handle = WorkspaceHandle(workspace_handle.clone());
-            self.workspace_sync
+            self.workspace
                 .current_revision(&handle)
                 .await
                 .ok()
@@ -924,17 +877,4 @@ fn attachment_resource(row: sqlx::sqlite::SqliteRow) -> Result<AttachmentResourc
         byte_size,
         blob_sha: row.try_get("blob_sha")?,
     })
-}
-
-fn parse_model_attempt_status(raw: &str) -> Result<ModelAttemptStatus, SessionsError> {
-    match raw {
-        "running" => Ok(ModelAttemptStatus::Running),
-        "succeeded" => Ok(ModelAttemptStatus::Succeeded),
-        "failed" => Ok(ModelAttemptStatus::Failed),
-        "canceled" => Ok(ModelAttemptStatus::Canceled),
-        "interrupted" => Ok(ModelAttemptStatus::Interrupted),
-        other => Err(SessionsError::Internal(anyhow::anyhow!(
-            "unknown model_attempts status {other}"
-        ))),
-    }
 }

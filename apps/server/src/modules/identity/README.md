@@ -1,3 +1,5 @@
-# identity
+# 身份
 
-Owns Owner identity, authentication, and Actor resolution; it does not own model or repository credentials. The current interface has no commands, owns no tables or files, and has no Module dependencies.
+身份能力只处理 Owner 的认证、恢复和 Actor 解析。它不拥有模型、项目凭据或资源授权；授权由资源所属能力根据不可变 ActorContext 判断。
+
+不要在这里扩展成员、角色或多用户模型。

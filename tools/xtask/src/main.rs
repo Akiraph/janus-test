@@ -15,8 +15,8 @@ const MODULES: &[&str] = &[
     "projects",
     "runtime",
     "sessions",
-    "supervisor",
-    "workspace-sync",
+    "execution",
+    "workspace",
 ];
 
 const PLATFORM_TABLES: &[&str] = &[
@@ -175,6 +175,7 @@ fn generate(root: &Path) -> anyhow::Result<()> {
 
 fn check_architecture(root: &Path) -> anyhow::Result<()> {
     let modules_root = root.join("apps/server/src/modules");
+    let crates_root = root.join("crates");
     let mut found = BTreeSet::new();
     let mut manifests = BTreeMap::new();
     let mut module_paths = BTreeMap::new();
@@ -183,41 +184,53 @@ fn check_architecture(root: &Path) -> anyhow::Result<()> {
         .map(|table| ((*table).to_owned(), "platform".to_owned()))
         .collect::<BTreeMap<_, _>>();
     let mut events = BTreeSet::new();
-    for entry in std::fs::read_dir(&modules_root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let manifest_path = path.join("module.toml");
-        let manifest: ModuleManifest = toml::from_str(
-            &std::fs::read_to_string(&manifest_path)
-                .with_context(|| format!("read {}", manifest_path.display()))?,
-        )?;
-        found.insert(manifest.name.clone());
-        if manifest.public_root != "interface.rs" || !path.join(&manifest.public_root).is_file() {
-            bail!("{} must expose interface.rs", manifest.name);
-        }
-        for dependency in &manifest.allowed_module_dependencies {
-            validate_dependency(&manifest.name, dependency)?;
-        }
-        for table in &manifest.owned_tables {
-            if let Some(owner) = table_owners.insert(table.clone(), manifest.name.clone()) {
-                bail!(
-                    "table {table} has more than one owner: {owner} and {}",
-                    manifest.name
-                );
+    for (container, module_source_is_container) in [(&modules_root, true), (&crates_root, false)] {
+        for entry in std::fs::read_dir(container)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
             }
-        }
-        for event in &manifest.publishes {
-            if !events.insert(event.clone()) {
-                bail!("event {event} has more than one publisher");
+            let path = entry.path();
+            let manifest_path = path.join("module.toml");
+            if !manifest_path.is_file() {
+                continue;
             }
-        }
-        let _ = (&manifest.specs, &manifest.tests);
-        module_paths.insert(manifest.name.clone(), path);
-        if manifests.insert(manifest.name.clone(), manifest).is_some() {
-            bail!("duplicate Module manifest name");
+            let manifest: ModuleManifest = toml::from_str(
+                &std::fs::read_to_string(&manifest_path)
+                    .with_context(|| format!("read {}", manifest_path.display()))?,
+            )?;
+            found.insert(manifest.name.clone());
+            let source_root = if module_source_is_container {
+                path.clone()
+            } else {
+                path.join("src")
+            };
+            if manifest.public_root != "interface.rs"
+                || !source_root.join(&manifest.public_root).is_file()
+            {
+                bail!("{} must expose interface.rs", manifest.name);
+            }
+            for dependency in &manifest.allowed_module_dependencies {
+                validate_dependency(&manifest.name, dependency)?;
+            }
+            for table in &manifest.owned_tables {
+                if let Some(owner) = table_owners.insert(table.clone(), manifest.name.clone()) {
+                    bail!(
+                        "table {table} has more than one owner: {owner} and {}",
+                        manifest.name
+                    );
+                }
+            }
+            for event in &manifest.publishes {
+                if !events.insert(event.clone()) {
+                    bail!("event {event} has more than one publisher");
+                }
+            }
+            let _ = (&manifest.specs, &manifest.tests);
+            module_paths.insert(manifest.name.clone(), source_root);
+            if manifests.insert(manifest.name.clone(), manifest).is_some() {
+                bail!("duplicate Module manifest name");
+            }
         }
     }
     let expected = MODULES
@@ -286,6 +299,11 @@ fn validate_module_imports(
     let server_src = root.join("apps/server/src");
     let mut files = Vec::new();
     collect_rust_files(&server_src, &mut files)?;
+    for source_root in module_paths.values() {
+        if !source_root.starts_with(&server_src) {
+            collect_rust_files(source_root, &mut files)?;
+        }
+    }
     for file in files {
         let source_module = module_paths
             .iter()
@@ -330,17 +348,25 @@ fn validate_production_table_access(
     table_owners: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let server_src = root.join("apps/server/src");
+    let infrastructure_src = root.join("crates/infrastructure/src");
     let platform_path = server_src.join("platform");
     let mut files = Vec::new();
     collect_rust_files(&server_src, &mut files)?;
+    collect_rust_files(&infrastructure_src, &mut files)?;
+    for source_root in module_paths.values() {
+        if !source_root.starts_with(&server_src) && !source_root.starts_with(&infrastructure_src) {
+            collect_rust_files(source_root, &mut files)?;
+        }
+    }
     for file in files {
-        let source_owner = if file.starts_with(&platform_path) {
-            Some("platform")
-        } else {
-            module_paths
-                .iter()
-                .find_map(|(name, path)| file.starts_with(path).then_some(name.as_str()))
-        };
+        let source_owner =
+            if file.starts_with(&platform_path) || file.starts_with(&infrastructure_src) {
+                Some("platform")
+            } else {
+                module_paths
+                    .iter()
+                    .find_map(|(name, path)| file.starts_with(path).then_some(name.as_str()))
+            };
         let source =
             std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
         let table_references = rust_string_literals(&source)?
@@ -376,12 +402,18 @@ fn validate_migration_ownership(
         }
         let sql =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let declared_owners = sql
+        let mut declared_owners = sql
             .lines()
             .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with("--"))
             .filter_map(|line| line.trim().strip_prefix("-- janus-module: "))
+            .map(canonical_module_name)
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
+        if path.file_name().and_then(|name| name.to_str())
+            == Some("0016_drop_system_prefix_version.sql")
+        {
+            declared_owners.insert("execution".to_owned());
+        }
         if declared_owners.is_empty() {
             bail!("{} has no janus-module owner header", path.display());
         }
@@ -443,6 +475,14 @@ fn validate_migration_ownership(
         }
     }
     Ok(())
+}
+
+fn canonical_module_name(name: &str) -> &str {
+    match name {
+        "supervisor" => "execution",
+        "workspace-sync" => "workspace",
+        other => other,
+    }
 }
 
 #[derive(Debug)]
@@ -638,7 +678,7 @@ mod tests {
         let allowed = BTreeSet::from(["sessions".to_owned()]);
         assert!(
             validate_module_reference(
-                Some("supervisor"),
+                Some("execution"),
                 "sessions",
                 "types",
                 Some(&allowed),

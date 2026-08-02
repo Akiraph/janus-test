@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
@@ -16,11 +16,7 @@ use crate::{
         SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage,
         TurnSummary,
     },
-    platform::{
-        id::{AskId, AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
-        managed_storage::BlobReference,
-        operations::OperationView,
-    },
+    platform::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId},
     transport::http::{
         auth::authenticate,
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -28,6 +24,9 @@ use crate::{
         problem::{Problem, codes},
         request_id::RequestContext,
     },
+};
+use janus_infrastructure::{
+    id::CorrelationId, managed_storage::BlobReference, operations::OperationView,
 };
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +39,25 @@ pub struct ListSessionsQuery {
 pub struct CreateSessionRequest {
     #[serde(default)]
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ContextUsageView {
+    pub estimated_input_tokens: i64,
+    pub context_limit: i64,
+    pub compact_status: String,
+    pub created_at: String,
+}
+
+impl From<crate::modules::execution::interface::ContextUsageView> for ContextUsageView {
+    fn from(value: crate::modules::execution::interface::ContextUsageView) -> Self {
+        Self {
+            estimated_input_tokens: value.estimated_input_tokens,
+            context_limit: value.context_limit,
+            compact_status: value.compact_status,
+            created_at: value.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -197,32 +215,22 @@ pub async fn get_session(
     get,
     path = "/api/v1/sessions/{id}/context",
     params(("id" = String, Path)),
-    responses((status = 200, body = DataResponse<Option<crate::modules::supervisor::interface::ContextUsageView>>), (status = 404, body = Problem))
+    responses((status = 200, body = DataResponse<Option<ContextUsageView>>), (status = 404, body = Problem))
 )]
 pub async fn session_context(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<
-    Json<DataResponse<Option<crate::modules::supervisor::interface::ContextUsageView>>>,
-    Problem,
-> {
+) -> Result<Json<DataResponse<Option<ContextUsageView>>>, Problem> {
     let _auth = authenticate(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
-    state
-        .sessions()
-        .get_session(session_id)
-        .await
-        .map_err(sessions_problem)?;
     let data = state
-        .supervisor()
-        .latest_context_usage(session_id)
+        .session_context_usage(session_id)
         .await
-        .map_err(|_| {
-            Problem::from_code(codes::INTERNAL_ERROR, "context usage could not be read")
-        })?;
+        .map_err(sessions_problem)?
+        .map(ContextUsageView::from);
     Ok(Json(DataResponse { data }))
 }
 
@@ -303,14 +311,6 @@ pub async fn post_message(
         })
         .await
         .map_err(sessions_problem)?;
-    if matches!(data.route.as_str(), "started" | "handed_off") {
-        let run_turn: TurnId = data
-            .turn_id
-            .parse()
-            .map_err(|_| Problem::from_code(codes::INTERNAL_ERROR, "invalid accepted Turn id"))?;
-        state.turn_runner().schedule(run_turn);
-    }
-
     Ok(Json(DataResponse { data }))
 }
 
@@ -516,8 +516,7 @@ pub async fn get_turn(
         .parse()
         .map_err(|_| Problem::from_code(codes::RESOURCE_NOT_FOUND, "invalid turn id"))?;
     let data = state
-        .sessions()
-        .get_turn(session_id, turn_id)
+        .turn_summary(session_id, turn_id)
         .await
         .map_err(sessions_problem)?;
     Ok(Json(DataResponse { data }))
@@ -545,7 +544,7 @@ pub async fn session_diff(
         .await
         .map_err(sessions_problem)?;
     let summary = state
-        .workspace_sync()
+        .workspace()
         .diff_summary(session_id)
         .await
         .map_err(|e| Problem::from_code(codes::INTERNAL_ERROR, format!("diff failed: {e}")))?;

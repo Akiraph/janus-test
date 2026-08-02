@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
+use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use thiserror::Error;
@@ -10,10 +10,11 @@ use url::Url;
 use utoipa::ToSchema;
 
 use crate::platform::{
-    clock::format_utc,
-    events::{EventStore, NewEvent},
     id::{AttemptId, ModelId, ProviderId, RoundId},
     secret::{Secret, SecretCipher, fingerprint, mask_key},
+};
+use janus_infrastructure::{
+    events::{EventStore, NewEvent},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 
@@ -73,6 +74,13 @@ pub struct ProbeResult {
     pub http_status: Option<u16>,
     pub latency_ms: u64,
     pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelAttemptView {
+    pub attempt: i64,
+    pub status: String,
+    pub detail: Option<String>,
 }
 
 /// A model embedded inside its provider. Stored as an element of the
@@ -345,7 +353,7 @@ impl ModelsInterface {
                 ));
             }
         }
-        let now = format_utc(Utc::now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
         sqlx::query("DELETE FROM model_failover WHERE primary_model_id = ?")
             .bind(primary_model_id)
@@ -416,7 +424,7 @@ impl ModelsInterface {
         validate_provider(&input)?;
         validate_models(&input)?;
         let id = ProviderId::new().to_string();
-        let now = format_utc(Utc::now());
+        let now = now_utc_str();
         let (ciphertext, key_fingerprint, key_preview) =
             self.encrypt_key(owner_id, &id, input.api_key.as_deref())?;
         let models_json = serde_json::to_string(
@@ -473,7 +481,7 @@ impl ModelsInterface {
                 .map(EmbeddedModelInput::to_view)
                 .collect::<Vec<_>>(),
         )?;
-        let now = format_utc(Utc::now());
+        let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
         let changed = sqlx::query("UPDATE model_providers SET kind=?, display_name=?, base_url=?, api_key_ciphertext=?, api_key_fingerprint=?, api_key_preview=?, models_json=?, enabled=?, updated_at=? WHERE id=? AND owner_id=?")
             .bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(work.connection()).await?.rows_affected();
@@ -645,7 +653,7 @@ impl ModelsInterface {
         error_json: Option<&serde_json::Value>,
         req: &super::stream_types::ModelRequest,
     ) -> Result<(), ModelsError> {
-        let ended = format_utc(Utc::now());
+        let ended = now_utc_str();
         let changed = sqlx::query(
             "UPDATE model_attempts SET status = ?, input_tokens = ?, output_tokens = ?, \
              normalized_error_json = ?, ended_at = ? WHERE id = ? AND status = 'running'",
@@ -771,6 +779,42 @@ impl ModelsInterface {
                 .rows_affected();
         }
         Ok(deleted)
+    }
+
+    pub async fn latest_attempt_for_rounds(
+        &self,
+        round_ids: &[RoundId],
+    ) -> Result<Option<ModelAttemptView>, ModelsError> {
+        if round_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = vec!["?"; round_ids.len()].join(", ");
+        let statement = format!(
+            "SELECT attempt_number, status, normalized_error_json FROM model_attempts \
+             WHERE round_id IN ({placeholders}) ORDER BY created_at DESC, id DESC LIMIT 1"
+        );
+        let mut query = sqlx::query_as::<_, (i64, String, Option<String>)>(&statement);
+        for round_id in round_ids {
+            query = query.bind(round_id.to_string());
+        }
+        let Some((attempt, status, error_json)) = query.fetch_optional(&self.pool).await? else {
+            return Ok(None);
+        };
+        let detail = error_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| {
+                value
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|detail| !detail.is_empty());
+        Ok(Some(ModelAttemptView {
+            attempt,
+            status,
+            detail,
+        }))
     }
 
     async fn sync_normalized_models(

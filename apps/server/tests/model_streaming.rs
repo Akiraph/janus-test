@@ -8,12 +8,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
+use janus_infrastructure::{database::Database, events::EventStore};
 use janus_server::config::RunMode;
 use janus_server::modules::models::interface::{ModelsInterface, ProviderInput, ProviderKind};
 use janus_server::modules::models::stream_types::{
     ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
 };
-use janus_server::platform::{database::Database, events::EventStore, secret::SecretCipher};
+use janus_server::platform::secret::SecretCipher;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -107,7 +108,7 @@ async fn spawn_fixture(mode: &str) -> anyhow::Result<(SocketAddr, Arc<FixtureSta
 }
 
 async fn models_with_root(temp: &TempDir) -> anyhow::Result<(Database, ModelsInterface, String)> {
-    let database = Database::open(temp.path()).await?;
+    let database = Database::open(temp.path(), janus_server::migrator()).await?;
     let pool = database.pool().clone();
     let now = "2026-01-01T00:00:00.000Z";
     let tenant_id = "tenant-test";
@@ -367,7 +368,10 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
             .fetch_one(_db.pool())
             .await?;
     let err = err.unwrap_or_default();
-    assert!(!err.contains("sk-bad"), "secret leaked into error detail: {err}");
+    assert!(
+        !err.contains("sk-bad"),
+        "secret leaked into error detail: {err}"
+    );
     assert!(
         err.contains("bad key"),
         "upstream error message should be surfaced: {err}"

@@ -12,6 +12,6 @@ owned_tables = [
   "project_cli_configs",
 ]
 publishes = ["project.changed", "project.main_revision_changed", "git.state_changed", "git.update_conflict_changed"]
-allowed_module_dependencies = ["runtime", "workspace-sync"]
+allowed_module_dependencies = ["runtime", "workspace"]
 specs = []
 tests = []

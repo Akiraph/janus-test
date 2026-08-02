@@ -14,9 +14,10 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::AppState;
-use crate::platform::operations::{
-    KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION, OperationStatus,
+use crate::application::operation_kinds::{
+    KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION,
 };
+use janus_infrastructure::operations::OperationStatus;
 
 /// Lease TTL for a claimed work item: short enough that a dead worker's lease
 /// is reclaimed quickly, long enough for a clone to finish.
@@ -49,7 +50,7 @@ pub fn spawn(state: AppState) {
 /// Spawn the Job-settled wake-up loop. Subscribes to Runtime's broadcast of
 /// terminal Job ids and resumes any `waiting_for_job` Turn that no longer has
 /// unfinished finite Jobs. Single-flight: each resume schedules one next
-/// Supervisor Round via the application Turn runner.
+/// Execution Round via the application coordinator.
 pub fn spawn_job_wake(state: AppState) {
     let mut rx = state.runtime().subscribe_job_settled();
     tokio::spawn(async move {
@@ -58,8 +59,8 @@ pub fn spawn_job_wake(state: AppState) {
         loop {
             tokio::select! {
                 notification = rx.recv() => match notification {
-                    Ok(job_id) => match state.turn_runner().settle_job(job_id).await {
-                        Ok(Some(turn_id)) => state.turn_runner().schedule(turn_id),
+                    Ok(job_id) => match state.execution_coordinator().settle_job(job_id).await {
+                        Ok(Some(turn_id)) => state.execution_coordinator().schedule(turn_id),
                         Ok(None) => {}
                         Err(error) => {
                             warn!(%error, %job_id, "settle Job notification failed");
@@ -71,7 +72,7 @@ pub fn spawn_job_wake(state: AppState) {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 },
                 _ = reconciliation.tick() => {
-                    if let Err(error) = state.turn_runner().reconcile_waiting_jobs().await {
+                    if let Err(error) = state.execution_coordinator().reconcile_waiting_jobs().await {
                         warn!(%error, "waiting Job reconciliation failed");
                     }
                 }
@@ -233,7 +234,7 @@ async fn record_operation_success(state: &AppState, kind: &str, project_id: &str
     let Some(op_id) = resolve_operation_id(state, kind, project_id, payload).await else {
         return;
     };
-    let correlation = crate::platform::id::CorrelationId::new();
+    let correlation = janus_infrastructure::id::CorrelationId::new();
     let _ = state
         .operations()
         .finish(
@@ -260,7 +261,7 @@ async fn record_operation_failure(
     let Some(op_id) = resolve_operation_id(state, kind, project_id, payload).await else {
         return;
     };
-    let correlation = crate::platform::id::CorrelationId::new();
+    let correlation = janus_infrastructure::id::CorrelationId::new();
     let _ = state
         .operations()
         .finish(
