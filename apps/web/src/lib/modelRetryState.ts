@@ -3,7 +3,7 @@ import { createSignal } from "solid-js";
 /**
  * Live model-retry state driven by `model.attempt_retrying` SSE events.
  *
- * The SSE event is emitted by the supervisor just *before* it sleeps for a
+ * The SSE event is emitted by execution just *before* it sleeps for a
  * retry, so the UI can render `Reconnecting (X/5): reason` while the backoff
  * elapses — the most useful information the user can have is "it failed, but
  * it's trying again, here's why". When the turn settles (success, terminal

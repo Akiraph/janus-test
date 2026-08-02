@@ -1,4 +1,4 @@
-use anyhow::Context;
+﻿use anyhow::Context;
 use janus_infrastructure::{events::NewEvent, id::CorrelationId, operations::OperationStatus};
 use janus_server::{AppState, application::workers, config::Config, router};
 use serde_json::json;
@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     let config = match Config::from_env().context("invalid Janus configuration") {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[DEBUG config error] {:#}", e);
+            eprintln!("configuration error: {:#}", e);
             return Err(e);
         }
     };
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let state = match AppState::initialize(config).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[DEBUG init error] {:#}", e);
+            eprintln!("initialization error: {:#}", e);
             return Err(e);
         }
     };
@@ -32,11 +32,10 @@ async fn main() -> anyhow::Result<()> {
     // the flag true for unit tests; main flips it off for the real process.
     state.begin_startup_recovery();
 
-    // Startup recovery (`DAT-RECOVER-01` subset): clean leftover incoming temp
-    // objects from a crashed write, and mark operations left `running` by a
-    // prior process as `needs_attention` so a client can re-issue them rather
-    // than the control plane guessing whether a half-done clone happened.
-    // Runtime + execution recovery already ran inside AppState::initialize.
+    // Finish process-level recovery after capability and execution recovery:
+    // remove crash leftovers and make interrupted Operations explicit so a
+    // client can retry instead of the control plane guessing their outcome.
+    // Runtime and execution recovery already ran during AppState::initialize.
     if let Err(error) = state.blobs().clean_incoming().await {
         warn!(%error, "clean incoming objects on startup");
     }
@@ -68,9 +67,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("record system startup event")?;
 
-    workers::spawn(state.clone());
-    workers::spawn_job_wake(state.clone());
-    workers::spawn_ask_expiry(state.clone());
+    workers::spawn(state.application().clone());
+    workers::spawn_job_wake(state.application().clone());
+    workers::spawn_ask_expiry(state.application().clone());
 
     let listener = TcpListener::bind(bind)
         .await
@@ -86,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("serve Janus")?;
     janus_server::application::lifecycle::graceful_shutdown(
-        &shutdown_state,
+        shutdown_state.application(),
         std::time::Duration::from_secs(10),
     )
     .await;

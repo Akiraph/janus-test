@@ -1,19 +1,10 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
-use janus_server::{
-    modules::runtime::interface::{
-        CapabilityReason, CapabilityScope, CapabilityState, CommandKind, DelegatedCliKind,
-        ExecutionEnvironment, ExecutionSpec, JobStatus, LogCursor, NetworkPolicy,
-        RelativeWorkingDirectory, ResourceLimits, RuntimeCapability, RuntimeCapabilityId,
-        RuntimeError, RuntimeErrorCode, RuntimeSpec, RuntimeStatus, SecretEnvironmentVariable,
-        ServiceImpact, ServiceSpec, ServiceStatus, TerminalSize, TerminalStatus, ValidatedCommand,
-        local_deployment_capabilities,
-    },
-    platform::{
-        id::{CliSessionId, RuntimeId, ServiceId, SessionId, TerminalId, ToolCallId},
-        secret::Secret,
-    },
+use janus_infrastructure::id::{
+    CliSessionId, RuntimeId, ServiceId, SessionId, TerminalId, ToolCallId,
 };
+use janus_infrastructure::secrets::Secret;
+use janus_runtime::interface::*;
 use serde::Serialize;
 use serde_json::json;
 
@@ -237,8 +228,8 @@ fn runtime_spec_requires_a_trusted_absolute_workspace() -> anyhow::Result<()> {
     assert!(
         RuntimeSpec::new(
             RuntimeId::new(),
-            janus_server::modules::runtime::interface::RuntimeScope::session(SessionId::new()),
-            janus_server::modules::runtime::interface::ExecutorKind::Local,
+            janus_runtime::interface::RuntimeScope::session(SessionId::new()),
+            janus_runtime::interface::ExecutorKind::Local,
             PathBuf::from("relative"),
             limits(),
             NetworkPolicy::DenyAll,
@@ -249,8 +240,8 @@ fn runtime_spec_requires_a_trusted_absolute_workspace() -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let spec = RuntimeSpec::new(
         RuntimeId::new(),
-        janus_server::modules::runtime::interface::RuntimeScope::session(SessionId::new()),
-        janus_server::modules::runtime::interface::ExecutorKind::Local,
+        janus_runtime::interface::RuntimeScope::session(SessionId::new()),
+        janus_runtime::interface::ExecutorKind::Local,
         directory.path().to_path_buf(),
         limits(),
         NetworkPolicy::DenyAll,
@@ -280,7 +271,7 @@ fn runtime_errors_have_exhaustive_stable_codes() {
         RuntimeError::CommandForbidden,
         RuntimeError::NetworkPolicyDenied,
         RuntimeError::RuntimeUnavailable,
-        RuntimeError::JobLost(janus_server::platform::id::JobId::new()),
+        RuntimeError::JobLost(janus_infrastructure::id::JobId::new()),
         RuntimeError::ServiceLost(ServiceId::new()),
         RuntimeError::TerminalTicketInvalid,
         RuntimeError::TerminalScrollbackExpired {

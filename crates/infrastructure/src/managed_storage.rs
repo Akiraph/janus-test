@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
 
-use crate::{hex_encode, id::BlobSha, random_hex_token};
+use crate::{id::BlobSha, random_hex_token};
 
 fn shard(sha: &str) -> String {
     sha.chars().take(2).collect()
@@ -19,6 +19,17 @@ fn shard(sha: &str) -> String {
 
 fn object_path(objects_root: &Path, sha: &str) -> PathBuf {
     objects_root.join("sha256").join(shard(sha)).join(sha)
+}
+
+fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[derive(Clone)]

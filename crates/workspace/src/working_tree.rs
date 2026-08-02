@@ -87,7 +87,7 @@ pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<Vec
         } else if source_metadata.is_dir() {
             // Git may collapse a fully-untracked subtree into a single
             // directory entry (a trailing-slash path). Recursively mirror the
-            // subtree rather than bailing — keeps Session seeding resilient
+            // subtree rather than bailing - keeps Session seeding resilient
             // to any leftover untracked dir regardless of .gitignore state.
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -176,6 +176,7 @@ pub async fn hash_working_tree(root: &Path) -> anyhow::Result<ManifestRoot> {
             "--exclude-standard",
         ],
     )?;
+    // Bound file reads so a large repository does not create one task per path.
     let files = stream::iter(paths.into_iter().map(|path| {
         let root = root.to_path_buf();
         async move { read_manifest_file(&root, path).await }
@@ -451,7 +452,9 @@ fn copy_dir_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
         let from = entry.path();
         let name = entry.file_name();
         let to = target.join(&name);
-        let metadata = entry.metadata()?;
+        // Follow no links while inspecting the source: the copy contract is to
+        // reproduce links, not to copy their targets or recurse through them.
+        let metadata = std::fs::symlink_metadata(&from)?;
         if metadata.file_type().is_symlink() {
             copy_symlink(&from, &to)?;
         } else if metadata.is_file() {
@@ -462,4 +465,28 @@ fn copy_dir_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn directory_copy_preserves_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().expect("source");
+        let target = tempfile::tempdir().expect("target");
+        std::fs::write(source.path().join("file.txt"), b"content").expect("write file");
+        symlink("file.txt", source.path().join("link.txt")).expect("create link");
+
+        super::copy_dir_tree(source.path(), target.path().join("copy").as_path())
+            .expect("copy directory");
+
+        assert!(
+            std::fs::symlink_metadata(target.path().join("copy/link.txt"))
+                .expect("copied link")
+                .file_type()
+                .is_symlink()
+        );
+    }
 }

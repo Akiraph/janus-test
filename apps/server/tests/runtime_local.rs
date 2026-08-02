@@ -1,15 +1,11 @@
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context as _;
+use janus_infrastructure::id::{JobId, RuntimeId, ServiceId, SessionId, ToolCallId, TurnId};
+use janus_runtime::interface::*;
 use janus_server::{
     AppState,
     config::{Config, RunMode},
-    modules::runtime::interface::{
-        ExecutionEnvironment, ExecutionSpec, ExecutorKind, JobSpec, JobStatus, NetworkPolicy,
-        RelativeWorkingDirectory, ResourceLimits, RuntimeSpec, ServiceImpact, ServiceSpec,
-        ServiceStatus, ValidatedCommand,
-    },
-    platform::id::{JobId, RuntimeId, ServiceId, SessionId, ToolCallId, TurnId},
 };
 use tempfile::TempDir;
 
@@ -80,7 +76,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
     let runtime_id = RuntimeId::new();
     let runtime = RuntimeSpec::new(
         runtime_id,
-        janus_server::modules::runtime::interface::RuntimeScope::session(session_id),
+        janus_runtime::interface::RuntimeScope::session(session_id),
         ExecutorKind::Local,
         workspace,
         limits(10_000),
@@ -91,10 +87,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
         .ensure_runtime(&runtime)
         .await
         .context("ensure runtime")?;
-    assert_eq!(
-        ready.status,
-        janus_server::modules::runtime::interface::RuntimeStatus::Ready
-    );
+    assert_eq!(ready.status, janus_runtime::interface::RuntimeStatus::Ready);
 
     let sync = state
         .runtime()
@@ -128,7 +121,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
         .runtime()
         .log_range(
             stdin_projection.log_stream_id,
-            janus_server::modules::runtime::interface::LogCursor::new(0),
+            janus_runtime::interface::LogCursor::new(0),
             4096,
         )
         .await
@@ -225,7 +218,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
     assert_eq!(state.runtime().job(stdin_id).await?.status, JobStatus::Lost);
     assert_eq!(
         state.runtime().runtime(runtime_id).await?.status,
-        janus_server::modules::runtime::interface::RuntimeStatus::Lost
+        janus_runtime::interface::RuntimeStatus::Lost
     );
     Ok(())
 }

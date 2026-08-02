@@ -7,11 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
-hex = "0.4"
 janus-infrastructure = { path = "../infrastructure" }
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

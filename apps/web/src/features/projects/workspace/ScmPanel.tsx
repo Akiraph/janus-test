@@ -5,8 +5,9 @@ import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { NotificationEvent, useNotifications } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
-import { getErrorMessage, type GitUpdateConflictView } from "../../../lib/api";
 import {
+  type GitUpdateConflictView,
+  getErrorMessage,
   gitCommit,
   gitFetch,
   gitPush,
@@ -103,11 +104,7 @@ export function ScmPanel(props: ScmPanelProps) {
   return (
     <section class="ide-sidebar-panel scm-panel" aria-label="Source Control">
       <NotificationEvent
-        message={
-          status.isError
-            ? getErrorMessage(status.error, "Git status failed")
-            : null
-        }
+        message={status.isError ? getErrorMessage(status.error, "Git status failed") : null}
         variant="danger"
         action={{ label: "Retry", onClick: () => void status.refetch() }}
       />

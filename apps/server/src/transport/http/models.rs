@@ -1,6 +1,5 @@
-use crate::{
+﻿use crate::{
     AppState,
-    modules::models::interface::{ModelsError, ProviderInput},
     transport::http::{
         auth::{authenticate, authorized},
         dto::DataResponse,
@@ -13,12 +12,13 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
 };
+use janus_models::interface::{ModelsError, ProviderInput};
 
-#[utoipa::path(get, path = "/api/v1/model-providers", responses((status = 200, body = DataResponse<Vec<crate::modules::models::interface::ProviderView>>), (status = 401, body = Problem)))]
+#[utoipa::path(get, path = "/api/v1/model-providers", responses((status = 200, body = DataResponse<Vec<janus_models::interface::ProviderView>>), (status = 401, body = Problem)))]
 pub async fn providers(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<DataResponse<Vec<crate::modules::models::interface::ProviderView>>>, Problem> {
+) -> Result<Json<DataResponse<Vec<janus_models::interface::ProviderView>>>, Problem> {
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
@@ -28,7 +28,7 @@ pub async fn providers(
             .map_err(problem)?,
     }))
 }
-#[utoipa::path(post, path = "/api/v1/model-providers", request_body = ProviderInput, responses((status = 201, body = DataResponse<crate::modules::models::interface::ProviderView>), (status = 422, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/model-providers", request_body = ProviderInput, responses((status = 201, body = DataResponse<janus_models::interface::ProviderView>), (status = 422, body = Problem)))]
 pub async fn create_provider(
     State(state): State<AppState>,
     Extension(context): Extension<RequestContext>,
@@ -37,7 +37,7 @@ pub async fn create_provider(
 ) -> Result<
     (
         StatusCode,
-        Json<DataResponse<crate::modules::models::interface::ProviderView>>,
+        Json<DataResponse<janus_models::interface::ProviderView>>,
     ),
     Problem,
 > {
@@ -49,14 +49,14 @@ pub async fn create_provider(
         .map_err(problem)?;
     Ok((StatusCode::CREATED, Json(DataResponse { data: view })))
 }
-#[utoipa::path(patch, path = "/api/v1/model-providers/{id}", params(("id" = String, Path)), request_body = ProviderInput, responses((status = 200, body = DataResponse<crate::modules::models::interface::ProviderView>), (status = 404, body = Problem)))]
+#[utoipa::path(patch, path = "/api/v1/model-providers/{id}", params(("id" = String, Path)), request_body = ProviderInput, responses((status = 200, body = DataResponse<janus_models::interface::ProviderView>), (status = 404, body = Problem)))]
 pub async fn update_provider(
     State(state): State<AppState>,
     Extension(context): Extension<RequestContext>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(input): Json<ProviderInput>,
-) -> Result<Json<DataResponse<crate::modules::models::interface::ProviderView>>, Problem> {
+) -> Result<Json<DataResponse<janus_models::interface::ProviderView>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     let view = state
         .models()
@@ -80,12 +80,12 @@ pub async fn delete_provider(
         .map_err(problem)?;
     Ok(StatusCode::NO_CONTENT)
 }
-#[utoipa::path(post, path = "/api/v1/model-providers/{id}/probe", params(("id" = String, Path)), responses((status = 200, body = DataResponse<crate::modules::models::interface::ProbeResult>), (status = 404, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/model-providers/{id}/probe", params(("id" = String, Path)), responses((status = 200, body = DataResponse<janus_models::interface::ProbeResult>), (status = 404, body = Problem)))]
 pub async fn probe_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<DataResponse<crate::modules::models::interface::ProbeResult>>, Problem> {
+) -> Result<Json<DataResponse<janus_models::interface::ProbeResult>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state

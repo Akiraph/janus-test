@@ -5,23 +5,24 @@ use std::{
 
 use tracing::{debug, error, warn};
 
-use crate::modules::execution::interface::{
+use janus_execution::interface::{
     ExecutionError, ExecutionInterface, ToolCallSettlement, TurnWait,
 };
-use crate::modules::models::interface::{ModelPreference, ModelsError, ModelsInterface};
-use crate::modules::projects::interface::{ProjectsError, ProjectsInterface};
-use crate::modules::runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
-use crate::modules::sessions::interface::{
-    ReasoningEffort, SessionModelPreference, SessionsError, SessionsInterface, TurnBlockerOutcome,
-    TurnBlockers, TurnModelSnapshot, TurnStatus,
-};
-use crate::platform::id::{JobId, SessionId, TurnId};
-use janus_infrastructure::events::NewEvent;
-use janus_infrastructure::id::CorrelationId;
 use janus_infrastructure::unit_of_work::{UnitOfWork, UnitOfWorkTransaction};
+use janus_infrastructure::{
+    events::NewEvent,
+    id::{CorrelationId, JobId, SessionId, TurnId},
+};
+use janus_models::interface::{ModelPreference, ModelsError, ModelsInterface};
+use janus_projects::interface::{ProjectsError, ProjectsInterface};
+use janus_runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
+use janus_sessions::interface::{
+    ReasoningEffort, ReplaceToolResultInput, SessionModelPreference, SessionsError,
+    SessionsInterface, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus,
+};
 
 #[derive(Debug, thiserror::Error)]
-pub enum TurnExecutionError {
+pub(crate) enum TurnExecutionError {
     #[error("session execution state failed: {0}")]
     Sessions(#[from] SessionsError),
     #[error("execution module failed: {0}")]
@@ -41,7 +42,7 @@ pub enum TurnExecutionError {
 }
 
 #[derive(Clone)]
-pub struct ExecutionCoordinator {
+pub(crate) struct ExecutionCoordinator {
     models: ModelsInterface,
     projects: ProjectsInterface,
     sessions: SessionsInterface,
@@ -61,7 +62,7 @@ pub(crate) struct ToolResultRecord<'a> {
 }
 
 impl ExecutionCoordinator {
-    pub fn new(
+    pub(crate) fn new(
         models: ModelsInterface,
         projects: ProjectsInterface,
         sessions: SessionsInterface,
@@ -80,7 +81,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    pub fn schedule(&self, turn_id: TurnId) {
+    pub(crate) fn schedule(&self, turn_id: TurnId) {
         let Some(claim) = self.claim(turn_id) else {
             debug!(%turn_id, "Turn execution wake coalesced");
             return;
@@ -91,14 +92,6 @@ impl ExecutionCoordinator {
                 error!(%error, %turn_id, "Execution coordinator failed");
             }
         });
-    }
-
-    pub async fn run(&self, initial_turn_id: TurnId) -> Result<(), TurnExecutionError> {
-        let Some(claim) = self.claim(initial_turn_id) else {
-            debug!(%initial_turn_id, "Turn execution wake coalesced");
-            return Ok(());
-        };
-        self.run_claimed(claim).await
     }
 
     async fn run_claimed(&self, mut claim: TurnClaim) -> Result<(), TurnExecutionError> {
@@ -112,9 +105,8 @@ impl ExecutionCoordinator {
                 let execution = match self.execution.execute_turn(turn_id).await {
                     Ok(execution) => execution,
                     Err(execution_error) => {
-                        // Surface the real cause, not a generic label: the failure
-                        // reason becomes `completion_reason` on the Turn, which the
-                        // UI status row shows verbatim (BUG 3).
+                        // Preserve the provider or tool error as the Turn's
+                        // completion reason so operators can act on the real cause.
                         let reason = execution_error.to_string();
                         warn!(%execution_error, %turn_id, "settling unexpected execution failure");
                         self.execution
@@ -165,7 +157,7 @@ impl ExecutionCoordinator {
     pub(crate) async fn resolve_model_snapshot_in_tx(
         &self,
         tx: &mut sqlx::SqliteConnection,
-        project_id: crate::platform::id::ProjectId,
+        project_id: janus_infrastructure::id::ProjectId,
         expected_owner_id: Option<&str>,
         preference: Option<&SessionModelPreference>,
     ) -> Result<Option<TurnModelSnapshot>, TurnExecutionError> {
@@ -222,7 +214,7 @@ impl ExecutionCoordinator {
     async fn activate_next_queued_after(
         &self,
         terminal_turn_id: TurnId,
-        session_id: crate::platform::id::SessionId,
+        session_id: janus_infrastructure::id::SessionId,
     ) -> Result<Option<TurnId>, TurnExecutionError> {
         let workspace_revision = self.sessions.current_workspace_revision(session_id).await?;
         let now = self.sessions.now();
@@ -277,7 +269,7 @@ impl ExecutionCoordinator {
 
     async fn coordinate_wait(
         &self,
-        session_id: crate::platform::id::SessionId,
+        session_id: janus_infrastructure::id::SessionId,
         turn_id: TurnId,
         wait: TurnWait,
     ) -> Result<bool, TurnExecutionError> {
@@ -381,7 +373,10 @@ impl ExecutionCoordinator {
             .await?)
     }
 
-    pub async fn settle_job(&self, job_id: JobId) -> Result<Option<TurnId>, TurnExecutionError> {
+    pub(crate) async fn settle_job(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<TurnId>, TurnExecutionError> {
         let job = self.runtime.job(job_id).await?;
         if !job.status.is_terminal() {
             return Ok(None);
@@ -492,15 +487,17 @@ impl ExecutionCoordinator {
             .sessions
             .replace_tool_result_in_tx(
                 work.connection(),
-                record.session_id,
-                source_turn_id,
-                &settlement.tool_call_id,
-                &settlement.provider_call_id,
-                &settlement.tool_name,
-                settlement.status.as_str(),
-                &settlement.summary,
-                &settlement.model_parts,
-                record.now,
+                ReplaceToolResultInput {
+                    session_id: record.session_id,
+                    source_turn_id,
+                    tool_call_id: &settlement.tool_call_id,
+                    provider_call_id: &settlement.provider_call_id,
+                    tool_name: &settlement.tool_name,
+                    status: settlement.status.as_str(),
+                    summary: &settlement.summary,
+                    model_parts: &settlement.model_parts,
+                    now: record.now,
+                },
             )
             .await?;
         let mut payload = serde_json::json!({
@@ -544,7 +541,7 @@ impl ExecutionCoordinator {
         Ok(())
     }
 
-    pub async fn reconcile_waiting_jobs(&self) -> Result<u64, TurnExecutionError> {
+    pub(crate) async fn reconcile_waiting_jobs(&self) -> Result<u64, TurnExecutionError> {
         let mut resumed = 0;
         for job_id in self.execution.waiting_job_ids(100).await? {
             if self.settle_job(job_id).await?.is_some() {

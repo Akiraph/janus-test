@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -13,6 +13,7 @@ const MODULES: &[&str] = &[
     "identity",
     "models",
     "projects",
+    "source-control",
     "runtime",
     "sessions",
     "execution",
@@ -185,6 +186,9 @@ fn check_architecture(root: &Path) -> anyhow::Result<()> {
         .collect::<BTreeMap<_, _>>();
     let mut events = BTreeSet::new();
     for (container, module_source_is_container) in [(&modules_root, true), (&crates_root, false)] {
+        if !container.is_dir() {
+            continue;
+        }
         for entry in std::fs::read_dir(container)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {

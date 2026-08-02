@@ -51,6 +51,45 @@ typed_id!(CausationId);
 typed_id!(OperationId);
 typed_id!(WorkItemId);
 
+// Capability IDs remain technical UUID wrappers. Their owning tables and
+// domain rules live in the corresponding capability crate.
+typed_id!(TenantId);
+typed_id!(ActorId);
+typed_id!(OwnerId);
+typed_id!(PasskeyId);
+typed_id!(ProviderId);
+typed_id!(ModelId);
+typed_id!(ProjectId);
+typed_id!(GithubCredentialId);
+typed_id!(RevisionId);
+typed_id!(GitUpdateConflictId);
+typed_id!(SessionId);
+typed_id!(TurnId);
+typed_id!(MessageId);
+typed_id!(RoundId);
+typed_id!(ToolCallId);
+typed_id!(CheckpointId);
+typed_id!(AttachmentId);
+typed_id!(UploadId);
+typed_id!(TimelineItemId);
+typed_id!(AttemptId);
+typed_id!(SnapshotId);
+typed_id!(RuntimeId);
+typed_id!(JobId);
+typed_id!(ServiceId);
+typed_id!(TerminalId);
+typed_id!(LogStreamId);
+typed_id!(RuntimeTicketId);
+typed_id!(RuntimePortId);
+typed_id!(CliSessionId);
+typed_id!(RuntimeSecretId);
+typed_id!(EgressRuleId);
+typed_id!(CliConfigId);
+typed_id!(AskId);
+typed_id!(PlanVersionId);
+typed_id!(ContextVersionId);
+typed_id!(CompactSummaryId);
+
 /// A storage label returned by trusted blob operations; parsing it does not
 /// prove that the value is a SHA-256 digest or that the object exists.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]

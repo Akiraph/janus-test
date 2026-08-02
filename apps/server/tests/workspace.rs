@@ -1,4 +1,4 @@
-//! Gate-1 integration tests for Session copy + Merkle + Diff + delete.
+﻿//! Gate-1 integration tests for Session copy + Merkle + Diff + delete.
 //!
 //! These exercise the public `WorkspaceInterface` against a real temp
 //! data root (SQLite migrations + BlobStore + filesystem), without HTTP.
@@ -7,8 +7,11 @@ mod support;
 
 use std::path::PathBuf;
 
-use janus_infrastructure::{database::Database, managed_storage::BlobStore};
-use janus_server::platform::id::{ProjectId, SessionId};
+use janus_infrastructure::{
+    database::Database,
+    id::{ProjectId, SessionId},
+    managed_storage::BlobStore,
+};
 use janus_workspace::interface::{FileMutation, WorkspaceHandle, WorkspaceInterface};
 use serde_json::json;
 use sqlx::SqlitePool;

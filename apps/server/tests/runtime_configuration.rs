@@ -3,27 +3,17 @@ use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
 use anyhow::Context;
 use janus_infrastructure::{
     database::Database, events::EventStore, managed_storage::BlobStore,
-    operations::OperationInterface,
+    operations::OperationInterface, secrets::SecretCipher,
 };
-use janus_server::{
-    adapters::git::system_runner,
-    config::RunMode,
-    modules::{
-        models::interface::{
-            EmbeddedModelInput, ModelsError, ModelsInterface, ProviderInput, ProviderKind,
-        },
-        projects::interface::{
-            EgressScheme, ProjectCliConfigInput, ProjectEgressRuleInput, ProjectRuntimeConfigInput,
-            ProjectRuntimeSecretInput, ProjectsError, ProjectsInterface,
-        },
-        runtime::interface::{
-            CapabilityReason, CapabilityScope, CapabilityState, DelegatedCliKind,
-            DeploymentCapabilityProbe, EffectiveCapabilityConfig, ExecutorKind, NetworkPolicy,
-            ResourceLimits, RuntimeCapabilityEvaluator, RuntimeCapabilityId,
-        },
-    },
-    platform::secret::SecretCipher,
+use janus_models::interface::{
+    EmbeddedModelInput, ModelsError, ModelsInterface, ProviderInput, ProviderKind,
 };
+use janus_projects::interface::{
+    EgressScheme, ProjectCliConfigInput, ProjectEgressRuleInput, ProjectRuntimeConfigInput,
+    ProjectRuntimeSecretInput, ProjectsError, ProjectsInterface,
+};
+use janus_runtime::interface::*;
+use janus_server::adapters::git::system_runner;
 use janus_workspace::interface::WorkspaceInterface;
 use sqlx::{
     SqlitePool,
@@ -49,7 +39,7 @@ impl Fx {
         let database = Database::open(temp.path(), janus_server::migrator()).await?;
         let pool = database.pool().clone();
         seed_owner_and_project(&pool).await?;
-        let cipher = SecretCipher::load(temp.path(), RunMode::Development)?;
+        let cipher = SecretCipher::load(temp.path(), false)?;
         let blobs = BlobStore::new(pool.clone(), temp.path())?;
         let workspace = WorkspaceInterface::new(pool.clone(), temp.path(), blobs);
         let events = EventStore::new(pool.clone());

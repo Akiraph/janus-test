@@ -1,12 +1,12 @@
-//! HTTP transport for the Projects Module: Project lifecycle, GitHub PAT
+//! HTTP transport for the Projects capability: project lifecycle, GitHub PAT
 //! credentials and Main Workspace file read/write.
 //!
 //! Handlers follow the same shape as `transport/http/models.rs`: authenticate or
-//! authorize, call the Module, map `ProjectsError` to a `Problem`, and emit a
+//! authorize, call the capability, map `ProjectsError` to a `Problem`, and emit a
 //! `project.changed` / `project.main_revision_changed` event on mutating side
 //! effects. Operations (clone, delete) return `202 + OperationView` because the
 //! actual external side effect runs in the background worker; the Operation
-//! Module already emits `operation.changed` from inside its transaction.
+//! capability already emits `operation.changed` from inside its transaction.
 //!
 //! Idempotency keys and `If-Match` are extracted via `transport/http/conditions`.
 
@@ -21,11 +21,6 @@ use utoipa::ToSchema;
 
 use crate::{
     AppState,
-    modules::projects::interface::{
-        CreateGithubCredentialInput, CreateProjectInput, CredentialProbeResult,
-        GithubCredentialView, ProjectView, ProjectsError, RetryProjectInput,
-        UpdateGithubCredentialInput,
-    },
     transport::http::{
         auth::{authenticate, authorized},
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -35,6 +30,10 @@ use crate::{
     },
 };
 use janus_infrastructure::id::CorrelationId;
+use janus_projects::interface::{
+    CreateGithubCredentialInput, CreateProjectInput, CredentialProbeResult, GithubCredentialView,
+    ProjectView, ProjectsError, RetryProjectInput, UpdateGithubCredentialInput,
+};
 use janus_workspace::interface::{
     DeleteFileInput, FileMetaView, FileTreeView, MoveFileInput, RevisionRef, SaveTextInput,
 };
@@ -236,7 +235,7 @@ pub async fn delete_project(
     let expected_version = if_match_version(&headers)?;
     let correlation_id = CorrelationId::new();
     // The DELETE Project contract requires an Idempotency-Key per `API-IDEM-01`;
-    // the underlying Module currently records intent via correlation_id only,
+    // the underlying capability currently records intent via correlation_id only,
     // so we validate presence here and forward the correlation_id.
     let idempotency = require_idempotency(
         &headers,

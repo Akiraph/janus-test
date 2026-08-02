@@ -1,5 +1,5 @@
 //! HTTP transport for durable Operations: the read side a client polls after a
-//! `202` from clone/delete/git operations. The Operation Module already emits
+//! `202` from clone/delete/git operations. The owning capability already emits
 //! `operation.changed` from its own transaction; this only exposes the current
 //! projection.
 

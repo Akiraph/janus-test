@@ -1,22 +1,22 @@
-use crate::AppState;
-use crate::modules::projects::interface::ProjectsError;
-use crate::modules::runtime::interface::{
+use crate::application::Application;
+use janus_infrastructure::id::{ProjectId, RuntimeId, TerminalId};
+use janus_projects::interface::ProjectsError;
+use janus_runtime::interface::{
     ExecutionEnvironment, ExecutorKind, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
     RuntimeError, RuntimeScope, RuntimeSpec, RuntimeStatus, TerminalProjection, TerminalSize,
     TerminalSpec,
 };
-use crate::platform::id::{ProjectId, RuntimeId, TerminalId};
 
 #[derive(Debug, thiserror::Error)]
-pub enum ProjectTerminalError {
+pub(crate) enum ProjectTerminalError {
     #[error(transparent)]
     Projects(#[from] ProjectsError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
 }
 
-impl AppState {
-    pub async fn create_project_terminal(
+impl Application {
+    pub(crate) async fn create_project_terminal(
         &self,
         owner_id: &str,
         project_id: ProjectId,

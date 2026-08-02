@@ -202,7 +202,7 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
       "50",
     ]);
     const projectId = requireOperationTarget(project.data, "project creation");
-    const sessionTitle = "Live supervisor";
+    const sessionTitle = "Live execution";
     const sessionOperation = runCliJson<DataResponse<OperationView>>(testCli, [
       "--base-url",
       CONTROL_ORIGIN,

@@ -4,11 +4,10 @@
 //! supports compaction. The manual `schedule_compact` path and context-version
 //! record are tested independently of automatic Round wiring.
 
-use janus_infrastructure::database::Database;
-use janus_server::modules::execution::context::{
+use janus_execution::interface::{
     latest_compact_summary, record_context_version, schedule_compact,
 };
-use janus_server::platform::id::SessionId;
+use janus_infrastructure::{database::Database, id::SessionId};
 use serde_json::json;
 use tempfile::TempDir;
 

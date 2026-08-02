@@ -1,27 +1,26 @@
 use axum::{
-    Extension, Json,
+    Json,
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
 };
+use janus_identity::{AuthContext, AuthenticationGrant, IdentityError};
 
 use crate::{
     AppState,
-    modules::identity::interface::{AuthContext, AuthenticationGrant, IdentityError},
     transport::http::{
         dto::{
             CeremonyCompleteRequest, DataResponse, InitializeOptionsRequest, PasskeyOptionsRequest,
             RecoveryExchangeRequest, RenamePasskeyRequest,
         },
         problem::Problem,
-        request_id::RequestContext,
     },
 };
 
-#[utoipa::path(post, path = "/api/v1/auth/initialize/options", request_body = InitializeOptionsRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::CeremonyOptions>), (status = 400, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/auth/initialize/options", request_body = InitializeOptionsRequest, responses((status = 200, body = DataResponse<janus_identity::CeremonyOptions>), (status = 400, body = Problem)))]
 pub async fn initialize_options(
     State(state): State<AppState>,
     Json(input): Json<InitializeOptionsRequest>,
-) -> Result<Json<DataResponse<crate::modules::identity::interface::CeremonyOptions>>, Problem> {
+) -> Result<Json<DataResponse<janus_identity::CeremonyOptions>>, Problem> {
     Ok(Json(DataResponse {
         data: state
             .identity()
@@ -31,17 +30,11 @@ pub async fn initialize_options(
     }))
 }
 
-#[utoipa::path(post, path = "/api/v1/auth/initialize/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::OwnerView>), (status = 400, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/auth/initialize/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<janus_identity::OwnerView>), (status = 400, body = Problem)))]
 pub async fn initialize_complete(
     State(state): State<AppState>,
     Json(input): Json<CeremonyCompleteRequest>,
-) -> Result<
-    (
-        HeaderMap,
-        Json<DataResponse<crate::modules::identity::interface::OwnerView>>,
-    ),
-    Problem,
-> {
+) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     grant_response(
         state
             .identity()
@@ -51,25 +44,19 @@ pub async fn initialize_complete(
     )
 }
 
-#[utoipa::path(post, path = "/api/v1/auth/passkey/options", responses((status = 200, body = DataResponse<crate::modules::identity::interface::CeremonyOptions>), (status = 400, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/auth/passkey/options", responses((status = 200, body = DataResponse<janus_identity::CeremonyOptions>), (status = 400, body = Problem)))]
 pub async fn login_options(
     State(state): State<AppState>,
-) -> Result<Json<DataResponse<crate::modules::identity::interface::CeremonyOptions>>, Problem> {
+) -> Result<Json<DataResponse<janus_identity::CeremonyOptions>>, Problem> {
     Ok(Json(DataResponse {
         data: state.identity().login_options().await.map_err(problem)?,
     }))
 }
-#[utoipa::path(post, path = "/api/v1/auth/passkey/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::OwnerView>), (status = 400, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/auth/passkey/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<janus_identity::OwnerView>), (status = 400, body = Problem)))]
 pub async fn login_complete(
     State(state): State<AppState>,
     Json(input): Json<CeremonyCompleteRequest>,
-) -> Result<
-    (
-        HeaderMap,
-        Json<DataResponse<crate::modules::identity::interface::OwnerView>>,
-    ),
-    Problem,
-> {
+) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     grant_response(
         state
             .identity()
@@ -79,11 +66,11 @@ pub async fn login_complete(
     )
 }
 
-#[utoipa::path(get, path = "/api/v1/me", responses((status = 200, body = DataResponse<crate::modules::identity::interface::OwnerView>), (status = 401, body = Problem)))]
+#[utoipa::path(get, path = "/api/v1/me", responses((status = 200, body = DataResponse<janus_identity::OwnerView>), (status = 401, body = Problem)))]
 pub async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<DataResponse<crate::modules::identity::interface::OwnerView>>, Problem> {
+) -> Result<Json<DataResponse<janus_identity::OwnerView>>, Problem> {
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state.identity().me(&auth, &auth.csrf_token).await,
@@ -105,22 +92,22 @@ pub async fn logout(
     );
     Ok((output, StatusCode::NO_CONTENT))
 }
-#[utoipa::path(get, path = "/api/v1/me/passkeys", responses((status = 200, body = DataResponse<Vec<crate::modules::identity::interface::PasskeyView>>), (status = 401, body = Problem)))]
+#[utoipa::path(get, path = "/api/v1/me/passkeys", responses((status = 200, body = DataResponse<Vec<janus_identity::PasskeyView>>), (status = 401, body = Problem)))]
 pub async fn passkeys(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<DataResponse<Vec<crate::modules::identity::interface::PasskeyView>>>, Problem> {
+) -> Result<Json<DataResponse<Vec<janus_identity::PasskeyView>>>, Problem> {
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state.identity().passkeys(&auth).await.map_err(problem)?,
     }))
 }
-#[utoipa::path(post, path = "/api/v1/me/passkeys/options", request_body = PasskeyOptionsRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::CeremonyOptions>), (status = 401, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/me/passkeys/options", request_body = PasskeyOptionsRequest, responses((status = 200, body = DataResponse<janus_identity::CeremonyOptions>), (status = 401, body = Problem)))]
 pub async fn passkey_options(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<PasskeyOptionsRequest>,
-) -> Result<Json<DataResponse<crate::modules::identity::interface::CeremonyOptions>>, Problem> {
+) -> Result<Json<DataResponse<janus_identity::CeremonyOptions>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
@@ -130,12 +117,12 @@ pub async fn passkey_options(
             .map_err(problem)?,
     }))
 }
-#[utoipa::path(post, path = "/api/v1/me/passkeys/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::PasskeyView>), (status = 401, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/me/passkeys/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<janus_identity::PasskeyView>), (status = 401, body = Problem)))]
 pub async fn passkey_complete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<CeremonyCompleteRequest>,
-) -> Result<Json<DataResponse<crate::modules::identity::interface::PasskeyView>>, Problem> {
+) -> Result<Json<DataResponse<janus_identity::PasskeyView>>, Problem> {
     let auth = authorized(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
@@ -221,12 +208,12 @@ pub async fn recovery_exchange(
         }),
     ))
 }
-#[utoipa::path(post, path = "/api/v1/auth/recovery/passkey/options", request_body = PasskeyOptionsRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::CeremonyOptions>), (status = 400, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/auth/recovery/passkey/options", request_body = PasskeyOptionsRequest, responses((status = 200, body = DataResponse<janus_identity::CeremonyOptions>), (status = 400, body = Problem)))]
 pub async fn recovery_passkey_options(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<PasskeyOptionsRequest>,
-) -> Result<Json<DataResponse<crate::modules::identity::interface::CeremonyOptions>>, Problem> {
+) -> Result<Json<DataResponse<janus_identity::CeremonyOptions>>, Problem> {
     let token = cookie(&headers, "janus_recovery")
         .ok_or_else(|| problem(IdentityError::InvalidRecoveryCode))?;
     Ok(Json(DataResponse {
@@ -237,18 +224,12 @@ pub async fn recovery_passkey_options(
             .map_err(problem)?,
     }))
 }
-#[utoipa::path(post, path = "/api/v1/auth/recovery/passkey/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<crate::modules::identity::interface::OwnerView>), (status = 400, body = Problem)))]
+#[utoipa::path(post, path = "/api/v1/auth/recovery/passkey/complete", request_body = CeremonyCompleteRequest, responses((status = 200, body = DataResponse<janus_identity::OwnerView>), (status = 400, body = Problem)))]
 pub async fn recovery_passkey_complete(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<CeremonyCompleteRequest>,
-) -> Result<
-    (
-        HeaderMap,
-        Json<DataResponse<crate::modules::identity::interface::OwnerView>>,
-    ),
-    Problem,
-> {
+) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     let token = cookie(&headers, "janus_recovery")
         .ok_or_else(|| problem(IdentityError::InvalidRecoveryCode))?;
     grant_response(
@@ -281,16 +262,9 @@ pub async fn authorized(state: &AppState, headers: &HeaderMap) -> Result<AuthCon
     Ok(auth)
 }
 
-#[allow(clippy::result_large_err)]
 fn grant_response(
     grant: AuthenticationGrant,
-) -> Result<
-    (
-        HeaderMap,
-        Json<DataResponse<crate::modules::identity::interface::OwnerView>>,
-    ),
-    Problem,
-> {
+) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     let mut headers = HeaderMap::new();
     let cookie = format!(
         "__Host-janus_session={}; Path=/; Max-Age=604800; Secure; HttpOnly; SameSite=Strict",
@@ -402,6 +376,3 @@ fn problem(error: IdentityError) -> Problem {
         }
     }
 }
-
-#[allow(dead_code)]
-fn _request_context(_: Extension<RequestContext>) {}

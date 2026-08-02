@@ -1,4 +1,4 @@
-//! HTTP + WebSocket transport for Terminal (M4 Stage 3).
+//! HTTP and WebSocket transport for Runtime-owned Terminals.
 //!
 //! Terminal shells run on the Local pipe backend: `bash` (git bash on
 //! Windows) is spawned with stdin/stdout/stderr pipes; there is no ConPTY or
@@ -19,16 +19,16 @@ use axum::{
 };
 use base64::Engine;
 use futures_util::SinkExt;
+use janus_infrastructure::id::{ProjectId, TerminalId};
+use janus_runtime::interface::{
+    ExecutionEnvironment, LogCursor, RelativeWorkingDirectory, TerminalProjection, TerminalSignal,
+    TerminalSize, TerminalTicket, TerminalTicketRequest,
+};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
     AppState,
-    modules::runtime::interface::{
-        ExecutionEnvironment, LogCursor, RelativeWorkingDirectory, TerminalProjection,
-        TerminalSignal, TerminalSize, TerminalTicket, TerminalTicketRequest,
-    },
-    platform::id::{ProjectId, TerminalId},
     transport::http::{
         auth::authenticate,
         dto::DataResponse,
@@ -118,6 +118,7 @@ pub async fn create_terminal(
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid environment"))?;
     let _ = context;
     let data = state
+        .application()
         .create_project_terminal(
             &auth.owner_id,
             project_id,
@@ -281,14 +282,14 @@ pub async fn close_terminal(
     get,
     path = "/api/v1/terminals/{id}/scrollback",
     params(("id" = String, Path), ("after" = Option<String>, Query), ("limit" = Option<usize>, Query)),
-    responses((status = 200, body = DataResponse<crate::modules::runtime::interface::LogRange>), (status = 401, body = Problem))
+    responses((status = 200, body = DataResponse<janus_runtime::interface::LogRange>), (status = 401, body = Problem))
 )]
 pub async fn terminal_scrollback(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     Query(query): Query<ScrollbackQuery>,
-) -> Result<Json<DataResponse<crate::modules::runtime::interface::LogRange>>, Problem> {
+) -> Result<Json<DataResponse<janus_runtime::interface::LogRange>>, Problem> {
     let _auth = authenticate(&state, &headers).await?;
     let terminal_id: TerminalId = id
         .parse()
@@ -482,9 +483,9 @@ async fn drive_terminal(
                 if let Ok(terminal) = status
                     && matches!(
                         terminal.status,
-                        crate::modules::runtime::interface::TerminalStatus::Exited
-                            | crate::modules::runtime::interface::TerminalStatus::Failed
-                            | crate::modules::runtime::interface::TerminalStatus::Lost
+                        janus_runtime::interface::TerminalStatus::Exited
+                            | janus_runtime::interface::TerminalStatus::Failed
+                            | janus_runtime::interface::TerminalStatus::Lost
                     )
                 {
                     let _ = socket
@@ -508,7 +509,7 @@ async fn drive_terminal(
 
 async fn send_problem(
     socket: &mut WebSocket,
-    error: &crate::modules::runtime::interface::RuntimeError,
+    error: &janus_runtime::interface::RuntimeError,
 ) -> Result<(), ()> {
     let message = serde_json::json!({
         "kind": "error",
@@ -525,7 +526,6 @@ fn base64_decode(value: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(value).ok()
 }
 
-#[allow(clippy::result_large_err)]
 fn parse_cursor(value: Option<String>) -> Result<LogCursor, Problem> {
     match value {
         None => Ok(LogCursor::ZERO),
@@ -536,7 +536,6 @@ fn parse_cursor(value: Option<String>) -> Result<LogCursor, Problem> {
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn origin_for(headers: &HeaderMap) -> Result<String, Problem> {
     headers
         .get(header::ORIGIN)

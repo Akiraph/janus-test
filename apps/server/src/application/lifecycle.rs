@@ -1,9 +1,9 @@
 //! Cross-module Session/Project deletion and bounded Runtime shutdown.
 //!
-//! Sessions and Projects modules must not depend on Runtime (architecture
-//! module.toml). Deletion that stops live Jobs/Services/Terminals therefore
+//! Sessions and Projects declare no Runtime dependency in their architecture
+//! manifests. Deletion that stops live Jobs, Services, or Terminals therefore
 //! lives here: isolate the resource, stop Runtime-owned processes, then hand
-//! the durable row/workspace removal back to the owning module.
+//! durable row and workspace removal back to the owning capability.
 
 use std::time::Duration;
 
@@ -11,29 +11,27 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use crate::AppState;
+use crate::application::Application;
 use crate::application::operation_kinds::{KIND_CREATE_SESSION, KIND_DELETE_SESSION};
-use crate::modules::execution::interface::{ExecutionError, ExecutionInterface};
-use crate::modules::models::interface::{ModelsError, ModelsInterface};
-use crate::modules::projects::interface::ProjectsError;
-use crate::modules::runtime::interface::{
-    JobStatus, RuntimeError, RuntimeInterface, RuntimeScope, ServiceStatus, TerminalStatus,
-};
-use crate::modules::sessions::interface::{SessionsError, SessionsInterface, TurnStatus};
-use crate::platform::id::{ProjectId, SessionId};
+use janus_execution::interface::ExecutionError;
 use janus_infrastructure::{
     events::NewEvent,
-    id::CorrelationId,
+    id::{CorrelationId, ProjectId, SessionId},
     operations::{
         CreateOperation, CreateWork, IdempotencyRequest, OperationError, OperationInterface,
         OperationStatus, OperationView, StepState,
     },
-    unit_of_work::UnitOfWork,
 };
+use janus_models::interface::ModelsError;
+use janus_projects::interface::ProjectsError;
+use janus_runtime::interface::{
+    JobStatus, RuntimeError, RuntimeScope, ServiceStatus, TerminalStatus,
+};
+use janus_sessions::interface::{SessionsError, TurnStatus};
 use janus_workspace::interface::WorkspaceError;
 
 #[derive(Debug, thiserror::Error)]
-pub enum SessionLifecycleError {
+pub(crate) enum SessionLifecycleError {
     #[error(transparent)]
     Models(#[from] ModelsError),
     #[error(transparent)]
@@ -59,7 +57,7 @@ pub enum SessionLifecycleError {
 }
 
 impl SessionLifecycleError {
-    pub fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Projects(error) => error.code(),
             Self::Sessions(SessionsError::NotFound) => "SESSION_NOT_FOUND",
@@ -98,25 +96,23 @@ struct DeleteSessionWork {
     actor: Value,
 }
 
-pub(crate) async fn recover_execution_state(
-    unit_of_work: &UnitOfWork,
-    models: &ModelsInterface,
-    runtime: &RuntimeInterface,
-    sessions: &SessionsInterface,
-    execution: &ExecutionInterface,
-) -> anyhow::Result<usize> {
-    let now = sessions.now();
-    let mut work = unit_of_work.begin().await?;
-    runtime
+pub(crate) async fn recover_execution_state(application: &Application) -> anyhow::Result<usize> {
+    let now = application.sessions().now();
+    let mut work = application.unit_of_work().begin().await?;
+    application
+        .runtime()
         .recover_uncertain_in_tx(work.connection(), &now)
         .await?;
-    models
+    application
+        .models()
         .interrupt_running_attempts_in_tx(work.connection(), &now)
         .await?;
-    execution
+    application
+        .execution()
         .interrupt_execution_in_tx(work.connection(), &now)
         .await?;
-    let recovered = sessions
+    let recovered = application
+        .sessions()
         .interrupt_active_turns_in_tx(work.connection(), &now)
         .await?;
     let correlation_id = CorrelationId::new().to_string();
@@ -163,8 +159,8 @@ pub(crate) async fn recover_execution_state(
     Ok(recovered.len())
 }
 
-pub async fn request_session_creation(
-    state: &AppState,
+pub(crate) async fn request_session_creation(
+    state: &Application,
     owner_id: &str,
     project_id: ProjectId,
     title: Option<String>,
@@ -204,8 +200,8 @@ pub async fn request_session_creation(
     Ok(created.operation)
 }
 
-pub async fn request_session_deletion(
-    state: &AppState,
+pub(crate) async fn request_session_deletion(
+    state: &Application,
     session_id: SessionId,
     expected_version: String,
     actor: Value,
@@ -241,7 +237,7 @@ pub async fn request_session_deletion(
 }
 
 pub(crate) async fn run_session_creation_operation(
-    state: &AppState,
+    state: &Application,
     payload: &Value,
 ) -> Result<(), SessionLifecycleError> {
     let input: CreateSessionWork = serde_json::from_value(payload.clone())?;
@@ -261,7 +257,7 @@ pub(crate) async fn run_session_creation_operation(
 }
 
 pub(crate) async fn run_session_deletion_operation(
-    state: &AppState,
+    state: &Application,
     payload: &Value,
 ) -> Result<(), SessionLifecycleError> {
     let input: DeleteSessionWork = serde_json::from_value(payload.clone())?;
@@ -339,7 +335,7 @@ async fn finish_session_operation(
 }
 
 async fn execute_session_creation(
-    state: &AppState,
+    state: &Application,
     input: &CreateSessionWork,
     correlation_id: CorrelationId,
 ) -> Result<SessionId, SessionLifecycleError> {
@@ -445,7 +441,7 @@ async fn execute_session_creation(
 }
 
 async fn execute_session_deletion(
-    state: &AppState,
+    state: &Application,
     input: &DeleteSessionWork,
     correlation_id: CorrelationId,
 ) -> Result<SessionId, SessionLifecycleError> {
@@ -466,7 +462,7 @@ async fn execute_session_deletion(
 }
 
 async fn execute_session_deletion_steps(
-    state: &AppState,
+    state: &Application,
     operation_id: &str,
     session_id: SessionId,
     expected_version: &str,
@@ -553,7 +549,7 @@ async fn run_operation_step(
 }
 
 async fn mark_session_deleting(
-    state: &AppState,
+    state: &Application,
     session_id: SessionId,
     expected_version: &str,
     actor: &Value,
@@ -586,7 +582,7 @@ async fn mark_session_deleting(
 }
 
 async fn delete_session_records(
-    state: &AppState,
+    state: &Application,
     session_id: SessionId,
     actor: &Value,
     correlation_id: CorrelationId,
@@ -647,8 +643,8 @@ async fn delete_session_records(
     Ok(())
 }
 
-pub async fn delete_project_with_runtime(
-    state: &AppState,
+pub(crate) async fn delete_project_with_runtime(
+    state: &Application,
     project_id: &str,
     operation_id: &str,
 ) -> Result<(), SessionLifecycleError> {
@@ -685,7 +681,7 @@ pub async fn delete_project_with_runtime(
 }
 
 async fn drain_session_runtime(
-    state: &AppState,
+    state: &Application,
     session_id: SessionId,
 ) -> Result<(), SessionLifecycleError> {
     let runtime = state.runtime();
@@ -712,14 +708,14 @@ async fn drain_session_runtime(
 }
 
 /// Best-effort Runtime drain used only during bounded process shutdown.
-pub async fn cleanup_session_runtime(state: &AppState, session_id: SessionId) {
+async fn cleanup_session_runtime(state: &Application, session_id: SessionId) {
     if let Err(error) = drain_session_runtime(state, session_id).await {
         warn!(%error, %session_id, "drain Runtime during graceful shutdown");
     }
 }
 
 async fn cleanup_project_terminals(
-    state: &AppState,
+    state: &Application,
     project_id: ProjectId,
 ) -> Result<(), SessionLifecycleError> {
     for terminal in state.runtime().list_terminals(project_id).await? {
@@ -743,7 +739,7 @@ async fn cleanup_project_terminals(
 /// Bounded graceful shutdown: stop every live Runtime we can see, then
 /// return. The deadline is a hard wall-clock cap so a hung process group cannot
 /// block process exit indefinitely.
-pub async fn graceful_shutdown(state: &AppState, deadline: Duration) {
+pub async fn graceful_shutdown(state: &Application, deadline: Duration) {
     info!(?deadline, "graceful shutdown: stopping live runtimes");
     let shutdown = async {
         match state.runtime().live_runtimes().await {

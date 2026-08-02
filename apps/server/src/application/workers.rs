@@ -1,19 +1,18 @@
 //! Background worker loop: leases durable work items and dispatches them to the
-//! owning Module handler. Single control-plane task is enough for Phase 1, but
-//! the lease nonce + TTL still protects against canceled tasks and restarted
-//! processes leaving a stale attempt (`DAT-OP-02`).
+//! owning capability handler. The current deployment uses one control-plane
+//! task; the lease nonce and TTL still protect against canceled tasks and
+//! restarted processes leaving a stale attempt.
 //!
-//! Handlers map `handler_kind` to a function. M2 handles `project.clone` and
-//! `project.delete`; git fetch/update/push are enqueued as Operations but the
-//! short ones also run inline in the request path (see `projects`), so the
-//! worker focuses on the long external side effects.
+//! Handlers map `handler_kind` to a function. Project clone/delete and Git
+//! operations are durable Operations; the worker focuses on their external
+//! side effects so an HTTP disconnect cannot lose the work.
 
 use std::time::Duration;
 
 use serde_json::Value;
 use tracing::{error, info, warn};
 
-use crate::AppState;
+use crate::application::Application;
 use crate::application::operation_kinds::{
     KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION,
 };
@@ -33,7 +32,7 @@ const HANDLED_KINDS: &[&str] = &[
 ];
 
 /// Spawn the background worker. Runs until the runtime shuts down.
-pub fn spawn(state: AppState) {
+pub fn spawn(state: Application) {
     tokio::spawn(async move {
         info!("janus worker started");
         loop {
@@ -51,7 +50,7 @@ pub fn spawn(state: AppState) {
 /// terminal Job ids and resumes any `waiting_for_job` Turn that no longer has
 /// unfinished finite Jobs. Single-flight: each resume schedules one next
 /// Execution Round via the application coordinator.
-pub fn spawn_job_wake(state: AppState) {
+pub fn spawn_job_wake(state: Application) {
     let mut rx = state.runtime().subscribe_job_settled();
     tokio::spawn(async move {
         info!("janus job-wake worker started");
@@ -83,7 +82,7 @@ pub fn spawn_job_wake(state: AppState) {
 
 /// Periodically expire due best-effort Asks through the application command so
 /// defaults become durable Turn input and only runnable Turns are scheduled.
-pub fn spawn_ask_expiry(state: AppState) {
+pub fn spawn_ask_expiry(state: Application) {
     tokio::spawn(async move {
         info!("janus ask-expiry worker started");
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -96,7 +95,7 @@ pub fn spawn_ask_expiry(state: AppState) {
     });
 }
 
-async fn run_once(state: &AppState) -> anyhow::Result<()> {
+async fn run_once(state: &Application) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
         let Some(claimed) = state
             .operations()
@@ -138,7 +137,7 @@ async fn run_once(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn dispatch(state: &AppState, kind: &str, payload: &Value) -> anyhow::Result<()> {
+async fn dispatch(state: &Application, kind: &str, payload: &Value) -> anyhow::Result<()> {
     match kind {
         KIND_CLONE => {
             let project_id = payload_string(payload, "project_id")?;
@@ -179,9 +178,7 @@ async fn dispatch(state: &AppState, kind: &str, payload: &Value) -> anyhow::Resu
                         kind,
                         project_id,
                         payload,
-                        &crate::modules::projects::interface::ProjectsError::Validation(
-                            error.to_string(),
-                        ),
+                        &janus_projects::interface::ProjectsError::Validation(error.to_string()),
                     )
                     .await;
                     Err(error.into())
@@ -212,7 +209,7 @@ fn payload_string<'a>(payload: &'a Value, field: &str) -> anyhow::Result<&'a str
 /// payload id avoids racing a later retry's Operation when two clones share a
 /// project_id (retry path).
 async fn resolve_operation_id(
-    state: &AppState,
+    state: &Application,
     kind: &str,
     project_id: &str,
     payload: &Value,
@@ -230,7 +227,12 @@ async fn resolve_operation_id(
 
 /// Mark the Operation backing this work item as succeeded so clients polling
 /// `GET /operations/{id}` leave the waiting state.
-async fn record_operation_success(state: &AppState, kind: &str, project_id: &str, payload: &Value) {
+async fn record_operation_success(
+    state: &Application,
+    kind: &str,
+    project_id: &str,
+    payload: &Value,
+) {
     let Some(op_id) = resolve_operation_id(state, kind, project_id, payload).await else {
         return;
     };
@@ -250,11 +252,11 @@ async fn record_operation_success(state: &AppState, kind: &str, project_id: &str
 /// Mark the Operation backing this work item as failed so the client can read
 /// the failure from `GET /operations/{id}`.
 async fn record_operation_failure(
-    state: &AppState,
+    state: &Application,
     kind: &str,
     project_id: &str,
     payload: &Value,
-    error: &crate::modules::projects::interface::ProjectsError,
+    error: &janus_projects::interface::ProjectsError,
 ) {
     // A miss is not fatal: the Project state itself already records the error
     // (clone -> `error` state).
@@ -277,7 +279,7 @@ async fn record_operation_failure(
 fn is_fatal(error: &anyhow::Error) -> bool {
     // Auth/unreachable failures are recorded on the Project (`error` state) and
     // should not be retried blindly; the user retries explicitly. Validation
-    // is fatal. Transient issues (none modeled in M2) would be retried.
+    // is fatal. Transient issues can be retried by the lease loop.
     let s = error.to_string();
     s.contains("validation") || s.contains("GIT_AUTH_FAILED") || s.contains("not creating")
 }

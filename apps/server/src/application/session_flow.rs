@@ -12,21 +12,22 @@ use std::collections::HashMap;
 
 use serde_json::json;
 
-use crate::AppState;
+use crate::application::Application;
 use crate::application::execution::{ToolResultRecord, TurnExecutionError};
-use crate::modules::execution::interface::{
+use janus_execution::interface::{
     AskAnswerDisposition, AskClosure, ContextUsageView, ExecutionError,
 };
-use crate::modules::runtime::interface::JobStatus;
-use crate::modules::sessions::interface::{
-    CancelResult, MessageRoute, MessageRouteResult, RecordAskAnswer, SessionModelPreference,
-    SessionsError, TurnStatus, TurnSummary,
-};
-use crate::platform::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId};
-use janus_infrastructure::clock::now_utc_str;
-use janus_infrastructure::events::NewEvent;
-use janus_infrastructure::id::CorrelationId;
 use janus_infrastructure::unit_of_work::UnitOfWorkTransaction;
+use janus_infrastructure::{
+    clock::now_utc_str,
+    events::NewEvent,
+    id::{AskId, AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
+};
+use janus_runtime::interface::JobStatus;
+use janus_sessions::interface::{
+    AppendSteerInput, CancelResult, CreateTurnInput, MessageRoute, MessageRouteResult,
+    RecordAskAnswer, SessionModelPreference, SessionsError, TurnStatus, TurnSummary,
+};
 
 struct SessionInput<'a> {
     owner_id: &'a str,
@@ -41,18 +42,18 @@ struct SessionInput<'a> {
     now: &'a str,
 }
 
-pub struct PostSessionMessage<'a> {
-    pub owner_id: &'a str,
-    pub session_id: SessionId,
-    pub content: &'a str,
-    pub expected_version: &'a str,
-    pub model_preference: Option<Option<&'a SessionModelPreference>>,
-    pub attachment_ids: &'a [AttachmentId],
-    pub actor: serde_json::Value,
+pub(crate) struct PostSessionMessage<'a> {
+    pub(crate) owner_id: &'a str,
+    pub(crate) session_id: SessionId,
+    pub(crate) content: &'a str,
+    pub(crate) expected_version: &'a str,
+    pub(crate) model_preference: Option<Option<&'a SessionModelPreference>>,
+    pub(crate) attachment_ids: &'a [AttachmentId],
+    pub(crate) actor: serde_json::Value,
 }
 
-impl AppState {
-    pub async fn post_session_message(
+impl Application {
+    pub(crate) async fn post_session_message(
         &self,
         input: PostSessionMessage<'_>,
     ) -> Result<MessageRouteResult, SessionsError> {
@@ -103,7 +104,7 @@ impl AppState {
         Ok(result)
     }
 
-    pub async fn session_context_usage(
+    pub(crate) async fn session_context_usage(
         &self,
         session_id: SessionId,
     ) -> Result<Option<ContextUsageView>, SessionsError> {
@@ -114,7 +115,7 @@ impl AppState {
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
     }
 
-    pub async fn turn_summary(
+    pub(crate) async fn turn_summary(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
@@ -202,15 +203,17 @@ impl AppState {
             .sessions()
             .create_turn_input_in_tx(
                 work.connection(),
-                session_id,
-                content,
-                &actor,
-                predecessor,
-                source_ask_id,
-                attachment_ids,
-                model_snapshot.as_ref(),
-                checkpoint_revision,
-                now,
+                CreateTurnInput {
+                    session_id,
+                    content,
+                    actor: &actor,
+                    predecessor_turn_id: predecessor,
+                    source_ask_id,
+                    attachment_ids,
+                    model_snapshot: model_snapshot.as_ref(),
+                    checkpoint_revision,
+                    now,
+                },
             )
             .await?;
 
@@ -311,8 +314,8 @@ impl AppState {
 
     fn message_accepted_events(
         session_id: SessionId,
-        created: &crate::modules::sessions::interface::CreatedTurnInput,
-        command: &crate::modules::sessions::interface::SessionCommandState,
+        created: &janus_sessions::interface::CreatedTurnInput,
+        command: &janus_sessions::interface::SessionCommandState,
         route: MessageRoute,
         predecessor: Option<&str>,
         actor: serde_json::Value,
@@ -418,7 +421,7 @@ impl AppState {
     /// default use the Turn, a manual late answer enqueues a new Turn; per
     /// design, late answers convert to a new ordinary Turn with source
     /// attribution). Returns `turn_status_after` for the caller/UI.
-    pub async fn answer_ask(
+    pub(crate) async fn answer_ask(
         &self,
         owner_id: &str,
         ask_id: AskId,
@@ -499,13 +502,15 @@ impl AppState {
                     self.sessions()
                         .append_steer_in_tx(
                             work.connection(),
-                            outcome.session_id,
-                            Some(answered.turn_id),
-                            &answer_text,
-                            &outcome.session_version,
-                            &actor,
-                            Some(&source_ask_id),
-                            &now,
+                            AppendSteerInput {
+                                session_id: outcome.session_id,
+                                expected_turn_id: Some(answered.turn_id),
+                                content: &answer_text,
+                                expected_version: &outcome.session_version,
+                                actor: &actor,
+                                source_ask_id: Some(&source_ask_id),
+                                now: &now,
+                            },
                         )
                         .await?,
                 );
@@ -653,7 +658,7 @@ impl AppState {
     /// Expire any due best-effort Asks, applying their default answer and
     /// resuming the controlling Turn if it is still `waiting_for_ask`. Called by
     /// a periodic sweeper (and at startup). Stale notifications are harmless.
-    pub async fn expire_asks(&self, _owner_id: &str) -> Result<u64, SessionsError> {
+    pub(crate) async fn expire_asks(&self, _owner_id: &str) -> Result<u64, SessionsError> {
         let now = now_utc_str();
         let mut work = self.unit_of_work().begin().await?;
         let expired = self
@@ -775,7 +780,7 @@ impl AppState {
 
     fn blocker_transition_event(
         turn_id: TurnId,
-        transition: &crate::modules::sessions::interface::TurnTransition,
+        transition: &janus_sessions::interface::TurnTransition,
         actor: serde_json::Value,
         correlation_id: &str,
     ) -> NewEvent {
@@ -878,7 +883,7 @@ impl AppState {
 
     /// Cancel a queued Turn immediately, or accept Cancel for an active Turn,
     /// bound-cancel its finite Jobs, then settle it as `canceled`/`interrupted`.
-    pub async fn cancel_active_turn(
+    pub(crate) async fn cancel_active_turn(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
@@ -997,7 +1002,7 @@ impl AppState {
 
     /// Resume a Turn parked on `waiting_for_model` and schedule execution through
     /// the application Turn runner. Returns whether a runnable wake was scheduled.
-    pub async fn retry_waiting_model(&self, turn_id: TurnId) -> Result<bool, SessionsError> {
+    pub(crate) async fn retry_waiting_model(&self, turn_id: TurnId) -> Result<bool, SessionsError> {
         let runnable =
             self.execution()
                 .retry_model(turn_id)

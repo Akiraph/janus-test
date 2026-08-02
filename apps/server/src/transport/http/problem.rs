@@ -1,4 +1,4 @@
-use axum::{
+﻿use axum::{
     Json,
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
@@ -8,32 +8,35 @@ use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Problem {
+    // Problems cross nearly every HTTP handler as the Result error. Boxed
+    // strings keep that common error path compact without changing JSON or
+    // OpenAPI representation, which remains a normal string in the response.
     #[serde(rename = "type")]
-    pub type_url: String,
-    pub title: String,
+    pub type_url: Box<str>,
+    pub title: Box<str>,
     pub status: u16,
-    pub code: String,
-    pub detail: String,
-    pub request_id: Option<String>,
+    pub code: Box<str>,
+    pub detail: Box<str>,
+    pub request_id: Option<Box<str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_cursor: Option<String>,
+    pub current_cursor: Option<Box<str>>,
 }
 
 impl Problem {
     pub fn new(status: StatusCode, code: &str, title: &str, detail: impl Into<String>) -> Self {
         Self {
-            type_url: format!("https://janus.local/problems/{code}"),
-            title: title.into(),
+            type_url: format!("https://janus.local/problems/{code}").into_boxed_str(),
+            title: title.to_owned().into_boxed_str(),
             status: status.as_u16(),
-            code: code.into(),
-            detail: detail.into(),
+            code: code.to_owned().into_boxed_str(),
+            detail: detail.into().into_boxed_str(),
             request_id: None,
             current_cursor: None,
         }
     }
 
     pub fn with_cursor(mut self, cursor: u64) -> Self {
-        self.current_cursor = Some(cursor.to_string());
+        self.current_cursor = Some(cursor.to_string().into_boxed_str());
         self
     }
 
@@ -142,38 +145,38 @@ fn code_status_title(code: &str) -> (StatusCode, &'static str) {
 
 /// Map a `RuntimeError` to a stable public `Problem`. Runtime error codes are
 /// the single source of truth for HTTP status and problem code.
-pub fn map_runtime_error(error: crate::modules::runtime::interface::RuntimeError) -> Problem {
+pub fn map_runtime_error(error: janus_runtime::interface::RuntimeError) -> Problem {
     use codes::*;
     let code = error.code();
     match code {
-        crate::modules::runtime::interface::RuntimeErrorCode::ValidationFailed => {
+        janus_runtime::interface::RuntimeErrorCode::ValidationFailed => {
             Problem::from_code(VALIDATION_FAILED, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::ResourceBusy => {
+        janus_runtime::interface::RuntimeErrorCode::ResourceBusy => {
             Problem::from_code(RESOURCE_BUSY, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::CommandForbidden => {
+        janus_runtime::interface::RuntimeErrorCode::CommandForbidden => {
             Problem::from_code(COMMAND_FORBIDDEN, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::NetworkPolicyDenied => {
+        janus_runtime::interface::RuntimeErrorCode::NetworkPolicyDenied => {
             Problem::from_code(NETWORK_POLICY_DENIED, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::RuntimeUnavailable => {
+        janus_runtime::interface::RuntimeErrorCode::RuntimeUnavailable => {
             Problem::from_code(RUNTIME_UNAVAILABLE, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::JobLost => {
+        janus_runtime::interface::RuntimeErrorCode::JobLost => {
             Problem::from_code(JOB_LOST, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::ServiceLost => {
+        janus_runtime::interface::RuntimeErrorCode::ServiceLost => {
             Problem::from_code(SERVICE_LOST, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::TerminalTicketInvalid => {
+        janus_runtime::interface::RuntimeErrorCode::TerminalTicketInvalid => {
             Problem::from_code(TERMINAL_TICKET_INVALID, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::TerminalScrollbackExpired => {
+        janus_runtime::interface::RuntimeErrorCode::TerminalScrollbackExpired => {
             Problem::from_code(TERMINAL_SCROLLBACK_EXPIRED, error.to_string())
         }
-        crate::modules::runtime::interface::RuntimeErrorCode::TerminalNotWritable => {
+        janus_runtime::interface::RuntimeErrorCode::TerminalNotWritable => {
             Problem::from_code(TERMINAL_NOT_WRITABLE, error.to_string())
         }
     }
@@ -203,7 +206,7 @@ mod tests {
             "session already has a running turn",
         );
         assert_eq!(p.status, StatusCode::CONFLICT.as_u16());
-        assert_eq!(p.code, codes::ACTIVE_TURN_EXISTS);
+        assert_eq!(&*p.code, codes::ACTIVE_TURN_EXISTS);
 
         let p = Problem::from_code(codes::SESSION_NOT_FOUND, "missing");
         assert_eq!(p.status, StatusCode::NOT_FOUND.as_u16());

@@ -1,4 +1,4 @@
-use std::{convert::Infallible, time::Duration};
+﻿use std::{convert::Infallible, time::Duration};
 
 use axum::{
     Extension,
@@ -151,6 +151,6 @@ pub async fn events(
 }
 
 fn with_request(mut problem: Problem, context: &RequestContext) -> Problem {
-    problem.request_id = Some(context.request_id.clone());
+    problem.request_id = Some(context.request_id.clone().into_boxed_str());
     problem
 }

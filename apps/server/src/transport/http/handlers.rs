@@ -1,15 +1,14 @@
-use axum::{
+﻿use axum::{
     Extension, Json,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header::HeaderName},
 };
+use janus_identity::InitializationState;
+use janus_runtime::interface::{DeploymentCapabilityProbe, RuntimeCapabilityEvaluator};
 
 use crate::{
     AppState,
     config::RunMode,
-    modules::identity::interface::InitializationState,
-    modules::runtime::interface::{DeploymentCapabilityProbe, RuntimeCapabilityEvaluator},
-    modules::sessions::interface::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES},
     transport::http::{
         dto::{
             BootstrapData, BootstrapResponse, BootstrapState, DatabaseInfo, EventInfo,
@@ -19,6 +18,7 @@ use crate::{
         request_id::RequestContext,
     },
 };
+use janus_sessions::interface::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES};
 
 pub static X_EVENT_CURSOR: HeaderName = HeaderName::from_static("x-janus-event-cursor");
 
@@ -174,6 +174,6 @@ fn internal_problem(context: &RequestContext, detail: &str) -> Problem {
         "Internal server error",
         detail,
     );
-    problem.request_id = Some(context.request_id.clone());
+    problem.request_id = Some(context.request_id.clone().into_boxed_str());
     problem
 }

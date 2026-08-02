@@ -1,13 +1,13 @@
 //! Session workspace copy lifecycle: create (from Main), delete.
 //!
-//! Session directory layout (`DAT-FS-01`):
+//! Session directory layout:
 //! `data_root/workspaces/sessions/<session-id>/repo/`
 //! Handle: `session:<session-id>` (symmetric to Main `main:<project-id>`).
 //!
 //! Session copies are **git worktrees** of the Main clone, not file-tree
 //! copies. Main is itself a `git clone` result (see `projects::run_clone`), so
 //! `git worktree add` shares Main's `.git` object database and checks out a
-//! working tree in seconds — no recursive file copy, no re-`git init`, and the
+//! working tree in seconds - no recursive file copy, no re-`git init`, and the
 //! Session inherits Main's full history instead of becoming an orphan repo.
 
 use std::process::Command;
@@ -139,7 +139,7 @@ pub fn main_worktree_is_clean(main_repo: &Path) -> anyhow::Result<bool> {
 
 /// Remove the Session workspace tree.
 ///
-/// Tries `git worktree remove` first (run from the worktree itself — any
+/// Tries `git worktree remove` first (run from the worktree itself - any
 /// worktree is a valid git context for `worktree remove`) so Main's
 /// `worktrees/` admin directory stays consistent. Falls back to a plain
 /// recursive delete if the worktree was already pruned or was never registered

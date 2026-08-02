@@ -81,7 +81,10 @@ export function SessionTabView(props: SessionTabViewProps) {
     return isModelStreamOutputDurable(output, durableAssistantRounds()) ? null : output;
   });
   const active = createMemo(() => Boolean(activeTurnId() ?? pendingTurnId()));
-  const queuedTurns = useQueuedTurns(props.sessionId, () => activeTurnId() ?? pendingTurnId() ?? null);
+  const queuedTurns = useQueuedTurns(
+    props.sessionId,
+    () => activeTurnId() ?? pendingTurnId() ?? null,
+  );
 
   async function withFreshSessionVersion<T>(
     command: (version: string) => Promise<T>,
@@ -159,17 +162,10 @@ export function SessionTabView(props: SessionTabViewProps) {
     const status = latestTurn.data?.status;
     const output = modelStreamOutput(props.sessionId(), turnId);
     const hasDurableOutput = isModelStreamOutputDurable(output, durableAssistantRounds());
-    const terminal = [
-      "completed",
-      "failed",
-      "canceled",
-      "interrupted",
-      "handed_off",
-    ].includes(status ?? "");
-    if (
-      hasDurableOutput ||
-      (terminal && output === null)
-    ) {
+    const terminal = ["completed", "failed", "canceled", "interrupted", "handed_off"].includes(
+      status ?? "",
+    );
+    if (hasDurableOutput || (terminal && output === null)) {
       clearModelStreamText(props.sessionId(), turnId);
       clearRetryState(props.sessionId(), turnId);
     }

@@ -17,12 +17,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use janus_source_control::{DiffView, GitLogEntry, GitStatus};
+
 use crate::{
     AppState,
-    adapters::git::{DiffView, GitLogEntry, GitStatus},
-    modules::projects::interface::{
-        GitUpdateConflictView, GitUpdateInput, ProjectsError, ResolveGitUpdateConflictInput,
-    },
     transport::http::{
         auth::{authenticate, authorized},
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -31,6 +29,9 @@ use crate::{
     },
 };
 use janus_infrastructure::id::CorrelationId;
+use janus_projects::interface::{
+    GitUpdateConflictView, GitUpdateInput, ProjectsError, ResolveGitUpdateConflictInput,
+};
 
 // ----- Transport DTOs (adapters::git types do not derive ToSchema) --------
 
@@ -494,7 +495,7 @@ pub async fn git_push(
         &format!("/api/v1/projects/{id}/git/commands/push"),
         body.as_slice(),
     )?;
-    // Resolve the Project's GitHub PAT (if any) inside the Module so private
+    // Resolve the Project's GitHub PAT (if any) inside the capability so private
     // push works without the transport layer ever seeing the secret.
     let operation = state
         .projects()
@@ -659,7 +660,7 @@ pub async fn resolve_update_conflict(
                     .paths
                     .into_iter()
                     .map(
-                        |p| crate::modules::projects::interface::ResolveGitUpdateConflictPath {
+                        |p| janus_projects::interface::ResolveGitUpdateConflictPath {
                             path: p.path,
                             choice: p.choice,
                             edited_text: p.edited_text,

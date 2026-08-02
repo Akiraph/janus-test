@@ -1,4 +1,4 @@
-use std::{io::Read, path::PathBuf, time::Duration};
+﻿use std::{io::Read, path::PathBuf, time::Duration};
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand};

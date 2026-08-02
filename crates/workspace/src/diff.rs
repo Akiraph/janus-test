@@ -1,14 +1,14 @@
 //! Path-level Diff summary between Session and Main manifests.
 //!
-//! M3 only: file-level added / modified / deleted counts + path lists.
-//! No three-way merge, no Apply conditions (`apply_enabled: false` at the HTTP layer).
+//! Reports file-level added, modified, and deleted paths. It does not perform
+//! three-way merge or apply changes; `apply_enabled` remains false.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use super::manifest::{ManifestRoot, file_content_index, is_text_bytes, split_lines};
+use super::manifest::{is_text_bytes, split_lines};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -37,7 +37,7 @@ pub enum DiffLineKind {
     Add,
     Delete,
     /// Collapsed run of unchanged lines between hunks. `text` holds a short label
-    /// like "⋯ 12 lines" and line numbers are omitted.
+    /// like "... 12 lines" and line numbers are omitted.
     Skip,
 }
 
@@ -67,18 +67,11 @@ pub struct DiffSummary {
     pub modified: u32,
     pub deleted: u32,
     pub paths: Vec<DiffPathEntry>,
-    /// Always false in M3; Apply/Sync land in M5.
+    /// Reserved for workflow-controlled Apply/Sync; currently always false.
     pub apply_enabled: bool,
 }
 
-/// Compare two manifests at the file-path level using leaf node hashes.
-pub fn diff_manifests(session: &ManifestRoot, main: &ManifestRoot) -> DiffSummary {
-    let session_files = file_content_index(session);
-    let main_files = file_content_index(main);
-    diff_file_maps(&session_files, &main_files)
-}
-
-/// Session vs Main content-hash maps (path → file node_hash).
+/// Session vs Main content-hash maps (path -> file node_hash).
 pub fn diff_file_maps(
     session: &BTreeMap<String, String>,
     main: &BTreeMap<String, String>,
@@ -137,13 +130,10 @@ const MAX_DIFF_BYTES: usize = 200 * 1024;
 const MAX_DIFF_LINES: usize = 4000;
 /// Unchanged lines kept on each side of a change region.
 const CONTEXT_LINES: usize = 3;
-/// Unchanged runs longer than this collapse into a single `Skip` line.
-const COLLAPSE_THRESHOLD: usize = CONTEXT_LINES * 2 + 1;
-
 /// Build line-level hunks for one file. Returns `(hunks, binary)`.
 ///
-/// - Binary / oversized → empty hunks + `binary: true`.
-/// - Text → one or more hunks with context, long equal spans collapsed via `Skip`.
+/// - Binary / oversized -> empty hunks + `binary: true`.
+/// - Text -> one or more hunks with context, long equal spans collapsed via `Skip`.
 pub fn line_hunks(session_bytes: &[u8], main_bytes: &[u8]) -> (Vec<DiffHunk>, bool) {
     if session_bytes.len() > MAX_DIFF_BYTES || main_bytes.len() > MAX_DIFF_BYTES {
         return (Vec::new(), true);
@@ -173,7 +163,7 @@ enum Op {
     Insert,
 }
 
-/// LCS-based edit script from `old` (main) → `new` (session).
+/// LCS-based edit script from `old` (main) -> `new` (session).
 fn lcs_ops(old: &[&[u8]], new: &[&[u8]]) -> Vec<Op> {
     let n = old.len();
     let m = new.len();
@@ -320,16 +310,11 @@ fn collapse_ops(ops: &[Op], old: &[&[u8]], new: &[&[u8]]) -> Vec<DiffHunk> {
                 i += 1;
             }
             if skipped > 0 {
-                // Only emit Skip when the collapsed region is meaningfully long.
-                // (Always true here because keep marks CONTEXT_LINES; remaining
-                // equals are at least COLLAPSE_THRESHOLD - 2*CONTEXT long, but we
-                // still emit for leading/trailing collapsed spans of any size.)
-                let _ = COLLAPSE_THRESHOLD;
                 lines.push(DiffLine {
                     kind: DiffLineKind::Skip,
                     old_no: None,
                     new_no: None,
-                    text: format!("⋯ {skipped} lines"),
+                    text: format!("... {skipped} lines"),
                 });
             }
         }
@@ -370,7 +355,7 @@ mod tests {
 
     #[test]
     fn line_hunks_marks_change_and_collapses_common() {
-        // 20 shared lines, one middle change — must collapse the bulk.
+        // 20 shared lines, one middle change - must collapse the bulk.
         let mut main = String::new();
         let mut sess = String::new();
         for i in 0..20 {

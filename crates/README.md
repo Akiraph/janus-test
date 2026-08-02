@@ -1,7 +1,61 @@
-# 独立 crate
+# Crate Boundaries
 
-这里放按依赖方向拆出的稳定模块。每个 crate 都应有清楚的接口、独立的测试入口和尽量小的业务依赖；不要为了复用几行代码建立新的共享层，也不要把跨能力工作流塞进基础 crate。
+`crates/` contains technical foundations and capability modules that can be
+compiled and tested along the dependency graph. A split moves ownership and
+`interface.rs` first, then moves implementation. Cross-capability transactions,
+scheduling, recovery, and composition remain in `apps/server/application/`.
 
-拆分应先确认所有权和依赖方向，再移动实现。crate 之间通过公开接口协作，表和跨能力事务仍归属于拥有它们的能力或 `application/`。
+## Current layout
 
-当前 `infrastructure` 是技术基座 crate，承载通用 ID、时钟、SQLite、事务、公开事件、操作日志和 Blob 存储。`workspace` 是第一个独立能力 crate，拥有工作区副本、内容修订、快照、清单、差异和受控文件变更。其他业务模块和工作流继续留在 server，直到它们的接口足够窄、所有权足够稳定再单独拆出。
+| Crate | Current ownership | Dependency direction |
+| --- | --- | --- |
+| `janus-infrastructure` | Generic IDs, clocks, SQLite, transactions, public events, operation journals, and Blob storage | Generic technical libraries only |
+| `janus-workspace` | Main/Session copies, content revisions, snapshots, manifests, diffs, and controlled file mutations | `infrastructure` |
+| `janus-source-control` | Git errors, status/log values, update outcomes, and the `GitRunner` port | Generic serialization and standard future types |
+| `janus-identity` | Single-owner passkeys, recovery grants, and authentication state | `infrastructure` plus WebAuthn implementation |
+| `janus-models` | Provider credentials, model configuration, failover attempts, usage, and stream adapters | `infrastructure` |
+| `janus-runtime` | Runtime configuration, lifecycle state, logs, tickets, and recovery projections | `infrastructure` |
+| `janus-projects` | Project metadata, repository credentials, runtime policy, and Project Git projections | `infrastructure`, `runtime`, `source-control`, `workspace` |
+| `janus-sessions` | Session, Turn, Message, timeline, checkpoint, upload, and attachment projections | `infrastructure`, `workspace` |
+| `janus-execution` | Round, Tool Call, Ask, plan, context, and stream-diagnostic projections | `infrastructure`, `models`, `projects`, `runtime`, `sessions`, `workspace` |
+
+`janus-source-control` is currently at the interface-migration stage. The Git
+process adapter remains in server, and Projects temporarily owns the Git
+projection and conflict tables. Moving those tables and transactions later
+must preserve historical table names, event names, and migration-owner
+normalization.
+
+## Boundary rules
+
+- A capability exposes public behavior only through its own `interface.rs`.
+- A crate writes only tables it owns. Cross-capability writes are composed by an
+  application workflow in a short transaction.
+- Do not add generic repositories, service locators, or a global event bus for
+  small amounts of reuse.
+- Keep dependencies evidence-based. Remove an unused direct dependency before
+  introducing a shared layer for a few lines of code.
+- Do not suppress lint or boundary problems with blanket attributes. Fix the
+  code, narrow the interface, or add a focused test.
+- Applied SQLx migrations are immutable. Historical types and public event
+  names remain compatible during extraction.
+
+## Documentation rules
+
+Each capability README records only maintenance-relevant context: mission,
+observable behavior, invariants, boundaries, temporary compatibility
+conditions, and design decisions. Comments explain behavior causes or external
+constraints; they do not restate the code.
+
+## Verification
+
+```text
+cargo fmt --all -- --check
+cargo check -p janus-infrastructure
+cargo check -p janus-workspace
+cargo check -p janus-source-control
+cargo run -p xtask -- check architecture
+git diff --check
+```
+
+When server wiring or real file/SQLite behavior changes, also verify with the
+compiled server, real SQLite, public HTTP/SSE, and `janus-test`.

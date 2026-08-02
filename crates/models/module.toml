@@ -1,0 +1,14 @@
+name = "models"
+public_root = "interface.rs"
+owned_tables = [
+  "model_providers",
+  "models",
+  "model_failover",
+  "model_recovery_cooldowns",
+  "model_attempts",
+  "model_usage_ledger",
+]
+publishes = ["model_config.changed"]
+allowed_module_dependencies = []
+specs = []
+tests = []

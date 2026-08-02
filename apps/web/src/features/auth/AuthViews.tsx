@@ -7,6 +7,7 @@ import { createSignal, For, Show } from "solid-js";
 import { Button } from "../../components/ui/Button";
 import { NotificationEvent } from "../../components/ui/notifications";
 import {
+  getErrorMessage,
   initializeComplete,
   initializeOptions,
   loginComplete,
@@ -14,7 +15,6 @@ import {
   recoveryComplete,
   recoveryExchange,
   recoveryOptions,
-  getErrorMessage,
 } from "../../lib/api";
 import { authenticationOptions, credentialPayload, registrationOptions } from "../../lib/webauthn";
 import "./auth.css";

@@ -1,5 +1,5 @@
-# 外部适配器
+# External Adapters
 
-这里把模型 Provider、Git、文件系统和本地或容器进程接入能力模块定义的窄接口。适配器可以处理协议、进程和资源限制，但不能决定 Session、Turn 或项目工作流的业务结果，也不能直接写别人的表和公共事件。
+This directory contains deployment-provided implementations: `git.rs` connects the system Git executable, and `runtime/local.rs` connects local processes and terminals. Model Provider and Workspace filesystem interfaces are owned by their capability crates; the server injects an implementation only where deployment needs one.
 
-同一能力需要第二种外部实现时才增加接口；接口应由能力模块拥有，适配器只是实现。真实适配器优先用临时目录、临时仓库和本地进程做契约测试。
+Adapters may handle protocols, processes, paths, and resource limits, but they must not decide Session, Turn, or Project workflow outcomes or write capability tables and public events directly. Do not introduce another adapter trait until a second implementation is required. Contract tests should use temporary directories, repositories, and local processes where possible.

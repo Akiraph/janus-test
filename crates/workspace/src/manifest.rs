@@ -1,8 +1,8 @@
-//! Merkle manifest collection for Managed Content (`DAT-BLOB-02` / `WS-003`).
+//! Merkle manifest collection for managed workspace content.
 //!
 //! Deterministic, version-domain-separated, length-prefixed encoding:
-//! - file node: domain `janus-file-v2` + type + mode + normalized_len + content_hash → node_hash
-//! - dir node:  domain `janus-dir-v1` + sorted (name_len, name, node_type, node_hash)* → node_hash
+//! - file node: domain `janus-file-v2` + type + mode + normalized_len + content_hash -> node_hash
+//! - dir node:  domain `janus-dir-v1` + sorted (name_len, name, node_type, node_hash)* -> node_hash
 //!
 //! `content_hash` is computed over **line-normalized** text: CRLF/CR are
 //! treated equivalently to LF so a Session worktree checkout (LF) and a Main
@@ -10,12 +10,12 @@
 //! Binary files (any NUL byte) hash their raw bytes unchanged. This is what
 //! stops a clean Session copy from showing up as "every file modified" purely
 //! because one side normalized line endings and the other did not.
-//! `blob_sha` still stores the **raw** bytes in CAS (unmodified) — only the
+//! `blob_sha` still stores the **raw** bytes in CAS (unmodified) - only the
 //! content identity used for diffing is normalized.
 //!
 //! Walks the working tree, skipping only `.git` (VCS admin / worktree gitdir
 //! pointer). Janus's own data root must not appear in project trees in the
-//! first place — that is a path-resolution bug, not a skip-list concern.
+//! first place - that is a path-resolution bug, not a skip-list concern.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,7 @@ pub struct ManifestNode {
     pub is_text: bool,
 }
 
-/// Full tree walk result: root hash + every relative path → node metadata.
+/// Full tree walk result: root hash + every relative path -> node metadata.
 #[derive(Debug, Clone)]
 pub struct ManifestRoot {
     pub root_hash: String,
@@ -67,7 +67,8 @@ pub struct ManifestRoot {
 /// Collect a full Merkle manifest under `root`, writing file bytes into `blobs`.
 ///
 /// Skips the `.git` directory/file only. Other ignore rules (gitignore) are not
-/// applied in M3 MVP — documented tradeoff until an `ignore` dependency is added.
+/// applied. Only `.git` is skipped, so callers must provide an appropriate
+/// workspace root rather than relying on Git ignore rules.
 pub async fn collect_manifest(
     root: &Path,
     blobs: &BlobStore,
@@ -147,7 +148,7 @@ async fn collect_dir(
                 );
                 children.insert(name, (NodeKind::File, node_hash));
             }
-            // Symlinks / other types: skipped in M3 MVP (not followed, not hashed).
+            // Symlinks and other special types are skipped rather than followed.
         }
     }
 
@@ -195,10 +196,10 @@ pub fn hash_file_node(mode: u32, bytes: &[u8], is_text: bool) -> String {
     } else {
         hasher.update(bytes);
     }
-    hex::encode(hasher.finalize())
+    format!("{:x}", hasher.finalize())
 }
 
-/// Decide text vs binary the same way git does: any NUL byte → binary.
+/// Decide text vs binary the same way git does: any NUL byte -> binary.
 pub fn is_text_bytes(bytes: &[u8]) -> bool {
     !bytes.contains(&0u8)
 }
@@ -217,7 +218,7 @@ fn hash_normalized_text(hasher: &mut Sha256, bytes: &[u8]) {
 /// treating `\r\n`, `\n`, and `\r` as equivalent line breaks.
 ///
 /// A trailing terminator produces a final empty line so `"a\n"` and `"a"`
-/// remain distinct. `"a\nb\n"` → `["a", "b", ""]`; `"a\nb"` → `["a", "b"]`.
+/// remain distinct. `"a\nb\n"` -> `["a", "b", ""]`; `"a\nb"` -> `["a", "b"]`.
 pub fn split_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     SplitLines {
         bytes,
@@ -261,7 +262,7 @@ impl<'a> Iterator for SplitLines<'a> {
                 };
                 let line = &self.bytes[..idx];
                 self.bytes = &self.bytes[idx + term_len..];
-                // Trailing terminator → final empty line so "a\n" ≠ "a".
+                // Trailing terminator -> final empty line so "a\n" != "a".
                 if self.bytes.is_empty() {
                     self.pending_empty = true;
                 }
@@ -290,7 +291,7 @@ pub fn hash_dir_node(children: &BTreeMap<String, (NodeKind, String)>) -> String 
         write_str(&mut hasher, kind.as_tag());
         write_str(&mut hasher, node_hash);
     }
-    hex::encode(hasher.finalize())
+    format!("{:x}", hasher.finalize())
 }
 
 fn write_domain(hasher: &mut Sha256, domain: &[u8]) {
@@ -302,18 +303,6 @@ fn write_str(hasher: &mut Sha256, value: &str) {
     let bytes = value.as_bytes();
     hasher.update((bytes.len() as u32).to_be_bytes());
     hasher.update(bytes);
-}
-
-/// Build a path → content-hash map used by path-level diff (file leaves only).
-pub fn file_content_index(manifest: &ManifestRoot) -> BTreeMap<RelPath, String> {
-    manifest
-        .nodes
-        .iter()
-        .filter_map(|(path, node)| match node.kind {
-            NodeKind::File => Some((path.clone(), node.node_hash.clone())),
-            NodeKind::Dir => None,
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -1165,7 +1165,7 @@ export interface components {
     /** @enum {string} */
     BootstrapState: "uninitialized" | "initialized";
     /**
-     * @description Result of cancelling a Turn (Stage 4 state machine: `running ->
+     * @description Result of cancelling a Turn (`running ->
      *     canceling -> canceled|interrupted`).
      */
     CancelResult: {
@@ -1245,7 +1245,7 @@ export interface components {
     };
     DataResponse_CancelResult: {
       /**
-       * @description Result of cancelling a Turn (Stage 4 state machine: `running ->
+       * @description Result of cancelling a Turn (`running ->
        *     canceling -> canceled|interrupted`).
        */
       data: {
@@ -1852,8 +1852,7 @@ export interface components {
     };
     /**
      * @description Operation status. `needs_attention` means execution stopped at a decidable
-     *     state requiring an explicit follow-up command (e.g. a Git Update Conflict),
-     *     not "still running" or "unknown failure".
+     *     state that requires an explicit follow-up command, not an unknown failure.
      * @enum {string}
      */
     OperationStatus: "queued" | "running" | "succeeded" | "failed" | "canceled" | "needs_attention";

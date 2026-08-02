@@ -7,25 +7,22 @@ use std::{
 };
 
 use futures_util::future::BoxFuture;
+use janus_infrastructure::{
+    id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
+    secrets::random_token,
+    shell::{bash_program, bash_search_path, decode_process_output},
+};
+use janus_runtime::interface::{
+    CommandKind, ExecutionMode, ExecutionResult, ExecutionSpec, ExecutorKind,
+    ExecutorProcessHandle, ExecutorRuntimeHandle, ExitSummary, JobSpec, LogChannel, LogRetention,
+    LogStore, NetworkPolicy, ProcessCompletion, ResourceUsage, RuntimeError, RuntimeExecutor,
+    RuntimeSpec, ServiceSpec, TerminalSignal, TerminalSize, TerminalSpec,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     sync::{RwLock, mpsc, oneshot, watch},
     task::JoinHandle,
-};
-
-use crate::{
-    modules::runtime::interface::{
-        CommandKind, ExecutionMode, ExecutionResult, ExecutionSpec, ExecutorKind,
-        ExecutorProcessHandle, ExecutorRuntimeHandle, ExitSummary, JobSpec, LogChannel,
-        LogRetention, LogStore, NetworkPolicy, ProcessCompletion, ResourceUsage, RuntimeError,
-        RuntimeExecutor, RuntimeSpec, ServiceSpec, TerminalSignal, TerminalSize, TerminalSpec,
-    },
-    platform::{
-        id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
-        secret::random_token,
-        shell::{bash_program, bash_search_path, decode_process_output},
-    },
 };
 
 const OUTPUT_SUMMARY_BYTES: usize = 1024 * 1024;
@@ -69,6 +66,34 @@ struct PreparedCommand {
     command: Command,
     secret_values: Vec<String>,
     process_group_marker: Option<PathBuf>,
+}
+
+struct ProcessMonitor {
+    child: Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    commands: mpsc::Receiver<ProcessCommand>,
+    completion: watch::Sender<Option<ProcessCompletion>>,
+    stdout_task: JoinHandle<Vec<u8>>,
+    stderr_task: JoinHandle<Vec<u8>>,
+    logs: LogStore,
+    log_stream_id: LogStreamId,
+    pid: u32,
+    process_group_id: Option<u32>,
+    started: Instant,
+}
+
+struct TerminalMonitor {
+    child: Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    commands: mpsc::Receiver<ProcessCommand>,
+    completion: watch::Sender<Option<ProcessCompletion>>,
+    stdout_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
+    logs: LogStore,
+    scrollback_stream_id: LogStreamId,
+    pid: u32,
+    process_group_id: Option<u32>,
+    started: Instant,
 }
 
 impl LocalExecutor {
@@ -223,11 +248,11 @@ impl LocalExecutor {
         let (control, commands) = mpsc::channel(8);
         let (completion_tx, completion) = watch::channel(None);
         let logs = self.inner.logs.clone();
-        tokio::spawn(manage_process(
+        tokio::spawn(manage_process(ProcessMonitor {
             child,
             stdin,
             commands,
-            completion_tx,
+            completion: completion_tx,
             stdout_task,
             stderr_task,
             logs,
@@ -235,7 +260,7 @@ impl LocalExecutor {
             pid,
             process_group_id,
             started,
-        ));
+        }));
         Ok(ManagedProcess {
             nonce: runtime.nonce,
             process_identity: pid.to_string(),
@@ -358,19 +383,19 @@ impl LocalExecutor {
         let (completion_tx, completion) = watch::channel(None);
         let logs = self.inner.logs.clone();
         let started = Instant::now();
-        tokio::spawn(manage_terminal(
+        tokio::spawn(manage_terminal(TerminalMonitor {
             child,
             stdin,
             commands,
-            completion_tx,
+            completion: completion_tx,
             stdout_task,
             stderr_task,
             logs,
             scrollback_stream_id,
             pid,
-            None,
+            process_group_id: None,
             started,
-        ));
+        }));
         Ok(ManagedProcess {
             nonce: runtime.nonce,
             process_identity: pid.to_string(),
@@ -793,20 +818,20 @@ impl RuntimeExecutor for LocalExecutor {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn manage_process(
-    mut child: Child,
-    mut stdin: Option<tokio::process::ChildStdin>,
-    mut commands: mpsc::Receiver<ProcessCommand>,
-    completion: watch::Sender<Option<ProcessCompletion>>,
-    stdout_task: JoinHandle<Vec<u8>>,
-    stderr_task: JoinHandle<Vec<u8>>,
-    logs: LogStore,
-    log_stream_id: LogStreamId,
-    pid: u32,
-    process_group_id: Option<u32>,
-    started: Instant,
-) {
+async fn manage_process(input: ProcessMonitor) {
+    let ProcessMonitor {
+        mut child,
+        mut stdin,
+        mut commands,
+        completion,
+        stdout_task,
+        stderr_task,
+        logs,
+        log_stream_id,
+        pid,
+        process_group_id,
+        started,
+    } = input;
     let status = loop {
         tokio::select! {
             result = child.wait() => break result.ok(),
@@ -853,20 +878,20 @@ async fn manage_process(
 /// long-lived and exit happens via normal `/exit` input, `Ctrl-D`, or a
 /// `Terminate` command. Output readers do not accumulate bytes; the scrollback
 /// log stream is the durable record.
-#[allow(clippy::too_many_arguments)]
-async fn manage_terminal(
-    mut child: Child,
-    mut stdin: Option<tokio::process::ChildStdin>,
-    mut commands: mpsc::Receiver<ProcessCommand>,
-    completion: watch::Sender<Option<ProcessCompletion>>,
-    stdout_task: JoinHandle<()>,
-    stderr_task: JoinHandle<()>,
-    logs: LogStore,
-    scrollback_stream_id: LogStreamId,
-    pid: u32,
-    process_group_id: Option<u32>,
-    started: Instant,
-) {
+async fn manage_terminal(input: TerminalMonitor) {
+    let TerminalMonitor {
+        mut child,
+        mut stdin,
+        mut commands,
+        completion,
+        stdout_task,
+        stderr_task,
+        logs,
+        scrollback_stream_id,
+        pid,
+        process_group_id,
+        started,
+    } = input;
     let status = loop {
         tokio::select! {
             result = child.wait() => break result.ok(),
@@ -1073,11 +1098,11 @@ fn shell_command(script: &str) -> Command {
 }
 
 fn delegated_cli_command(
-    cli: crate::modules::runtime::interface::DelegatedCliKind,
-    session_id: Option<crate::platform::id::CliSessionId>,
+    cli: janus_runtime::interface::DelegatedCliKind,
+    session_id: Option<janus_infrastructure::id::CliSessionId>,
     input: &str,
 ) -> Command {
-    use crate::modules::runtime::interface::DelegatedCliKind;
+    use janus_runtime::interface::DelegatedCliKind;
     match cli {
         DelegatedCliKind::ClaudeCode => {
             let mut command = Command::new("claude");
@@ -1276,19 +1301,18 @@ fn elapsed_millis(started: Instant) -> u64 {
 mod tests {
     use std::{collections::BTreeMap, process::Stdio};
 
+    use anyhow::Context;
+    use janus_runtime::interface::{
+        ExecutionEnvironment, ExecutionSpec, ExecutorKind, JobSpec, LogChannel, LogCursor,
+        LogOwnerKind, LogStore, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
+        RuntimeError, RuntimeExecutor, RuntimeSpec, ValidatedCommand,
+    };
     use tempfile::TempDir;
     use tokio::process::Command;
 
     use super::LocalExecutor;
-    use crate::{
-        modules::runtime::interface::{
-            ExecutionEnvironment, ExecutionSpec, ExecutorKind, JobSpec, LogChannel, LogCursor,
-            LogOwnerKind, LogStore, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
-            RuntimeError, RuntimeExecutor, RuntimeSpec, ValidatedCommand,
-        },
-        platform::id::{JobId, SessionId, ToolCallId, TurnId},
-    };
     use janus_infrastructure::database::Database;
+    use janus_infrastructure::id::{JobId, SessionId, ToolCallId, TurnId};
 
     fn limits(timeout_ms: u64) -> ResourceLimits {
         ResourceLimits {
@@ -1309,10 +1333,10 @@ mod tests {
         let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
         let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
-        let runtime_id = crate::platform::id::RuntimeId::new();
+        let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            crate::modules::runtime::interface::RuntimeScope::session(SessionId::new()),
+            janus_runtime::interface::RuntimeScope::session(SessionId::new()),
             ExecutorKind::Local,
             workspace,
             limits(5_000),
@@ -1374,11 +1398,11 @@ mod tests {
         let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
         let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
-        let runtime_id = crate::platform::id::RuntimeId::new();
+        let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let session_id = SessionId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            crate::modules::runtime::interface::RuntimeScope::session(session_id),
+            janus_runtime::interface::RuntimeScope::session(session_id),
             ExecutorKind::Local,
             workspace,
             limits(30_000),
@@ -1421,7 +1445,8 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
-        .await??;
+        .await
+        .context("wait for descendant PID in the job log")??;
         assert!(process_exists(child_pid).await);
 
         executor
@@ -1432,15 +1457,16 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         })
-        .await?;
+        .await
+        .context("wait for descendant process cleanup")?;
         Ok(())
     }
 
     fn execution(
-        runtime_id: crate::platform::id::RuntimeId,
+        runtime_id: janus_infrastructure::id::RuntimeId,
         script: &str,
         timeout_ms: u64,
-    ) -> Result<ExecutionSpec, crate::modules::runtime::interface::RuntimeError> {
+    ) -> Result<ExecutionSpec, janus_runtime::interface::RuntimeError> {
         ExecutionSpec::new(
             runtime_id,
             RelativeWorkingDirectory::new(".")?,
@@ -1475,7 +1501,7 @@ mod tests {
 
     #[cfg(windows)]
     async fn process_exists(pid: u32) -> bool {
-        let Some(program) = crate::platform::shell::bash_program() else {
+        let Some(program) = janus_infrastructure::shell::bash_program() else {
             return false;
         };
         // Git Bash reports MSYS PIDs, which are not the same namespace as

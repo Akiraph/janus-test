@@ -115,7 +115,7 @@ export function ProjectsOverview() {
         await refresh();
       } catch (error) {
         if (!cancelled) {
-      notify(getErrorMessage(error, "Could not poll operation"), {
+          notify(getErrorMessage(error, "Could not poll operation"), {
             variant: "danger",
           });
         }
@@ -167,9 +167,7 @@ export function ProjectsOverview() {
     <section class="projects" aria-labelledby="workspace-title">
       <NotificationEvent
         message={
-          projects.isError
-            ? getErrorMessage(projects.error, "Failed to load projects")
-            : null
+          projects.isError ? getErrorMessage(projects.error, "Failed to load projects") : null
         }
         variant="danger"
         action={{ label: "Retry", onClick: () => void projects.refetch() }}

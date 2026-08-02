@@ -1,5 +1,7 @@
-# 工作流
+# Workflows
 
-这里放需要协调两个或更多能力的用例，例如创建会话、删除资源、推进执行和启动恢复。工作流负责顺序、事务边界、重试入口和恢复策略，但不拥有别人的持久状态，也不应把所有能力重新包成一个万能接口。
+`Application` is the server-internal interface for cross-capability workflows. It holds capability interfaces and the `ExecutionCoordinator`, then exposes use cases such as posting messages, settling Asks, retrying models, and creating Project terminals. Its dependency accessors are crate-private and exist only for workflows, workers, and recovery.
 
-外部模型、文件、Git、网络和进程操作必须在短事务之外执行；结果通过幂等命令回到拥有状态的能力。所有 Turn 唤醒和阻塞处理进入同一个 execution coordinator，HTTP、定时器和 Runtime 回调不能各自复制调度逻辑。
+Workflows own ordering, transaction boundaries, idempotent retry entry points, startup recovery, and resource cleanup, but never capability tables. External model, file, Git, network, and process operations run outside short database transactions; their results return through idempotent capability commands.
+
+Every Turn wake-up and blocking transition enters the same `ExecutionCoordinator`. HTTP, timers, and Runtime callbacks may be different triggers, but they must not duplicate scheduling logic. Add a cross-capability rule here first, then decide whether the rule actually belongs in a capability crate.

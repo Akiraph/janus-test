@@ -591,9 +591,7 @@ function AssistantOutput(props: { text: string; provisional?: boolean }) {
         aria-hidden="true"
       />
       <div class="session-message__body">
-        <Show when={props.text}>
-          {(text) => <MarkdownOutput text={text()} />}
-        </Show>
+        <Show when={props.text}>{(text) => <MarkdownOutput text={text()} />}</Show>
       </div>
     </div>
   );

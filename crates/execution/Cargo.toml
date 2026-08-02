@@ -1,0 +1,26 @@
+[package]
+name = "janus-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+janus-infrastructure = { path = "../infrastructure" }
+janus-models = { path = "../models" }
+janus-projects = { path = "../projects" }
+janus-runtime = { path = "../runtime" }
+janus-sessions = { path = "../sessions" }
+janus-workspace = { path = "../workspace" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

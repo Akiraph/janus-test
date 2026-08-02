@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, process::Command, time::Duration};
+﻿use std::{net::SocketAddr, path::PathBuf, process::Command, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -114,7 +114,7 @@ async fn public_clone_reaches_ready_and_exposes_files_and_git() -> anyhow::Resul
     let remote = make_public_repo()?;
     let data_root = TempDir::new()?;
     let state = AppState::initialize(test_config(data_root.path().into())).await?;
-    workers::spawn(state.clone());
+    workers::spawn(state.application().clone());
     let app = router(state.clone());
 
     let remote_url = remote
@@ -287,7 +287,7 @@ async fn git_update_conflict_can_be_resolved() -> anyhow::Result<()> {
     let remote = make_public_repo()?;
     let data_root = TempDir::new()?;
     let state = AppState::initialize(test_config(data_root.path().into())).await?;
-    workers::spawn(state.clone());
+    workers::spawn(state.application().clone());
     let app = router(state.clone());
 
     let remote_url = remote

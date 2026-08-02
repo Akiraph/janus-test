@@ -1,0 +1,21 @@
+[package]
+name = "janus-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+janus-infrastructure = { path = "../infrastructure" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+url.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+webauthn-rs = { version = "=0.6.1-dev", default-features = false, features = ["danger-allow-state-serialisation"] }
+
+[lints]
+workspace = true

@@ -10,12 +10,6 @@ import { getErrorMessage, getFileContentText, getFileMeta, saveFileText } from "
 import type { FileDocument } from "./workspaceState";
 import "./files.css";
 
-/**
- * Controlled single-file editor. The ProjectPage owns the tab store; this
- * component renders one file tab's surface and reports draft/save mutations
- * through `onPatch`. Draft state lives in the owned tab so switching or
- * closing tabs never loses unsaved input.
- */
 interface FileEditorProps {
   projectId: () => string | undefined;
   mainRevision: () => string | null;

@@ -75,10 +75,9 @@ export class ApiError extends Error {
 export function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) {
     const detail = error.message.trim();
-    const metadata = [
-      error.code,
-      error.requestId ? `request ${error.requestId}` : null,
-    ].filter((value): value is string => Boolean(value));
+    const metadata = [error.code, error.requestId ? `request ${error.requestId}` : null].filter(
+      (value): value is string => Boolean(value),
+    );
     if (detail && metadata.length > 0) {
       return `${detail} (${metadata.join(", ")})`;
     }
@@ -880,11 +879,10 @@ async function toApiError(response: Response): Promise<ApiError> {
     | { detail?: string; title?: string; code?: string; request_id?: string | null }
     | undefined;
   const message = value?.detail ?? value?.title ?? value?.code;
-  return new ApiError(
-    response.status,
-    message ?? `Janus returned ${response.status}`,
-    { code: value?.code, requestId: value?.request_id },
-  );
+  return new ApiError(response.status, message ?? `Janus returned ${response.status}`, {
+    code: value?.code,
+    requestId: value?.request_id,
+  });
 }
 
 function hasData(value: unknown): value is { data: unknown } {

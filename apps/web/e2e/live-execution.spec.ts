@@ -58,7 +58,7 @@ test.afterAll(async () => {
   await live?.stop();
 });
 
-test("a browser message completes through the live supervisor", async ({ page }) => {
+test("a browser message completes through live execution", async ({ page }) => {
   test.setTimeout(90_000);
 
   await page.goto(`/projects/${live.projectId}?view=sessions`, {

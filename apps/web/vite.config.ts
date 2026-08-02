@@ -24,8 +24,8 @@ export default defineConfig({
       clientFiles: [
         "./src/main.tsx",
         "./src/app/App.tsx",
-        "./src/pages/ProjectsPage.tsx",
-        "./src/pages/ProjectPage.tsx",
+        "./src/features/projects/ProjectsOverview.tsx",
+        "./src/features/projects/ProjectWorkspace.tsx",
       ],
     },
   },

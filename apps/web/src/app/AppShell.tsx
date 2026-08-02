@@ -9,10 +9,10 @@ import type { JSX } from "solid-js";
 import { Show, Suspense } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
 import { type TabItem, Tabs } from "../components/ui/Tabs";
+import { LoginView, SetupView } from "../features/auth/AuthViews";
 import { IdeShellScaffold } from "../features/projects/workspace/IdeShellScaffold";
 import { useBootstrap, useMe } from "../lib/queries";
 import { useEventStream } from "../lib/useEventStream";
-import { LoginPage, SetupPage } from "../pages/AuthPages";
 import "./app.css";
 
 const MODE_TABS: TabItem[] = [
@@ -57,22 +57,19 @@ export function AppShell(props: AppShellProps) {
   // inline route-loading marker while chunks/queries resolve, and mode
   // selection just re-runs the instant bootstrap lands.
   if (bootstrap.data?.data.state === "uninitialized" && !bootstrap.data?.data.development_auth)
-    return <SetupPage />;
+    return <SetupView />;
   if (
     bootstrap.data?.data.state === "initialized" &&
     me.isError &&
     !bootstrap.data?.data.development_auth
   )
-    return <LoginPage />;
+    return <LoginView />;
 
   return (
     <Show
       when={!isImmersive()}
       fallback={
         <main class="home-route home-route--immersive">
-          {/* ProjectPage is lazy + its createQueries suspend on cache miss.
-              Fallback must keep the IDE chrome (rail/sidebar/topbar), not a bare
-              spinner — otherwise every session open looks like a full reload. */}
           <Suspense fallback={<IdeShellScaffold />}>{props.children}</Suspense>
         </main>
       }

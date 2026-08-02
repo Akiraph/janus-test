@@ -1496,12 +1496,55 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "janus-infrastructure"
+name = "janus-execution"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
+ "janus-infrastructure",
+ "janus-models",
+ "janus-projects",
+ "janus-runtime",
+ "janus-sessions",
+ "janus-workspace",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "janus-identity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "janus-infrastructure",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.19",
+ "url",
+ "utoipa",
+ "uuid",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "janus-infrastructure"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
  "fs2",
+ "rand 0.9.5",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1513,6 +1556,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "janus-models"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "futures-util",
+ "janus-infrastructure",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.19",
+ "url",
+ "utoipa",
+]
+
+[[package]]
+name = "janus-projects"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "janus-infrastructure",
+ "janus-runtime",
+ "janus-source-control",
+ "janus-workspace",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.19",
+ "tokio",
+ "url",
+ "utoipa",
+]
+
+[[package]]
+name = "janus-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "futures-util",
+ "janus-infrastructure",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "utoipa",
+]
+
+[[package]]
 name = "janus-server"
 version = "0.1.0"
 dependencies = [
@@ -1520,18 +1617,22 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
- "chacha20poly1305",
  "chrono",
  "clap",
- "fs2",
  "futures-util",
  "hex",
  "http",
+ "janus-execution",
+ "janus-identity",
  "janus-infrastructure",
+ "janus-models",
+ "janus-projects",
+ "janus-runtime",
+ "janus-sessions",
+ "janus-source-control",
  "janus-workspace",
  "rand 0.9.5",
  "reqwest",
- "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1544,8 +1645,28 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "utoipa",
- "uuid",
- "webauthn-rs",
+]
+
+[[package]]
+name = "janus-sessions"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "janus-infrastructure",
+ "janus-workspace",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.19",
+ "utoipa",
+]
+
+[[package]]
+name = "janus-source-control"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -1568,7 +1689,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
- "hex",
  "janus-infrastructure",
  "serde",
  "serde_json",

@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
+﻿use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
-pub use crate::modules::runtime::interface::{
+pub use janus_runtime::interface::{
     CapabilityReason, CapabilityScope, CapabilityState, RuntimeCapability, RuntimeCapabilityId,
 };
 

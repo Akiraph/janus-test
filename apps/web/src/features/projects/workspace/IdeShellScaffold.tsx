@@ -6,18 +6,6 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
 import TerminalSquare from "lucide-solid/icons/terminal-square";
 
-/**
- * Empty-but-mounted IDE shell shown while the project page's queries are
- * suspended (SolidJS resource pending on first fetch / after a cache miss).
- *
- * This is the load-bearing fix for "the whole workspace vanishes when I click
- * a session": createQuery uses createResource, which suspends to the nearest
- * <Suspense> boundary. Without this scaffold that boundary was AppShell's, so
- * any session-switch that hit a cache miss replaced the entire ProjectPage
- * (activity rail, sidebar, tab strip — all of it) with a spinner. Putting a
- * Suspense boundary here with this scaffold as fallback keeps the workspace
- * chrome permanently visible; only the main-area surface shows a spinner.
- */
 export function IdeShellScaffold() {
   return (
     <section class="project-page project-page--ide" aria-busy="true">

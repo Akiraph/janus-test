@@ -1,22 +1,17 @@
-//! HTTP transport for Sessions (M3 Stage 5 minimal surface).
+//! HTTP transport for the Sessions capability.
 
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
+use janus_infrastructure::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId, UploadId};
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
     AppState,
     application::session_flow::PostSessionMessage,
-    modules::sessions::interface::{
-        AttachmentView, CancelResult, MAX_ATTACHMENT_BYTES, MessageRouteResult, QueuedTurnItem,
-        SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage,
-        TurnSummary,
-    },
-    platform::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId},
     transport::http::{
         auth::authenticate,
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -27,6 +22,11 @@ use crate::{
 };
 use janus_infrastructure::{
     id::CorrelationId, managed_storage::BlobReference, operations::OperationView,
+};
+use janus_sessions::interface::{
+    AttachmentView, CancelResult, MAX_ATTACHMENT_BYTES, MessageRouteResult, QueuedTurnItem,
+    SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage, TurnSummary,
+    UploadAttachmentInput,
 };
 
 #[derive(Debug, Deserialize)]
@@ -49,8 +49,8 @@ pub struct ContextUsageView {
     pub created_at: String,
 }
 
-impl From<crate::modules::execution::interface::ContextUsageView> for ContextUsageView {
-    fn from(value: crate::modules::execution::interface::ContextUsageView) -> Self {
+impl From<janus_execution::interface::ContextUsageView> for ContextUsageView {
+    fn from(value: janus_execution::interface::ContextUsageView) -> Self {
         Self {
             estimated_input_tokens: value.estimated_input_tokens,
             context_limit: value.context_limit,
@@ -175,7 +175,7 @@ pub async fn create_session(
         body.as_slice(),
     )?;
     let data = crate::application::lifecycle::request_session_creation(
-        &state,
+        state.application(),
         &auth.owner_id,
         project_id,
         input.title,
@@ -227,6 +227,7 @@ pub async fn session_context(
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
     let data = state
+        .application()
         .session_context_usage(session_id)
         .await
         .map_err(sessions_problem)?
@@ -265,7 +266,7 @@ pub async fn delete_session(
         "request_id": context.request_id,
     });
     let data = crate::application::lifecycle::request_session_deletion(
-        &state,
+        state.application(),
         session_id,
         expected_version,
         actor,
@@ -297,6 +298,7 @@ pub async fn post_message(
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
     let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
     let data = state
+        .application()
         .post_session_message(PostSessionMessage {
             owner_id: &auth.owner_id,
             session_id,
@@ -363,7 +365,7 @@ pub async fn upload_attachment(
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .unwrap_or("application/octet-stream");
-    let upload_id = crate::platform::id::UploadId::new();
+    let upload_id = UploadId::new();
     let attachment_id = AttachmentId::new();
     let reference = BlobReference::new(
         "sessions",
@@ -381,16 +383,16 @@ pub async fn upload_attachment(
         })?;
     let attachment = match state
         .sessions()
-        .create_upload_attachment(
-            &auth.owner_id,
+        .create_upload_attachment(UploadAttachmentInput {
+            owner_id: &auth.owner_id,
             session_id,
             upload_id,
             attachment_id,
             name,
             mime,
-            body.len() as u64,
-            blob_sha.as_str(),
-        )
+            byte_size: body.len() as u64,
+            blob_sha: blob_sha.as_str(),
+        })
         .await
     {
         Ok(attachment) => attachment,
@@ -516,6 +518,7 @@ pub async fn get_turn(
         .parse()
         .map_err(|_| Problem::from_code(codes::RESOURCE_NOT_FOUND, "invalid turn id"))?;
     let data = state
+        .application()
         .turn_summary(session_id, turn_id)
         .await
         .map_err(sessions_problem)?;
@@ -621,6 +624,7 @@ pub async fn cancel_turn(
     });
     let reason = body.reason.as_deref().unwrap_or("user_cancel");
     let data = state
+        .application()
         .cancel_active_turn(
             session_id,
             turn_id,
@@ -657,6 +661,7 @@ pub async fn answer_ask(
         "request_id": context.request_id,
     });
     let (turn_id, route_or_status, session_version) = state
+        .application()
         .answer_ask(&auth.owner_id, ask_id, &body.answer, actor)
         .await
         .map_err(sessions_problem)?;
@@ -695,6 +700,7 @@ pub async fn retry_model(
         .await
         .map_err(sessions_problem)?;
     let scheduled = state
+        .application()
         .retry_waiting_model(turn_id)
         .await
         .map_err(sessions_problem)?;

@@ -133,7 +133,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
     } catch (error) {
       // Session create/delete are sidebar actions — failures surface as a
       // transient toast, not a red block that occupies the session list.
-        notify(getErrorMessage(error, "Failed to create session"), {
+      notify(getErrorMessage(error, "Failed to create session"), {
         variant: "danger",
       });
     } finally {
@@ -165,7 +165,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
         }
       })();
     } catch (error) {
-        notify(getErrorMessage(error, "Failed to delete session"), {
+      notify(getErrorMessage(error, "Failed to delete session"), {
         variant: "danger",
       });
     } finally {

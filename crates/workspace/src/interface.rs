@@ -1,10 +1,8 @@
-//! Public workspace propagation boundary.
+//! Public Workspace capability boundary.
 //!
-//! M2 delivered Main copies + revision identity. M3 Stage 1 adds Session copies,
-//! full Merkle manifest collection (`manifest_root_hash`), path-level Diff summary,
-//! and Agent file mutations that advance Session Content Revisions.
-//!
-//! Apply/Sync execution, three-way merge, and external file watchers remain M4/M5.
+//! Owns copy lifecycle, content revision identity, manifests, diffs, and
+//! controlled file mutations. Apply/Sync orchestration and external watchers
+//! remain workflow responsibilities.
 
 use std::{
     collections::HashMap,
@@ -25,7 +23,7 @@ use janus_infrastructure::managed_storage::BlobStore;
 use super::diff::DiffSummary;
 pub use super::diff::{DiffLineKind, line_hunks};
 use super::manifest::{ManifestRoot, collect_manifest as walk_manifest};
-use super::path::{PathError, validate_workspace_path};
+pub use super::path::{PathError, validate_workspace_path};
 use super::session_copy::{
     create_session_worktree, main_repo_abs, main_worktree_is_clean, remove_session_tree,
     session_managed_dir, session_repo_abs,
@@ -132,6 +130,8 @@ fn cache_head_manifest(head: &str, manifest: &ManifestRoot) {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
     {
+        // This is an optimization only: a bounded cache prevents repeated
+        // clean-head scans without making revision correctness depend on it.
         if manifests.len() >= 16 && !manifests.contains_key(head) {
             manifests.clear();
         }
@@ -290,8 +290,8 @@ impl WorkspaceInterface {
 
     /// Create the Main workspace copy for a project and its first Content
     /// Revision. Idempotent: if the copy already exists, the existing revision
-    /// is returned. M2 leaves `manifest_root_hash` NULL for Main; Session copies
-    /// always populate it (see [`Self::ensure_session_copy`]).
+    /// is returned. Main revisions leave `manifest_root_hash` NULL; Session
+    /// revisions always populate it (see [`Self::ensure_session_copy`]).
     pub async fn ensure_main_copy(
         &self,
         project_id: impl Display,
@@ -369,7 +369,7 @@ impl WorkspaceInterface {
     }
 
     /// Advance a copy to a new revision without collecting a Merkle root
-    /// (Main editor path from M2). Prefer [`Self::apply_file_mutation`] for
+    /// (Main editor path). Prefer [`Self::apply_file_mutation`] for
     /// Session tool writes so `manifest_root_hash` is populated.
     pub async fn bump_revision(
         &self,
@@ -456,7 +456,7 @@ impl WorkspaceInterface {
         let session_abs = session_repo_abs(&self.data_root, &session_id);
         let main_abs = main_repo_abs(&self.data_root, &main_managed_dir);
 
-        // Session copy is a git worktree of the Main clone — shared .git object
+        // Session copy is a git worktree of the Main clone - shared .git object
         // store, detached-HEAD checkout at Main's current tree. No file copy,
         // no re-init; the Session inherits Main's history.
         let main_for_copy = main_abs.clone();
@@ -580,8 +580,8 @@ impl WorkspaceInterface {
     /// ABA: even if content returns to a previous root hash, a new
     /// `revision_id` is always allocated (monotonic identity).
     ///
-    /// M3 MVP uses full rescan after every mutation (documented tradeoff;
-    /// incremental ancestor rehash is a later optimization).
+    /// The current implementation uses a full rescan after every mutation;
+    /// incremental ancestor rehashing is an internal optimization left for later.
     pub async fn apply_file_mutation(
         &self,
         handle: &WorkspaceHandle,
@@ -677,6 +677,9 @@ impl WorkspaceInterface {
             }
         }
 
+        // The filesystem mutation happens before the short revision transaction.
+        // If the expected revision loses a race, bytes stay on disk but the
+        // identity does not advance; callers must re-read before retrying.
         let manifest = hash_working_tree(&root)
             .await
             .map_err(WorkspaceError::Internal)?;

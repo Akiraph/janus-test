@@ -9,7 +9,7 @@
 //! `API-COND-01` requires mutating single-resource requests to send `If-Match`
 //! with the resource's opaque `version`. A missing header yields
 //! `428 PRECONDITION_REQUIRED`; the actual mismatch (`412
-//! RESOURCE_VERSION_MISMATCH`) is surfaced by the Module when its optimistic
+//! RESOURCE_VERSION_MISMATCH`) is surfaced by the capability when its optimistic
 //! update affects zero rows.
 
 use axum::{
@@ -119,7 +119,6 @@ pub fn idempotency_request(
 /// Require an `Idempotency-Key` header. Returns the parsed `IdempotencyRequest`
 /// on success, or a `422` Problem explaining that the key is required for the
 /// command per `API-IDEM-01`.
-#[allow(clippy::result_large_err)]
 pub fn require_idempotency(
     headers: &HeaderMap,
     owner_id: &str,
@@ -143,7 +142,6 @@ pub fn require_idempotency(
 /// are stripped. An empty or missing header yields a `428
 /// PRECONDITION_REQUIRED` Problem so the client re-reads the resource and
 /// retries with its current `version`.
-#[allow(clippy::result_large_err)]
 pub fn if_match_version(headers: &HeaderMap) -> Result<String, Problem> {
     let raw = headers
         .get(IF_MATCH)

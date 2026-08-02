@@ -7,15 +7,11 @@
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context as _;
+use janus_infrastructure::id::{ProjectId, RuntimeId, TerminalId};
+use janus_runtime::interface::*;
 use janus_server::{
     AppState,
     config::{Config, RunMode},
-    modules::runtime::interface::{
-        ExecutionEnvironment, ExecutorKind, LogCursor, NetworkPolicy, RelativeWorkingDirectory,
-        ResourceLimits, RuntimeError, RuntimeScope, RuntimeSpec, RuntimeStatus, TerminalSignal,
-        TerminalSize, TerminalSpec, TerminalStatus,
-    },
-    platform::id::{ProjectId, RuntimeId, TerminalId},
 };
 use tempfile::TempDir;
 
@@ -135,7 +131,7 @@ async fn terminal_roundtrip_creates_issues_consumes_writes_and_closes() -> anyho
     // Write input and observe echo in the scrollback stream.
     state
         .runtime()
-        .write_terminal_input(terminal_id, b"printf ready\\n\nexit 0\n".to_vec())
+        .write_terminal_input(terminal_id, b"printf ready\\n\n".to_vec())
         .await
         .context("write input")?;
     let echoed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -363,10 +359,8 @@ async fn project_owner_terminal_persists_and_lists() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn terminal_ticket_request(
-    id: TerminalId,
-) -> janus_server::modules::runtime::interface::TerminalTicketRequest {
-    use janus_server::modules::runtime::interface::TerminalTicketRequest;
+fn terminal_ticket_request(id: TerminalId) -> janus_runtime::interface::TerminalTicketRequest {
+    use janus_runtime::interface::TerminalTicketRequest;
     TerminalTicketRequest {
         terminal_id: id,
         actor_id: "owner".into(),

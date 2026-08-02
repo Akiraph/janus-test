@@ -1,34 +1,37 @@
-import { Route, Router } from "@solidjs/router";
+import { Route, Router, useParams } from "@solidjs/router";
 import { lazy } from "solid-js";
 import { AppShell } from "./AppShell";
 
-const ModelsPage = lazy(() =>
-  import("../pages/ModelsPage").then((m) => ({ default: m.ModelsPage })),
+const ModelsRoute = lazy(() =>
+  import("../features/models/ModelsSettings").then((m) => ({ default: m.ModelsSettings })),
 );
-const SecurityPage = lazy(() =>
-  import("../pages/SecurityPage").then((m) => ({ default: m.SecurityPage })),
+const SecurityRoute = lazy(() =>
+  import("../features/security/SecuritySettings").then((m) => ({ default: m.SecuritySettings })),
 );
-const SystemPage = lazy(() =>
-  import("../pages/SystemPage").then((m) => ({ default: m.SystemPage })),
+const SystemRoute = lazy(() =>
+  import("../features/system/SystemStatus").then((m) => ({ default: m.SystemStatus })),
 );
-const ProjectsPage = lazy(() =>
-  import("../pages/ProjectsPage").then((m) => ({ default: m.ProjectsPage })),
+const ProjectsRoute = lazy(() =>
+  import("../features/projects/ProjectsOverview").then((m) => ({ default: m.ProjectsOverview })),
 );
-const ProjectPage = lazy(() =>
-  import("../pages/ProjectPage").then((m) => ({ default: m.ProjectPage })),
+const ProjectWorkspaceRoute = lazy(() =>
+  import("../features/projects/ProjectWorkspace").then((m) => ({ default: m.ProjectWorkspace })),
 );
+
+function ProjectRoute() {
+  const params = useParams<{ id: string }>();
+  return <ProjectWorkspaceRoute projectId={params.id} />;
+}
 
 export function App() {
   return (
     <Router root={AppShell}>
-      <Route path="/" component={ProjectsPage} />
-      <Route path="/projects/:id" component={ProjectPage} />
-      {/* Legacy session routes collapse into the project shell (tabs, not pages). */}
-      <Route path="/projects/:id/sessions/*rest" component={ProjectPage} />
-      <Route path="/settings" component={ModelsPage} />
-      <Route path="/system" component={SystemPage} />
-      <Route path="/models" component={ModelsPage} />
-      <Route path="/security" component={SecurityPage} />
+      <Route path="/" component={ProjectsRoute} />
+      <Route path="/projects/:id" component={ProjectRoute} />
+      <Route path="/settings" component={ModelsRoute} />
+      <Route path="/system" component={SystemRoute} />
+      <Route path="/models" component={ModelsRoute} />
+      <Route path="/security" component={SecurityRoute} />
     </Router>
   );
 }

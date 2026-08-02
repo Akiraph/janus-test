@@ -1,5 +1,5 @@
-//! GitRunner adapter: the system-`git` implementation of the port defined in
-//! `modules::projects::interface`.
+﻿//! GitRunner adapter: the system-`git` implementation of the port defined in
+//! `janus-source-control`.
 //!
 //! `ARC-004` and the GitRunner seam: projects/workspace drive clone,
 //! status, diff, index and remote operations through this thin process layer.
@@ -7,8 +7,8 @@
 //! temporary Git repositories with the same adapter rather than rewriting Git
 //! in memory. Only crash-simulation tests use a fake runner.
 //!
-//! The DTOs and `GitRunner` trait are owned by the domain interface; this module
-//! re-exports them so existing call sites keep compiling and
+//! The DTOs and `GitRunner` trait are owned by `janus-source-control`; this
+//! module re-exports them so existing call sites keep compiling and
 //! implements the system adapter against them. Commands run with
 //! `GIT_OPTIONAL_LOCKS=0` and read-only arguments so `status` does not try to
 //! refresh the index and fail when a reader races a writer.
@@ -22,7 +22,7 @@ use tokio::process::Command;
 
 use rand::RngCore;
 
-pub use crate::modules::projects::interface::{
+pub use janus_source_control::{
     DiffView, GitCredential, GitError, GitLogEntry, GitRunner, GitStatus, UpdateConflictPath,
     UpdateOutcome,
 };

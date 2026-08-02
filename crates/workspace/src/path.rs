@@ -1,14 +1,13 @@
 //! Workspace path resolution.
 //!
-//! `DAT-FS-01`: the database stores only managed handles relative to the data
-//! root, never absolute paths. Opening a workspace path starts from a trusted
+//! The database stores only managed handles relative to the data root, never
+//! absolute paths. Opening a workspace path starts from a trusted
 //! root, then resolves a relative UTF-8 path beneath it. A naive `canonicalize`
 //! followed by a plain open is not enough because it cannot stop a check-time
-//! vs use-time symlink swap. M2 enforces the simpler, sufficient guarantee for
-//! the Main Workspace: reject absolute paths, `..` traversal, and NUL, and join
-//! only beneath the workspace root.
+//! vs use-time symlink swap. The current guarantee rejects absolute paths,
+//! `..` traversal, and NUL, then joins only beneath the workspace root.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -67,11 +66,6 @@ pub fn validate_workspace_path(raw: &str) -> Result<PathBuf, PathError> {
         joined.push(part);
     }
     Ok(joined)
-}
-
-/// Resolve a validated relative path beneath an absolute workspace root.
-pub fn resolve_under(root: &Path, relative: &Path) -> PathBuf {
-    root.join(relative)
 }
 
 #[cfg(test)]

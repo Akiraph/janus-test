@@ -8,13 +8,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
-use janus_infrastructure::{database::Database, events::EventStore};
-use janus_server::config::RunMode;
-use janus_server::modules::models::interface::{ModelsInterface, ProviderInput, ProviderKind};
-use janus_server::modules::models::stream_types::{
+use janus_infrastructure::{database::Database, events::EventStore, secrets::SecretCipher};
+use janus_models::interface::{ModelsInterface, ProviderInput, ProviderKind};
+use janus_models::stream_types::{
     ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
 };
-use janus_server::platform::secret::SecretCipher;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -125,7 +123,7 @@ async fn models_with_root(temp: &TempDir) -> anyhow::Result<(Database, ModelsInt
         .bind(now)
         .execute(&pool)
         .await?;
-    let cipher = SecretCipher::load(temp.path(), RunMode::Development)?;
+    let cipher = SecretCipher::load(temp.path(), false)?;
     let events = EventStore::new(pool.clone());
     let models = ModelsInterface::new(pool, cipher, events)?;
     Ok((database, models, owner_id.into()))
@@ -155,15 +153,13 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
                 display_name: "Local OpenAI".into(),
                 base_url: format!("http://{addr}/v1"),
                 api_key: Some("sk-test-openai".into()),
-                models: vec![
-                    janus_server::modules::models::interface::EmbeddedModelInput {
-                        display_name: "Fixture".into(),
-                        upstream_model_id: "fixture-model".into(),
-                        supports_1m: false,
-                        supports_images: false,
-                        enabled: true,
-                    },
-                ],
+                models: vec![janus_models::interface::EmbeddedModelInput {
+                    display_name: "Fixture".into(),
+                    upstream_model_id: "fixture-model".into(),
+                    supports_1m: false,
+                    supports_images: false,
+                    enabled: true,
+                }],
                 enabled: true,
             },
             "test-model-config",
@@ -252,15 +248,13 @@ async fn anthropic_messages_stream() -> anyhow::Result<()> {
                 display_name: "Local Anthropic".into(),
                 base_url: format!("http://{addr}/v1"),
                 api_key: Some("sk-ant-test".into()),
-                models: vec![
-                    janus_server::modules::models::interface::EmbeddedModelInput {
-                        display_name: "Claude Fixture".into(),
-                        upstream_model_id: "claude-fixture".into(),
-                        supports_1m: false,
-                        supports_images: true,
-                        enabled: true,
-                    },
-                ],
+                models: vec![janus_models::interface::EmbeddedModelInput {
+                    display_name: "Claude Fixture".into(),
+                    upstream_model_id: "claude-fixture".into(),
+                    supports_1m: false,
+                    supports_images: true,
+                    enabled: true,
+                }],
                 enabled: true,
             },
             "test-model-config",
@@ -306,15 +300,13 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
                 display_name: "Bad OpenAI".into(),
                 base_url: format!("http://{addr}/v1"),
                 api_key: Some("sk-bad".into()),
-                models: vec![
-                    janus_server::modules::models::interface::EmbeddedModelInput {
-                        display_name: "X".into(),
-                        upstream_model_id: "x".into(),
-                        supports_1m: false,
-                        supports_images: false,
-                        enabled: true,
-                    },
-                ],
+                models: vec![janus_models::interface::EmbeddedModelInput {
+                    display_name: "X".into(),
+                    upstream_model_id: "x".into(),
+                    supports_1m: false,
+                    supports_images: false,
+                    enabled: true,
+                }],
                 enabled: true,
             },
             "test-model-config",
@@ -382,7 +374,7 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn openai_assembler_unit_parse() {
-    use janus_server::modules::models::openai_chat::OpenaiChatAssembler;
+    use janus_models::openai_chat::OpenaiChatAssembler;
     let mut a = OpenaiChatAssembler::default();
     let e1 = a
         .ingest_data(

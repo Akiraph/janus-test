@@ -1,5 +1,9 @@
-# 服务端
+# Server
 
-服务端是一个本地优先的控制平面。它要把业务状态、外部副作用和公开网络协议分开，让项目、会话和执行可以独立变化；`janus-infrastructure` 提供技术设施，server 只负责组装、部署策略和公共协议。
+`apps/server` is Janus's deployment composition root and public control plane. It creates infrastructure and capability interfaces, injects the local Git and Runtime adapters, owns the ordered SQLx migrations, and connects HTTP, SSE, WebSocket, and CLI boundaries to public capability APIs.
 
-后端改动应先找到拥有状态和规则的能力，再把跨能力动作放进工作流。模型、Git、文件和进程是外部副作用，必须通过适配器和窄接口进入；HTTP handler 只做边界转换。新增跨模块快捷调用、直接 SQL 读别人的表或把重试逻辑散落到入口，都会让这里重新变成无法演进的总线。
+`AppState` holds deployment resources and compatibility query access for transports and system tests. `application::Application` is the single composition boundary for cross-capability workflows: transaction ordering, execution scheduling, background workers, startup recovery, and resource cleanup. `Application` owns no business tables; each capability's `interface.rs` owns its state transitions.
+
+This directory may contain dependency wiring, cross-capability transactions, durable Operation workers, external-side-effect adapters, and public protocol conversion. It must not grow new capability implementations, generic repositories, global event buses, service locators, or direct writes to another capability's tables.
+
+During startup, `AppState::initialize` runs migrations and execution recovery. The process entry point then removes incoming Blob leftovers and marks stale Operations before `/health/ready` becomes successful. That ordering is a deployment contract, not background housekeeping.
