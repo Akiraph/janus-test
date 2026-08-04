@@ -11,9 +11,9 @@ use super::interface::SessionsInterface;
 use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, AppendSteerInput, AppendToolResultInput,
     ContextMessage, CreateTurnInput, CreatedTurnInput, ExecutionTurn, MAX_ATTACHMENTS,
-    MAX_MESSAGE_BYTES, QueuedTurnCandidate, RecordAskAnswer, RecordedTurnInput, RecoveredTurn,
-    ReplaceToolResultInput, SessionCommandState, SessionModelPreference, SessionsError,
-    TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus, TurnTransition,
+    MAX_MESSAGE_BYTES, QueuedTurnCandidate, RecoveredTurn, ReplaceToolResultInput,
+    SessionCommandState, SessionModelPreference, SessionsError, TurnBlockerOutcome, TurnBlockers,
+    TurnModelSnapshot, TurnStatus, TurnTransition,
 };
 
 const TURN_IS_RUNNABLE_SQL: &str = "SELECT EXISTS( \
@@ -267,7 +267,7 @@ impl SessionsInterface {
                AND message.status = 'active' \
                AND (message.turn_id IS NULL OR message.turn_id = current_turn.id OR \
                     (source_turn.sequence < current_turn.sequence AND \
-                     source_turn.status IN ('completed', 'failed', 'interrupted', 'handed_off'))) \
+                     source_turn.status IN ('completed', 'failed', 'canceled', 'interrupted', 'handed_off'))) \
              ORDER BY COALESCE(message.timeline_sequence, 0), message.created_at, message.id",
         )
         .bind(turn_id.to_string())
@@ -608,6 +608,7 @@ impl SessionsInterface {
         });
         if let Some(source_ask_id) = source_ask_id {
             projection["source_ask_id"] = json!(source_ask_id);
+            projection["ask_answer"] = json!(false);
         }
         sqlx::query(
             "INSERT INTO timeline_items \
@@ -653,77 +654,6 @@ impl SessionsInterface {
             sequence: next_sequence,
             display_order,
             checkpoint_id,
-        })
-    }
-
-    pub async fn record_ask_answer_in_tx(
-        &self,
-        tx: &mut SqliteConnection,
-        input: RecordAskAnswer<'_>,
-    ) -> Result<RecordedTurnInput, SessionsError> {
-        let RecordAskAnswer {
-            session_id,
-            turn_id,
-            ask_id,
-            answer,
-            actor,
-            now,
-        } = input;
-        let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
-        let message_id = MessageId::new();
-        let timeline_item_id = TimelineItemId::new();
-        let text = answer
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| answer.to_string());
-        let body = json!({
-            "parts": [{"type": "text", "text": text}],
-            "turn_input": {"kind": "ask_answer", "source_ask_id": ask_id.to_string()},
-        });
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'user', ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(body.to_string())
-        .bind(display_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        let projection = json!({
-            "kind": "user_message",
-            "message_id": message_id.to_string(),
-            "turn_id": turn_id.to_string(),
-            "text": text,
-            "source_ask_id": ask_id.to_string(),
-        });
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'user_message', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_item_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(message_id.to_string())
-        .bind(display_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        Ok(RecordedTurnInput {
-            message_id: message_id.to_string(),
-            timeline_item_id: timeline_item_id.to_string(),
-            display_order,
         })
     }
 

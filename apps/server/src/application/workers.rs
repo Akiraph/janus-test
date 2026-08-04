@@ -7,9 +7,10 @@
 //! operations are durable Operations; the worker focuses on their external
 //! side effects so an HTTP disconnect cannot lose the work.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::application::Application;
@@ -22,6 +23,12 @@ use janus_infrastructure::operations::OperationStatus;
 /// is reclaimed quickly, long enough for a clone to finish.
 const LEASE_TTL_SECONDS: i64 = 120;
 
+/// Session creation and deletion both update Git worktree administration and
+/// the same workspace-owned tables. Keep those filesystem operations single
+/// flight so a burst of sidebar actions cannot interleave half-created trees
+/// with cleanup or another worktree registration.
+const SESSION_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// The kinds the worker claims. Short git commands run inline in the request
 /// path; only the long external side effects go through the queue.
 const HANDLED_KINDS: &[&str] = &[
@@ -33,15 +40,16 @@ const HANDLED_KINDS: &[&str] = &[
 
 /// Spawn the background worker. Runs until the runtime shuts down.
 pub fn spawn(state: Application) {
+    let session_lifecycle = Arc::new(Semaphore::new(1));
     tokio::spawn(async move {
         info!("janus worker started");
         loop {
-            if let Err(error) = run_once(&state).await {
+            if let Err(error) = run_once(&state, &session_lifecycle).await {
                 error!(%error, "worker iteration failed");
             }
             // Idle pause between sweeps; claim_work returns None when the queue
             // is empty, so this keeps CPU flat without missing new items.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(SESSION_LIFECYCLE_POLL_INTERVAL).await;
         }
     });
 }
@@ -95,18 +103,31 @@ pub fn spawn_ask_expiry(state: Application) {
     });
 }
 
-async fn run_once(state: &Application) -> anyhow::Result<()> {
+async fn run_once(state: &Application, session_lifecycle: &Arc<Semaphore>) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
+        let session_permit = if matches!(*kind, KIND_CREATE_SESSION | KIND_DELETE_SESSION) {
+            // Do not claim work while the single session lifecycle slot is
+            // occupied. Leaving the item queued preserves FIFO ordering and
+            // lets the next sweep retry it without a lease timeout.
+            match session_lifecycle.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
         let Some(claimed) = state
             .operations()
             .claim_work(kind, LEASE_TTL_SECONDS)
             .await?
         else {
+            drop(session_permit);
             continue;
         };
         let worker_state = state.clone();
         let worker_kind = (*kind).to_owned();
         tokio::spawn(async move {
+            let _session_permit = session_permit;
             let outcome = dispatch(&worker_state, &worker_kind, &claimed.payload).await;
             match outcome {
                 Ok(()) => {

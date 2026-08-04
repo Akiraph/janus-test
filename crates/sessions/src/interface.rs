@@ -22,11 +22,11 @@ pub use super::types::{
     AskAnswerResult, AskSummary, AttachmentResource, AttachmentView, CancelResult, ContextMessage,
     CreateTurnInput, CreatedTurnInput, ExecutionTurn, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS,
     MAX_MESSAGE_BYTES, MessageRoute, MessageRouteResult, ModelAttemptStatus, QueuedTurnCandidate,
-    QueuedTurnItem, ReasoningEffort, RecordAskAnswer, RecordedTurnInput, RecoveredTurn,
-    ReplaceToolResultInput, SessionCommandState, SessionModelPreference, SessionSummary,
-    SessionsError, SteerResult, TerminalSettlement, TimelineItemView, TimelinePage,
-    TurnBlockerOutcome, TurnBlockers, TurnModelAttempt, TurnModelSnapshot, TurnStatus, TurnSummary,
-    TurnTransition, UploadAttachmentInput,
+    QueuedTurnItem, ReasoningEffort, RecordedTurnInput, RecoveredTurn, ReplaceToolResultInput,
+    SessionCommandState, SessionModelPreference, SessionSummary, SessionsError, SteerResult,
+    TerminalSettlement, TimelineItemView, TimelinePage, TimelineTurnStatus, TurnBlockerOutcome,
+    TurnBlockers, TurnModelAttempt, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
+    UploadAttachmentInput,
 };
 
 #[derive(Clone)]
@@ -139,9 +139,21 @@ impl SessionsInterface {
         .fetch_all(&self.pool)
         .await?;
 
+        let handles = rows
+            .iter()
+            .map(|row| {
+                row.try_get::<String, _>("workspace_handle")
+                    .map(WorkspaceHandle)
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let workspace_revisions = self.workspace.current_revisions(&handles).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            out.push(self.row_to_summary(row).await?);
+            let handle: String = row.try_get("workspace_handle")?;
+            let revision = workspace_revisions
+                .get(&handle)
+                .map(|revision| revision.0.clone());
+            out.push(Self::summary_from_row(row, revision)?);
         }
         Ok(out)
     }
@@ -614,7 +626,13 @@ impl SessionsInterface {
         after: Option<&str>,
         limit: i64,
     ) -> Result<TimelinePage, SessionsError> {
-        let _ = self.get_session(session_id).await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(SessionsError::NotFound);
+        }
         if before.is_some() && after.is_some() {
             return Err(SessionsError::TimelineCursorInvalid);
         }
@@ -628,11 +646,19 @@ impl SessionsInterface {
         let rows = if let Some(before) = before {
             let order = parse_cursor(before)?;
             sqlx::query(
-                "SELECT id, session_id, turn_id, kind, source_resource_id, display_order, \
-                        projection_json, status, version, created_at \
+                "SELECT timeline_items.id, timeline_items.session_id, timeline_items.turn_id, \
+                        timeline_items.kind, timeline_items.source_resource_id, \
+                        timeline_items.display_order, timeline_items.projection_json, \
+                        timeline_items.status, timeline_items.version, timeline_items.created_at, \
+                        turns.id AS turn_status_id, turns.status AS turn_status, \
+                        turns.cancellation_reason AS turn_cancellation_reason, \
+                        turns.completion_reason AS turn_completion_reason, \
+                        turns.created_at AS turn_created_at, turns.updated_at AS turn_updated_at \
                  FROM timeline_items \
-                 WHERE session_id = ? AND display_order < ? \
-                 ORDER BY display_order DESC LIMIT ?",
+                 LEFT JOIN turns ON turns.id = timeline_items.turn_id \
+                    AND turns.session_id = timeline_items.session_id \
+                 WHERE timeline_items.session_id = ? AND timeline_items.display_order < ? \
+                 ORDER BY timeline_items.display_order DESC LIMIT ?",
             )
             .bind(session_id.to_string())
             .bind(order)
@@ -642,11 +668,19 @@ impl SessionsInterface {
         } else if let Some(after) = after {
             let order = parse_cursor(after)?;
             sqlx::query(
-                "SELECT id, session_id, turn_id, kind, source_resource_id, display_order, \
-                        projection_json, status, version, created_at \
+                "SELECT timeline_items.id, timeline_items.session_id, timeline_items.turn_id, \
+                        timeline_items.kind, timeline_items.source_resource_id, \
+                        timeline_items.display_order, timeline_items.projection_json, \
+                        timeline_items.status, timeline_items.version, timeline_items.created_at, \
+                        turns.id AS turn_status_id, turns.status AS turn_status, \
+                        turns.cancellation_reason AS turn_cancellation_reason, \
+                        turns.completion_reason AS turn_completion_reason, \
+                        turns.created_at AS turn_created_at, turns.updated_at AS turn_updated_at \
                  FROM timeline_items \
-                 WHERE session_id = ? AND display_order > ? \
-                 ORDER BY display_order ASC LIMIT ?",
+                 LEFT JOIN turns ON turns.id = timeline_items.turn_id \
+                    AND turns.session_id = timeline_items.session_id \
+                 WHERE timeline_items.session_id = ? AND timeline_items.display_order > ? \
+                 ORDER BY timeline_items.display_order ASC LIMIT ?",
             )
             .bind(session_id.to_string())
             .bind(order)
@@ -655,11 +689,19 @@ impl SessionsInterface {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, session_id, turn_id, kind, source_resource_id, display_order, \
-                        projection_json, status, version, created_at \
+                "SELECT timeline_items.id, timeline_items.session_id, timeline_items.turn_id, \
+                        timeline_items.kind, timeline_items.source_resource_id, \
+                        timeline_items.display_order, timeline_items.projection_json, \
+                        timeline_items.status, timeline_items.version, timeline_items.created_at, \
+                        turns.id AS turn_status_id, turns.status AS turn_status, \
+                        turns.cancellation_reason AS turn_cancellation_reason, \
+                        turns.completion_reason AS turn_completion_reason, \
+                        turns.created_at AS turn_created_at, turns.updated_at AS turn_updated_at \
                  FROM timeline_items \
-                 WHERE session_id = ? \
-                 ORDER BY display_order DESC LIMIT ?",
+                 LEFT JOIN turns ON turns.id = timeline_items.turn_id \
+                    AND turns.session_id = timeline_items.session_id \
+                 WHERE timeline_items.session_id = ? \
+                 ORDER BY timeline_items.display_order DESC LIMIT ?",
             )
             .bind(session_id.to_string())
             .bind(limit)
@@ -828,6 +870,14 @@ impl SessionsInterface {
                 .ok()
                 .map(|r| r.0)
         };
+        Self::summary_from_row(row, workspace_revision)
+    }
+
+    fn summary_from_row(
+        row: sqlx::sqlite::SqliteRow,
+        workspace_revision: Option<String>,
+    ) -> Result<SessionSummary, SessionsError> {
+        let workspace_handle: String = row.try_get("workspace_handle")?;
         Ok(SessionSummary {
             id: row.try_get("id")?,
             project_id: row.try_get("project_id")?,
@@ -853,6 +903,19 @@ impl SessionsInterface {
 fn timeline_row(row: sqlx::sqlite::SqliteRow) -> Result<TimelineItemView, SessionsError> {
     let projection_json: String = row.try_get("projection_json")?;
     let projection: Value = serde_json::from_str(&projection_json)?;
+    let turn_status = row
+        .try_get::<Option<String>, _>("turn_status_id")?
+        .map(|id| {
+            Ok::<TimelineTurnStatus, SessionsError>(TimelineTurnStatus {
+                id,
+                status: row.try_get("turn_status")?,
+                cancellation_reason: row.try_get("turn_cancellation_reason")?,
+                completion_reason: row.try_get("turn_completion_reason")?,
+                created_at: row.try_get("turn_created_at")?,
+                updated_at: row.try_get("turn_updated_at")?,
+            })
+        })
+        .transpose()?;
     Ok(TimelineItemView {
         id: row.try_get("id")?,
         session_id: row.try_get("session_id")?,
@@ -864,6 +927,7 @@ fn timeline_row(row: sqlx::sqlite::SqliteRow) -> Result<TimelineItemView, Sessio
         status: row.try_get("status")?,
         version: row.try_get("version")?,
         created_at: row.try_get("created_at")?,
+        turn_status,
     })
 }
 

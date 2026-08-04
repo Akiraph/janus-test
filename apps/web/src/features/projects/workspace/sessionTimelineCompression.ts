@@ -1,37 +1,41 @@
-/**
- * Timeline compression layer - merges consecutive low-noise tool calls
- *
- * Inspired by Janus-old conversation-action-compression.ts but adapted for
- * the current event-sourced timeline architecture.
- */
+/** Compress consecutive low-noise timeline activity into Bun-style rows. */
 
-import type { SessionTimelineItem } from "./sessionTimeline";
+import type { SessionTimelineItem, ToolStatus } from "./sessionTimeline";
+import {
+  analyzeToolActivity,
+  formatThoughtDuration,
+  type ToolActivityCount,
+  type ToolActivityDetail,
+} from "./sessionTimeline";
 
 export function compressTimeline(
   items: readonly SessionTimelineItem[],
+  previous: readonly SessionTimelineItem[] = [],
 ): readonly SessionTimelineItem[] {
   const result: SessionTimelineItem[] = [];
+  const previousById = new Map(previous.map((item) => [item.id, item]));
 
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
     if (!item) continue;
 
-    // Only compress consecutive tool items that are compressible
-    if (!isCompressibleTool(item)) {
+    if (!isCompressibleActivityItem(item)) {
       result.push(item);
       continue;
     }
 
-    // Collect consecutive compressible tools
-    const group = collectConsecutiveTools(items, index);
-
-    if (group.length === 1) {
+    const group = collectActivityGroup(items, index);
+    if (group.length < 2) {
       result.push(item);
       continue;
     }
 
-    // Create compressed group
-    result.push(createCompressedToolGroup(group));
+    const isLatestGroup = index + group.length === items.length;
+    const compressed = createCompressedActivityGroup(group, isLatestGroup);
+    const cached = previousById.get(compressed.id);
+    result.push(
+      cached?.version !== undefined && cached.version === compressed.version ? cached : compressed,
+    );
     index += group.length - 1;
   }
 
@@ -39,195 +43,177 @@ export function compressTimeline(
 }
 
 type CompressibleTool = Extract<SessionTimelineItem, { type: "tool" }>;
+type CompressibleThought = Extract<SessionTimelineItem, { type: "assistant" }>;
+type CompressibleActivityItem = CompressibleTool | CompressibleThought;
 
-function isCompressibleTool(item: SessionTimelineItem | undefined): item is CompressibleTool {
-  if (item?.type !== "tool") return false;
-
-  // Only compress low-noise tools: read, bash (CLI commands)
-  const toolName = item.toolName.toLowerCase();
-  const isLowNoise = toolName === "read" || toolName === "bash";
-
-  // Only compress successful or predictable tools
-  const isCompressibleStatus =
-    item.view.status === "success" ||
-    item.view.status === "running" ||
-    (item.view.status === "failure" && item.view.body.kind === "command_output");
-
-  return isLowNoise && isCompressibleStatus && item.view.lowNoise !== false;
+function isCompressibleActivityItem(
+  item: SessionTimelineItem | undefined,
+): item is CompressibleActivityItem {
+  if (!item) return false;
+  if (item.type === "assistant") {
+    return item.reasoning.trim().length > 0 && item.text.trim().length === 0;
+  }
+  return isCompressibleTool(item);
 }
 
-function collectConsecutiveTools(
+function isCompressibleTool(item: SessionTimelineItem | undefined): item is CompressibleTool {
+  if (item?.type !== "tool" || !item.view.lowNoise || item.view.status === "failure") {
+    return false;
+  }
+  return toolActivities(item).length > 0;
+}
+
+function collectActivityGroup(
   items: readonly SessionTimelineItem[],
   startIndex: number,
-): CompressibleTool[] {
-  const group: CompressibleTool[] = [];
-
+): CompressibleActivityItem[] {
+  const group: CompressibleActivityItem[] = [];
   for (let index = startIndex; index < items.length; index += 1) {
     const item = items[index];
-
-    if (!isCompressibleTool(item)) {
-      break;
-    }
-
+    if (!isCompressibleActivityItem(item)) break;
     group.push(item);
   }
-
   return group;
 }
 
-interface ToolTypeCounts {
-  read: number;
-  bash: number;
-  other: number;
-}
-
-function countToolTypes(tools: readonly CompressibleTool[]): ToolTypeCounts {
-  const counts = { read: 0, bash: 0, other: 0 };
-
-  for (const tool of tools) {
-    const name = tool.toolName.toLowerCase();
-    if (name === "read") {
-      counts.read += 1;
-    } else if (name === "bash") {
-      counts.bash += 1;
-    } else {
-      counts.other += 1;
-    }
-  }
-
-  return counts;
-}
-
-function createCompressedToolGroup(tools: readonly CompressibleTool[]): SessionTimelineItem {
-  const counts = countToolTypes(tools);
-  const hasFailures = tools.some((t) => t.view.status === "failure");
-  const lastToolRunning = tools[tools.length - 1]?.view.status === "running";
-
-  // Build a human-verb phrase per tool type. Bash commands are classified by
-  // the verb they perform so a compressed span reads as an activity, not a
-  // raw "Ran N Commands" list.
-  const parts: string[] = [];
-  if (counts.read > 0) {
-    parts.push(formatReadVerb(counts.read, lastToolRunning));
-  }
-  if (counts.bash > 0) {
-    parts.push(formatBashVerb(tools, lastToolRunning));
-  }
-  if (counts.other > 0) {
-    parts.push(`${counts.other} ${counts.other === 1 ? "Tool" : "Tools"}`);
-  }
-
-  const title = joinParts(parts);
-  const status = lastToolRunning ? "running" : hasFailures ? "failure" : "success";
-
-  // Create a synthetic group tool item
-  const groupId = `group:${tools[0]?.id ?? "tools"}:${tools.length}`;
+function createCompressedActivityGroup(
+  items: readonly CompressibleActivityItem[],
+  isLatestGroup: boolean,
+): SessionTimelineItem {
+  const tools = items.filter((item): item is CompressibleTool => item.type === "tool");
+  const thoughts = items.filter((item): item is CompressibleThought => item.type === "assistant");
+  const counts = countActivities(tools);
+  const status = compressedStatus(tools);
+  const isLive = isLatestGroup && (status === "running" || hasActiveTurn(items));
+  const title = formatActivityTitle(thoughts, counts, isLive);
+  const groupId = `group:${items[0]?.id ?? "activity"}`;
+  const version = `${isLatestGroup ? "latest" : "history"}:${items
+    .map((item) => `${item.id}:${item.version ?? ""}`)
+    .join("|")}`;
+  const turnStatus = [...items].reverse().find((item) => item.turnStatus)?.turnStatus ?? null;
 
   return {
     type: "tool",
     id: groupId,
     sourceKind: "tool_group",
-    turnId: tools[0]?.turnId ?? null,
-    createdAt: tools[0]?.createdAt ?? new Date().toISOString(),
+    version,
+    turnId: items[0]?.turnId ?? null,
+    createdAt: items[0]?.createdAt ?? new Date().toISOString(),
     itemStatus: status,
+    turnStatus,
     toolName: "tool_group",
     toolStatus: status,
     summary: {
-      count: tools.length,
-      types: counts,
+      count: items.length,
+      activities: counts,
     },
     view: {
       title,
       status,
       body: {
-        kind: "structured",
-        value: {
-          tools: tools.map((t) => ({
-            id: t.id,
-            name: t.toolName,
-            title: t.view.title,
-            status: t.view.status,
-          })),
-        },
+        kind: "activity",
+        items: items.map(toActivityDetail),
       },
       expandable: true,
       lowNoise: false,
+      activity: counts,
     },
   };
 }
 
-/** Pluralize a noun: 1 stays singular, >1 gets an "s". */
+function toActivityDetail(item: CompressibleActivityItem): ToolActivityDetail {
+  if (item.type === "assistant") {
+    return {
+      kind: "thought",
+      id: item.id,
+      title: formatThoughtTitle([item], false),
+      text: item.reasoning,
+      durationMs: item.durationMs,
+    };
+  }
+  return { kind: "tool", id: item.id, name: item.toolName, view: item.view };
+}
+
+function toolActivities(tool: CompressibleTool): readonly ToolActivityCount[] {
+  return tool.view.activity ?? analyzeToolActivity(tool.toolName, tool.view.body) ?? [];
+}
+
+function countActivities(tools: readonly CompressibleTool[]): ToolActivityCount[] {
+  const counts: Record<ToolActivityCount["kind"], number> = {
+    read: 0,
+    search: 0,
+    list: 0,
+  };
+  for (const tool of tools) {
+    for (const activity of toolActivities(tool)) counts[activity.kind] += activity.count;
+  }
+  return (Object.entries(counts) as [ToolActivityCount["kind"], number][])
+    .filter(([, count]) => count > 0)
+    .map(([kind, count]) => ({ kind, count }));
+}
+
+function compressedStatus(tools: readonly CompressibleTool[]): ToolStatus {
+  if (tools.some((tool) => tool.view.status === "failure")) return "failure";
+  if (tools.some((tool) => tool.view.status === "running")) return "running";
+  return "success";
+}
+
+function hasActiveTurn(items: readonly CompressibleActivityItem[]): boolean {
+  return items.some((item) => {
+    const status = item.turnStatus?.status;
+    return (
+      status !== undefined &&
+      [
+        "queued",
+        "running",
+        "waiting_for_job",
+        "waiting_for_ask",
+        "waiting_for_model",
+        "canceling",
+      ].includes(status)
+    );
+  });
+}
+
+function formatActivityTitle(
+  thoughts: readonly CompressibleThought[],
+  counts: readonly ToolActivityCount[],
+  live: boolean,
+): string {
+  const parts: string[] = [];
+  if (thoughts.length > 0) parts.push(formatThoughtTitle(thoughts, live));
+
+  for (const activity of counts) {
+    const noun = plural(
+      activity.count,
+      activity.kind === "read" ? "file" : activity.kind === "search" ? "pattern" : "directory",
+    );
+    if (activity.kind === "read") parts.push(`${live ? "reading" : "read"} ${noun}`);
+    if (activity.kind === "search")
+      parts.push(`${live ? "searching for" : "searched for"} ${noun}`);
+    if (activity.kind === "list") parts.push(`${live ? "listing" : "listed"} ${noun}`);
+  }
+
+  if (parts.length === 0) return "Activity";
+  return capitalize(joinParts(parts));
+}
+
+function formatThoughtTitle(thoughts: readonly CompressibleThought[], live: boolean): string {
+  const durationMs = thoughts.reduce((sum, thought) => sum + (thought.durationMs ?? 0), 0);
+  const duration = durationMs > 0 ? ` ${formatThoughtDuration(durationMs)}` : "";
+  return `${live ? "Thinking" : "Thought"}${duration}`;
+}
+
+function joinParts(parts: readonly string[]): string {
+  if (parts.length === 1) return parts[0] ?? "";
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
+  return `${parts.slice(0, -1).join(", ")}, and ${parts.at(-1)}`;
+}
+
 function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-/** Format a non-bash tool verb. Read uses "Reading/Read N Files". */
-function formatReadVerb(count: number, running: boolean): string {
-  const noun = plural(count, "File");
-  if (running) return `Reading ${noun}`;
-  return `Read ${noun}`;
-}
-
-/** Classify bash commands in a compressed group into a single human verb.
- * Greps/ripgrep → "searching for N patterns", cat/head/tail → "reading N
- * files", ls/find/dir → "listing N directories", test/lint/build → "running
- * N commands". If the group mixes verbs, fall back to "running N commands". */
-function formatBashVerb(tools: readonly CompressibleTool[], running: boolean): string {
-  const commands = tools
-    .filter((t) => t.toolName.toLowerCase() === "bash")
-    .map((t) => firstCommandWord(t));
-
-  let operation: "search" | "read" | "list" | "run" = "run";
-  let noun = "Command";
-  const count = commands.length;
-
-  if (commands.every((cmd) => isSearchCommand(cmd))) {
-    operation = "search";
-    noun = "Pattern";
-  } else if (commands.every((cmd) => isReadCommand(cmd))) {
-    operation = "read";
-    noun = "File";
-  } else if (commands.every((cmd) => isListCommand(cmd))) {
-    operation = "list";
-    noun = "Directory";
-  }
-
-  const verbs: Record<typeof operation, readonly [running: string, completed: string]> = {
-    search: ["Searching for", "Searched for"],
-    read: ["Reading", "Read"],
-    list: ["Listing", "Listed"],
-    run: ["Running", "Ran"],
-  };
-  const verb = verbs[operation][running ? 0 : 1];
-  return `${verb} ${plural(count, noun).toLowerCase()}`;
-}
-
-function firstCommandWord(tool: CompressibleTool): string {
-  const body = tool.view.body;
-  if (body.kind === "command_output") {
-    return body.command.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
-  }
-  return "";
-}
-
-function isSearchCommand(cmd: string): boolean {
-  return ["grep", "rg", "ack", "ag"].includes(cmd);
-}
-
-function isReadCommand(cmd: string): boolean {
-  return ["cat", "head", "tail", "less", "more"].includes(cmd);
-}
-
-function isListCommand(cmd: string): boolean {
-  return ["ls", "find", "dir", "tree"].includes(cmd);
-}
-
-function joinParts(parts: readonly string[]): string {
-  if (parts.length === 0) return "Processed Items";
-  if (parts.length === 1) return parts[0] ?? "";
-  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
-
-  const last = parts[parts.length - 1];
-  const rest = parts.slice(0, -1).join(", ");
-  return `${rest}, and ${last}`;
+function capitalize(value: string): string {
+  return value.length === 0 ? value : `${value.charAt(0).toUpperCase()}${value.slice(1)}`;
 }

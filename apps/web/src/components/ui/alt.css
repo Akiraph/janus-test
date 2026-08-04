@@ -29,6 +29,10 @@
   white-space: normal;
 }
 
+.alt-bubble--interactive {
+  pointer-events: auto;
+}
+
 @media (prefers-reduced-transparency: reduce) {
   .alt-bubble {
     background: var(--surface);

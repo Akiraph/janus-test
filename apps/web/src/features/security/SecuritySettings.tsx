@@ -2,8 +2,6 @@ import { useQueryClient } from "@tanstack/solid-query";
 import KeyRound from "lucide-solid/icons/key-round";
 import LogOut from "lucide-solid/icons/log-out";
 import RefreshCw from "lucide-solid/icons/refresh-cw";
-import ShieldCheck from "lucide-solid/icons/shield-check";
-import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { useNotifications } from "../../components/ui/notifications";
 import { logout } from "../../lib/api";
@@ -45,10 +43,6 @@ export function SecuritySettings() {
               <span>Use your device authenticator for every sign-in.</span>
             </div>
           </div>
-          <Badge variant="success">
-            <ShieldCheck size={12} />
-            Protected
-          </Badge>
         </div>
 
         <div class="account-row">

@@ -1,6 +1,6 @@
 import ChevronRight from "lucide-solid/icons/chevron-right";
 import FileCode2 from "lucide-solid/icons/file-code-2";
-import { createEffect, createMemo, createSignal, For, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import { NotificationEvent } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
 import type { FileTreeView } from "../../../lib/api";
@@ -22,6 +22,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
   const [loading, setLoading] = createSignal<Set<string>>(new Set());
   const [errors, setErrors] = createSignal<Record<string, string>>({});
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
+  let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function loadPath(path: string, force = false) {
     const id = props.projectId();
@@ -81,15 +82,21 @@ export function FileTreePanel(props: FileTreePanelProps) {
     props.refreshToken?.();
     const rootEntries = children()[""];
     if (!id || !rootEntries) return;
-    for (const entry of rootEntries) {
-      if (
-        entry.kind === "dir" &&
-        children()[entry.path] === undefined &&
-        !loading().has(entry.path)
-      ) {
-        void loadPath(entry.path);
+    prefetchTimer = setTimeout(() => {
+      for (const entry of rootEntries) {
+        if (
+          entry.kind === "dir" &&
+          children()[entry.path] === undefined &&
+          !loading().has(entry.path)
+        ) {
+          void loadPath(entry.path);
+        }
       }
-    }
+    }, 150);
+    onCleanup(() => {
+      if (prefetchTimer !== undefined) clearTimeout(prefetchTimer);
+      prefetchTimer = undefined;
+    });
   });
 
   function toggleDir(path: string) {

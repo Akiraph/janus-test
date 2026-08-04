@@ -1,7 +1,5 @@
-import { useQueryClient } from "@tanstack/solid-query";
 import ChevronRight from "lucide-solid/icons/chevron-right";
 import { createEffect, createSignal, For, Show } from "solid-js";
-import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { NotificationEvent, useNotifications } from "../../../components/ui/notifications";
 import { SideScrollbar } from "../../../components/ui/SideScrollbar";
@@ -32,7 +30,6 @@ interface ScmPanelProps {
 
 export function ScmPanel(props: ScmPanelProps) {
   const notify = useNotifications().notify;
-  const queryClient = useQueryClient();
   const status = useGitStatus(props.projectId);
   const [selected, setSelected] = createSignal<Set<string>>(new Set());
   const [message, setMessage] = createSignal("");
@@ -54,27 +51,26 @@ export function ScmPanel(props: ScmPanelProps) {
     });
   }
 
-  async function refreshGit() {
-    const id = props.projectId();
-    if (!id) return;
-    // Fire status (re-fetch) and conflict checks in parallel — they have no
-    // dependency on each other, so awaiting one before the other just stalls
-    // the SCM panel behind git-status when conflicts could resolve first.
-    const conflictsP = listGitUpdateConflicts(id)
+  async function refreshConflicts(id: string) {
+    await listGitUpdateConflicts(id)
       .then(setConflicts)
       .catch(() => {
         // Conflicts endpoint failures shouldn't block status view.
       });
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: ["git-status", id] }),
-      conflictsP,
-    ]);
+  }
+
+  async function refreshGit() {
+    const id = props.projectId();
+    if (!id) return;
+    // Status is fetched by the query on mount; refresh it explicitly only
+    // after a user action. Conflict metadata remains independent.
+    await Promise.all([status.refetch(), refreshConflicts(id)]);
   }
 
   createEffect(() => {
     const id = props.projectId();
     if (!id) return;
-    void refreshGit();
+    void refreshConflicts(id);
   });
 
   async function run(action: () => Promise<void>, success: string) {
@@ -121,10 +117,6 @@ export function ScmPanel(props: ScmPanelProps) {
           <div class="ide-scroll-host">
             <div class="scm-body ide-sidebar-scroll" ref={setScrollHost}>
               <div class="scm-summary">
-                <Badge variant="neutral">
-                  {data().branch ?? "detached"}
-                  {data().head_sha ? ` · ${data().head_sha?.slice(0, 7)}` : ""}
-                </Badge>
                 <span class="scm-ahead-behind">
                   ↑{data().ahead} ↓{data().behind}
                 </span>

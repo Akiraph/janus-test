@@ -13,6 +13,8 @@ interface AltProps {
   delay?: number;
   /** Optional class on the bubble wrapper. */
   class?: string;
+  /** Keep the bubble interactive so buttons inside it can be clicked. */
+  interactive?: boolean;
   /** The element that triggers the bubble on hover/focus. */
   children: import("solid-js").JSX.Element;
 }
@@ -32,6 +34,7 @@ export function Alt(props: AltProps) {
   const offsetY = () => props.offsetY ?? -10;
   const delay = () => props.delay ?? 40;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let hideTimer: ReturnType<typeof setTimeout> | undefined;
   let pointer = { x: 0, y: 0 };
   let usingPointer = false;
 
@@ -76,6 +79,7 @@ export function Alt(props: AltProps) {
 
   const show = () => {
     if (timer) clearTimeout(timer);
+    if (hideTimer) clearTimeout(hideTimer);
     timer = setTimeout(() => {
       if (usingPointer) placeAtPointer();
       else placeAtTrigger();
@@ -89,8 +93,24 @@ export function Alt(props: AltProps) {
     }, delay());
   };
 
+  const cancelHide = () => {
+    if (hideTimer) clearTimeout(hideTimer);
+  };
+
   const hide = () => {
     if (timer) clearTimeout(timer);
+    if (props.interactive) {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => {
+        const triggerHovered = triggerRef?.matches(":hover") ?? false;
+        const bubbleHovered = bubbleRef?.matches(":hover") ?? false;
+        if (!triggerHovered && !bubbleHovered) {
+          usingPointer = false;
+          setOpen(false);
+        }
+      }, 120);
+      return;
+    }
     usingPointer = false;
     setOpen(false);
   };
@@ -136,6 +156,7 @@ export function Alt(props: AltProps) {
 
   onCleanup(() => {
     if (timer) clearTimeout(timer);
+    if (hideTimer) clearTimeout(hideTimer);
   });
 
   return (
@@ -147,8 +168,13 @@ export function Alt(props: AltProps) {
             <div
               ref={bubbleRef}
               class={`alt-bubble ${props.class ?? ""}`}
+              classList={{ "alt-bubble--interactive": !!props.interactive }}
               style={{ position: "fixed", top: `${c.top}px`, left: `${c.left}px` }}
               role="tooltip"
+              onPointerEnter={cancelHide}
+              onPointerLeave={hide}
+              onFocusIn={cancelHide}
+              onFocusOut={hide}
             >
               {props.content}
             </div>

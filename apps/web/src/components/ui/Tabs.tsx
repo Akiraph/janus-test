@@ -5,7 +5,6 @@ export interface TabItem {
   value: string;
   label: string;
   disabled?: boolean;
-  badge?: string;
 }
 
 interface TabsProps {
@@ -108,7 +107,6 @@ export function Tabs(props: TabsProps) {
               onFocus={() => setFocused(tab.value)}
             >
               <span class="ui-tabs__label">{tab.label}</span>
-              {tab.badge ? <small class="ui-tabs__badge">{tab.badge}</small> : null}
             </button>
           );
         }}

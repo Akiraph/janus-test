@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use super::events::{EventEnvelope, EventStore, NewEvent};
@@ -14,12 +16,33 @@ impl UnitOfWork {
     }
 
     pub async fn begin(&self) -> Result<UnitOfWorkTransaction<'_>, sqlx::Error> {
+        let transaction = 'begin: {
+            for attempt in 0_u32..=4 {
+                match self.pool.begin_with("BEGIN IMMEDIATE").await {
+                    Ok(transaction) => break 'begin transaction,
+                    Err(error) if attempt < 4 && is_sqlite_busy(&error) => {
+                        let delay = Duration::from_millis(25 * (1_u64 << attempt));
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            unreachable!("the transaction retry loop always returns or breaks")
+        };
         Ok(UnitOfWorkTransaction {
-            transaction: self.pool.begin_with("BEGIN IMMEDIATE").await?,
+            transaction,
             events: self.events.clone(),
             event_count: 0,
         })
     }
+}
+
+fn is_sqlite_busy(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(database) = error else {
+        return false;
+    };
+    matches!(database.code().as_deref(), Some("5") | Some("6"))
+        || database.message().contains("database is locked")
 }
 
 pub struct UnitOfWorkTransaction<'a> {

@@ -115,7 +115,8 @@ export function SessionComposer(props: SessionComposerProps) {
   });
 
   const hasContent = () => Boolean(draft().trim()) || attachments().length > 0;
-  const canSubmit = () => !props.disabled && !submitting() && !uploading() && hasContent();
+  const canSubmit = () =>
+    !props.disabled && !submitting() && !uploading() && !canceling() && hasContent();
   const actionLabel = () => (props.delivery === "queue" ? "Queue message" : "Send message");
 
   function resize() {
@@ -253,7 +254,7 @@ export function SessionComposer(props: SessionComposerProps) {
                 <button
                   type="button"
                   aria-label={`Remove ${attachment.name}`}
-                  disabled={submitting()}
+                  disabled={submitting() || canceling()}
                   onClick={() => void removeAttachment(attachment)}
                 >
                   <X size={12} />
@@ -271,7 +272,7 @@ export function SessionComposer(props: SessionComposerProps) {
         rows={1}
         placeholder={props.delivery === "queue" ? "Queue a message..." : "Send a message..."}
         value={draft()}
-        disabled={submitting()}
+        disabled={submitting() || canceling()}
         onInput={(event) => {
           setDraft(event.currentTarget.value);
           setReceipt(null);
@@ -301,6 +302,7 @@ export function SessionComposer(props: SessionComposerProps) {
             disabled={
               submitting() ||
               uploading() ||
+              canceling() ||
               Boolean(props.disabled) ||
               attachments().length >= (props.limits?.max_attachments ?? 20)
             }
@@ -316,7 +318,7 @@ export function SessionComposer(props: SessionComposerProps) {
             aria-label="Model"
             value={modelValue()}
             options={modelOptions()}
-            disabled={submitting() || Boolean(props.disabled)}
+            disabled={submitting() || canceling() || Boolean(props.disabled)}
             onChange={(value) => {
               setModelValue(value);
             }}
@@ -327,7 +329,11 @@ export function SessionComposer(props: SessionComposerProps) {
             value={reasoningEffort()}
             options={REASONING_OPTIONS}
             disabled={
-              submitting() || Boolean(props.disabled) || !selectedModel() || !supportsReasoning()
+              submitting() ||
+              canceling() ||
+              Boolean(props.disabled) ||
+              !selectedModel() ||
+              !supportsReasoning()
             }
             onChange={(value) => setReasoningEffort(value as ReasoningEffort)}
           />

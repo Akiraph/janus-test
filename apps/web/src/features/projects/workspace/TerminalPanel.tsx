@@ -5,7 +5,6 @@ import Square from "lucide-solid/icons/square";
 import TerminalSquare from "lucide-solid/icons/terminal-square";
 import X from "lucide-solid/icons/x";
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
-import { Badge } from "../../../components/ui/Badge";
 import { Button } from "../../../components/ui/Button";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { NotificationEvent } from "../../../components/ui/notifications";
@@ -315,15 +314,6 @@ export function TerminalPanel(props: TerminalPanelProps) {
       <div class="ide-sidebar-header terminal-panel__header">
         <span>{props.title ?? "Terminal"}</span>
         <div class="terminal-panel__actions">
-          <Show when={terminal()}>
-            <Badge
-              variant={
-                status() === "live" ? "success" : status() === "error" ? "danger" : "warning"
-              }
-            >
-              {status()}
-            </Badge>
-          </Show>
           <Button
             variant="ghost"
             size="sm"

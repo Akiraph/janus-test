@@ -6,6 +6,7 @@ interface SessionDiffViewProps {
   files: readonly SessionDiffFile[];
   loading: boolean;
   error: string | null;
+  actionError: string | null;
   onRetry: () => void;
 }
 
@@ -13,7 +14,7 @@ export function SessionDiffView(props: SessionDiffViewProps) {
   return (
     <section class="session-diff" aria-label="Session changes">
       <NotificationEvent
-        message={props.error}
+        message={props.error ?? props.actionError}
         variant="danger"
         action={{ label: "Retry", onClick: props.onRetry }}
       />
@@ -45,6 +46,10 @@ function SessionDiffFileRow(props: { file: SessionDiffFile }) {
           {open() ? "-" : "+"}
         </span>
         <span class="mono session-diff__file-path">{props.file.path}</span>
+        <span class="session-diff__file-stats">
+          <span class="session-diff__file-additions">+{props.file.additions}</span>
+          <span class="session-diff__file-deletions">-{props.file.deletions}</span>
+        </span>
         <span class="session-diff__file-kind" data-kind={props.file.kind}>
           {props.file.kind}
         </span>

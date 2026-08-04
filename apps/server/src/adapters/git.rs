@@ -41,6 +41,8 @@ impl SystemGit {
     fn base(repo: &Path) -> Command {
         let mut command = Command::new("git");
         command
+            .arg("-c")
+            .arg(format!("safe.directory={}", safe_directory(repo)))
             .current_dir(repo)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -130,6 +132,8 @@ impl GitRunner for SystemGit {
             std::fs::create_dir_all(parent).ok();
             let mut command = Command::new("git");
             command
+                .arg("-c")
+                .arg(format!("safe.directory={}", safe_directory(into)))
                 .current_dir(parent)
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .env("GIT_TERMINAL_PROMPT", "0")
@@ -474,6 +478,13 @@ impl GitRunner for SystemGit {
     ) -> BoxFuture<'a, Result<String, GitError>> {
         Box::pin(async move { complete_fast_forward(repo, remote, branch).await })
     }
+}
+
+fn safe_directory(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 async fn rev_parse(repo: &Path, rev: &str) -> Result<String, GitError> {

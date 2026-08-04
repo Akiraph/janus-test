@@ -10,11 +10,12 @@
 //! working tree in seconds - no recursive file copy, no re-`git init`, and the
 //! Session inherits Main's full history instead of becoming an orphan repo.
 
-use std::process::Command;
 use std::{
     fmt::Display,
     path::{Path, PathBuf},
 };
+
+use super::git_command;
 
 /// Relative managed_dir stored in `workspace_copies.managed_dir`.
 pub fn session_managed_dir(session_id: impl Display) -> String {
@@ -33,6 +34,19 @@ pub fn session_repo_abs(data_root: &Path, session_id: impl Display) -> PathBuf {
             .join("sessions")
             .join(session_id.to_string())
             .join("repo"),
+    )
+}
+
+/// Absolute path to the legacy filesystem baseline for a Session.
+/// New propagation baselines are persisted as manifests; this path remains
+/// only for lazy migration of older workspace rows.
+pub fn propagation_base_abs(data_root: &Path, session_id: impl Display) -> PathBuf {
+    absoluteish(
+        data_root
+            .join("workspaces")
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("base"),
     )
 }
 
@@ -75,7 +89,7 @@ pub fn create_session_worktree(main_repo: &Path, session_repo: &Path) -> anyhow:
     // Refuse a target that already exists (even with --force) when it is a
     // non-empty leftover. Clear any stale target first.
     if session_repo.exists() {
-        let _ = Command::new("git")
+        let _ = git_command(&main_repo)
             .args(["worktree", "remove", "--force"])
             .arg(&session_repo)
             .current_dir(&main_repo)
@@ -87,7 +101,7 @@ pub fn create_session_worktree(main_repo: &Path, session_repo: &Path) -> anyhow:
     } else if let Some(parent) = session_repo.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let status = Command::new("git")
+    let status = git_command(&main_repo)
         .args([
             "-c",
             "core.autocrlf=false",
@@ -109,7 +123,7 @@ pub fn create_session_worktree(main_repo: &Path, session_repo: &Path) -> anyhow:
     // Guardrail: if the session path somehow still landed under Main, surface
     // it as an error rather than silently polluting the project tree.
     if session_repo.starts_with(&main_repo) {
-        let _ = Command::new("git")
+        let _ = git_command(&main_repo)
             .args(["worktree", "remove", "--force"])
             .arg(&session_repo)
             .current_dir(&main_repo)
@@ -126,7 +140,7 @@ pub fn create_session_worktree(main_repo: &Path, session_repo: &Path) -> anyhow:
 }
 
 pub fn main_worktree_is_clean(main_repo: &Path) -> anyhow::Result<bool> {
-    let output = Command::new("git")
+    let output = git_command(main_repo)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(main_repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -139,29 +153,16 @@ pub fn main_worktree_is_clean(main_repo: &Path) -> anyhow::Result<bool> {
 
 /// Remove the Session workspace tree.
 ///
-/// Tries `git worktree remove` first (run from the worktree itself - any
-/// worktree is a valid git context for `worktree remove`) so Main's
-/// `worktrees/` admin directory stays consistent. Falls back to a plain
-/// recursive delete if the worktree was already pruned or was never registered
-/// (e.g. created before the worktree scheme), so deletion stays idempotent.
+/// Git worktree administration is deliberately not part of this blocking
+/// cleanup: stale entries are harmless to Main and can be pruned by a later
+/// repository maintenance pass, while `git worktree remove` can wait
+/// indefinitely on malformed or externally-held worktrees. Keeping this
+/// function filesystem-only makes Session deletion bounded and idempotent.
 pub fn remove_session_tree(data_root: &Path, session_id: impl Display) -> anyhow::Result<()> {
     let session_root = data_root
         .join("workspaces")
         .join("sessions")
         .join(session_id.to_string());
-    let session_repo = session_root.join("repo");
-    // Best-effort worktree deregistration; ignore failure (already gone / never
-    // a worktree) and clean the on-disk tree regardless.
-    if session_repo.is_dir() {
-        let _ = Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(&session_repo)
-            .current_dir(&session_repo)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .status();
-        // `worktree remove` leaves the session_root/repo directory behind in
-        // some edge cases; ensure the whole session tree is gone.
-    }
     if session_root.exists() {
         std::fs::remove_dir_all(&session_root)?;
     }
@@ -170,6 +171,8 @@ pub fn remove_session_tree(data_root: &Path, session_id: impl Display) -> anyhow
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
     use tempfile::TempDir;
 

@@ -1,14 +1,56 @@
 //! Path-level Diff summary between Session and Main manifests.
 //!
-//! Reports file-level added, modified, and deleted paths. It does not perform
-//! three-way merge or apply changes; `apply_enabled` remains false.
+//! Reports file-level added, modified, and deleted paths, plus the line-level
+//! details used by the Session Diff view.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::manifest::{is_text_bytes, split_lines};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PropagationDirection {
+    Sync,
+    Apply,
+}
+
+impl PropagationDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Apply => "apply",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PropagationConflictPath {
+    pub path: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub main_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PropagationConflict {
+    pub direction: PropagationDirection,
+    pub paths: Vec<PropagationConflictPath>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct PropagationResult {
+    pub direction: PropagationDirection,
+    pub changed_paths: Vec<String>,
+    pub session_revision: String,
+    pub main_revision: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +94,8 @@ pub struct DiffHunk {
 pub struct DiffPathEntry {
     pub path: String,
     pub kind: DiffChangeKind,
+    pub additions: u32,
+    pub deletions: u32,
     /// Line-level hunks when available. Empty for binary / oversized / pure path
     /// classification without content. Frontend collapses by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -67,8 +111,9 @@ pub struct DiffSummary {
     pub modified: u32,
     pub deleted: u32,
     pub paths: Vec<DiffPathEntry>,
-    /// Reserved for workflow-controlled Apply/Sync; currently always false.
+    pub sync_enabled: bool,
     pub apply_enabled: bool,
+    pub pending_conflict: Option<PropagationConflict>,
 }
 
 /// Session vs Main content-hash maps (path -> file node_hash).
@@ -89,6 +134,8 @@ pub fn diff_file_maps(
                 paths.push(DiffPathEntry {
                     path: path.clone(),
                     kind: DiffChangeKind::Modified,
+                    additions: 0,
+                    deletions: 0,
                     hunks: Vec::new(),
                     binary: false,
                 });
@@ -98,6 +145,8 @@ pub fn diff_file_maps(
                 paths.push(DiffPathEntry {
                     path: path.clone(),
                     kind: DiffChangeKind::Added,
+                    additions: 0,
+                    deletions: 0,
                     hunks: Vec::new(),
                     binary: false,
                 });
@@ -107,6 +156,8 @@ pub fn diff_file_maps(
                 paths.push(DiffPathEntry {
                     path: path.clone(),
                     kind: DiffChangeKind::Deleted,
+                    additions: 0,
+                    deletions: 0,
                     hunks: Vec::new(),
                     binary: false,
                 });
@@ -120,7 +171,9 @@ pub fn diff_file_maps(
         modified,
         deleted,
         paths,
+        sync_enabled: false,
         apply_enabled: false,
+        pending_conflict: None,
     }
 }
 
@@ -154,6 +207,28 @@ pub fn line_hunks(session_bytes: &[u8], main_bytes: &[u8]) -> (Vec<DiffHunk>, bo
     let ops = lcs_ops(&main_lines, &session_lines);
     let hunks = collapse_ops(&ops, &main_lines, &session_lines);
     (hunks, false)
+}
+
+/// Count changed content lines without treating the synthetic empty line used
+/// by `split_lines` to distinguish a trailing newline as a user line.
+pub(crate) fn line_change_counts(session_bytes: &[u8], main_bytes: &[u8]) -> (u32, u32) {
+    let session_lines = content_lines(session_bytes);
+    let main_lines = content_lines(main_bytes);
+    let ops = lcs_ops(&main_lines, &session_lines);
+    let additions = ops.iter().filter(|op| **op == Op::Insert).count();
+    let deletions = ops.iter().filter(|op| **op == Op::Delete).count();
+    (
+        additions.try_into().unwrap_or(u32::MAX),
+        deletions.try_into().unwrap_or(u32::MAX),
+    )
+}
+
+fn content_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = split_lines(bytes).collect();
+    if matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
+        lines.pop();
+    }
+    lines
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +473,13 @@ mod tests {
         let (hunks, binary) = line_hunks(b"a\nb\n", b"a\nb\n");
         assert!(!binary);
         assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn line_change_counts_ignore_trailing_newline_sentinel() {
+        assert_eq!(line_change_counts(b"new\n", b""), (1, 0));
+        assert_eq!(line_change_counts(b"", b"old\n"), (0, 1));
+        assert_eq!(line_change_counts(b"new\n", b"old\n"), (1, 1));
     }
 
     #[test]

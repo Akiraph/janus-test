@@ -3,9 +3,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use janus_infrastructure::id::{
-    AskId, AttachmentId, ProjectId, RoundId, SessionId, TurnId, UploadId,
-};
+use janus_infrastructure::id::{AttachmentId, ProjectId, RoundId, SessionId, TurnId, UploadId};
 use janus_workspace::interface::WorkspaceError;
 
 pub const MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
@@ -546,15 +544,6 @@ pub struct ReplaceToolResultInput<'a> {
     pub now: &'a str,
 }
 
-pub struct RecordAskAnswer<'a> {
-    pub session_id: SessionId,
-    pub turn_id: TurnId,
-    pub ask_id: AskId,
-    pub answer: &'a serde_json::Value,
-    pub actor: &'a serde_json::Value,
-    pub now: &'a str,
-}
-
 pub struct AppendAssistantMessage<'a> {
     pub session_id: SessionId,
     pub turn_id: TurnId,
@@ -589,7 +578,7 @@ pub struct SteerResult {
     pub session_version: String,
 }
 
-/// Blocking vs best-effort Ask. Execution creates the Ask row;
+/// Blocking vs non-blocking Ask. Execution creates the Ask row;
 /// Sessions owns the answer/expiry write that resumes the Turn.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AskSummary {
@@ -611,6 +600,16 @@ pub struct AskAnswerResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TimelineTurnStatus {
+    pub id: String,
+    pub status: String,
+    pub cancellation_reason: Option<String>,
+    pub completion_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TimelineItemView {
     pub id: String,
     pub session_id: String,
@@ -622,6 +621,8 @@ pub struct TimelineItemView {
     pub status: String,
     pub version: String,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub turn_status: Option<TimelineTurnStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

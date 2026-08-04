@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::stream_types::{
     ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent, StreamChannel,
-    TokenUsage, ToolCallDelta,
+    TokenUsage, ToolCallDelta, append_reasoning_summary,
 };
 
 pub fn build_messages_body(req: &ModelRequest) -> Value {
@@ -173,7 +173,7 @@ impl AnthropicAssembler {
                     }
                 } else if dtype == "thinking_delta" {
                     if let Some(text) = delta.get("thinking").and_then(|t| t.as_str()) {
-                        self.reasoning.push_str(text);
+                        append_reasoning_summary(&mut self.reasoning, text);
                         self.seq += 1;
                         out.push(ModelStreamEvent::Delta {
                             attempt_id: attempt_id.to_owned(),
@@ -248,9 +248,11 @@ impl AnthropicAssembler {
                         .and_then(|x| x.as_u64())
                         .unwrap_or(0);
                     let input = self.usage.as_ref().map(|u| u.input_tokens).unwrap_or(0);
+                    let cache_tokens = self.usage.as_ref().map(|u| u.cache_tokens).unwrap_or(0);
                     let usage = TokenUsage {
                         input_tokens: input,
                         output_tokens: out_tok,
+                        cache_tokens,
                     };
                     self.usage = Some(usage.clone());
                     // Emit a usage-only delta so the UI can show live output token count.
@@ -274,6 +276,16 @@ impl AnthropicAssembler {
             }
             "message_start" => {
                 if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                    let cache_tokens = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0)
+                        .saturating_add(
+                            usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0),
+                        );
                     let usage = TokenUsage {
                         input_tokens: usage
                             .get("input_tokens")
@@ -283,6 +295,7 @@ impl AnthropicAssembler {
                             .get("output_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0),
+                        cache_tokens,
                     };
                     self.usage = Some(usage.clone());
                     // Emit a usage-only delta so the UI can show baseline input token count.
@@ -321,6 +334,7 @@ impl AnthropicAssembler {
             usage: self.usage.clone().unwrap_or(TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                cache_tokens: 0,
             }),
             stop_reason: self.stop_reason.clone(),
             tool_calls,

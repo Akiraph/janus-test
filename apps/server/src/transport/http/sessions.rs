@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 
 use crate::{
     AppState,
-    application::session_flow::PostSessionMessage,
+    application::{session_flow::PostSessionMessage, workspace_sync::WorkspacePropagationError},
     transport::http::{
         auth::authenticate,
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -28,6 +28,7 @@ use janus_sessions::interface::{
     SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage, TurnSummary,
     UploadAttachmentInput,
 };
+use janus_workspace::interface::{DiffSummary, PropagationResult};
 
 #[derive(Debug, Deserialize)]
 pub struct ListSessionsQuery {
@@ -100,6 +101,14 @@ pub struct CancelTurnRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AnswerAskRequest {
     pub answer: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AnswerAskResult {
+    pub ask_id: String,
+    pub turn_id: String,
+    pub route_or_status: String,
+    pub session_version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,13 +538,13 @@ pub async fn get_turn(
     get,
     path = "/api/v1/sessions/{id}/diff",
     params(("id" = String, Path)),
-    responses((status = 200, body = DataResponse<serde_json::Value>), (status = 404, body = Problem))
+    responses((status = 200, body = DataResponse<DiffSummary>), (status = 404, body = Problem))
 )]
 pub async fn session_diff(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<DataResponse<serde_json::Value>>, Problem> {
+) -> Result<Json<DataResponse<DiffSummary>>, Problem> {
     let _auth = authenticate(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
@@ -551,12 +560,72 @@ pub async fn session_diff(
         .diff_summary(session_id)
         .await
         .map_err(|e| Problem::from_code(codes::INTERNAL_ERROR, format!("diff failed: {e}")))?;
-    let data = serde_json::json!({
-        "apply_enabled": false,
-        "sync_enabled": false,
-        "note": "Apply and sync controls are not available yet.",
-        "summary": summary,
+    Ok(Json(DataResponse { data: summary }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/sync",
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = DataResponse<PropagationResult>),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<DataResponse<PropagationResult>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let actor = serde_json::json!({
+        "kind": "owner",
+        "id": auth.owner_id,
+        "request_id": context.request_id,
     });
+    let data = state
+        .application()
+        .sync_session_workspace(session_id, actor)
+        .await
+        .map_err(workspace_propagation_problem)?;
+    Ok(Json(DataResponse { data }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/apply",
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, body = DataResponse<PropagationResult>),
+        (status = 404, body = Problem),
+        (status = 409, body = Problem)
+    )
+)]
+pub async fn apply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<DataResponse<PropagationResult>>, Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let actor = serde_json::json!({
+        "kind": "owner",
+        "id": auth.owner_id,
+        "request_id": context.request_id,
+    });
+    let data = state
+        .application()
+        .apply_session_workspace(session_id, actor)
+        .await
+        .map_err(workspace_propagation_problem)?;
     Ok(Json(DataResponse { data }))
 }
 
@@ -642,7 +711,7 @@ pub async fn cancel_turn(
     path = "/api/v1/asks/{ask_id}/answer",
     request_body = AnswerAskRequest,
     params(("ask_id" = String, Path)),
-    responses((status = 200, body = DataResponse<serde_json::Value>), (status = 404, body = Problem))
+    responses((status = 200, body = DataResponse<AnswerAskResult>), (status = 404, body = Problem))
 )]
 pub async fn answer_ask(
     State(state): State<AppState>,
@@ -650,7 +719,7 @@ pub async fn answer_ask(
     Path(ask_id): Path<String>,
     Extension(context): Extension<RequestContext>,
     Json(body): Json<AnswerAskRequest>,
-) -> Result<Json<DataResponse<serde_json::Value>>, Problem> {
+) -> Result<Json<DataResponse<AnswerAskResult>>, Problem> {
     let auth = authenticate(&state, &headers).await?;
     let ask_id: AskId = ask_id
         .parse()
@@ -666,12 +735,12 @@ pub async fn answer_ask(
         .await
         .map_err(sessions_problem)?;
     Ok(Json(DataResponse {
-        data: serde_json::json!({
-            "ask_id": ask_id.to_string(),
-            "turn_id": turn_id.to_string(),
-            "route_or_status": route_or_status,
-            "session_version": session_version,
-        }),
+        data: AnswerAskResult {
+            ask_id: ask_id.to_string(),
+            turn_id: turn_id.to_string(),
+            route_or_status,
+            session_version,
+        },
     }))
 }
 
@@ -743,6 +812,33 @@ fn sessions_problem(error: SessionsError) -> Problem {
             Problem::from_code(codes::VALIDATION_FAILED, error.to_string())
         }
         other => Problem::from_code(codes::INTERNAL_ERROR, other.to_string()),
+    }
+}
+
+fn workspace_propagation_problem(error: WorkspacePropagationError) -> Problem {
+    match error {
+        WorkspacePropagationError::Sessions(error) => sessions_problem(error),
+        WorkspacePropagationError::Conflict(conflict) => {
+            let paths = conflict
+                .paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Problem::from_code(
+                codes::WORKSPACE_PROPAGATION_CONFLICT,
+                format!(
+                    "workspace {} has conflicts: {paths}",
+                    conflict.direction.as_str()
+                ),
+            )
+        }
+        WorkspacePropagationError::Workspace(error) => {
+            Problem::from_code(codes::INTERNAL_ERROR, error.to_string())
+        }
+        WorkspacePropagationError::Internal(error) => {
+            Problem::from_code(codes::INTERNAL_ERROR, error.to_string())
+        }
     }
 }
 

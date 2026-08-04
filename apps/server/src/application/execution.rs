@@ -97,7 +97,14 @@ impl ExecutionCoordinator {
     async fn run_claimed(&self, mut claim: TurnClaim) -> Result<(), TurnExecutionError> {
         loop {
             let turn_id = claim.turn_id;
-            let before = self.sessions.execution_turn(turn_id).await?;
+            let before = match self.sessions.execution_turn(turn_id).await {
+                Ok(state) => state,
+                Err(SessionsError::NotFound) => {
+                    debug!(%turn_id, "dropping execution wake for deleted Turn");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             if before.status.is_active() {
                 if !before.active {
                     return Ok(());
@@ -124,7 +131,14 @@ impl ExecutionCoordinator {
                 }
             }
 
-            let after = self.sessions.execution_turn(turn_id).await?;
+            let after = match self.sessions.execution_turn(turn_id).await {
+                Ok(state) => state,
+                Err(SessionsError::NotFound) => {
+                    debug!(%turn_id, "Turn deleted while execution was settling");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             let next_turn = if after.status.advances_queue() {
                 self.activate_next_queued_after(turn_id, after.session_id)
                     .await?

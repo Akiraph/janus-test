@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { Match, Show, Switch } from "solid-js";
 import { FileTreePanel } from "./FileTreePanel";
 import { LazyTerminalPanel } from "./LazyTerminalPanel";
 import { ScmPanel } from "./ScmPanel";
@@ -13,6 +13,8 @@ interface WorkspaceSidebarProps {
   branch: () => string | null;
   activeFilePath: () => string | null;
   activeSessionId: () => string | null;
+  sessionCreating: () => boolean;
+  onSessionCreating: (creating: boolean) => void;
   treeRefresh: () => number;
   onOpenFile: (path: string) => void;
   onOpenSession: (sessionId: string, title?: string | null) => void;
@@ -23,41 +25,43 @@ export function WorkspaceSidebar(props: WorkspaceSidebarProps) {
   return (
     <Show when={props.open}>
       <aside class="ide-sidebar" aria-label="Workspace sidebar">
-        <div class="ide-sidebar-view" hidden={props.activity !== "explorer"}>
-          <FileTreePanel
-            projectId={props.projectId}
-            activePath={props.activeFilePath}
-            onOpenFile={props.onOpenFile}
-            refreshToken={props.treeRefresh}
-          />
-        </div>
-        <div class="ide-sidebar-view" hidden={props.activity !== "sessions"}>
-          <SessionsPanel
-            projectId={props.projectId}
-            projectReady={props.ready}
-            activeSessionId={props.activeSessionId}
-            onOpenSession={props.onOpenSession}
-            onSessionDeleted={props.onSessionDeleted}
-          />
-        </div>
-        <div class="ide-sidebar-view" hidden={props.activity !== "scm"}>
-          <ScmPanel
-            projectId={props.projectId}
-            onOpenFile={props.onOpenFile}
-            branch={props.branch}
-          />
-        </div>
-        <div class="ide-sidebar-view" hidden={props.activity !== "terminal"}>
-          <div class="ide-sidebar-panel terminal-sidebar-panel">
-            <Show when={props.activity === "terminal"}>
+        <Switch>
+          <Match when={props.activity === "explorer"}>
+            <FileTreePanel
+              projectId={props.projectId}
+              activePath={props.activeFilePath}
+              onOpenFile={props.onOpenFile}
+              refreshToken={props.treeRefresh}
+            />
+          </Match>
+          <Match when={props.activity === "sessions"}>
+            <SessionsPanel
+              projectId={props.projectId}
+              projectReady={props.ready}
+              activeSessionId={props.activeSessionId}
+              creating={props.sessionCreating}
+              onCreatingChange={props.onSessionCreating}
+              onOpenSession={props.onOpenSession}
+              onSessionDeleted={props.onSessionDeleted}
+            />
+          </Match>
+          <Match when={props.activity === "scm"}>
+            <ScmPanel
+              projectId={props.projectId}
+              onOpenFile={props.onOpenFile}
+              branch={props.branch}
+            />
+          </Match>
+          <Match when={props.activity === "terminal"}>
+            <div class="ide-sidebar-panel terminal-sidebar-panel">
               <LazyTerminalPanel
                 projectId={props.projectId}
                 title="Main Terminal"
                 active={() => props.activity === "terminal"}
               />
-            </Show>
-          </div>
-        </div>
+            </div>
+          </Match>
+        </Switch>
       </aside>
     </Show>
   );

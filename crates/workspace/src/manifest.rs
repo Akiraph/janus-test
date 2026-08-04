@@ -13,13 +13,14 @@
 //! `blob_sha` still stores the **raw** bytes in CAS (unmodified) - only the
 //! content identity used for diffing is normalized.
 //!
-//! Walks the working tree, skipping only `.git` (VCS admin / worktree gitdir
-//! pointer). Janus's own data root must not appear in project trees in the
-//! first place - that is a path-resolution bug, not a skip-list concern.
+//! Walks the working tree, skipping VCS administration and Janus-owned runtime
+//! entries. Janus's own data root must not appear in project trees in the first
+//! place, but runtime-created scratch entries are also excluded defensively.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use janus_infrastructure::managed_storage::{BlobReference, BlobStore};
@@ -27,7 +28,7 @@ use janus_infrastructure::managed_storage::{BlobReference, BlobStore};
 /// Relative path using `/` separators (workspace-root relative).
 pub type RelPath = String;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     File,
     Dir,
@@ -43,7 +44,7 @@ impl NodeKind {
 }
 
 /// One leaf or internal node after collection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestNode {
     pub kind: NodeKind,
     pub mode: u32,
@@ -57,7 +58,7 @@ pub struct ManifestNode {
 }
 
 /// Full tree walk result: root hash + every relative path -> node metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestRoot {
     pub root_hash: String,
     /// All non-root nodes keyed by relative path (`a/b.txt`). Root itself is not keyed.
@@ -76,6 +77,26 @@ pub async fn collect_manifest(
 ) -> anyhow::Result<ManifestRoot> {
     let (root_hash, nodes) = collect_dir(root, Path::new(""), blobs, blob_owner_id).await?;
     Ok(ManifestRoot { root_hash, nodes })
+}
+
+/// Return true for filesystem entries that can redirect traversal outside the
+/// workspace root. Windows junctions are reparse points even when they are not
+/// reported as symbolic links by the standard library.
+pub(crate) fn is_link_or_reparse(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 async fn collect_dir(
@@ -97,7 +118,7 @@ async fn collect_dir(
         let mut entries = tokio::fs::read_dir(&abs).await?;
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
+            if name == ".git" || is_workspace_internal_component(&name) {
                 continue;
             }
             let child_rel = if rel.as_os_str().is_empty() {
@@ -106,7 +127,10 @@ async fn collect_dir(
                 rel.join(&name)
             };
             let child_abs = entry.path();
-            let meta = entry.metadata().await?;
+            let meta = tokio::fs::symlink_metadata(&child_abs).await?;
+            if is_link_or_reparse(&meta) {
+                continue;
+            }
             if meta.is_dir() {
                 let (child_hash, nested) =
                     Box::pin(collect_dir(abs_root, &child_rel, blobs, blob_owner_id)).await?;
@@ -154,6 +178,17 @@ async fn collect_dir(
 
     let root_hash = hash_dir_node(&children);
     Ok((root_hash, all_nodes))
+}
+
+pub(crate) fn is_workspace_internal_component(name: &str) -> bool {
+    name == ".janus-dev"
+        || name == ".janus-tmp"
+        || name.starts_with(".janus-runtime-")
+        || (name.len() > 2 && name.starts_with('%') && name.ends_with('%'))
+}
+
+pub(crate) fn is_workspace_internal_path(path: &str) -> bool {
+    path.split(['/', '\\']).any(is_workspace_internal_component)
 }
 
 fn path_to_rel(path: &Path) -> RelPath {
@@ -387,5 +422,44 @@ mod tests {
     fn empty_dir_has_stable_hash() {
         let empty = BTreeMap::new();
         assert_eq!(hash_dir_node(&empty), hash_dir_node(&BTreeMap::new()));
+    }
+
+    #[tokio::test]
+    async fn collect_manifest_does_not_follow_directory_links() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = root.path().join("external");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create directory link");
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    link.to_str().expect("link path"),
+                    outside.path().to_str().expect("outside path"),
+                ])
+                .output()
+                .expect("create directory junction");
+            assert!(
+                result.status.success(),
+                "mklink failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("sqlite");
+        let blobs = janus_infrastructure::managed_storage::BlobStore::new(pool, root.path())
+            .expect("blob store");
+        let manifest = collect_manifest(root.path(), &blobs, "manifest-test")
+            .await
+            .expect("collect manifest");
+
+        assert!(!manifest.nodes.contains_key("external"));
     }
 }

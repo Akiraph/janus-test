@@ -74,6 +74,34 @@ pub enum StreamChannel {
     ToolCallPreview,
 }
 
+/// Join provider reasoning-summary deltas without relying on provider or API
+/// kind. Some upstreams emit each summary sentence as a separate delta and
+/// omit the whitespace that was present in the original summary.
+pub fn append_reasoning_summary(previous: &mut String, delta: &str) {
+    let delta_starts_without_whitespace = delta
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace());
+    let previous_ends_without_whitespace = previous
+        .chars()
+        .last()
+        .is_some_and(|character| !character.is_whitespace());
+    let looks_like_new_summary_sentence = delta.len() >= 20
+        && delta
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.chars().next().is_some_and(|ch| ch.is_uppercase()));
+
+    if !previous.is_empty()
+        && delta_starts_without_whitespace
+        && previous_ends_without_whitespace
+        && looks_like_new_summary_sentence
+    {
+        previous.push('\n');
+    }
+    previous.push_str(delta);
+}
+
 /// Measures the model reasoning interval independently from answer/tool
 /// output. Provider adapters observe deltas before awaiting event persistence.
 #[derive(Debug, Default)]
@@ -133,8 +161,13 @@ pub struct CompletedToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct TokenUsage {
+    /// Input tokens that were not served from the provider cache.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens served from the provider cache. This is accounting
+    /// metadata; it is never included in `input_tokens`.
+    #[serde(default)]
+    pub cache_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,7 +227,7 @@ pub enum ModelStreamEvent {
 mod tests {
     use std::{thread, time::Duration};
 
-    use super::{ModelStreamEvent, StreamChannel, StreamTiming};
+    use super::{ModelStreamEvent, StreamChannel, StreamTiming, append_reasoning_summary};
 
     fn delta(channel: StreamChannel, text: &str) -> ModelStreamEvent {
         ModelStreamEvent::Delta {
@@ -228,5 +261,21 @@ mod tests {
         let mut timing = StreamTiming::default();
         timing.observe(&delta(StreamChannel::Text, "answer"));
         assert_eq!(timing.reasoning_duration_ms(), None);
+    }
+
+    #[test]
+    fn reasoning_summary_deltas_are_separated_by_content_shape() {
+        let mut summary = String::from("Summarizing the workspace state");
+        append_reasoning_summary(&mut summary, "Detailing the relevant files");
+        assert_eq!(
+            summary,
+            "Summarizing the workspace state\nDetailing the relevant files"
+        );
+
+        append_reasoning_summary(&mut summary, " with more context");
+        assert_eq!(
+            summary,
+            "Summarizing the workspace state\nDetailing the relevant files with more context"
+        );
     }
 }

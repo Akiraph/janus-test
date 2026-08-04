@@ -30,7 +30,7 @@
   font-weight: var(--weight-semibold);
 }
 
-.account-row span:not(.ui-badge) {
+.account-row span {
   color: var(--text-muted);
   font-size: var(--text-sm);
 }

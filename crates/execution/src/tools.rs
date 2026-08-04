@@ -14,7 +14,7 @@ use janus_workspace::interface::{
     DiffLineKind, FileMutation, WorkspaceHandle, WorkspaceInterface, line_hunks,
 };
 
-use super::paths::resolve_session_path;
+use super::paths::{normalize_session_path, resolve_session_path};
 use super::registry::{is_forbidden_tool, is_registered};
 use super::types::{
     AskMode, AskRequest, ExecutionError, ToolDisplay, ToolDisplayBody, ToolExecutionDisposition,
@@ -695,6 +695,8 @@ async fn tool_write(
         .get("content")
         .and_then(|c| c.as_str())
         .ok_or_else(|| ExecutionError::Internal(anyhow::anyhow!("content required")))?;
+    let normalized_path =
+        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
     // Path validation only (mutation API re-validates).
     let abs = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
@@ -708,7 +710,7 @@ async fn tool_write(
     };
 
     let mutation = FileMutation::Write {
-        path: path.to_owned(),
+        path: normalized_path,
         content: content.as_bytes().to_vec(),
     };
     let rev = ctx
@@ -785,6 +787,8 @@ async fn tool_edit(
         .get("path")
         .and_then(|p| p.as_str())
         .ok_or(ExecutionError::ToolPathInvalid)?;
+    let normalized_path =
+        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
     let abs = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     // edit cannot create files — the model must use `write` for new files.
@@ -794,7 +798,7 @@ async fn tool_edit(
             "TOOL_EDIT_TARGET_MISSING",
         ));
     }
-    if !ctx.read_paths.contains(path) {
+    if !ctx.read_paths.contains(path) && !ctx.read_paths.contains(&normalized_path) {
         return Ok(fail_text(
             "edit requires reading the file first; call read on this path before editing",
             "TOOL_EDIT_NOT_READ",
@@ -849,7 +853,7 @@ async fn tool_edit(
     }
 
     let mutation = FileMutation::Write {
-        path: path.to_owned(),
+        path: normalized_path,
         content: content.as_bytes().to_vec(),
     };
     let rev = ctx
@@ -882,6 +886,8 @@ async fn tool_remove(
         .get("path")
         .and_then(|p| p.as_str())
         .ok_or(ExecutionError::ToolPathInvalid)?;
+    let normalized_path =
+        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
     let _ = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     let rev = ctx
@@ -889,7 +895,7 @@ async fn tool_remove(
         .apply_file_mutation(
             handle,
             FileMutation::Delete {
-                path: path.to_owned(),
+                path: normalized_path,
             },
             None,
             "tool.delete",
@@ -1018,6 +1024,8 @@ async fn tool_attachment_save(
         .get("path")
         .and_then(Value::as_str)
         .ok_or(ExecutionError::ToolPathInvalid)?;
+    let normalized_path =
+        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
     let _ = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     let Some(bytes) = read_attachment_bytes(ctx.blobs, &attachment).await? else {
@@ -1031,7 +1039,7 @@ async fn tool_attachment_save(
         .apply_file_mutation(
             handle,
             FileMutation::Write {
-                path: path.to_owned(),
+                path: normalized_path,
                 content: bytes,
             },
             None,
@@ -1159,16 +1167,19 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
     };
     use std::collections::BTreeMap;
 
-    let command = input
+    let display_command = input
         .get("command")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ExecutionError::Internal(anyhow::anyhow!("command required")))?;
-    if command.trim().is_empty() {
+    if display_command.trim().is_empty() {
         return Ok(fail_text("command is empty", "VALIDATION_FAILED"));
+    }
+    if let Err(detail) = validate_workspace_command(display_command) {
+        return Ok(fail_text(&detail, "BASH_PATH_ESCAPE"));
     }
     let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("sync");
     if mode == "async" {
-        return tool_bash_async(ctx, command, input).await;
+        return tool_bash_async(ctx, display_command, input).await;
     }
     if mode != "sync" {
         return Ok(fail_text(
@@ -1178,30 +1189,34 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
     }
 
     let timeout = timeout_ms(input, 30_000).min(120_000);
+    let repo = session_repo(ctx.workspace, ctx.session_id)?;
+    let cwd = working_directory(input)?;
+    let fallback_cwd = local_working_directory(&repo, &cwd)?;
+    let command = normalize_workspace_command(
+        display_command,
+        &workspace_command_prefix(&repo, &fallback_cwd),
+    );
 
     let runtime_proj = match ensure_session_runtime(ctx).await {
         Ok(runtime) => runtime,
         Err(ExecutionError::Runtime(error)) if error.retryable() => {
             tracing::warn!(%error, "preferred Runtime unavailable; using system Bash fallback");
-            let repo = session_repo(ctx.workspace, ctx.session_id)?;
-            let raw_cwd = input
-                .get("working_directory")
-                .and_then(|value| value.as_str())
-                .unwrap_or(".");
-            let abs_cwd = if raw_cwd == "." {
-                repo
-            } else {
-                repo.join(raw_cwd)
-            };
-            return run_local_sync(ctx, command, Some(&abs_cwd), timeout).await;
+            return run_local_sync(
+                ctx,
+                &command,
+                display_command,
+                &repo,
+                &fallback_cwd,
+                timeout,
+            )
+            .await;
         }
         Err(error) => return Err(error),
     };
-    let cwd = working_directory(input)?;
     let spec = ExecutionSpec::new(
         runtime_proj.id,
         cwd,
-        ValidatedCommand::shell(command)
+        ValidatedCommand::shell(&command)
             .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("command: {e}")))?,
         ExecutionEnvironment::new(BTreeMap::new(), vec![])
             .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("env: {e}")))?,
@@ -1217,29 +1232,28 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
                 %error,
                 "Runtime sync execution unavailable; using local Git Bash fallback"
             );
-            let repo = session_repo(ctx.workspace, ctx.session_id)?;
-            let raw_cwd = input
-                .get("working_directory")
-                .and_then(|value| value.as_str())
-                .unwrap_or(".");
-            let abs_cwd = if raw_cwd == "." {
-                repo
-            } else {
-                repo.join(raw_cwd)
-            };
-            return run_local_sync(ctx, command, Some(&abs_cwd), timeout).await;
+            return run_local_sync(
+                ctx,
+                &command,
+                display_command,
+                &repo,
+                &fallback_cwd,
+                timeout,
+            )
+            .await;
         }
         Err(error) => return Err(ExecutionError::Runtime(error)),
     };
 
     bash_outcome(
-        command,
+        display_command,
         result.exit.exit_code,
         result.timed_out,
         result.duration_ms,
         result.truncated,
         &result.stdout,
         &result.stderr,
+        &repo,
     )
 }
 
@@ -1247,7 +1261,7 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
 /// the background-job machinery (log stream, Turn waiting) lives there.
 async fn tool_bash_async(
     ctx: &ToolContext<'_>,
-    command: &str,
+    display_command: &str,
     input: &Value,
 ) -> Result<ToolOutcome, ExecutionError> {
     use janus_infrastructure::id::JobId;
@@ -1256,11 +1270,18 @@ async fn tool_bash_async(
     };
     use std::collections::BTreeMap;
 
+    let repo = session_repo(ctx.workspace, ctx.session_id)?;
+    let cwd = working_directory(input)?;
+    let fallback_cwd = local_working_directory(&repo, &cwd)?;
+    let command = normalize_workspace_command(
+        display_command,
+        &workspace_command_prefix(&repo, &fallback_cwd),
+    );
     let runtime_proj = ensure_session_runtime(ctx).await?;
     let timeout = timeout_ms(input, 300_000).min(3_600_000);
     let execution = ExecutionSpec::new(
         runtime_proj.id,
-        working_directory(input)?,
+        cwd,
         ValidatedCommand::shell(command)
             .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("command: {e}")))?,
         ExecutionEnvironment::new(BTreeMap::new(), vec![])
@@ -1309,7 +1330,9 @@ async fn tool_bash_async(
 async fn run_local_sync(
     _ctx: &ToolContext<'_>,
     command: &str,
-    cwd: Option<&std::path::Path>,
+    display_command: &str,
+    workspace_root: &Path,
+    cwd: &Path,
     timeout_ms: u64,
 ) -> Result<ToolOutcome, ExecutionError> {
     use std::time::Duration;
@@ -1322,13 +1345,11 @@ async fn run_local_sync(
         return Ok(fail_text(detail, "BASH_UNAVAILABLE"));
     };
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(["--login", "-c", command]);
-    if let Some(path) = bash_search_path() {
-        cmd.env("PATH", path);
-    }
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
+    // The fallback is still a degraded local executor, but it must not load
+    // the host user's shell profile or inherit its complete environment.
+    cmd.args(["--noprofile", "--norc", "-c", command]);
+    apply_fallback_environment(&mut cmd, workspace_root);
+    cmd.current_dir(cwd);
     let started = std::time::Instant::now();
     let output = tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output()).await;
     let (timed_out, exit_code, stdout, stderr) = match output {
@@ -1347,14 +1368,233 @@ async fn run_local_sync(
     };
     let duration_ms = started.elapsed().as_millis() as u64;
     bash_outcome(
-        command,
+        display_command,
         exit_code,
         timed_out,
         duration_ms,
         false,
         &stdout,
         &stderr,
+        workspace_root,
     )
+}
+
+fn local_working_directory(
+    repo: &Path,
+    cwd: &janus_runtime::interface::RelativeWorkingDirectory,
+) -> Result<std::path::PathBuf, ExecutionError> {
+    let candidate =
+        resolve_session_path(repo, cwd.as_str()).map_err(|_| ExecutionError::ToolPathInvalid)?;
+    let canonical_root = repo
+        .canonicalize()
+        .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("workspace: {error}")))?;
+    let canonical_cwd = candidate
+        .canonicalize()
+        .map_err(|_| ExecutionError::ToolPathInvalid)?;
+    if !canonical_cwd.starts_with(&canonical_root) {
+        return Err(ExecutionError::ToolPathInvalid);
+    }
+    Ok(canonical_cwd)
+}
+
+fn workspace_command_prefix(workspace_root: &Path, cwd: &Path) -> String {
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_owned());
+    let relative = cwd.strip_prefix(&canonical_root).unwrap_or(cwd);
+    let depth = relative
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count();
+    if depth == 0 {
+        return ".".into();
+    }
+    std::iter::repeat_n("..", depth)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn validate_workspace_command(command: &str) -> Result<(), String> {
+    if command.contains('\0')
+        || command.contains("$(")
+        || command.contains('`')
+        || command.contains("${")
+    {
+        return Err(
+            "Bash blocked: command substitution or environment expansion is not allowed; use an explicit `/workspace/...` or workspace-relative path."
+                .into(),
+        );
+    }
+
+    // Keep quoted text intact: a sentence such as "compare vba / gradio" is
+    // not a path expression and must not turn its slash into a fake root token.
+    for token in shell_command_tokens(command) {
+        if let Some(detail) = workspace_path_violation(&token) {
+            return Err(detail);
+        }
+    }
+    Ok(())
+}
+
+fn workspace_path_violation(value: &str) -> Option<String> {
+    let value = value.trim_matches(['"', '\'']);
+    if value == "/dev/null" {
+        return None;
+    }
+    if value == ".." || (value.starts_with('\\') && !is_shell_escape_literal(value)) {
+        return Some(format_parent_traversal(value));
+    }
+    if value.starts_with('/') {
+        let Some(relative) = value.strip_prefix("/workspace") else {
+            return Some(format_absolute_path(value));
+        };
+        if relative.is_empty() {
+            return None;
+        }
+        if !relative.starts_with('/') {
+            return Some(format_absolute_path(value));
+        }
+        if relative
+            .split(['/', '\\'])
+            .any(|part| part.trim_matches(['"', '\'']) == "..")
+        {
+            return Some(format_parent_traversal(value));
+        }
+        return None;
+    }
+    if value.len() >= 3
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value.as_bytes()[1] == b':'
+        && matches!(value.as_bytes()[2], b'/' | b'\\')
+    {
+        return Some(format_absolute_path(value));
+    }
+    if value
+        .split(['/', '\\'])
+        .any(|part| part.trim_matches(['"', '\'']) == "..")
+    {
+        return Some(format_parent_traversal(value));
+    }
+    None
+}
+
+fn is_shell_escape_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 2
+        && bytes[0] == b'\\'
+        && matches!(
+            bytes[1],
+            b'a' | b'b' | b'e' | b'f' | b'n' | b'r' | b't' | b'v' | b'0'
+        )
+}
+
+fn format_absolute_path(value: &str) -> String {
+    format!(
+        "Bash blocked: absolute path `{value}` is outside the Session workspace; use `/workspace/...` or a workspace-relative path."
+    )
+}
+
+fn format_parent_traversal(value: &str) -> String {
+    format!(
+        "Bash blocked: path `{value}` traverses outside the Session workspace; remove `..` and use a workspace-relative path."
+    )
+}
+
+fn normalize_workspace_command(command: &str, workspace_prefix: &str) -> String {
+    const ALIAS: &str = "/workspace";
+    let mut normalized = String::with_capacity(command.len());
+    let mut offset = 0;
+    while offset < command.len() {
+        let remaining = &command[offset..];
+        if remaining.starts_with(ALIAS) {
+            let before = command[..offset].chars().next_back();
+            let after = command[offset + ALIAS.len()..].chars().next();
+            let before_is_boundary = before
+                .is_none_or(|value| value.is_whitespace() || "\"'(){}[];|&<>=$".contains(value));
+            let after_is_boundary = after
+                .is_none_or(|value| value.is_whitespace() || "/\\\"'(){}[];|&<>=$".contains(value));
+            if before_is_boundary && after_is_boundary {
+                normalized.push_str(workspace_prefix);
+                offset += ALIAS.len();
+                continue;
+            }
+        }
+        let character = remaining
+            .chars()
+            .next()
+            .expect("offset is always on a character boundary");
+        normalized.push(character);
+        offset += character.len_utf8();
+    }
+    normalized
+}
+
+fn shell_command_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && !single_quote {
+            current.push(character);
+            escaped = true;
+            continue;
+        }
+        match character {
+            '\'' if !double_quote => single_quote = !single_quote,
+            '"' if !single_quote => double_quote = !double_quote,
+            character
+                if !single_quote
+                    && !double_quote
+                    && (character.is_whitespace() || ";&|<>".contains(character)) =>
+            {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                if !character.is_whitespace() {
+                    tokens.push(character.to_string());
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn apply_fallback_environment(command: &mut tokio::process::Command, workspace_root: &Path) {
+    command.env_clear();
+    if let Some(path) = bash_search_path() {
+        command.env("PATH", path);
+    }
+    command.env("HOME", workspace_root);
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("LANG", "C.UTF-8");
+    let temp = workspace_root.join(".janus-tmp");
+    let _ = std::fs::create_dir_all(&temp);
+    command.env("TMPDIR", &temp);
+    command.env("TEMP", &temp);
+    command.env("TMP", &temp);
+    command.env("USER", "Janus");
+    command.env("USERNAME", "Janus");
+    command.env("LOGNAME", "Janus");
+    command.env("USERDOMAIN", "Janus");
+    command.env("HOSTNAME", "Janus");
+    command.env("COMPUTERNAME", "Janus");
+    #[cfg(windows)]
+    for key in ["COMSPEC", "PATHEXT", "SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
 }
 
 /// Build a ToolOutcome from a completed (sync) bash run. Shared by the
@@ -1367,9 +1607,13 @@ fn bash_outcome(
     truncated: bool,
     stdout: &str,
     stderr: &str,
+    workspace_root: &Path,
 ) -> Result<ToolOutcome, ExecutionError> {
-    let (stdout_out, stdout_truncated) = truncate_tool_text(stdout, 8_000);
-    let (stderr_out, stderr_truncated) = truncate_tool_text(stderr, 4_000);
+    let command = sanitize_workspace_text(command, workspace_root);
+    let stdout = sanitize_workspace_text(stdout, workspace_root);
+    let stderr = sanitize_workspace_text(stderr, workspace_root);
+    let (stdout_out, stdout_truncated) = truncate_tool_text(&stdout, 8_000);
+    let (stderr_out, stderr_truncated) = truncate_tool_text(&stderr, 4_000);
     let ok = !timed_out && exit_code == Some(0);
     let summary = json!({
         "command": command,
@@ -1405,6 +1649,227 @@ fn bash_outcome(
         finish_summary: None,
         wait: None,
     })
+}
+
+fn sanitize_workspace_text(text: &str, workspace_root: &Path) -> String {
+    let mut sanitized = text.to_owned();
+    let mut variants = vec![workspace_root.to_string_lossy().into_owned()];
+    if let Ok(canonical) = workspace_root.canonicalize() {
+        variants.push(canonical.to_string_lossy().into_owned());
+    }
+    let unix_variants = variants
+        .iter()
+        .map(|value| value.replace('\\', "/"))
+        .collect::<Vec<_>>();
+    variants.extend(unix_variants);
+    if cfg!(windows) {
+        let drive_variants = variants
+            .iter()
+            .filter_map(|value| {
+                let bytes = value.as_bytes();
+                (bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\')).then(
+                    || {
+                        let drive = value[..1].to_ascii_lowercase();
+                        let rest = value[2..].replace('\\', "/");
+                        format!("/{drive}{rest}")
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        variants.extend(drive_variants);
+    }
+    variants.retain(|value| !value.is_empty());
+    variants.sort_by(|left, right| right.len().cmp(&left.len()));
+    variants.dedup();
+    for variant in variants {
+        sanitized = sanitized.replace(&variant, "/workspace");
+    }
+    sanitized = sanitized
+        .replace("CodexSandboxOffline", "Janus")
+        .replace("codexsandboxoffline", "Janus")
+        .replace("CODEXSANDBOXOFFLINE", "Janus")
+        .replace("CodexOfflineSandbox", "Janus")
+        .replace("codexofflinesandbox", "Janus")
+        .replace("CODEXOFFLINESANDBOX", "Janus");
+    if cfg!(windows) {
+        sanitized = sanitized.replace('\\', "/");
+    }
+
+    let mut output = String::with_capacity(sanitized.len());
+    for line in sanitized.split_inclusive('\n') {
+        let (content, ending) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |content| (content, "\n"));
+        if content.contains(".janus-runtime-") || content.contains(".janus-tmp") {
+            output.push_str("[runtime artifact hidden]");
+        } else if is_git_bash_host_identity_line(content) {
+            output.push_str("[host detail hidden]");
+        } else if let Some(redacted) = redact_host_path_fragments(content) {
+            output.push_str(&redacted);
+        } else if is_runtime_identity_line(content) {
+            let leading = &content[..content.len() - content.trim_start().len()];
+            output.push_str(leading);
+            output.push_str("Janus");
+        } else if let Some(key) = sensitive_environment_key(content) {
+            let leading = &content[..content.len() - content.trim_start().len()];
+            output.push_str(leading);
+            output.push_str(key);
+            if is_runtime_identity_key(key) {
+                output.push_str("=Janus");
+            } else {
+                output.push_str("=[redacted]");
+            }
+        } else {
+            output.push_str(content);
+        }
+        output.push_str(ending);
+    }
+    output
+}
+
+fn is_git_bash_host_identity_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("MINGW_NT-")
+        || trimmed.starts_with("MINGW64")
+        || trimmed.starts_with("MSYS_NT-")
+}
+
+fn redact_host_path_fragments(line: &str) -> Option<String> {
+    let mut result = String::with_capacity(line.len());
+    let mut cursor = 0;
+    let mut found = false;
+    for (index, _) in line.char_indices() {
+        let boundary = line[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|character| character.is_whitespace() || ":=([{<\"'".contains(character));
+        if index < cursor || !boundary || !is_host_path_start(&line[index..]) {
+            continue;
+        }
+        if !found {
+            result.push_str(&line[..index]);
+            found = true;
+        } else {
+            result.push_str(&line[cursor..index]);
+        }
+        let end = line[index..]
+            .char_indices()
+            .find_map(|(offset, character)| character.is_whitespace().then_some(index + offset))
+            .unwrap_or(line.len());
+        result.push_str("[host path hidden]");
+        cursor = end;
+    }
+    if !found {
+        return None;
+    }
+    result.push_str(&line[cursor..]);
+    Some(result)
+}
+
+fn is_host_path_start(value: &str) -> bool {
+    if value.starts_with("/workspace") {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let unix_drive_path =
+        bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/';
+    let windows_drive_path =
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/';
+    unix_drive_path
+        || windows_drive_path
+        || value.starts_with("//")
+        || value.starts_with("/mingw")
+        || value.starts_with("/usr/")
+        || value.starts_with("/bin/")
+        || value.starts_with("/etc/")
+}
+
+fn sensitive_environment_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start().trim_end_matches('\r');
+    let key = trimmed
+        .split_once('=')
+        .map(|(key, _)| key)
+        .or_else(|| trimmed.split_once(':').map(|(key, _)| key))?;
+    const SENSITIVE_KEYS: &[&str] = &[
+        "ACLOCAL_PATH",
+        "ALLUSERSPROFILE",
+        "APPDATA",
+        "COMPUTERNAME",
+        "COMSPEC",
+        "CONFIG_SITE",
+        "DISPLAY",
+        "EXEPATH",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "HOSTNAME",
+        "HOME",
+        "INFOPATH",
+        "LOCALAPPDATA",
+        "MANPATH",
+        "MINGW_CHOST",
+        "MINGW_PACKAGE_PREFIX",
+        "MINGW_PREFIX",
+        "MSYSTEM",
+        "MSYSTEM_CARCH",
+        "MSYSTEM_CHOST",
+        "MSYSTEM_PREFIX",
+        "ORIGINAL_PATH",
+        "ORIGINAL_TEMP",
+        "ORIGINAL_TMP",
+        "LOGNAME",
+        "OLDPWD",
+        "PATH",
+        "PATHEXT",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_SYSTEM_INCLUDE_PATH",
+        "PKG_CONFIG_SYSTEM_LIBRARY_PATH",
+        "PWD",
+        "PS1",
+        "PLINK_PROTOCOL",
+        "SHLVL",
+        "SHELL",
+        "SystemDrive",
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+        "USERDOMAIN",
+        "USERNAME",
+        "USERPROFILE",
+        "WINDIR",
+        "JANUS_RUNTIME_PID_FILE",
+        "_",
+    ];
+    SENSITIVE_KEYS
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(key))
+        .map(|_| key)
+}
+
+fn is_runtime_identity_key(key: &str) -> bool {
+    ["LOGNAME", "USER", "USERNAME", "USERDOMAIN"]
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(key))
+}
+
+fn is_runtime_identity_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.contains('=') || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let separator = match (trimmed.rfind('\\'), trimmed.rfind('/')) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(index), None) | (None, Some(index)) => Some(index),
+        (None, None) => None,
+    };
+    let Some(separator) = separator else {
+        return false;
+    };
+    let user = &trimmed[separator + 1..];
+    user.eq_ignore_ascii_case("codexsandboxoffline")
+        || user.eq_ignore_ascii_case("codexofflinesandbox")
+        || user.eq_ignore_ascii_case("janus")
 }
 
 fn truncate_tool_text(text: &str, max_bytes: usize) -> (String, bool) {
@@ -1571,6 +2036,9 @@ async fn tool_read_output(
             LogChannel::Stderr => stderr.push_str(&chunk.text),
         }
     }
+    let workspace_root = session_repo(ctx.workspace, ctx.session_id)?;
+    let stdout = sanitize_workspace_text(&stdout, &workspace_root);
+    let stderr = sanitize_workspace_text(&stderr, &workspace_root);
     let status = format!("{:?}", job.status).to_ascii_lowercase();
     let summary = json!({
         "job_id": raw_id,
@@ -1662,22 +2130,27 @@ async fn tool_ask_user(
     if prompt.trim().is_empty() {
         return Ok(fail_text("prompt is required", "VALIDATION_FAILED"));
     }
-    let mode = match input
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("blocking")
-    {
+    let requested_mode = input.get("mode").and_then(Value::as_str);
+    let mode = match requested_mode.unwrap_or("blocking") {
         "blocking" => AskMode::Blocking,
-        "best_effort" => AskMode::BestEffort,
+        "non_blocking" | "best_effort" => AskMode::NonBlocking,
         _ => {
             return Ok(fail_text(
-                "mode must be blocking|best_effort",
+                "mode must be blocking|non_blocking",
                 "VALIDATION_FAILED",
             ));
         }
     };
     let choices = input.get("choices").cloned().unwrap_or(json!([]));
-    let default = input.get("default").cloned();
+    let multiple = input
+        .get("multiple")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `default` is read only for the legacy mode so new non-blocking asks
+    // cannot preselect the answer that the model is supposed to judge later.
+    let default = (requested_mode == Some("best_effort"))
+        .then(|| input.get("default").cloned())
+        .flatten();
     let expires_in_ms = match input.get("expires_in_ms") {
         None => None,
         Some(value) => match value.as_u64().filter(|value| *value > 0) {
@@ -1690,9 +2163,9 @@ async fn tool_ask_user(
             }
         },
     };
-    if mode == AskMode::BestEffort && (default.is_none() || expires_in_ms.is_none()) {
+    if mode == AskMode::NonBlocking && expires_in_ms.is_none() {
         return Ok(fail_text(
-            "best_effort requires default and expires_in_ms",
+            "non_blocking requires expires_in_ms",
             "VALIDATION_FAILED",
         ));
     }
@@ -1715,6 +2188,8 @@ async fn tool_ask_user(
         "ask_id": ask_id.to_string(),
         "mode": mode.as_str(),
         "prompt": prompt,
+        "choices": choices.clone(),
+        "multiple": multiple,
         "expires_at": expires_at,
     });
     let request = AskRequest {
@@ -1724,6 +2199,7 @@ async fn tool_ask_user(
         mode,
         prompt: json!({"text": prompt}),
         choices,
+        multiple,
         default,
         expires_at,
     };
@@ -1743,7 +2219,10 @@ async fn tool_ask_user(
 mod tests {
     use serde_json::json;
 
-    use super::{attach_tool_display, truncate_tool_text};
+    use super::{
+        attach_tool_display, normalize_workspace_command, sanitize_workspace_text,
+        truncate_tool_text, validate_workspace_command,
+    };
     use crate::{
         registry::available_tools,
         types::{ToolExecutionDisposition, ToolOutcome, ToolResultPart},
@@ -1791,5 +2270,118 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn workspace_command_guard_allows_read_only_compounds() {
+        assert!(validate_workspace_command("pwd && echo --- && ls -la").is_ok());
+        assert!(validate_workspace_command("git status && git diff -- README.md").is_ok());
+        assert!(validate_workspace_command("cat /workspace/src/main.rs").is_ok());
+        assert!(validate_workspace_command("pwd 2>/dev/null").is_ok());
+        assert!(
+            validate_workspace_command(
+                r#"ls -- '%SystemDrive%/ProgramData/Microsoft/Windows/Caches/cversions.2.db'"#
+            )
+            .is_ok()
+        );
+        assert!(validate_workspace_command(
+            r#"cd /workspace && grep -rn -i -e "gradio" --include="*.md" . 2>/dev/null | head -40"#
+        )
+        .is_ok());
+        assert!(
+            validate_workspace_command(
+                r#"echo "references to vba / zxxk / gradio" && grep -rn . 2>/dev/null"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_workspace_command(r#"echo "$ORIGINAL_PATH" | tr ':' '\n' | grep -i janus"#)
+                .is_ok()
+        );
+        assert_eq!(
+            normalize_workspace_command("cat /workspace/src/main.rs", "."),
+            "cat ./src/main.rs"
+        );
+        assert_eq!(
+            normalize_workspace_command("cat /workspace/src/main.rs", "../.."),
+            "cat ../../src/main.rs"
+        );
+    }
+
+    #[test]
+    fn workspace_command_guard_rejects_escape_vectors() {
+        assert_eq!(
+            validate_workspace_command("cat /etc/passwd").unwrap_err(),
+            "Bash blocked: absolute path `/etc/passwd` is outside the Session workspace; use `/workspace/...` or a workspace-relative path.",
+        );
+        assert_eq!(
+            validate_workspace_command("cat /workspace/../outside").unwrap_err(),
+            "Bash blocked: path `/workspace/../outside` traverses outside the Session workspace; remove `..` and use a workspace-relative path.",
+        );
+        for command in [
+            "cd ..",
+            "cat ../secrets.txt",
+            r#"type C:\Users\Administrator\secret.txt"#,
+            "cat /c/Windows/System32/drivers/etc/hosts",
+        ] {
+            assert!(
+                validate_workspace_command(command).is_err(),
+                "expected rejection for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_output_redacts_paths_and_environment_lines() {
+        let root = std::path::Path::new(r"C:\workspace\session");
+        let output = sanitize_workspace_text(
+            "PWD=C:\\workspace\\session\\src\nPATH=C:\\Windows\\System32\nC:\\workspace\\session\\src\\main.rs\n",
+            root,
+        );
+        assert!(!output.contains(r"C:\workspace\session"));
+        assert!(output.contains("PWD=[redacted]"));
+        assert!(output.contains("PATH=[redacted]"));
+        assert!(output.contains("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn workspace_output_hides_runtime_host_details() {
+        let root = std::path::Path::new(r"C:\\workspace\\session");
+        let output = sanitize_workspace_text(
+            "ORIGINAL_PATH=C:\\host\\bin\nUSERNAME=CodexSandboxOffline\nwin-host\\codexsandboxoffline\n",
+            root,
+        );
+        assert!(output.contains("ORIGINAL_PATH=[redacted]"));
+        assert!(output.contains("USERNAME=Janus"));
+        assert!(output.contains("Janus\n"));
+        assert!(!output.contains("Codex"));
+    }
+
+    #[test]
+    fn workspace_output_hides_git_bash_host_details() {
+        let root = std::path::Path::new(r"C:\\workspace\\session");
+        let output = sanitize_workspace_text(
+            "MINGW64_NT-10.0-22631 WIN-20260424EMY 3.6.7-fb42d713.x86_64 2026-03-29 11:44 UTC x86_64 Msys\n/c/Users/Administrator/AppData/Local/Microsoft/WindowsApps/python3\n/c/Python314/python\nwhich: /d/Tools/python.exe\n/c/Program Files/nodejs/node\n/mingw64/bin/git\nsrc/c/project.py\n/workspace/src/main.rs\n",
+            root,
+        );
+        assert!(!output.contains("MINGW64_NT-10.0-22631"));
+        assert!(!output.contains("/c/Users/Administrator"));
+        assert!(!output.contains("/c/Python314"));
+        assert!(!output.contains("/d/Tools/python.exe"));
+        assert!(!output.contains("/mingw64/bin/git"));
+        assert!(output.contains("src/c/project.py"));
+        assert!(output.contains("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn workspace_output_hides_janus_runtime_artifacts() {
+        let root = std::path::Path::new(r"C:\workspace\session");
+        let output = sanitize_workspace_text(
+            ".janus-runtime-nRQ23w-V9JsiFp-N.pid\n.janus-tmp\n/workspace/.janus-tmp/output.log\n",
+            root,
+        );
+
+        assert!(!output.contains(".janus-runtime-"));
+        assert!(!output.contains(".janus-tmp"));
     }
 }

@@ -1,5 +1,6 @@
 import { Route, Router, useParams } from "@solidjs/router";
 import { lazy } from "solid-js";
+import { ProjectWorkspace } from "../features/projects/ProjectWorkspace";
 import { AppShell } from "./AppShell";
 
 const ModelsRoute = lazy(() =>
@@ -14,13 +15,9 @@ const SystemRoute = lazy(() =>
 const ProjectsRoute = lazy(() =>
   import("../features/projects/ProjectsOverview").then((m) => ({ default: m.ProjectsOverview })),
 );
-const ProjectWorkspaceRoute = lazy(() =>
-  import("../features/projects/ProjectWorkspace").then((m) => ({ default: m.ProjectWorkspace })),
-);
-
 function ProjectRoute() {
   const params = useParams<{ id: string }>();
-  return <ProjectWorkspaceRoute projectId={params.id} />;
+  return <ProjectWorkspace projectId={params.id} />;
 }
 
 export function App() {

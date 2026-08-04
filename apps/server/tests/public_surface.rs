@@ -240,6 +240,8 @@ fn openapi_contains_every_public_route() {
         "/api/v1/sessions/{id}/turns/{turn_id}/retry-model",
         "/api/v1/asks/{ask_id}/answer",
         "/api/v1/sessions/{id}/diff",
+        "/api/v1/sessions/{id}/sync",
+        "/api/v1/sessions/{id}/apply",
         "/api/v1/terminals",
         "/api/v1/terminals/{id}/scrollback",
         "/api/v1/terminals/{id}/tickets",

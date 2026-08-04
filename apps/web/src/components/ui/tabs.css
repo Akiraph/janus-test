@@ -45,8 +45,3 @@
   color: var(--text-faint);
   cursor: not-allowed;
 }
-
-.ui-tabs__badge {
-  font-size: var(--text-xs);
-  color: var(--text-faint);
-}

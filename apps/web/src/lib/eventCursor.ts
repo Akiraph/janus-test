@@ -8,6 +8,7 @@
  */
 
 const STORAGE_KEY = "janus:event-cursor";
+export const EVENT_CURSOR_RESET = "janus:event-cursor-reset";
 
 let memoryCursor: string | null = null;
 
@@ -41,5 +42,59 @@ export function clearEventCursor(): void {
     localStorage.removeItem(STORAGE_KEY);
   } catch {
     // Best-effort.
+  }
+}
+
+/** Reconcile a persisted cursor against a known current server high-water
+ * mark. A restarted or replaced local database can make a previously valid
+ * browser cursor point past the new event log. */
+export function reconcileEventCursor(serverCursor: string | null): string | null {
+  return reconcileEventCursorBounds(null, serverCursor);
+}
+
+/** Reconcile against both retained bounds. An expired cursor is moved to just
+ * before the first retained event so the next SSE connection can replay what
+ * is still available instead of receiving another expiry error from `after=0`.
+ */
+export function reconcileEventCursorBounds(
+  serverMinCursor: string | null,
+  serverMaxCursor: string | null,
+): string | null {
+  const localCursor = getLastEventCursor();
+  if (!localCursor) return null;
+  if (
+    (serverMinCursor !== null && !isDecimalCursor(serverMinCursor)) ||
+    (serverMaxCursor !== null && !isDecimalCursor(serverMaxCursor)) ||
+    !isDecimalCursor(localCursor)
+  ) {
+    clearEventCursor();
+    notifyCursorReset();
+    return null;
+  }
+  if (serverMaxCursor !== null && BigInt(localCursor) > BigInt(serverMaxCursor)) {
+    clearEventCursor();
+    notifyCursorReset();
+    return null;
+  }
+  if (
+    serverMinCursor !== null &&
+    BigInt(serverMinCursor) > 0n &&
+    BigInt(localCursor) + 1n < BigInt(serverMinCursor)
+  ) {
+    const replacement = (BigInt(serverMinCursor) - 1n).toString();
+    setLastEventCursor(replacement);
+    notifyCursorReset();
+    return replacement;
+  }
+  return localCursor;
+}
+
+function isDecimalCursor(value: string): boolean {
+  return /^\d+$/.test(value);
+}
+
+function notifyCursorReset(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(EVENT_CURSOR_RESET));
   }
 }

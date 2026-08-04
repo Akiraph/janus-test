@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::stream_types::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
-    StreamChannel, TokenUsage, ToolCallDelta, ToolSpec,
+    StreamChannel, TokenUsage, ToolCallDelta, ToolSpec, append_reasoning_summary,
 };
 
 pub fn build_chat_body(req: &ModelRequest) -> Value {
@@ -160,15 +160,22 @@ impl OpenaiChatAssembler {
         let mut out = Vec::new();
 
         if let Some(usage) = v.get("usage") {
+            let cache_tokens = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let usage = TokenUsage {
                 input_tokens: usage
                     .get("prompt_tokens")
                     .and_then(|x| x.as_u64())
-                    .unwrap_or(0),
+                    .unwrap_or(0)
+                    .saturating_sub(cache_tokens),
                 output_tokens: usage
                     .get("completion_tokens")
                     .and_then(|x| x.as_u64())
                     .unwrap_or(0),
+                cache_tokens,
             };
             self.usage = Some(usage.clone());
             // Emit a usage-only delta so the UI can show live token counts.
@@ -200,7 +207,7 @@ impl OpenaiChatAssembler {
                 .find_map(|key| delta.get(key).and_then(Value::as_str))
                 .filter(|value| !value.is_empty())
             {
-                self.reasoning.push_str(reasoning);
+                append_reasoning_summary(&mut self.reasoning, reasoning);
                 self.seq += 1;
                 out.push(ModelStreamEvent::Delta {
                     attempt_id: attempt_id.to_owned(),
@@ -300,6 +307,7 @@ impl OpenaiChatAssembler {
             usage: self.usage.clone().unwrap_or(TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                cache_tokens: 0,
             }),
             stop_reason: self.finish_reason.clone(),
             tool_calls,

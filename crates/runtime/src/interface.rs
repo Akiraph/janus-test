@@ -511,6 +511,11 @@ impl RelativeWorkingDirectory {
     pub fn new(value: impl Into<String>) -> Result<Self, RuntimeError> {
         let value = value.into();
         let normalized = value.trim();
+        let normalized = match normalized.strip_prefix("/workspace") {
+            Some("") => ".",
+            Some(rest) if rest.starts_with('/') => rest.strip_prefix('/').unwrap_or("."),
+            _ => normalized,
+        };
         if normalized.is_empty() || normalized == "." {
             return Ok(Self(".".into()));
         }
@@ -520,7 +525,8 @@ impl RelativeWorkingDirectory {
             || normalized.contains('\0')
         {
             return Err(RuntimeError::InvalidSpec(
-                "working_directory must use a workspace-relative slash path".into(),
+                "working_directory must use a workspace-relative slash path or /workspace alias"
+                    .into(),
             ));
         }
         let mut segments = normalized.split('/');
@@ -1396,5 +1402,28 @@ impl RuntimeError {
 
     pub fn unavailable(detail: impl Into<String>) -> Self {
         Self::RuntimeUnavailableDetail(detail.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RelativeWorkingDirectory;
+
+    #[test]
+    fn accepts_the_logical_workspace_absolute_prefix() {
+        assert_eq!(
+            RelativeWorkingDirectory::new("/workspace")
+                .expect("workspace root should be valid")
+                .as_str(),
+            "."
+        );
+        assert_eq!(
+            RelativeWorkingDirectory::new("/workspace/src")
+                .expect("workspace child should be valid")
+                .as_str(),
+            "src"
+        );
+        assert!(RelativeWorkingDirectory::new("/workspace/../outside").is_err());
+        assert!(RelativeWorkingDirectory::new("/etc").is_err());
     }
 }

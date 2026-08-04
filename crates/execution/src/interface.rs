@@ -36,8 +36,6 @@ pub use super::types::{
     ToolOutcome, ToolResultPart, TurnExecutionOutcome, TurnWait,
 };
 
-const MAX_ROUNDS: usize = 12;
-
 #[derive(Debug, Clone)]
 pub struct ContextUsageView {
     pub estimated_input_tokens: i64,
@@ -257,13 +255,8 @@ impl ExecutionInterface {
                 .bind(turn_id.to_string())
                 .fetch_one(&self.pool)
                 .await?;
-        if last_round_sequence >= MAX_ROUNDS as i64 {
-            self.fail_turn(session_id, turn_id, "max rounds exceeded")
-                .await?;
-            return Ok(TurnExecutionOutcome::default());
-        }
-
-        for round_seq in (last_round_sequence + 1)..=MAX_ROUNDS as i64 {
+        let mut round_seq = last_round_sequence.saturating_add(1);
+        loop {
             if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
                 return Ok(TurnExecutionOutcome::default());
             }
@@ -371,6 +364,7 @@ impl ExecutionInterface {
                                 json!({
                                     "input_tokens": u.input_tokens,
                                     "output_tokens": u.output_tokens,
+                                    "cache_tokens": u.cache_tokens,
                                 })
                             });
                             let _ = events
@@ -583,6 +577,8 @@ impl ExecutionInterface {
             if finished {
                 break;
             }
+
+            round_seq = round_seq.saturating_add(1);
         }
 
         if finished {
@@ -596,9 +592,6 @@ impl ExecutionInterface {
             if matches!(completion, CompleteTurnOutcome::WaitingForJob) {
                 return Ok(TurnExecutionOutcome::coordinate(TurnWait::job()));
             }
-        } else {
-            self.fail_turn(session_id, turn_id, "max rounds exceeded")
-                .await?;
         }
         Ok(TurnExecutionOutcome::default())
     }
@@ -683,6 +676,28 @@ fn tool_result_message(outcome: &ToolOutcome, provider_call_id: &str) -> (ChatMe
         },
         Value::Array(durable_parts),
     )
+}
+
+fn format_ask_answer(answer: &Value) -> String {
+    match answer {
+        Value::Null => "No answer was provided.".to_owned(),
+        Value::String(value) => value.clone(),
+        Value::Array(values) => {
+            let answer = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if answer.is_empty() {
+                "No answer was provided.".to_owned()
+            } else {
+                answer
+            }
+        }
+        value => value.to_string(),
+    }
 }
 
 impl ExecutionInterface {
@@ -1154,6 +1169,7 @@ impl ExecutionInterface {
                 correlation_id: correlation_id.clone(),
                 causation_id: None,
                 payload: json!({
+                    "session_id": session_id.to_string(),
                     "tool_call_id": call.id.to_string(),
                     "provider_call_id": call.request.id,
                     "tool_name": call.request.name,
@@ -1292,6 +1308,7 @@ impl ExecutionInterface {
                 correlation_id: CorrelationId::new().to_string(),
                 causation_id: None,
                 payload: json!({
+                    "session_id": session_id.to_string(),
                     "tool_call_id": accepted.id.to_string(),
                     "provider_call_id": accepted.request.id,
                     "tool_name": accepted.request.name,
@@ -1416,6 +1433,7 @@ impl ExecutionInterface {
             correlation_id: CorrelationId::new().to_string(),
             causation_id: None,
             payload: json!({
+                "session_id": session_id.to_string(),
                 "tool_call_id": accepted.id.to_string(),
                 "provider_call_id": accepted.request.id,
                 "tool_name": accepted.request.name,
@@ -1520,6 +1538,7 @@ impl ExecutionInterface {
             correlation_id: CorrelationId::new().to_string(),
             causation_id: None,
             payload: json!({
+                "session_id": session_id.to_string(),
                 "tool_call_id": accepted.id.to_string(),
                 "provider_call_id": accepted.request.id,
                 "tool_name": accepted.request.name,
@@ -1982,7 +2001,7 @@ impl ExecutionInterface {
         .bind(request.id.to_string())
         .bind(request.turn_id.to_string())
         .bind(request.tool_call_id.to_string())
-        .bind(request.mode.as_str())
+        .bind(request.mode.storage_str())
         .bind(request.prompt.to_string())
         .bind(request.choices.to_string())
         .bind(request.default.as_ref().map(Value::to_string))
@@ -2089,8 +2108,16 @@ impl ExecutionInterface {
         ask_status: AskStatus,
         now: &str,
     ) -> Result<ToolCallSettlement, ExecutionError> {
-        let row: Option<(String, String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT ask.turn_id, ask.tool_call_id, call.tool_name, call.provider_call_id, call.input_json \
+        let row: Option<(
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT ask.turn_id, ask.tool_call_id, call.tool_name, call.provider_call_id, \
+                    call.input_json, ask.answer_json \
              FROM asks AS ask \
              JOIN tool_calls AS call ON call.id = ask.tool_call_id \
              JOIN rounds AS round ON round.id = call.round_id \
@@ -2101,7 +2128,14 @@ impl ExecutionInterface {
         .bind(ask_status.as_str())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((source_turn_id, tool_call_id, tool_name, provider_call_id, input_json)) = row
+        let Some((
+            source_turn_id,
+            tool_call_id,
+            tool_name,
+            provider_call_id,
+            input_json,
+            answer_json,
+        )) = row
         else {
             return Err(ExecutionError::Internal(anyhow::anyhow!(
                 "settled Ask has no matching waiting Tool Call"
@@ -2112,24 +2146,45 @@ impl ExecutionInterface {
                 "waiting Ask Tool Call has no Provider call id"
             ))
         })?;
+        let input = serde_json::from_str::<Value>(&input_json).unwrap_or_else(|_| json!({}));
+        let answer = answer_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .unwrap_or(Value::Null);
+        let mode = match input.get("mode").and_then(Value::as_str) {
+            Some("best_effort") | Some("nonblocking") | Some("non_blocking") => "non_blocking",
+            Some(value) => value,
+            None => "blocking",
+        };
+        let answer_text = format_ask_answer(&answer);
         let summary = json!({
             "ask_id": ask_id.to_string(),
+            "mode": mode,
+            "prompt": input.get("prompt").and_then(Value::as_str).unwrap_or_default(),
+            "choices": input.get("choices").cloned().unwrap_or_else(|| json!([])),
+            "multiple": input.get("multiple").and_then(Value::as_bool).unwrap_or(false),
+            "answer": answer.clone(),
             "status": ask_status.as_str(),
         });
+        let result_text = if answer.is_null() {
+            format!(
+                "ask_user {} (ask_id={ask_id}): no answer was provided",
+                ask_status.as_str()
+            )
+        } else {
+            format!(
+                "ask_user {} (ask_id={ask_id}): {answer_text}",
+                ask_status.as_str()
+            )
+        };
         let mut outcome = ToolOutcome {
             disposition: ToolExecutionDisposition::Succeeded,
-            parts: vec![ToolResultPart::Text {
-                text: format!(
-                    "ask_user {} (ask_id={ask_id}); the response is recorded as attributed user input",
-                    ask_status.as_str()
-                ),
-            }],
+            parts: vec![ToolResultPart::Text { text: result_text }],
             summary,
             error_code: None,
             finish_summary: None,
             wait: None,
         };
-        let input = serde_json::from_str::<Value>(&input_json).unwrap_or_else(|_| json!({}));
         attach_tool_display(&tool_name, &input, &mut outcome);
         let summary = outcome.summary.clone();
         let (_, model_parts) = tool_result_message(&outcome, &provider_call_id);
@@ -2174,6 +2229,19 @@ impl ExecutionInterface {
         .fetch_one(&mut *tx)
         .await?;
         Ok(count > 0)
+    }
+
+    pub async fn has_due_non_blocking_asks(&self, now: &str) -> Result<bool, ExecutionError> {
+        let due: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM asks \
+             WHERE status = ? AND mode = 'best_effort' \
+               AND expires_at IS NOT NULL AND expires_at <= ?)",
+        )
+        .bind(AskStatus::Open.as_str())
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(due != 0)
     }
 
     pub async fn expire_due_asks_in_tx(

@@ -22,6 +22,7 @@ interface WorkspaceDocumentsProps {
   projectId: () => string | undefined;
   project: () => ProjectView | undefined;
   ready: () => boolean;
+  sessionCreating: () => boolean;
   onFileSaved: (projectId: string) => void | Promise<void>;
 }
 
@@ -119,6 +120,7 @@ export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
               >
                 <SessionTabView
                   sessionId={() => (document() as SessionDocument).sessionId}
+                  creating={props.sessionCreating}
                   subView={() => (document() as SessionDocument).subView}
                   onSubViewChange={(subView) =>
                     props.workspace.updateSession(document().id, (session) => {

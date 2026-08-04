@@ -89,6 +89,14 @@ impl LogStore {
             .await
             .map_err(storage_error)?;
         let now = now_utc_str();
+        // Sync streams are per command invocation. The runtime id is reused
+        // for every synchronous command, so it cannot satisfy the historical
+        // owner uniqueness constraint.
+        let stored_owner_id = if owner == LogOwnerKind::Sync {
+            id.to_string()
+        } else {
+            owner_id.to_owned()
+        };
         sqlx::query(
             "INSERT INTO log_streams \
              (id, owner_kind, owner_id, relative_path, first_cursor, next_cursor, retained_bytes, \
@@ -97,7 +105,7 @@ impl LogStore {
         )
         .bind(id.to_string())
         .bind(owner.as_str())
-        .bind(owner_id)
+        .bind(stored_owner_id)
         .bind(&relative_path)
         .bind(&now)
         .bind(&now)
@@ -574,8 +582,22 @@ mod tests {
         )
         .execute(&pool)
         .await?;
+        sqlx::query(
+            "CREATE UNIQUE INDEX log_streams_owner_idx ON log_streams (owner_kind, owner_id)",
+        )
+        .execute(&pool)
+        .await?;
         let store = LogStore::new(pool, temp.path());
         Ok((temp, store))
+    }
+
+    #[tokio::test]
+    async fn sync_streams_are_unique_per_invocation() -> anyhow::Result<()> {
+        let (_temp, store) = test_store().await?;
+        let first = store.create(LogOwnerKind::Sync, "runtime-1").await?;
+        let second = store.create(LogOwnerKind::Sync, "runtime-1").await?;
+        assert_ne!(first.id, second.id);
+        Ok(())
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ async fn openai_chat_fixture(
     let body = concat!(
         "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n",
         "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n",
-        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n",
+        "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":1}}}\n\n",
         "data: [DONE]\n\n",
     );
     Response::builder()
@@ -52,7 +52,7 @@ async fn anthropic_messages_fixture(
     }
     let body = concat!(
         "event: message_start\n",
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":2}}}\n\n",
         "event: content_block_start\n",
         "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
         "event: content_block_delta\n",
@@ -204,8 +204,9 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
         })
         .collect();
     assert_eq!(usage_deltas.len(), 1);
-    assert_eq!(usage_deltas[0].input_tokens, 3);
+    assert_eq!(usage_deltas[0].input_tokens, 2);
     assert_eq!(usage_deltas[0].output_tokens, 2);
+    assert_eq!(usage_deltas[0].cache_tokens, 1);
     match events.last() {
         Some(ModelStreamEvent::Completed {
             text,
@@ -214,8 +215,9 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
             ..
         }) => {
             assert_eq!(text, "Hello");
-            assert_eq!(usage.input_tokens, 3);
+            assert_eq!(usage.input_tokens, 2);
             assert_eq!(usage.output_tokens, 2);
+            assert_eq!(usage.cache_tokens, 1);
             assert!(tool_calls.is_empty());
         }
         other => panic!("expected Completed, got {other:?}"),
@@ -231,6 +233,12 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
         .fetch_one(_db.pool())
         .await?;
     assert_eq!(ledger, 1);
+    let ledger_usage: (i64, i64, i64) = sqlx::query_as(
+        "SELECT input_tokens, output_tokens, cache_tokens FROM model_usage_ledger LIMIT 1",
+    )
+    .fetch_one(_db.pool())
+    .await?;
+    assert_eq!(ledger_usage, (2, 2, 1));
 
     Ok(())
 }
@@ -281,6 +289,7 @@ async fn anthropic_messages_stream() -> anyhow::Result<()> {
             assert_eq!(text, "Hi!");
             assert_eq!(usage.input_tokens, 5);
             assert_eq!(usage.output_tokens, 2);
+            assert_eq!(usage.cache_tokens, 5);
         }
         other => panic!("expected Completed, got {other:?}"),
     }

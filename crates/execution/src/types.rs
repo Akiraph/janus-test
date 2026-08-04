@@ -246,14 +246,23 @@ fn string_items(value: Option<&serde_json::Value>) -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskMode {
     Blocking,
-    BestEffort,
+    NonBlocking,
 }
 
 impl AskMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Blocking => "blocking",
-            Self::BestEffort => "best_effort",
+            Self::NonBlocking => "non_blocking",
+        }
+    }
+
+    /// Keep the deployed database value while exposing the clearer public
+    /// `non_blocking` name to the model and HTTP projections.
+    pub const fn storage_str(self) -> &'static str {
+        match self {
+            Self::Blocking => "blocking",
+            Self::NonBlocking => "best_effort",
         }
     }
 
@@ -330,6 +339,7 @@ pub struct AskRequest {
     pub mode: AskMode,
     pub prompt: serde_json::Value,
     pub choices: serde_json::Value,
+    pub multiple: bool,
     pub default: Option<serde_json::Value>,
     pub expires_at: Option<String>,
 }

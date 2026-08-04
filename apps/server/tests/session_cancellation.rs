@@ -266,3 +266,101 @@ async fn cancel_endpoint_settles_active_turn_and_releases_session() -> anyhow::R
 
     Ok(())
 }
+
+#[tokio::test]
+async fn a_new_turn_keeps_durable_messages_from_a_canceled_turn() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let seeded = seed_session(&state, false).await?;
+    let pool = state.database().pool();
+    let prior_turn_id = seeded.active_turn_id;
+    let next_turn_id = TurnId::new();
+
+    sqlx::query(
+        "UPDATE turns SET status = 'canceled', cancellation_reason = 'user_cancel', updated_at = ? \
+         WHERE id = ?",
+    )
+    .bind(NOW)
+    .bind(prior_turn_id.to_string())
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO turns \
+         (id, session_id, sequence, status, model_snapshot_json, version, created_at, updated_at) \
+         VALUES (?, ?, 2, 'running', '{}', 'v_turn_2', ?, ?)",
+    )
+    .bind(next_turn_id.to_string())
+    .bind(seeded.session_id.to_string())
+    .bind(NOW)
+    .bind(NOW)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE sessions SET state = 'active', active_turn_id = ?, version = 'v_session_2' \
+         WHERE id = ?",
+    )
+    .bind(next_turn_id.to_string())
+    .bind(seeded.session_id.to_string())
+    .execute(pool)
+    .await?;
+
+    for (id, turn_id, kind, sequence, text) in [
+        (
+            "message-canceled-user",
+            prior_turn_id.to_string(),
+            "user",
+            1_i64,
+            "The canceled request still matters",
+        ),
+        (
+            "message-canceled-assistant",
+            prior_turn_id.to_string(),
+            "assistant",
+            2_i64,
+            "The canceled turn had useful context",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, session_id, turn_id, actor_json, kind, body_json, status, \
+              timeline_sequence, version, created_at) \
+             VALUES (?, ?, ?, '{}', ?, ?, 'active', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(seeded.session_id.to_string())
+        .bind(turn_id)
+        .bind(kind)
+        .bind(json!({"parts": [{"type": "text", "text": text}]}).to_string())
+        .bind(sequence)
+        .bind(format!("v_{id}"))
+        .bind(NOW)
+        .execute(pool)
+        .await?;
+    }
+
+    let context = state
+        .sessions()
+        .context_messages(seeded.session_id, next_turn_id)
+        .await?;
+    let context_text: Vec<&str> = context
+        .iter()
+        .filter_map(|message| {
+            message
+                .body
+                .get("parts")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+        })
+        .collect();
+    assert_eq!(
+        context_text,
+        vec![
+            "The canceled request still matters",
+            "The canceled turn had useful context"
+        ]
+    );
+
+    Ok(())
+}

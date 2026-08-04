@@ -50,7 +50,7 @@ pub use problem::Problem;
         sessions::list_sessions, sessions::create_session, sessions::get_session,
         sessions::delete_session, sessions::post_message, sessions::upload_attachment,
         sessions::delete_attachment, sessions::session_context, sessions::timeline,
-        sessions::queued_turns, sessions::get_turn, sessions::session_diff, sessions::steer, sessions::cancel_turn,
+        sessions::queued_turns, sessions::get_turn, sessions::session_diff, sessions::sync, sessions::apply, sessions::steer, sessions::cancel_turn,
         sessions::answer_ask, sessions::retry_model,
         terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
         terminal::resize_terminal, terminal::signal_terminal, terminal::close_terminal,
@@ -112,6 +112,11 @@ pub use problem::Problem;
         janus_infrastructure::operations::OperationView,
         janus_infrastructure::operations::OperationStatus,
         janus_workspace::interface::RevisionRef,
+        janus_workspace::interface::DiffSummary,
+        janus_workspace::interface::PropagationConflict,
+        janus_workspace::interface::PropagationConflictPath,
+        janus_workspace::interface::PropagationDirection,
+        janus_workspace::interface::PropagationResult,
         projects::UpdateProjectRequest,
         git::GitStatusView,
         git::GitLogEntryView,
@@ -141,6 +146,7 @@ pub use problem::Problem;
         sessions::SteerRequest,
         sessions::CancelTurnRequest,
         sessions::AnswerAskRequest,
+        sessions::AnswerAskResult,
         janus_runtime::interface::TerminalProjection,
         janus_runtime::interface::TerminalStatus,
         janus_runtime::interface::TerminalSize,
@@ -337,6 +343,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/asks/{ask_id}/answer", post(sessions::answer_ask))
         .route("/api/v1/sessions/{id}/diff", get(sessions::session_diff))
+        .route("/api/v1/sessions/{id}/sync", post(sessions::sync))
+        .route("/api/v1/sessions/{id}/apply", post(sessions::apply))
         .route(
             "/api/v1/terminals",
             get(terminal::list_terminals).post(terminal::create_terminal),

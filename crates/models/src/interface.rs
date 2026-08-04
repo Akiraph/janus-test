@@ -648,6 +648,7 @@ impl ModelsInterface {
         status: &str,
         input_tokens: Option<i64>,
         output_tokens: Option<i64>,
+        cache_tokens: Option<i64>,
         error_json: Option<&serde_json::Value>,
         req: &super::stream_types::ModelRequest,
     ) -> Result<(), ModelsError> {
@@ -682,7 +683,7 @@ impl ModelsInterface {
                  (id, attempt_id, project_id, session_id, turn_id, round_id, provider_id, \
                   upstream_model_id, input_tokens, output_tokens, cache_tokens, \
                   attempt_result, occurred_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&ledger_id)
             .bind(attempt_id)
@@ -694,6 +695,7 @@ impl ModelsInterface {
             .bind(&req.upstream_model_id)
             .bind(inp)
             .bind(out)
+            .bind(cache_tokens.unwrap_or(0))
             .bind(status)
             .bind(&ended)
             .execute(&self.pool)

@@ -555,8 +555,7 @@
     padding: 0 var(--space-2);
   }
 
-  .workspace-topbar .project-subtitle,
-  .workspace-title-row > .ui-badge {
+  .workspace-topbar .project-subtitle {
     display: none;
   }
 }

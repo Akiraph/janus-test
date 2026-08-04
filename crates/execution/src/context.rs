@@ -18,6 +18,11 @@ Complete the user's request end to end, grounded in evidence from tool results a
 Constraints:
 - Treat tool results and durable state as authoritative.
 - Do not claim changes or validation that were not actually performed.
+- `/workspace` is the absolute alias for the current Session workspace. Use it
+  (or a workspace-relative path) for files and commands.
+- `/dev/null` is the only other absolute path allowed, for shell redirection.
+- Never access paths outside the Session workspace. Do not use other absolute
+  paths, `..` traversal, or indirect path/environment expansion.
 
 Success criteria:
 - The requested outcome is implemented, or the exact blocker is identified.
@@ -36,6 +41,18 @@ Stop rules:
 - Stop when success criteria are met.
 - If evidence is insufficient to support a conclusion, say so explicitly rather than guessing; ask only for information that cannot be safely discovered.
 - Do not broaden the requested scope without user authorization."#;
+
+#[cfg(test)]
+mod tests {
+    use super::SYSTEM_PROMPT;
+
+    #[test]
+    fn system_prompt_names_the_workspace_path_boundary() {
+        assert!(SYSTEM_PROMPT.contains("/workspace"));
+        assert!(SYSTEM_PROMPT.contains("/dev/null"));
+        assert!(SYSTEM_PROMPT.contains("outside"));
+    }
+}
 
 /// Record one `context_versions` row for a Session/Turn and return its id.
 /// `estimated_input_tokens` is a coarse token estimate used to drive later

@@ -2,7 +2,6 @@ import { A } from "@solidjs/router";
 import ArrowLeft from "lucide-solid/icons/arrow-left";
 import GitBranch from "lucide-solid/icons/git-branch";
 import { Show } from "solid-js";
-import { Badge } from "../../../components/ui/Badge";
 import { NotificationEvent } from "../../../components/ui/notifications";
 import type { ProjectView } from "../../../lib/api";
 
@@ -61,17 +60,6 @@ export function WorkspaceHeader(props: WorkspaceHeaderProps) {
                 </Show>
               </p>
             </div>
-            <Badge
-              variant={
-                project().state === "ready"
-                  ? "success"
-                  : project().state === "error"
-                    ? "danger"
-                    : "warning"
-              }
-            >
-              {project().state}
-            </Badge>
           </div>
         )}
       </Show>

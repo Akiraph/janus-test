@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    process::Command,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -9,13 +8,14 @@ use futures_util::stream::{self, StreamExt};
 
 use super::path::validate_workspace_path;
 use super::{
-    diff::{DiffChangeKind, DiffSummary, diff_file_maps, line_hunks},
+    diff::{DiffChangeKind, DiffSummary, diff_file_maps, line_change_counts, line_hunks},
+    git_command,
     manifest::{
-        ManifestNode, ManifestRoot, NodeKind, hash_dir_node, hash_file_node, is_text_bytes,
+        ManifestNode, ManifestRoot, NodeKind, hash_dir_node, hash_file_node, is_link_or_reparse,
+        is_text_bytes, is_workspace_internal_path,
     },
 };
 
-#[cfg(unix)]
 use super::manifest::file_mode;
 
 const MANIFEST_READ_CONCURRENCY: usize = 64;
@@ -24,6 +24,11 @@ struct GitTreeState {
     head: String,
     managed: BTreeSet<String>,
     changed: BTreeSet<String>,
+}
+
+pub(crate) struct WorkingTreeFingerprint {
+    pub head: String,
+    pub changed_paths: Vec<String>,
 }
 
 impl GitTreeState {
@@ -39,7 +44,10 @@ impl GitTreeState {
                 "--exclude-standard",
             ],
         )?;
-        let mut changed = git_paths(root, &["diff", "--name-only", "-z", "HEAD", "--"])?;
+        let mut changed = git_paths(
+            root,
+            &["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
+        )?;
         changed.extend(git_paths(
             root,
             &["ls-files", "-z", "--others", "--exclude-standard"],
@@ -50,6 +58,33 @@ impl GitTreeState {
             changed,
         })
     }
+}
+
+pub(crate) fn working_tree_fingerprint(
+    root: &Path,
+    previous_files: &[String],
+) -> anyhow::Result<WorkingTreeFingerprint> {
+    let state = GitTreeState::read(root)?;
+    let mut changed = state.changed;
+    // Git cannot report an untracked file that was removed since the last
+    // manifest. Check the previous file set so incremental rehashing can
+    // remove those stale nodes without reading the whole tree.
+    for path in previous_files {
+        let rel = validate_workspace_path(path)?;
+        let current = root.join(rel);
+        let missing = match std::fs::symlink_metadata(current) {
+            Ok(metadata) => !metadata.is_file() || is_link_or_reparse(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.into()),
+        };
+        if missing {
+            changed.insert(path.clone());
+        }
+    }
+    Ok(WorkingTreeFingerprint {
+        head: state.head,
+        changed_paths: changed.into_iter().collect(),
+    })
 }
 
 pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<Vec<String>> {
@@ -64,6 +99,9 @@ pub fn seed_session_from_main(main: &Path, session: &Path) -> anyhow::Result<Vec
     let changed_paths = changed.iter().cloned().collect();
     for path in changed {
         let rel = validate_workspace_path(&path)?;
+        if path_has_link_or_reparse_component(main, &rel)? {
+            continue;
+        }
         let source = main.join(&rel);
         let target = session.join(&rel);
         let source_metadata = match std::fs::symlink_metadata(&source) {
@@ -155,10 +193,14 @@ pub async fn diff_working_trees(session: &Path, main: &Path) -> anyhow::Result<D
             DiffChangeKind::Deleted | DiffChangeKind::Modified => main_bytes.get(&entry.path),
             DiffChangeKind::Added => None,
         };
-        let (hunks, binary) = line_hunks(
-            session_content.map(Vec::as_slice).unwrap_or_default(),
-            main_content.map(Vec::as_slice).unwrap_or_default(),
-        );
+        let session_bytes = session_content.map(Vec::as_slice).unwrap_or_default();
+        let main_bytes = main_content.map(Vec::as_slice).unwrap_or_default();
+        let (hunks, binary) = line_hunks(session_bytes, main_bytes);
+        (entry.additions, entry.deletions) = if binary {
+            (0, 0)
+        } else {
+            line_change_counts(session_bytes, main_bytes)
+        };
         entry.hunks = hunks;
         entry.binary = binary;
     }
@@ -193,6 +235,15 @@ pub async fn hash_working_tree(root: &Path) -> anyhow::Result<ManifestRoot> {
     }
     let (root_hash, nodes) = tree.finish("");
     Ok(ManifestRoot { root_hash, nodes })
+}
+
+pub(crate) async fn read_manifest_node(
+    root: &Path,
+    path: &str,
+) -> anyhow::Result<Option<ManifestNode>> {
+    Ok(read_manifest_file(root, path.to_owned())
+        .await?
+        .map(|(_, node)| node))
 }
 
 pub async fn rehash_working_tree_paths(
@@ -236,8 +287,7 @@ async fn read_manifest_file(
     path: String,
 ) -> anyhow::Result<Option<(String, ManifestNode)>> {
     let rel = validate_workspace_path(&path)?;
-    let absolute = root.join(rel);
-    let Some((bytes, mode)) = read_file(&absolute).await? else {
+    let Some((bytes, mode)) = read_file(root, &rel).await? else {
         return Ok(None);
     };
     let is_text = is_text_bytes(&bytes);
@@ -322,34 +372,51 @@ async fn read_managed_file(
         return Ok(None);
     }
     let rel = validate_workspace_path(path)?;
-    let absolute = root.join(rel);
-    let Some((bytes, mode)) = read_file(&absolute).await? else {
+    let Some((bytes, mode)) = read_file(root, &rel).await? else {
         return Ok(None);
     };
     let hash = hash_file_node(mode, &bytes, is_text_bytes(&bytes));
     Ok(Some(ManagedFile { bytes, hash }))
 }
 
-#[cfg(unix)]
-async fn read_file(path: &Path) -> anyhow::Result<Option<(Vec<u8>, u32)>> {
-    let metadata = match tokio::fs::metadata(path).await {
+async fn read_file(root: &Path, rel: &Path) -> anyhow::Result<Option<(Vec<u8>, u32)>> {
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component.as_os_str());
+        let metadata = match tokio::fs::symlink_metadata(&current).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if is_link_or_reparse(&metadata) {
+            return Ok(None);
+        }
+    }
+
+    let metadata = match tokio::fs::symlink_metadata(&current).await {
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let bytes = tokio::fs::read(path).await?;
+    let bytes = tokio::fs::read(&current).await?;
     Ok(Some((bytes, file_mode(&metadata))))
 }
 
-#[cfg(not(unix))]
-async fn read_file(path: &Path) -> anyhow::Result<Option<(Vec<u8>, u32)>> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => Ok(Some((bytes, 0o100644))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => Ok(None),
-        Err(error) => Err(error.into()),
+fn path_has_link_or_reparse_component(root: &Path, rel: &Path) -> anyhow::Result<bool> {
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component.as_os_str());
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if is_link_or_reparse(&metadata) {
+            return Ok(true);
+        }
     }
+    Ok(false)
 }
 
 fn git_text(root: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -378,11 +445,19 @@ fn git_paths(root: &Path, args: &[&str]) -> anyhow::Result<BTreeSet<String>> {
         .map(|path| {
             String::from_utf8(path.to_vec()).map_err(|_| anyhow!("Git path is not valid UTF-8"))
         })
+        .filter(|path| match path {
+            Ok(path) => !is_ignored_workspace_path(path),
+            Err(_) => true,
+        })
         .collect()
 }
 
+fn is_ignored_workspace_path(path: &str) -> bool {
+    is_workspace_internal_path(path)
+}
+
 fn git_output(root: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
-    let output = Command::new("git")
+    let output = git_command(root)
         .args(args)
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -467,8 +542,122 @@ fn copy_dir_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mirror a legacy filesystem baseline while excluding VCS administration
+/// metadata. New propagation baselines are persisted as manifests; this path
+/// only supports lazy migration of rows created before that change.
+pub(crate) fn mirror_managed_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
+    remove_path(target)?;
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            copy_symlink(&from, &to)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&from, &to)?;
+        } else if metadata.is_dir() {
+            copy_dir_tree(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy or remove selected managed paths. The Workspace interface advances the
+/// persisted manifest baseline after the filesystem operation succeeds. All
+/// paths have already been validated there; keeping the operation blocking and
+/// grouped avoids interleaving half a propagation with another scan.
+pub(crate) fn propagate_paths(
+    source: &Path,
+    target: &Path,
+    transfer_paths: &[String],
+) -> anyhow::Result<()> {
+    for path in transfer_paths {
+        copy_or_remove_path(source, target, path)?;
+    }
+    Ok(())
+}
+
+fn copy_or_remove_path(source_root: &Path, target_root: &Path, path: &str) -> anyhow::Result<()> {
+    let source = source_root.join(path);
+    let target = target_root.join(path);
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_path(&target)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if metadata.file_type().is_symlink() {
+        remove_path(&target)?;
+        copy_symlink(&source, &target)?;
+    } else if metadata.is_file() {
+        remove_path(&target)?;
+        std::fs::copy(&source, &target)?;
+    } else if metadata.is_dir() {
+        remove_path(&target)?;
+        copy_dir_tree(&source, &target)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn git_path_scan_ignores_runtime_and_host_placeholder_paths() {
+        assert!(super::is_ignored_workspace_path(
+            "%SystemDrive%/ProgramData/Microsoft/Windows/Caches/cversions.2.db"
+        ));
+        assert!(super::is_ignored_workspace_path(".janus-tmp/output.log"));
+        assert!(super::is_ignored_workspace_path(".janus-runtime-test.pid"));
+        assert!(!super::is_ignored_workspace_path("apps/server/src/main.rs"));
+    }
+
+    #[tokio::test]
+    async fn read_file_does_not_follow_external_directory_links() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = root.path().join("external");
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, b"outside").expect("outside file");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create directory link");
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    link.to_str().expect("link path"),
+                    outside.path().to_str().expect("outside path"),
+                ])
+                .output()
+                .expect("create directory junction");
+            assert!(
+                result.status.success(),
+                "mklink failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        let followed = super::read_file(root.path(), Path::new("external/secret.txt"))
+            .await
+            .expect("read link path");
+        assert!(followed.is_none(), "external link target must not be read");
+    }
+
     #[cfg(unix)]
     #[test]
     fn directory_copy_preserves_symlinks() {

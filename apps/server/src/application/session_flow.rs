@@ -26,7 +26,7 @@ use janus_infrastructure::{
 use janus_runtime::interface::JobStatus;
 use janus_sessions::interface::{
     AppendSteerInput, CancelResult, CreateTurnInput, MessageRoute, MessageRouteResult,
-    RecordAskAnswer, SessionModelPreference, SessionsError, TurnStatus, TurnSummary,
+    SessionModelPreference, SessionsError, TurnStatus, TurnSummary,
 };
 
 struct SessionInput<'a> {
@@ -464,36 +464,11 @@ impl Application {
                     SessionsError::Internal(anyhow::anyhow!("record Ask Tool result: {error}"))
                 })?;
         }
-        let accepted_by_original = answered.disposition == AskAnswerDisposition::Accepted
-            && outcome.active
-            && matches!(
-                outcome.status,
-                TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
-            );
         let answer_text = answer
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| answer.to_string());
         let source_ask_id = answered.ask_id.to_string();
-        let recorded = if accepted_by_original {
-            Some(
-                self.sessions()
-                    .record_ask_answer_in_tx(
-                        work.connection(),
-                        RecordAskAnswer {
-                            session_id: outcome.session_id,
-                            turn_id: answered.turn_id,
-                            ask_id: answered.ask_id,
-                            answer,
-                            actor: &actor,
-                            now: &now,
-                        },
-                    )
-                    .await?,
-            )
-        } else {
-            None
-        };
         let mut late_steer = None;
         let mut late_message = None;
         if answered.disposition == AskAnswerDisposition::Late {
@@ -550,24 +525,6 @@ impl Application {
                     "ask_id": answered.ask_id.to_string(),
                     "turn_id": answered.turn_id.to_string(),
                     "status": "answered",
-                }),
-            })
-            .await
-            .map_err(SessionsError::Internal)?;
-        }
-        if let Some(recorded) = &recorded {
-            work.append_event(NewEvent {
-                event_type: "timeline.item_created".into(),
-                actor: actor.clone(),
-                resource: Some(json!({"kind": "session", "id": outcome.session_id.to_string()})),
-                correlation_id: correlation_id.clone(),
-                causation_id: None,
-                payload: json!({
-                    "timeline_item_id": recorded.timeline_item_id,
-                    "message_id": recorded.message_id,
-                    "display_order": recorded.display_order,
-                    "kind": "user_message",
-                    "source_ask_id": answered.ask_id.to_string(),
                 }),
             })
             .await
@@ -660,6 +617,14 @@ impl Application {
     /// a periodic sweeper (and at startup). Stale notifications are harmless.
     pub(crate) async fn expire_asks(&self, _owner_id: &str) -> Result<u64, SessionsError> {
         let now = now_utc_str();
+        let has_due_asks = self
+            .execution()
+            .has_due_non_blocking_asks(&now)
+            .await
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error.to_string())))?;
+        if !has_due_asks {
+            return Ok(0);
+        }
         let mut work = self.unit_of_work().begin().await?;
         let expired = self
             .execution()
@@ -683,11 +648,6 @@ impl Application {
                         "reconcile expired Ask blockers: {error}"
                     ))
                 })?;
-            let original_can_consume = outcome.active
-                && matches!(
-                    outcome.status,
-                    TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
-                );
             for ask in asks {
                 self.execution_coordinator()
                     .record_tool_result_in_tx(
@@ -721,41 +681,6 @@ impl Application {
                 })
                 .await
                 .map_err(SessionsError::Internal)?;
-                if original_can_consume && let Some(default) = &ask.default {
-                    let recorded = self
-                        .sessions()
-                        .record_ask_answer_in_tx(
-                            work.connection(),
-                            RecordAskAnswer {
-                                session_id: outcome.session_id,
-                                turn_id,
-                                ask_id: ask.ask_id,
-                                answer: default,
-                                actor: &actor,
-                                now: &now,
-                            },
-                        )
-                        .await?;
-                    work.append_event(NewEvent {
-                        event_type: "timeline.item_created".into(),
-                        actor: actor.clone(),
-                        resource: Some(json!({
-                            "kind": "session",
-                            "id": outcome.session_id.to_string(),
-                        })),
-                        correlation_id: correlation_id.clone(),
-                        causation_id: None,
-                        payload: json!({
-                            "timeline_item_id": recorded.timeline_item_id,
-                            "message_id": recorded.message_id,
-                            "display_order": recorded.display_order,
-                            "kind": "user_message",
-                            "source_ask_id": ask.ask_id.to_string(),
-                        }),
-                    })
-                    .await
-                    .map_err(SessionsError::Internal)?;
-                }
             }
             if let Some(transition) = &outcome.transition {
                 work.append_event(Self::blocker_transition_event(

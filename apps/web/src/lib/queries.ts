@@ -18,8 +18,9 @@ import {
   listProjects,
   listSessions,
   type SessionSummary,
+  type TimelinePage,
 } from "./api";
-import { sessionTimelineRefetchInterval } from "./queryPolicy";
+import { retainSessionTimeline, sessionTimelineRefetchInterval } from "./queryPolicy";
 
 export function useBootstrap() {
   return createQuery(() => ({
@@ -113,13 +114,16 @@ export function useSessions(projectId: () => string | undefined) {
   });
 }
 
-export function useSession(sessionId: () => string | undefined) {
+export function useSession(
+  sessionId: () => string | undefined,
+  shouldLoad: () => boolean = () => true,
+) {
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["session", id],
       queryFn: () => getSession(id as string),
-      enabled: Boolean(id),
+      enabled: Boolean(id) && shouldLoad(),
       refetchInterval: (query) => {
         const state = query.state.data?.state;
         return state === "active" ? 1500 : false;
@@ -128,25 +132,37 @@ export function useSession(sessionId: () => string | undefined) {
   });
 }
 
-export function useSessionContext(sessionId: () => string | undefined) {
+export function useSessionContext(
+  sessionId: () => string | undefined,
+  shouldLoad: () => boolean = () => true,
+) {
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["session-context", id],
       queryFn: () => getSessionContext(id as string),
-      enabled: Boolean(id),
+      enabled: Boolean(id) && shouldLoad(),
     };
   });
 }
 
-export function useSessionTimeline(sessionId: () => string | undefined) {
+export function useSessionTimeline(
+  sessionId: () => string | undefined,
+  shouldLoad: () => boolean = () => true,
+) {
   const queryClient = useQueryClient();
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["session-timeline", id],
-      queryFn: () => getSessionTimeline(id as string, { limit: 100 }),
-      enabled: Boolean(id),
+      queryFn: async () => {
+        const next = await getSessionTimeline(id as string, { limit: 100 });
+        const previous = queryClient.getQueryData<TimelinePage>(["session-timeline", id]);
+        const session = queryClient.getQueryData<SessionSummary>(["session", id]);
+        return retainSessionTimeline(previous, next, session);
+      },
+      placeholderData: (previous) => previous,
+      enabled: Boolean(id) && shouldLoad(),
       // Poll only while a turn is running. Constant 3s polling on idle sessions
       // burns requests and re-suspending the main surface for no benefit.
       refetchInterval: (query) => {
@@ -160,15 +176,15 @@ export function useSessionTimeline(sessionId: () => string | undefined) {
 
 export function useSessionDiff(
   sessionId: () => string | undefined,
-  /** Diff is expensive (full Merkle walk). Only enable when the Diff pane is open. */
-  enabled: () => boolean = () => true,
+  shouldLoad: () => boolean = () => true,
 ) {
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["session-diff", id],
       queryFn: () => getSessionDiff(id as string),
-      enabled: Boolean(id) && enabled(),
+      enabled: Boolean(id) && shouldLoad(),
+      placeholderData: (previous) => previous,
     };
   });
 }
@@ -180,6 +196,7 @@ export function useTurn(sessionId: () => string | undefined, turnId: () => strin
     return {
       queryKey: ["turn", sid, tid],
       queryFn: () => getTurn(sid as string, tid as string),
+      placeholderData: (previous) => previous,
       enabled: Boolean(sid) && Boolean(tid),
       refetchInterval: (query) => {
         const status = query.state.data?.status;
@@ -201,13 +218,14 @@ export function useTurn(sessionId: () => string | undefined, turnId: () => strin
 export function useQueuedTurns(
   sessionId: () => string | undefined,
   activeTurnId: () => string | null | undefined,
+  shouldLoad: () => boolean = () => true,
 ) {
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["queued-turns", id],
       queryFn: () => getQueuedTurns(id as string),
-      enabled: Boolean(id),
+      enabled: Boolean(id) && shouldLoad(),
       // The queue only changes on send/cancel/promote, all of which emit SSE
       // events that invalidate this query. Poll only while a turn is active
       // as a fallback so the bar updates when promotion fires.

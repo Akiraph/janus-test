@@ -19,6 +19,7 @@ pub(crate) mod operation_kinds;
 pub(crate) mod project_terminal;
 pub(crate) mod session_flow;
 pub mod workers;
+pub(crate) mod workspace_sync;
 
 use execution::ExecutionCoordinator;
 

@@ -6,7 +6,6 @@ import Plus from "lucide-solid/icons/plus";
 import RefreshCw from "lucide-solid/icons/refresh-cw";
 import Trash2 from "lucide-solid/icons/trash-2";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
-import { Badge, type BadgeVariant } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
@@ -29,20 +28,6 @@ const ACCESS_OPTIONS: readonly SelectOption[] = [
   { value: "github_private", label: "GitHub private (PAT)" },
 ];
 
-function stateVariant(state: string): BadgeVariant {
-  switch (state) {
-    case "ready":
-      return "success";
-    case "creating":
-    case "deleting":
-      return "warning";
-    case "error":
-      return "danger";
-    default:
-      return "neutral";
-  }
-}
-
 function formatActivity(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
@@ -64,7 +49,6 @@ export function ProjectsOverview() {
     projectId?: string;
     name: string;
   } | null>(null);
-  const [progress, setProgress] = createSignal<OperationView | null>(null);
 
   async function refresh() {
     await queryClient.invalidateQueries({ queryKey: ["projects"] });
@@ -80,8 +64,6 @@ export function ProjectsOverview() {
       try {
         const operation = await getOperation(current.operationId);
         if (cancelled) return;
-        setProgress(operation);
-
         if (operation.status === "succeeded") {
           await refresh();
           let projectId = current.projectId ?? operation.target_id ?? undefined;
@@ -93,7 +75,6 @@ export function ProjectsOverview() {
             projectId = list.find((item) => item.name === current.name)?.id;
           }
           setTracking(null);
-          setProgress(null);
           notify("Project ready", { variant: "success" });
           if (projectId) navigate(`/projects/${projectId}`);
           return;
@@ -106,12 +87,11 @@ export function ProjectsOverview() {
         ) {
           await refresh();
           setTracking(null);
-          setProgress(null);
           notify(problemMessage(operation.problem), { variant: "danger" });
           return;
         }
 
-        // Still running: also refresh projects so state badges update.
+        // Still running: also refresh projects so the list stays current.
         await refresh();
       } catch (error) {
         if (!cancelled) {
@@ -138,7 +118,6 @@ export function ProjectsOverview() {
         projectId: project.id,
         name: project.name,
       });
-      setProgress(operation);
       notify("Retry started");
       await refresh();
     } catch (error) {
@@ -155,7 +134,6 @@ export function ProjectsOverview() {
         projectId: project.id,
         name: project.name,
       });
-      setProgress(operation);
       notify("Delete started");
       await refresh();
     } catch (error) {
@@ -182,23 +160,6 @@ export function ProjectsOverview() {
           Create project
         </Button>
       </div>
-
-      <Show when={tracking()}>
-        {(current) => (
-          <article class="operation-card" aria-live="polite">
-            <div class="record-title">
-              <h3>{current().name}</h3>
-              <Badge variant="warning">{progress()?.status ?? "queued"}</Badge>
-            </div>
-            <p>
-              {progress()?.current_step
-                ? `Step: ${progress()?.current_step}`
-                : "Waiting for clone operation…"}
-            </p>
-            <p class="operation-meta">Operation {current().operationId}</p>
-          </article>
-        )}
-      </Show>
 
       <Show
         when={!projects.isPending}
@@ -234,7 +195,6 @@ export function ProjectsOverview() {
                           <A href={`/projects/${project.id}`}>{project.name}</A>
                         </Show>
                       </h3>
-                      <Badge variant={stateVariant(project.state)}>{project.state}</Badge>
                     </div>
                     <p class="project-repo">{project.repository.url}</p>
                     <div class="record-chips">
@@ -304,7 +264,6 @@ export function ProjectsOverview() {
               ...(projectId ? { projectId } : {}),
               name: input.name,
             });
-            setProgress(operation);
             await refresh();
           }}
         />

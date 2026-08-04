@@ -178,16 +178,23 @@ impl LocalExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        apply_minimal_environment(&mut command);
+        let temporary_root = canonical_workspace.join(".janus-tmp");
+        tokio::fs::create_dir_all(&temporary_root)
+            .await
+            .map_err(|error| {
+                RuntimeError::unavailable(format!("runtime temp directory: {error}"))
+            })?;
+        apply_minimal_environment(&mut command, &canonical_workspace, &temporary_root);
         for (name, value) in spec.environment().ordinary() {
             command.env(name, value);
         }
-        let secret_values = spec
+        let mut secret_values = spec
             .environment()
             .secrets()
             .iter()
             .map(|value| value.value().expose().to_owned())
             .collect::<Vec<_>>();
+        secret_values.extend(runtime_redaction_values(&canonical_workspace));
         for value in spec.environment().secrets() {
             command.env(value.name(), value.value().expose());
         }
@@ -335,16 +342,23 @@ impl LocalExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        apply_minimal_environment(&mut command);
+        let temporary_root = canonical_workspace.join(".janus-tmp");
+        tokio::fs::create_dir_all(&temporary_root)
+            .await
+            .map_err(|error| {
+                RuntimeError::unavailable(format!("terminal temp directory: {error}"))
+            })?;
+        apply_minimal_environment(&mut command, &canonical_workspace, &temporary_root);
         for (name, value) in spec.environment.ordinary() {
             command.env(name, value);
         }
-        let secret_values = spec
+        let mut secret_values = spec
             .environment
             .secrets()
             .iter()
             .map(|value| value.value().expose().to_owned())
             .collect::<Vec<_>>();
+        secret_values.extend(runtime_redaction_values(&canonical_workspace));
         for value in spec.environment.secrets() {
             command.env(value.name(), value.value().expose());
         }
@@ -974,7 +988,7 @@ fn terminal_command(size: TerminalSize) -> Command {
             PathBuf::from("bash")
         });
         let mut command = Command::new(program);
-        command.args(["--login", "-i"]);
+        command.args(["--noprofile", "--norc", "-i"]);
         command.env("COLUMNS", size.cols.to_string());
         command.env("LINES", size.rows.to_string());
         command.env("TERM", "dumb");
@@ -984,7 +998,7 @@ fn terminal_command(size: TerminalSize) -> Command {
     {
         let mut command =
             Command::new(bash_program().unwrap_or_else(|| PathBuf::from("/bin/bash")));
-        command.args(["--login", "-i"]);
+        command.args(["--noprofile", "--norc", "-i"]);
         command.env("COLUMNS", size.cols.to_string());
         command.env("LINES", size.rows.to_string());
         command.env("TERM", "dumb");
@@ -1086,7 +1100,7 @@ fn shell_command(script: &str) -> Command {
         // when Git for Windows is installed outside PATH.
         let program = bash_program().unwrap_or_else(|| PathBuf::from("bash"));
         let mut command = Command::new(program);
-        command.args(["--login", "-c", script]);
+        command.args(["--noprofile", "--norc", "-c", script]);
         command
     }
     #[cfg(not(windows))]
@@ -1124,7 +1138,7 @@ fn delegated_cli_command(
     }
 }
 
-fn apply_minimal_environment(command: &mut Command) {
+fn apply_minimal_environment(command: &mut Command, workspace_root: &Path, temporary_root: &Path) {
     command.env_clear();
     const KEYS: &[&str] = if cfg!(windows) {
         &[
@@ -1147,7 +1161,53 @@ fn apply_minimal_environment(command: &mut Command) {
     if let Some(path) = bash_search_path() {
         command.env("PATH", path);
     }
+    command.env("HOME", workspace_root);
+    command.env("USER", "Janus");
+    command.env("USERNAME", "Janus");
+    command.env("LOGNAME", "Janus");
+    command.env("USERDOMAIN", "Janus");
+    command.env("HOSTNAME", "Janus");
+    command.env("COMPUTERNAME", "Janus");
+    command.env("TMPDIR", temporary_root);
+    command.env("TEMP", temporary_root);
+    command.env("TMP", temporary_root);
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
     command.env("GIT_OPTIONAL_LOCKS", "0");
+}
+
+fn workspace_redaction_values(workspace_root: &Path) -> Vec<String> {
+    let raw = workspace_root.to_string_lossy().into_owned();
+    let unix = raw.replace('\\', "/");
+    let mut values = vec![raw, unix.clone()];
+    if cfg!(windows) {
+        let bytes = unix.as_bytes();
+        if bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'/') {
+            values.push(format!("/{}{}", unix[..1].to_ascii_lowercase(), &unix[2..]));
+        }
+    }
+    values.retain(|value| !value.is_empty());
+    values.sort_by(|left, right| right.len().cmp(&left.len()));
+    values.dedup();
+    values
+}
+
+fn runtime_redaction_values(workspace_root: &Path) -> Vec<String> {
+    let mut values = workspace_redaction_values(workspace_root);
+    values.push("CodexSandboxOffline".into());
+    values.push("codexsandboxoffline".into());
+    values.push("CodexOfflineSandbox".into());
+    values.push("codexofflinesandbox".into());
+    for key in ["PATH", "TEMP", "TMP", "TMPDIR", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            let value = value.to_string_lossy().into_owned();
+            if !value.is_empty() {
+                values.push(value);
+            }
+        }
+    }
+    values.sort_by(|left, right| right.len().cmp(&left.len()));
+    values.dedup();
+    values
 }
 
 fn has_forbidden_background_syntax(script: &str) -> bool {
@@ -1386,6 +1446,50 @@ mod tests {
                 )
                 .await
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_shell_uses_the_janus_runtime_environment() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let workspace = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace).await?;
+        let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
+        let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
+        let executor = LocalExecutor::new(logs.clone());
+        let runtime_id = janus_infrastructure::id::RuntimeId::new();
+        let runtime = RuntimeSpec::new(
+            runtime_id,
+            janus_runtime::interface::RuntimeScope::session(SessionId::new()),
+            ExecutorKind::Local,
+            workspace,
+            limits(5_000),
+            NetworkPolicy::DenyAll,
+        )?;
+        executor.ensure_runtime(&runtime).await?;
+
+        let log = logs.create(LogOwnerKind::Sync, "environment").await?;
+        let result = executor
+            .execute_sync(
+                execution(
+                    runtime_id,
+                    r#"printf 'USER=%s\nUSERNAME=%s\nLOGNAME=%s\nORIGINAL_PATH=%s\n' "$USER" "$USERNAME" "$LOGNAME" "$ORIGINAL_PATH""#,
+                    5_000,
+                )?,
+                log.id,
+            )
+            .await?;
+
+        assert!(result.stdout.contains("USER=Janus"));
+        assert!(result.stdout.contains("USERNAME=Janus"));
+        assert!(result.stdout.contains("LOGNAME=Janus"));
+        assert_eq!(
+            result
+                .stdout
+                .lines()
+                .find(|line| line.starts_with("ORIGINAL_PATH=")),
+            Some("ORIGINAL_PATH=")
         );
         Ok(())
     }

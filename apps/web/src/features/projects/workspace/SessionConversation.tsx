@@ -5,6 +5,7 @@ import { createEffect, createMemo, createSignal, For, type JSX, onCleanup, Show 
 import { EmptyState } from "../../../components/ui/EmptyState";
 import { NotificationEvent } from "../../../components/ui/notifications";
 import type {
+  AskAnswer,
   AttachmentView,
   ContextUsageView,
   ProviderView,
@@ -20,7 +21,13 @@ import { QueuedMessagesBar } from "./QueuedMessagesBar";
 import { rowOpenState, toggleRowOpen } from "./rowOpenState";
 import { AskCard, JobCard, ModelCard, PlanCard, ServiceCard } from "./SessionCards";
 import { SessionComposer, type SessionMessageReceipt } from "./SessionComposer";
-import { formatThoughtDuration, type SessionTimelineItem, type ToolView } from "./sessionTimeline";
+import { isNearLatest, keepLatestContentVisible } from "./sessionScrollPolicy";
+import {
+  formatThoughtDuration,
+  type SessionTimelineItem,
+  type ToolActivityDetail,
+  type ToolView,
+} from "./sessionTimeline";
 import { isTurnRunning } from "./turnPresentation";
 
 interface SessionConversationProps {
@@ -34,6 +41,8 @@ interface SessionConversationProps {
   modelPreference: SessionModelPreference | null;
   providers: readonly ProviderView[];
   turn: TurnSummary | null;
+  provisionalUserTurnId: string | null;
+  provisionalUserText: string;
   provisionalText: string;
   provisionalReasoning: string;
   provisionalRoundId: string | null;
@@ -46,7 +55,7 @@ interface SessionConversationProps {
   ) => Promise<SessionMessageReceipt>;
   onUploadAttachment: (sessionId: string, file: File) => Promise<AttachmentView>;
   onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
-  onAnswer?: (askId: string, answer: string) => Promise<void>;
+  onAnswer?: (askId: string, answer: AskAnswer) => Promise<void>;
   onCancel?: (() => Promise<void>) | undefined;
   queuedTurns?: readonly QueuedTurnItem[] | undefined;
   onQueuedTurnCancel?: ((turn: QueuedTurnItem) => Promise<void>) | undefined;
@@ -54,17 +63,66 @@ interface SessionConversationProps {
 
 export function SessionConversation(props: SessionConversationProps) {
   let scroller: HTMLDivElement | undefined;
+  let activityObserver: ResizeObserver | undefined;
+  let scrollFrame: number | undefined;
+  let observedActivityContainer = false;
+  let observedSessionId = "";
   let followLatest = true;
 
-  createEffect(() => {
-    const count = props.items.length;
-    const provisionalLength = props.provisionalText.length;
-    const reasoningLength = props.provisionalReasoning.length;
-    if ((count > 0 || provisionalLength > 0 || reasoningLength > 0) && followLatest && scroller) {
-      requestAnimationFrame(() => {
-        if (scroller && followLatest) scroller.scrollTop = scroller.scrollHeight;
-      });
+  function cancelScrollFrame() {
+    if (scrollFrame === undefined) return;
+    cancelAnimationFrame(scrollFrame);
+    scrollFrame = undefined;
+  }
+
+  function updateFollowLatest() {
+    if (!scroller) return;
+    followLatest = isNearLatest(scroller.scrollHeight, scroller.scrollTop, scroller.clientHeight);
+  }
+
+  function scheduleScrollToLatest() {
+    cancelScrollFrame();
+    scrollFrame = requestAnimationFrame(() => {
+      scrollFrame = undefined;
+      if (!scroller || !followLatest) return;
+      keepLatestContentVisible(scroller, followLatest);
+    });
+  }
+
+  function observeActivityContainer(element: HTMLDivElement) {
+    activityObserver?.disconnect();
+    if (typeof ResizeObserver !== "undefined") {
+      activityObserver = new ResizeObserver(() => scheduleScrollToLatest());
+      activityObserver.observe(element);
     }
+    if (!observedActivityContainer) {
+      observedActivityContainer = true;
+      followLatest = true;
+      scheduleScrollToLatest();
+    }
+  }
+
+  function bottomTurn(): TurnStatusLike | null {
+    if (props.turn) return props.turn;
+    for (let index = props.items.length - 1; index >= 0; index -= 1) {
+      const turn = props.items[index]?.turnStatus;
+      if (turn) return turn as TurnStatusLike;
+    }
+    return null;
+  }
+
+  createEffect(() => {
+    const sessionId = props.sessionId;
+    if (sessionId === observedSessionId) return;
+    observedSessionId = sessionId;
+    followLatest = true;
+    scheduleScrollToLatest();
+  });
+
+  onCleanup(() => {
+    cancelScrollFrame();
+    activityObserver?.disconnect();
+    activityObserver = undefined;
   });
 
   return (
@@ -79,14 +137,12 @@ export function SessionConversation(props: SessionConversationProps) {
         ref={scroller}
         role="log"
         aria-live="polite"
-        onScroll={() => {
-          if (!scroller) return;
-          followLatest = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 80;
-        }}
+        onScroll={updateFollowLatest}
       >
         <Show
           when={
             props.items.length > 0 ||
+            Boolean(props.provisionalUserText) ||
             Boolean(props.provisionalText) ||
             Boolean(props.provisionalReasoning) ||
             props.turn !== null
@@ -112,7 +168,10 @@ export function SessionConversation(props: SessionConversationProps) {
             </Show>
           }
         >
-          <div class="session-conversation__items">
+          <div
+            class="session-conversation__items"
+            ref={(element) => observeActivityContainer(element)}
+          >
             <For each={props.items}>
               {(item) => (
                 <ConversationEntry
@@ -121,6 +180,20 @@ export function SessionConversation(props: SessionConversationProps) {
                 />
               )}
             </For>
+            <Show
+              when={
+                props.provisionalUserText &&
+                !props.items.some(
+                  (item) => item.type === "user" && item.turnId === props.provisionalUserTurnId,
+                )
+              }
+            >
+              <div class="session-message session-message--user">
+                <div class="session-message__user-content">
+                  <div class="session-message__bubble">{props.provisionalUserText}</div>
+                </div>
+              </div>
+            </Show>
             <Show when={props.provisionalReasoning}>
               {(reasoning) => (
                 <EventRow
@@ -140,7 +213,9 @@ export function SessionConversation(props: SessionConversationProps) {
             <Show when={props.provisionalText}>
               {(text) => <AssistantOutput text={text()} provisional />}
             </Show>
-            <TurnStatusOutput turn={props.turn} sessionId={props.sessionId} />
+            <Show when={bottomTurn()}>
+              {(turn) => <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />}
+            </Show>
           </div>
         </Show>
       </div>
@@ -173,7 +248,12 @@ export function SessionConversation(props: SessionConversationProps) {
   );
 }
 
-function TurnStatusOutput(props: { turn: TurnSummary | null; sessionId: string }) {
+type TurnStatusLike = Pick<
+  TurnSummary,
+  "id" | "status" | "created_at" | "updated_at" | "completion_reason" | "cancellation_reason"
+> & { model_attempt?: TurnSummary["model_attempt"] };
+
+function TurnStatusOutput(props: { turn: TurnStatusLike | null; sessionId: string }) {
   // Tick once per second while a turn is active so the elapsed time display
   // stays fresh without waiting for a query refetch.
   const [tick, setTick] = createSignal(0);
@@ -220,7 +300,7 @@ function TurnStatusOutput(props: { turn: TurnSummary | null; sessionId: string }
 
 interface TurnStatusVisual {
   text: string;
-  tone: "muted" | "warning" | "danger" | "success";
+  tone: "muted" | "normal" | "warning" | "danger" | "success";
   pulse: boolean;
 }
 
@@ -234,7 +314,7 @@ interface TurnStatusVisual {
  * - terminal failure → `Failed: reason`, reading `completion_reason`.
  * - terminal success -> keep a compact `Worked for Xs` row in the timeline.
  */
-function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStatusVisual | null {
+function turnStatusVisual(turn: TurnStatusLike | null, sessionId: string): TurnStatusVisual | null {
   if (!turn) return null;
   const live = retryState(sessionId, turn.id);
   const retry =
@@ -274,7 +354,7 @@ function turnStatusVisual(turn: TurnSummary | null, sessionId: string): TurnStat
     case "waiting_for_job":
       return { text: "Waiting for a job to finish...", tone: "warning", pulse: true };
     case "waiting_for_ask":
-      return { text: "Waiting for your answer...", tone: "warning", pulse: true };
+      return { text: "Waiting for your answer...", tone: "normal", pulse: true };
     case "waiting_for_model":
       return {
         text: turn.completion_reason || "Waiting for the model...",
@@ -319,9 +399,8 @@ function formatElapsed(ms: number): string {
 function formatTokens(output: import("../../../lib/modelStream").ModelStreamOutput | null): string {
   if (!output?.usage) return "";
   const parts: string[] = [];
+  if (output.usage.inputTokens > 0) parts.push(`↑ ${formatTokenCount(output.usage.inputTokens)}`);
   if (output.usage.outputTokens > 0) parts.push(`↓ ${formatTokenCount(output.usage.outputTokens)}`);
-  // Input tokens are only shown when they exceed the baseline (Round 2+).
-  // For now show only output to avoid confusion with cumulative input counts.
   return parts.join(" · ");
 }
 
@@ -350,7 +429,7 @@ function provisionalThinkingTitle(): string {
 
 function ConversationEntry(props: {
   item: SessionTimelineItem;
-  onAnswer?: (askId: string, answer: string) => Promise<void>;
+  onAnswer?: (askId: string, answer: AskAnswer) => Promise<void>;
 }) {
   switch (props.item.type) {
     case "user":
@@ -509,7 +588,17 @@ function EventRow(props: {
           />
         </Show>
       </button>
-      <Show when={expandable() && open()}>{props.children}</Show>
+      <Show when={expandable()}>
+        <div
+          class="session-event__body-wrap"
+          classList={{ "session-event__body-wrap--open": open() }}
+          aria-hidden={!open()}
+        >
+          <div class="session-event__body-content">
+            <div class="session-event__body">{props.children}</div>
+          </div>
+        </div>
+      </Show>
     </article>
   );
 }
@@ -525,16 +614,21 @@ function ToolBody(props: { view: ToolView }) {
       return <pre class="session-event__terminal">{body.text}</pre>;
     case "structured":
       return <pre class="session-event__terminal">{JSON.stringify(body.value, null, 2)}</pre>;
+    case "activity":
+      return <ActivityBody items={body.items} />;
     case "error":
       return (
-        <div class="session-event__body">
+        <>
           <pre class="session-event__terminal session-event__terminal--err">{body.detail}</pre>
           <span class="session-event__exit">{body.code}</span>
-        </div>
+        </>
       );
     case "command_output":
       return (
-        <div class="session-event__body">
+        <>
+          <Show when={body.command}>
+            <pre class="session-event__command">{body.command}</pre>
+          </Show>
           <Show when={body.stdout}>
             <pre class="session-event__terminal">{body.stdout}</pre>
           </Show>
@@ -547,9 +641,49 @@ function ToolBody(props: { view: ToolView }) {
           <Show when={body.exitCode !== null}>
             <span class="session-event__exit">exit {body.exitCode}</span>
           </Show>
-        </div>
+        </>
       );
   }
+}
+
+function ActivityBody(props: { items: readonly ToolActivityDetail[] }) {
+  return (
+    <div class="session-event__activity">
+      <For each={props.items}>
+        {(item) => {
+          if (item.kind === "thought") {
+            return (
+              <div class="session-event__activity-thought">
+                <div class="session-event__activity-heading">
+                  <span class="session-event__dot" data-tone="muted" aria-hidden="true" />
+                  <span class="session-event__title">{item.title}</span>
+                </div>
+                <div class="session-event__activity-thought-body">
+                  <MarkdownOutput text={item.text} />
+                </div>
+              </div>
+            );
+          }
+          return (
+            <div class="session-event__activity-tool">
+              <EventRow
+                itemId={`activity:${item.id}`}
+                title={item.view.title}
+                tone={toolDotTone(item.view)}
+                pulse={item.view.status === "running"}
+                autoOpen={false}
+                expandable={item.view.expandable}
+                lowNoise={item.view.lowNoise}
+                ariaLabel={item.view.title}
+              >
+                <ToolBody view={item.view} />
+              </EventRow>
+            </div>
+          );
+        }}
+      </For>
+    </div>
+  );
 }
 
 function DiffBody(props: { patch: string }) {
@@ -580,6 +714,20 @@ function DiffBody(props: { patch: string }) {
 }
 
 function AssistantOutput(props: { text: string; provisional?: boolean }) {
+  const [visibleText, setVisibleText] = createSignal(props.text);
+  let frame: number | undefined;
+  createEffect(() => {
+    const next = props.text;
+    if (next === visibleText()) return;
+    if (frame !== undefined) cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => {
+      frame = undefined;
+      setVisibleText(next);
+    });
+  });
+  onCleanup(() => {
+    if (frame !== undefined) cancelAnimationFrame(frame);
+  });
   return (
     <div
       class="session-message session-message--assistant"
@@ -591,7 +739,7 @@ function AssistantOutput(props: { text: string; provisional?: boolean }) {
         aria-hidden="true"
       />
       <div class="session-message__body">
-        <Show when={props.text}>{(text) => <MarkdownOutput text={text()} />}</Show>
+        <Show when={visibleText()}>{(text) => <MarkdownOutput text={text()} />}</Show>
       </div>
     </div>
   );

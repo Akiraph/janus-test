@@ -8,6 +8,7 @@ use janus_infrastructure::clock::now_utc_str;
 use super::anthropic::{AnthropicAssembler, build_messages_body};
 use super::interface::{ModelsError, ModelsInterface, ProviderKind};
 use super::openai_chat::{OpenaiChatAssembler, build_chat_body};
+use super::openai_responses::{OpenaiResponsesAssembler, build_responses_body};
 use super::sse::SseParser;
 use super::stream_types::{ModelRequest, ModelStreamEvent, StreamTiming};
 use janus_infrastructure::{id::AttemptId, secrets::Secret};
@@ -72,9 +73,19 @@ impl ModelsInterface {
         .await?;
 
         let result = match kind {
-            ProviderKind::OpenaiChat | ProviderKind::OpenaiResponses => {
+            ProviderKind::OpenaiChat => {
                 self.stream_openai_chat(&req, &row.base_url, key.as_ref(), &attempt_id, on_event)
                     .await
+            }
+            ProviderKind::OpenaiResponses => {
+                self.stream_openai_responses(
+                    &req,
+                    &row.base_url,
+                    key.as_ref(),
+                    &attempt_id,
+                    on_event,
+                )
+                .await
             }
             ProviderKind::Anthropic => {
                 self.stream_anthropic(&req, &row.base_url, key.as_ref(), &attempt_id, on_event)
@@ -106,6 +117,7 @@ impl ModelsInterface {
                     status,
                     usage.as_ref().map(|u| u.input_tokens as i64),
                     usage.as_ref().map(|u| u.output_tokens as i64),
+                    usage.as_ref().map(|u| u.cache_tokens as i64),
                     err_json.as_ref(),
                     &req,
                 )
@@ -124,6 +136,7 @@ impl ModelsInterface {
                 self.finalize_attempt(
                     &attempt_id,
                     "failed",
+                    None,
                     None,
                     None,
                     Some(&serde_json::json!({"code": "PROVIDER_STREAM_FAILED", "detail": detail})),
@@ -206,6 +219,87 @@ impl ModelsInterface {
                     events.push(event);
                 }
             }
+        }
+        assembler.reasoning_duration_ms = timing.reasoning_duration_ms();
+        let completed = assembler.finish(attempt_id);
+        on_event(completed.clone()).await;
+        events.push(completed);
+        Ok(events)
+    }
+
+    async fn stream_openai_responses<F, Fut>(
+        &self,
+        req: &ModelRequest,
+        base_url: &str,
+        key: Option<&Secret>,
+        attempt_id: &str,
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, ModelsError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let url = append_path_segment(base_url, "responses")?;
+        let body = build_responses_body(req);
+        let mut request = self
+            .client_ref()
+            .post(url)
+            .header("accept", "text/event-stream")
+            .header("content-type", "application/json")
+            .json(&body);
+        if let Some(key) = key {
+            request = request.bearer_auth(key.expose());
+        }
+        let response = request.send().await.map_err(|e| {
+            ModelsError::Internal(anyhow::anyhow!(
+                "provider unreachable: {}",
+                classify_reqwest(&e)
+            ))
+        })?;
+        let status = response.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            let detail = provider_http_error(response, status.as_u16(), key).await;
+            let failed = ModelStreamEvent::Failed {
+                attempt_id: attempt_id.to_owned(),
+                code: "PROVIDER_AUTH_FAILED".into(),
+                detail,
+            };
+            on_event(failed.clone()).await;
+            return Ok(vec![failed]);
+        }
+        if !status.is_success() {
+            let detail = provider_http_error(response, status.as_u16(), key).await;
+            let failed = ModelStreamEvent::Failed {
+                attempt_id: attempt_id.to_owned(),
+                code: "PROVIDER_STREAM_FAILED".into(),
+                detail,
+            };
+            on_event(failed.clone()).await;
+            return Ok(vec![failed]);
+        }
+
+        let mut parser = SseParser::new();
+        let mut assembler = OpenaiResponsesAssembler::for_tools(&req.tools);
+        let mut timing = StreamTiming::default();
+        let mut events = Vec::new();
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|e| {
+                ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+            })?;
+            for (event_name, data) in parser.push(&chunk) {
+                let more = assembler
+                    .ingest_event(attempt_id, &event_name, &data)
+                    .map_err(|e| ModelsError::Internal(anyhow::anyhow!(e)))?;
+                for event in more {
+                    timing.observe(&event);
+                    on_event(event.clone()).await;
+                    events.push(event);
+                }
+            }
+        }
+        if assembler.failed.is_some() {
+            return Ok(events);
         }
         assembler.reasoning_duration_ms = timing.reasoning_duration_ms();
         let completed = assembler.finish(attempt_id);

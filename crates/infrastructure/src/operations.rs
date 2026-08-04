@@ -303,13 +303,13 @@ impl OperationInterface {
         input_summary: Value,
     ) -> Result<StepState, OperationError> {
         let now = now_utc_str();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.unit_of_work.begin().await?;
         let existing: Option<(String,)> = sqlx::query_as(
             "SELECT status FROM operation_steps WHERE operation_id = ? AND step_key = ?",
         )
         .bind(operation_id)
         .bind(step_key)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.connection())
         .await?;
         let state = match existing {
             Some((status,)) if status == "succeeded" => StepState::AlreadySucceeded,
@@ -321,7 +321,7 @@ impl OperationInterface {
                     .bind(serde_json::to_string(&input_summary)?)
                     .bind(&now)
                     .bind(&now)
-                    .execute(&mut *tx)
+                    .execute(tx.connection())
                     .await?;
                 StepState::Running
             }
@@ -332,7 +332,7 @@ impl OperationInterface {
             .bind(&version)
             .bind(&now)
             .bind(operation_id)
-            .execute(&mut *tx)
+            .execute(tx.connection())
             .await?;
         tx.commit().await?;
         Ok(state)

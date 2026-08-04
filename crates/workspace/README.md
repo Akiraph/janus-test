@@ -3,8 +3,9 @@
 ## Mission
 
 `janus-workspace` owns Main and Session workspace copies, content revisions,
-snapshots, manifests, diffs, and controlled file mutations. New callers use
-`interface.rs`; Project, Session, and Execution do not read Workspace tables.
+snapshots, manifests, diffs, propagation state, and controlled file mutations.
+New callers use `interface.rs`; Project, Session, and Execution do not read
+Workspace tables.
 The remaining Project editor write path is a compatibility boundary that still
 needs to move its filesystem mutation behind this interface.
 
@@ -24,14 +25,21 @@ needs to move its filesystem mutation behind this interface.
 - An expected revision is checked again when the revision transaction runs. A
   mismatch returns an error and does not advance the revision identity; callers
   must re-read before retrying.
+- Diff summaries expose whether Main-to-Session or Session-to-Main propagation
+  is possible. Propagation copies filesystem changes without creating a Git
+  commit and returns a structured conflict when both sides changed one path.
+- A propagation conflict remains durable until the Session is edited and a
+  subsequent Apply succeeds, so a failed HTTP request or process restart does
+  not lose the files that still need resolution.
 - Workspace-relative paths reject absolute roots, drive or UNC prefixes, NULs,
   and `..` traversal. `.git` paths are not editable through file mutations.
 
 ## Invariants
 
 - `workspace_copies`, `content_revisions`, `workspace_snapshots`, and
-  `propagation_links` are owned here. Historical table names, event strings,
-  and migration ownership remain unchanged during the crate move.
+  `propagation_links`, and `workspace_propagation_conflicts` are owned here.
+  Historical table names, event strings, and migration ownership remain
+  unchanged during the crate move.
 - Manifest identity excludes symlink targets and special filesystem entries;
   callers must not rely on those entries being materialized as regular files.
 - Revision changes and their manifest roots are written through the Workspace
@@ -44,7 +52,8 @@ needs to move its filesystem mutation behind this interface.
 Project owns project metadata, credentials, and runtime policy. Source Control
 owns Git status, fetch, update, conflict, and commit protocol. Session and
 Execution own their conversations and lifecycle state. Application workflows
-compose these capabilities; HTTP only maps public requests and responses.
+compose these capabilities and enforce Session lifecycle/event ordering; HTTP
+only maps public requests and responses.
 
 The current implementation uses Git worktree lifecycle operations and the
 managed filesystem to materialize copies. That mechanism is private to the
@@ -59,3 +68,8 @@ must remain outside this crate.
 - File mutation currently performs a full manifest rescan. This keeps revision
   roots correct while leaving incremental rehashing as an implementation
   optimization rather than a caller-visible contract.
+- The three-way propagation baseline is a persisted manifest outside the Git
+  worktree. New Sessions store it beside the propagation cursors instead of
+  copying the entire tree; legacy filesystem baselines are read once and
+  migrated lazily. It advances only where Main and Session agree after a
+  successful propagation.

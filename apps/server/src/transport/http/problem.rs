@@ -63,6 +63,7 @@ pub mod codes {
     pub const SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
     pub const ACTIVE_TURN_EXISTS: &str = "ACTIVE_TURN_EXISTS";
     pub const SESSION_DELETING: &str = "SESSION_DELETING";
+    pub const WORKSPACE_PROPAGATION_CONFLICT: &str = "WORKSPACE_PROPAGATION_CONFLICT";
     pub const TIMELINE_CURSOR_INVALID: &str = "TIMELINE_CURSOR_INVALID";
     pub const TURN_NOT_INTERACTIVE: &str = "TURN_NOT_INTERACTIVE";
     pub const TURN_TERMINAL: &str = "TURN_TERMINAL";
@@ -109,6 +110,7 @@ fn code_status_title(code: &str) -> (StatusCode, &'static str) {
         OPERATION_IN_PROGRESS
         | ACTIVE_TURN_EXISTS
         | SESSION_DELETING
+        | WORKSPACE_PROPAGATION_CONFLICT
         | RESOURCE_BUSY
         | TURN_NOT_INTERACTIVE
         | TURN_TERMINAL

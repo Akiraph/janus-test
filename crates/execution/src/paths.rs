@@ -1,17 +1,34 @@
-﻿//! Session tool path safety: relative, no `..`, no `.git`, no Main handle.
+//! Session tool path safety: relative, no `..`, no `.git`, no Main handle.
 
 use std::path::{Path, PathBuf};
 
 use janus_workspace::interface::{PathError, validate_workspace_path};
 
-/// Resolve a tool-supplied relative path under the Session repo root.
-/// Rejects absolute / traversal / NUL via `validate_workspace_path`, and
-/// refuses any path whose first component is `.git`.
+/// Normalize a tool path into the workspace-relative representation used by
+/// the mutation API. `/workspace` is a logical absolute alias for the Session
+/// workspace; every other absolute path remains invalid.
+pub fn normalize_session_path(raw: &str) -> Result<String, PathError> {
+    let relative = match raw.strip_prefix("/workspace") {
+        Some("") => ".",
+        Some(rest) if rest.starts_with('/') => rest.strip_prefix('/').unwrap_or("."),
+        _ => raw,
+    };
+    if relative.is_empty() || relative == "." {
+        return Ok(".".into());
+    }
+    let path = validate_workspace_path(relative)?;
+    Ok(path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Resolve a tool-supplied path under the Session repo root. Rejects every
+/// absolute path except the logical `/workspace` alias, traversal, NUL, and
+/// `.git` paths.
 pub fn resolve_session_path(repo_root: &Path, raw: &str) -> Result<PathBuf, PathError> {
-    let rel = if raw.is_empty() || raw == "." {
+    let normalized = normalize_session_path(raw)?;
+    let rel = if normalized == "." {
         PathBuf::new()
     } else {
-        validate_workspace_path(raw)?
+        PathBuf::from(normalized)
     };
     if is_git_component(&rel) {
         return Err(PathError::Invalid);
@@ -43,5 +60,18 @@ mod tests {
         let root = Path::new("/tmp/session/repo");
         let p = resolve_session_path(root, "src/lib.rs").expect("valid path");
         assert!(p.ends_with("src/lib.rs") || p.ends_with(r"src\lib.rs"));
+    }
+
+    #[test]
+    fn accepts_the_logical_workspace_absolute_prefix() {
+        let root = Path::new("/tmp/session/repo");
+        let p = resolve_session_path(root, "/workspace/src/lib.rs").expect("valid path");
+        assert!(p.ends_with("src/lib.rs") || p.ends_with(r"src\lib.rs"));
+        assert_eq!(
+            normalize_session_path("/workspace/src/lib.rs").unwrap(),
+            "src/lib.rs"
+        );
+        assert!(resolve_session_path(root, "/workspace/../outside").is_err());
+        assert!(resolve_session_path(root, "/etc/passwd").is_err());
     }
 }

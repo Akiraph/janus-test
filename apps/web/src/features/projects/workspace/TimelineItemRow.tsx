@@ -1,5 +1,6 @@
 import Loader2 from "lucide-solid/icons/loader-2";
 import { createSignal, For, Show } from "solid-js";
+import type { AskAnswer } from "../../../lib/api";
 import { MarkdownOutput } from "./MarkdownOutput";
 import { AskCard, JobCard, ModelCard, PlanCard, ServiceCard } from "./SessionCards";
 import type { SessionTimelineItem, ToolView } from "./sessionTimeline";
@@ -12,7 +13,7 @@ import { ThoughtRow } from "./ThoughtRow";
  */
 export function TimelineItemRow(props: {
   item: SessionTimelineItem;
-  onAnswer?: (askId: string, answer: string) => Promise<void>;
+  onAnswer?: (askId: string, answer: AskAnswer) => Promise<void>;
 }) {
   switch (props.item.type) {
     case "user":
@@ -225,6 +226,9 @@ function ToolBodyContent(props: { view: ToolView; isGroup: boolean }) {
     case "command_output":
       return (
         <div>
+          <Show when={body.command}>
+            <pre class="session-event__command">{body.command}</pre>
+          </Show>
           <Show when={body.stdout}>
             <pre class="session-event__terminal">{body.stdout}</pre>
           </Show>

@@ -17,7 +17,7 @@ import "./app.css";
 
 const MODE_TABS: TabItem[] = [
   { value: "code", label: "Code" },
-  { value: "mtc", label: "MTC", disabled: true, badge: "soon" },
+  { value: "mtc", label: "MTC", disabled: true },
 ];
 
 /** Inline route-loading marker for non-workspace routes while a lazy chunk

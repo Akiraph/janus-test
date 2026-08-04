@@ -1,4 +1,4 @@
-﻿//! Gate-1 integration tests for Session copy + Merkle + Diff + delete.
+//! Gate-1 integration tests for Session copy + Merkle + Diff + delete.
 //!
 //! These exercise the public `WorkspaceInterface` against a real temp
 //! data root (SQLite migrations + BlobStore + filesystem), without HTTP.
@@ -12,7 +12,9 @@ use janus_infrastructure::{
     id::{ProjectId, SessionId},
     managed_storage::BlobStore,
 };
-use janus_workspace::interface::{FileMutation, WorkspaceHandle, WorkspaceInterface};
+use janus_workspace::interface::{
+    FileMutation, PropagationDirection, PropagationError, WorkspaceHandle, WorkspaceInterface,
+};
 use serde_json::json;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -188,6 +190,24 @@ async fn ensure_session_copy_from_main() -> anyhow::Result<()> {
             .fetch_one(&fx.pool)
             .await?;
     assert_eq!(links, 1);
+
+    let baseline_json: String = sqlx::query_scalar(
+        "SELECT baseline_manifest_json FROM propagation_links WHERE session_id = ?",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&fx.pool)
+    .await?;
+    let baseline: serde_json::Value = serde_json::from_str(&baseline_json)?;
+    assert_eq!(baseline["root_hash"], result.manifest_root_hash);
+    assert!(baseline["nodes"].is_object());
+    assert!(
+        !fx.data_root
+            .join("workspaces")
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("base")
+            .exists()
+    );
 
     // Idempotent re-call returns the same revision.
     let again = fx
@@ -417,7 +437,7 @@ async fn diff_summary_reports_paths() -> anyhow::Result<()> {
         .await?;
 
     let summary = fx.sync.diff_summary(session_id).await?;
-    assert!(!summary.apply_enabled);
+    assert!(summary.apply_enabled);
     assert_eq!(summary.added, 1);
     assert_eq!(summary.modified, 1);
     assert_eq!(summary.deleted, 1);
@@ -444,6 +464,14 @@ async fn diff_summary_reports_paths() -> anyhow::Result<()> {
             .any(|(p, k)| *p == "src/lib.rs" && k.contains("Deleted")),
         "expected deleted src/lib.rs, got {kinds:?}"
     );
+    let stats = summary
+        .paths
+        .iter()
+        .map(|path| (path.path.as_str(), (path.additions, path.deletions)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(stats.get("README.md"), Some(&(1, 1)));
+    assert_eq!(stats.get("new.txt"), Some(&(1, 0)));
+    assert_eq!(stats.get("src/lib.rs"), Some(&(0, 1)));
     Ok(())
 }
 
@@ -485,5 +513,148 @@ async fn delete_session_copy_cleans_disk_and_db() -> anyhow::Result<()> {
 
     // Idempotent second delete.
     fx.sync.delete_session_copy(session_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_copies_main_only_changes_and_preserves_session_changes() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let main = fx
+        .data_root
+        .join("workspaces")
+        .join("main")
+        .join(fx.project_id.to_string())
+        .join("repo");
+    let session = fx
+        .data_root
+        .join("workspaces")
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("repo");
+
+    std::fs::write(main.join("main-only.txt"), b"from main\n")?;
+    fx.sync
+        .apply_file_mutation(
+            &WorkspaceHandle::session(session_id),
+            FileMutation::Write {
+                path: "session-only.txt".into(),
+                content: b"from session\n".to_vec(),
+            },
+            None,
+            "tool.write",
+            json!({"kind": "test"}),
+        )
+        .await?;
+
+    let before = fx.sync.diff_summary(session_id).await?;
+    assert!(before.sync_enabled);
+    assert!(before.apply_enabled);
+
+    let result = fx
+        .sync
+        .propagate(
+            session_id,
+            PropagationDirection::Sync,
+            json!({"kind": "test"}),
+        )
+        .await?;
+    assert_eq!(result.changed_paths, vec!["main-only.txt"]);
+    assert_eq!(
+        std::fs::read(session.join("main-only.txt"))?,
+        b"from main\n"
+    );
+    assert_eq!(
+        std::fs::read(session.join("session-only.txt"))?,
+        b"from session\n"
+    );
+    assert!(!fx.sync.diff_summary(session_id).await?.sync_enabled);
+    assert!(fx.sync.diff_summary(session_id).await?.apply_enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn propagation_conflict_is_persisted_until_session_edit_then_apply() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let main = fx
+        .data_root
+        .join("workspaces")
+        .join("main")
+        .join(fx.project_id.to_string())
+        .join("repo")
+        .join("README.md");
+    let handle = WorkspaceHandle::session(session_id);
+
+    std::fs::write(&main, b"# main edit\n")?;
+    fx.sync
+        .apply_file_mutation(
+            &handle,
+            FileMutation::Write {
+                path: "README.md".into(),
+                content: b"# session edit\n".to_vec(),
+            },
+            None,
+            "tool.write",
+            json!({"kind": "test"}),
+        )
+        .await?;
+
+    let conflict = fx
+        .sync
+        .propagate(
+            session_id,
+            PropagationDirection::Sync,
+            json!({"kind": "test"}),
+        )
+        .await
+        .expect_err("different edits to one path must conflict");
+    let PropagationError::Conflict(conflict) = conflict else {
+        anyhow::bail!("expected a propagation conflict, got {conflict:?}");
+    };
+    assert_eq!(conflict.paths.len(), 1);
+    assert_eq!(conflict.paths[0].path, "README.md");
+    assert_eq!(
+        fx.sync
+            .diff_summary(session_id)
+            .await?
+            .pending_conflict
+            .as_ref()
+            .map(|pending| pending.paths.len()),
+        Some(1)
+    );
+
+    fx.sync
+        .apply_file_mutation(
+            &handle,
+            FileMutation::Write {
+                path: "README.md".into(),
+                content: b"# merged edit\n".to_vec(),
+            },
+            None,
+            "tool.write",
+            json!({"kind": "test"}),
+        )
+        .await?;
+    let result = fx
+        .sync
+        .propagate(
+            session_id,
+            PropagationDirection::Apply,
+            json!({"kind": "test"}),
+        )
+        .await?;
+    assert_eq!(result.changed_paths, vec!["README.md"]);
+    assert_eq!(std::fs::read(main)?, b"# merged edit\n");
+    let summary = fx.sync.diff_summary(session_id).await?;
+    assert!(summary.pending_conflict.is_none());
+    assert!(!summary.sync_enabled);
+    assert!(!summary.apply_enabled);
     Ok(())
 }

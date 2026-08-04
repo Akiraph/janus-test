@@ -42,7 +42,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_Value"
+                  "$ref": "#/components/schemas/DataResponse_AnswerAskResult"
                 }
               }
             }
@@ -3184,6 +3184,56 @@
         }
       }
     },
+    "/api/v1/sessions/{id}/apply": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "apply",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_PropagationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sessions/{id}/attachments": {
       "post": {
         "tags": [
@@ -3365,7 +3415,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_Value"
+                  "$ref": "#/components/schemas/DataResponse_DiffSummary"
                 }
               }
             }
@@ -3506,6 +3556,56 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DataResponse_SteerResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{id}/sync": {
+      "post": {
+        "tags": [
+          "sessions"
+        ],
+        "operationId": "sync",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_PropagationResult"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -4189,6 +4289,29 @@
           "answer": {}
         }
       },
+      "AnswerAskResult": {
+        "type": "object",
+        "required": [
+          "ask_id",
+          "turn_id",
+          "route_or_status",
+          "session_version"
+        ],
+        "properties": {
+          "ask_id": {
+            "type": "string"
+          },
+          "route_or_status": {
+            "type": "string"
+          },
+          "session_version": {
+            "type": "string"
+          },
+          "turn_id": {
+            "type": "string"
+          }
+        }
+      },
       "AttachmentId": {
         "type": "string",
         "format": "uuid"
@@ -4504,6 +4627,37 @@
           }
         }
       },
+      "DataResponse_AnswerAskResult": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "ask_id",
+              "turn_id",
+              "route_or_status",
+              "session_version"
+            ],
+            "properties": {
+              "ask_id": {
+                "type": "string"
+              },
+              "route_or_status": {
+                "type": "string"
+              },
+              "session_version": {
+                "type": "string"
+              },
+              "turn_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "DataResponse_AttachmentView": {
         "type": "object",
         "required": [
@@ -4632,6 +4786,64 @@
               },
               "status": {
                 "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_DiffSummary": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "added",
+              "modified",
+              "deleted",
+              "paths",
+              "sync_enabled",
+              "apply_enabled"
+            ],
+            "properties": {
+              "added": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "apply_enabled": {
+                "type": "boolean"
+              },
+              "deleted": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "modified": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/DiffPathEntry"
+                }
+              },
+              "pending_conflict": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PropagationConflict"
+                  }
+                ]
+              },
+              "sync_enabled": {
+                "type": "boolean"
               }
             }
           }
@@ -5214,6 +5426,40 @@
                 "type": "string"
               },
               "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_PropagationResult": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "direction",
+              "changed_paths",
+              "session_revision",
+              "main_revision"
+            ],
+            "properties": {
+              "changed_paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "direction": {
+                "$ref": "#/components/schemas/PropagationDirection"
+              },
+              "main_revision": {
+                "type": "string"
+              },
+              "session_revision": {
                 "type": "string"
               }
             }
@@ -6268,6 +6514,158 @@
           }
         }
       },
+      "DiffChangeKind": {
+        "type": "string",
+        "enum": [
+          "added",
+          "modified",
+          "deleted"
+        ]
+      },
+      "DiffHunk": {
+        "type": "object",
+        "description": "One contiguous change region. Unchanged spans longer than the context window\nbecome a single `Skip` line instead of being listed out.",
+        "required": [
+          "lines"
+        ],
+        "properties": {
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffLine"
+            }
+          }
+        }
+      },
+      "DiffLine": {
+        "type": "object",
+        "description": "One rendered line inside a file hunk. `old_no` / `new_no` are 1-based;\neither may be absent for pure additions / deletions.",
+        "required": [
+          "kind",
+          "text"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/DiffLineKind"
+          },
+          "new_no": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "old_no": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "DiffLineKind": {
+        "type": "string",
+        "enum": [
+          "context",
+          "add",
+          "delete",
+          "skip"
+        ]
+      },
+      "DiffPathEntry": {
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "additions",
+          "deletions"
+        ],
+        "properties": {
+          "additions": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "binary": {
+            "type": "boolean",
+            "description": "True when content is binary or too large for line-level display."
+          },
+          "deletions": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "hunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffHunk"
+            },
+            "description": "Line-level hunks when available. Empty for binary / oversized / pure path\nclassification without content. Frontend collapses by default."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DiffChangeKind"
+          },
+          "path": {
+            "type": "string"
+          }
+        }
+      },
+      "DiffSummary": {
+        "type": "object",
+        "required": [
+          "added",
+          "modified",
+          "deleted",
+          "paths",
+          "sync_enabled",
+          "apply_enabled"
+        ],
+        "properties": {
+          "added": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "apply_enabled": {
+            "type": "boolean"
+          },
+          "deleted": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "modified": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DiffPathEntry"
+            }
+          },
+          "pending_conflict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PropagationConflict"
+              }
+            ]
+          },
+          "sync_enabled": {
+            "type": "boolean"
+          }
+        }
+      },
       "DiffViewParam": {
         "type": "string",
         "enum": [
@@ -7285,6 +7683,90 @@
           }
         }
       },
+      "PropagationConflict": {
+        "type": "object",
+        "required": [
+          "direction",
+          "paths"
+        ],
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/PropagationDirection"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PropagationConflictPath"
+            }
+          }
+        }
+      },
+      "PropagationConflictPath": {
+        "type": "object",
+        "required": [
+          "path",
+          "kind"
+        ],
+        "properties": {
+          "base_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "main_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "session_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PropagationDirection": {
+        "type": "string",
+        "enum": [
+          "sync",
+          "apply"
+        ]
+      },
+      "PropagationResult": {
+        "type": "object",
+        "required": [
+          "direction",
+          "changed_paths",
+          "session_revision",
+          "main_revision"
+        ],
+        "properties": {
+          "changed_paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "direction": {
+            "$ref": "#/components/schemas/PropagationDirection"
+          },
+          "main_revision": {
+            "type": "string"
+          },
+          "session_revision": {
+            "type": "string"
+          }
+        }
+      },
       "ProviderInput": {
         "type": "object",
         "required": [
@@ -8134,6 +8616,16 @@
               "null"
             ]
           },
+          "turn_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimelineTurnStatus"
+              }
+            ]
+          },
           "version": {
             "type": "string"
           }
@@ -8170,6 +8662,41 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "TimelineTurnStatus": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "cancellation_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completion_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
           }
         }
       },

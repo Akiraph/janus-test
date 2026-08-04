@@ -788,6 +788,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/sessions/{id}/apply": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["apply"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/sessions/{id}/attachments": {
     parameters: {
       query?: never;
@@ -894,6 +910,22 @@ export interface paths {
     get?: never;
     put?: never;
     post: operations["steer"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/sessions/{id}/sync": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["sync"];
     delete?: never;
     options?: never;
     head?: never;
@@ -1137,6 +1169,12 @@ export interface components {
     AnswerAskRequest: {
       answer: unknown;
     };
+    AnswerAskResult: {
+      ask_id: string;
+      route_or_status: string;
+      session_version: string;
+      turn_id: string;
+    };
     /** Format: uuid */
     AttachmentId: string;
     AttachmentView: {
@@ -1230,6 +1268,14 @@ export interface components {
       http_status?: number | null;
       status: string;
     };
+    DataResponse_AnswerAskResult: {
+      data: {
+        ask_id: string;
+        route_or_status: string;
+        session_version: string;
+        turn_id: string;
+      };
+    };
     DataResponse_AttachmentView: {
       data: {
         /** Format: int64 */
@@ -1267,6 +1313,20 @@ export interface components {
         /** Format: int32 */
         http_status?: number | null;
         status: string;
+      };
+    };
+    DataResponse_DiffSummary: {
+      data: {
+        /** Format: int32 */
+        added: number;
+        apply_enabled: boolean;
+        /** Format: int32 */
+        deleted: number;
+        /** Format: int32 */
+        modified: number;
+        paths: components["schemas"]["DiffPathEntry"][];
+        pending_conflict?: null | components["schemas"]["PropagationConflict"];
+        sync_enabled: boolean;
       };
     };
     DataResponse_FileMetaView: {
@@ -1409,6 +1469,14 @@ export interface components {
         state: string;
         updated_at: string;
         version: string;
+      };
+    };
+    DataResponse_PropagationResult: {
+      data: {
+        changed_paths: string[];
+        direction: components["schemas"]["PropagationDirection"];
+        main_revision: string;
+        session_revision: string;
       };
     };
     DataResponse_ProviderView: {
@@ -1662,6 +1730,56 @@ export interface components {
       expected_main_revision?: string | null;
       path: string;
       recursive?: boolean;
+    };
+    /** @enum {string} */
+    DiffChangeKind: "added" | "modified" | "deleted";
+    /**
+     * @description One contiguous change region. Unchanged spans longer than the context window
+     *     become a single `Skip` line instead of being listed out.
+     */
+    DiffHunk: {
+      lines: components["schemas"]["DiffLine"][];
+    };
+    /**
+     * @description One rendered line inside a file hunk. `old_no` / `new_no` are 1-based;
+     *     either may be absent for pure additions / deletions.
+     */
+    DiffLine: {
+      kind: components["schemas"]["DiffLineKind"];
+      /** Format: int32 */
+      new_no?: number | null;
+      /** Format: int32 */
+      old_no?: number | null;
+      text: string;
+    };
+    /** @enum {string} */
+    DiffLineKind: "context" | "add" | "delete" | "skip";
+    DiffPathEntry: {
+      /** Format: int32 */
+      additions: number;
+      /** @description True when content is binary or too large for line-level display. */
+      binary?: boolean;
+      /** Format: int32 */
+      deletions: number;
+      /**
+       * @description Line-level hunks when available. Empty for binary / oversized / pure path
+       *     classification without content. Frontend collapses by default.
+       */
+      hunks?: components["schemas"]["DiffHunk"][];
+      kind: components["schemas"]["DiffChangeKind"];
+      path: string;
+    };
+    DiffSummary: {
+      /** Format: int32 */
+      added: number;
+      apply_enabled: boolean;
+      /** Format: int32 */
+      deleted: number;
+      /** Format: int32 */
+      modified: number;
+      paths: components["schemas"]["DiffPathEntry"][];
+      pending_conflict?: null | components["schemas"]["PropagationConflict"];
+      sync_enabled: boolean;
     };
     /** @enum {string} */
     DiffViewParam: "working_vs_index" | "index_vs_head" | "working_vs_head";
@@ -1929,6 +2047,25 @@ export interface components {
       updated_at: string;
       version: string;
     };
+    PropagationConflict: {
+      direction: components["schemas"]["PropagationDirection"];
+      paths: components["schemas"]["PropagationConflictPath"][];
+    };
+    PropagationConflictPath: {
+      base_hash?: string | null;
+      kind: string;
+      main_hash?: string | null;
+      path: string;
+      session_hash?: string | null;
+    };
+    /** @enum {string} */
+    PropagationDirection: "sync" | "apply";
+    PropagationResult: {
+      changed_paths: string[];
+      direction: components["schemas"]["PropagationDirection"];
+      main_revision: string;
+      session_revision: string;
+    };
     ProviderInput: {
       api_key?: string | null;
       base_url: string;
@@ -2177,6 +2314,7 @@ export interface components {
       source_resource_id?: string | null;
       status: string;
       turn_id?: string | null;
+      turn_status?: null | components["schemas"]["TimelineTurnStatus"];
       version: string;
     };
     TimelinePage: {
@@ -2185,6 +2323,14 @@ export interface components {
       items: components["schemas"]["TimelineItemView"][];
       newest_cursor?: string | null;
       oldest_cursor?: string | null;
+    };
+    TimelineTurnStatus: {
+      cancellation_reason?: string | null;
+      completion_reason?: string | null;
+      created_at: string;
+      id: string;
+      status: string;
+      updated_at: string;
     };
     /**
      * @description The most recent model attempt for this Turn's active Round, projected onto
@@ -2272,7 +2418,7 @@ export interface operations {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_Value"];
+          "application/json": components["schemas"]["DataResponse_AnswerAskResult"];
         };
       };
       404: {
@@ -4635,6 +4781,43 @@ export interface operations {
       };
     };
   };
+  apply: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_PropagationResult"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   upload_attachment: {
     parameters: {
       query: {
@@ -4763,7 +4946,7 @@ export interface operations {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_Value"];
+          "application/json": components["schemas"]["DataResponse_DiffSummary"];
         };
       };
       404: {
@@ -4859,6 +5042,43 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["DataResponse_SteerResult"];
+        };
+      };
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  sync: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_PropagationResult"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
         };
       };
       409: {

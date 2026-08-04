@@ -6,7 +6,6 @@ import Plus from "lucide-solid/icons/plus";
 import Trash2 from "lucide-solid/icons/trash-2";
 import { createSignal, For, Show } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
@@ -30,12 +29,6 @@ const KIND_OPTIONS: readonly SelectOption[] = [
   { value: "openai_chat", label: "OpenAI Chat Completions" },
   { value: "openai_responses", label: "OpenAI Responses API" },
 ];
-
-const KIND_BADGE_LABEL: Record<ProviderKind, string> = {
-  anthropic: "Anthropic Messages",
-  openai_chat: "OpenAI Chat Completions",
-  openai_responses: "OpenAI Responses API",
-};
 
 const KIND_BASE_URL_PLACEHOLDER: Record<ProviderKind, string> = {
   anthropic: "https://api.anthropic.com",
@@ -110,7 +103,6 @@ export function ModelsSettings() {
           <div>
             <span class="settings-group-title">
               Model Providers
-              <Badge variant="neutral">{providers.data?.length ?? 0}</Badge>
             </span>
             <small>Connections used to access upstream model APIs.</small>
           </div>
@@ -144,16 +136,7 @@ export function ModelsSettings() {
                           <div class="record-copy">
                             <div class="record-title">
                               <h3>{provider.display_name}</h3>
-                              <Badge variant={provider.api_key_is_set ? "success" : "warning"}>
-                                {provider.api_key_is_set
-                                  ? (provider.api_key_preview ?? "Key set")
-                                  : "No API key"}
-                              </Badge>
-                              <Show when={!provider.enabled}>
-                                <Badge variant="neutral">Disabled</Badge>
-                              </Show>
                             </div>
-                            <Badge variant="neutral">{KIND_BADGE_LABEL[provider.kind]}</Badge>
                             <p>{provider.base_url}</p>
                           </div>
                           <div class="record-actions">
@@ -188,10 +171,7 @@ export function ModelsSettings() {
 
                         <div class="provider-models">
                           <div class="provider-models-heading">
-                            <span>
-                              Models
-                              <Badge variant="neutral">{provider.models.length}</Badge>
-                            </span>
+                            <span>Models</span>
                           </div>
                           <Show
                             when={provider.models.length > 0}
@@ -214,9 +194,6 @@ export function ModelsSettings() {
                                         <span>images</span>
                                       </Show>
                                     </div>
-                                    <Badge variant={model.enabled ? "success" : "neutral"}>
-                                      {model.enabled ? "Enabled" : "Disabled"}
-                                    </Badge>
                                   </div>
                                 )}
                               </For>

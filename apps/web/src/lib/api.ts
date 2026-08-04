@@ -38,7 +38,10 @@ export type CancelResult = components["schemas"]["CancelResult"];
 export type QueuedTurnItem = components["schemas"]["QueuedTurnItem"];
 export type TimelinePage = components["schemas"]["TimelinePage"];
 export type TimelineItemView = components["schemas"]["TimelineItemView"];
+export type TimelineTurnStatus = components["schemas"]["TimelineTurnStatus"];
 export type TurnSummary = components["schemas"]["TurnSummary"];
+export type SessionDiffSummary = components["schemas"]["DiffSummary"];
+export type PropagationResult = components["schemas"]["PropagationResult"];
 export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
 export type PostMessageRequest = components["schemas"]["PostMessageRequest"];
 export type TerminalProjection = components["schemas"]["TerminalProjection"];
@@ -48,6 +51,9 @@ export type TerminalSignal = components["schemas"]["TerminalSignal"];
 export type CreateTerminalRequest = components["schemas"]["CreateTerminalRequest"];
 export type LogRange = components["schemas"]["LogRange"];
 export type RuntimeCapability = components["schemas"]["RuntimeCapability"];
+
+export type AskAnswerResult = components["schemas"]["AnswerAskResult"];
+export type AskAnswer = string | readonly string[];
 let csrfToken: string | undefined;
 
 export class ApiError extends Error {
@@ -339,6 +345,16 @@ export async function postSessionMessage(
   ).data;
 }
 
+export async function answerAsk(askId: string, answer: AskAnswer): Promise<AskAnswerResult> {
+  return (
+    await requestJson<{ data: AskAnswerResult }>(
+      `/api/v1/asks/${encodeURIComponent(askId)}/answer`,
+      { method: "POST", body: JSON.stringify({ answer }) },
+      isDataResponse,
+    )
+  ).data;
+}
+
 export async function cancelTurn(
   sessionId: string,
   turnId: string,
@@ -417,11 +433,31 @@ export async function getSessionTimeline(
   ).data;
 }
 
-export async function getSessionDiff(id: string): Promise<Record<string, unknown>> {
+export async function getSessionDiff(id: string): Promise<SessionDiffSummary> {
   return (
-    await requestJson<{ data: Record<string, unknown> }>(
+    await requestJson<{ data: SessionDiffSummary }>(
       `/api/v1/sessions/${id}/diff`,
       { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function syncSession(id: string): Promise<PropagationResult> {
+  return (
+    await requestJson<{ data: PropagationResult }>(
+      `/api/v1/sessions/${id}/sync`,
+      { method: "POST" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function applySession(id: string): Promise<PropagationResult> {
+  return (
+    await requestJson<{ data: PropagationResult }>(
+      `/api/v1/sessions/${id}/apply`,
+      { method: "POST" },
       isDataResponse,
     )
   ).data;

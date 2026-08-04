@@ -184,15 +184,32 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "ask_user",
-                description: "Ask the user a blocking or best-effort question.",
+                description: "Ask the user one concise-sentence question. Provide concise choices; each choice may be a string or an object with a short one-sentence annotation. Set multiple true when more than one choice may be selected. The UI also offers a manual answer and decline option. Use blocking when the turn must wait, or non_blocking when it may continue after the answer window closes. Non-blocking asks require expires_in_ms and do not use a preselected answer.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "prompt": {"type": "string"},
-                        "choices": {"type": "array", "items": {"type": "string"}},
-                        "mode": {"type": "string", "enum": ["blocking", "best_effort"]},
-                        "default": {"type": "string"},
-                        "expires_in_ms": {"type": "integer", "minimum": 1}
+                        "choices": {
+                            "type": "array",
+                            "items": {
+                                "oneOf": [
+                                    {"type": "string"},
+                                    {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string"},
+                                            "annotation": {"type": "string"}
+                                        },
+                                        "required": ["label"],
+                                        "additionalProperties": false
+                                    }
+                                ]
+                            },
+                            "minItems": 2
+                        },
+                        "multiple": {"type": "boolean", "default": false},
+                        "mode": {"type": "string", "enum": ["blocking", "non_blocking"]},
+                        "expires_in_ms": {"type": "integer", "minimum": 1, "description": "Required for non-blocking asks."}
                     },
                     "required": ["prompt", "mode"]
                 }),

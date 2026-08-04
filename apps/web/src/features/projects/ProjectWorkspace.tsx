@@ -18,6 +18,7 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const compact = useIsMobile();
   const workspace = createWorkspaceState(compact);
   const [treeRefresh, setTreeRefresh] = createSignal(0);
+  const [sessionCreating, setSessionCreating] = createSignal(false);
   let trackedProjectId: string | undefined;
   let lastMainRevision: string | null | undefined;
 
@@ -26,6 +27,7 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
     if (trackedProjectId !== undefined && trackedProjectId !== id) {
       workspace.reset();
       setTreeRefresh(0);
+      setSessionCreating(false);
       lastMainRevision = undefined;
     }
     trackedProjectId = id;
@@ -81,6 +83,8 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
           branch={branch}
           activeFilePath={workspace.activeFilePath}
           activeSessionId={workspace.activeSessionId}
+          sessionCreating={sessionCreating}
+          onSessionCreating={(creating) => setSessionCreating(creating)}
           treeRefresh={treeRefresh}
           onOpenFile={workspace.openFile}
           onOpenSession={workspace.openSession}
@@ -91,6 +95,7 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
           projectId={projectId}
           project={() => project.data}
           ready={ready}
+          sessionCreating={sessionCreating}
           onFileSaved={() => {
             setTreeRefresh((value) => value + 1);
           }}
