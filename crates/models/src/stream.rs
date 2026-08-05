@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use janus_infrastructure::clock::now_utc_str;
 
 use super::anthropic::{AnthropicAssembler, build_messages_body};
-use super::interface::{ModelsError, ModelsInterface, ProviderKind};
+use super::interface::{AttemptFinalization, ModelsError, ModelsInterface, ProviderKind};
 use super::openai_chat::{OpenaiChatAssembler, build_chat_body};
 use super::openai_responses::{OpenaiResponsesAssembler, build_responses_body};
 use super::sse::SseParser;
@@ -44,6 +44,20 @@ impl ModelsInterface {
         F: FnMut(ModelStreamEvent) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.stream_completion_with_candidate(req, 0, on_event)
+            .await
+    }
+
+    pub async fn stream_completion_with_candidate<F, Fut>(
+        &self,
+        req: ModelRequest,
+        candidate_order: i64,
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, ModelsError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let row = self
             .provider_row_public(&req.owner_id, &req.provider_id)
             .await?;
@@ -68,6 +82,7 @@ impl ModelsInterface {
             req.round_id.as_deref().unwrap_or("round-unset"),
             &req.provider_id,
             &req.upstream_model_id,
+            candidate_order,
             &started,
         )
         .await?;
@@ -114,12 +129,14 @@ impl ModelsInterface {
                 };
                 self.finalize_attempt(
                     &attempt_id,
-                    status,
-                    usage.as_ref().map(|u| u.input_tokens as i64),
-                    usage.as_ref().map(|u| u.output_tokens as i64),
-                    usage.as_ref().map(|u| u.cache_tokens as i64),
-                    err_json.as_ref(),
-                    &req,
+                    AttemptFinalization {
+                        status,
+                        input_tokens: usage.as_ref().map(|u| u.input_tokens as i64),
+                        output_tokens: usage.as_ref().map(|u| u.output_tokens as i64),
+                        cache_tokens: usage.as_ref().map(|u| u.cache_tokens as i64),
+                        error_json: err_json.as_ref(),
+                        request: &req,
+                    },
                 )
                 .await?;
                 Ok(events)
@@ -135,12 +152,17 @@ impl ModelsInterface {
                 on_event(failed.clone()).await;
                 self.finalize_attempt(
                     &attempt_id,
-                    "failed",
-                    None,
-                    None,
-                    None,
-                    Some(&serde_json::json!({"code": "PROVIDER_STREAM_FAILED", "detail": detail})),
-                    &req,
+                    AttemptFinalization {
+                        status: "failed",
+                        input_tokens: None,
+                        output_tokens: None,
+                        cache_tokens: None,
+                        error_json: Some(&serde_json::json!({
+                            "code": "PROVIDER_STREAM_FAILED",
+                            "detail": detail
+                        })),
+                        request: &req,
+                    },
                 )
                 .await?;
                 Ok(vec![failed])

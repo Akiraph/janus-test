@@ -6,12 +6,17 @@
 //! disconnects and process restarts.
 
 use janus_execution::interface::ExecutionInterface;
-use janus_infrastructure::{operations::OperationInterface, unit_of_work::UnitOfWork};
+use janus_infrastructure::{
+    id::TurnId,
+    operations::OperationInterface,
+    unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
+};
 use janus_models::interface::ModelsInterface;
 use janus_projects::interface::ProjectsInterface;
 use janus_runtime::interface::RuntimeInterface;
 use janus_sessions::interface::SessionsInterface;
 use janus_workspace::interface::WorkspaceInterface;
+use serde_json::json;
 
 pub(crate) mod execution;
 pub mod lifecycle;
@@ -102,5 +107,21 @@ impl Application {
 
     pub(crate) fn execution_coordinator(&self) -> &ExecutionCoordinator {
         &self.execution_coordinator
+    }
+
+    pub(crate) async fn enqueue_turn_wake_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        turn_id: TurnId,
+    ) -> anyhow::Result<()> {
+        self.operations
+            .enqueue_work_in_tx(
+                work,
+                operation_kinds::KIND_TURN_WAKE,
+                json!({"turn_id": turn_id.to_string()}),
+            )
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
     }
 }

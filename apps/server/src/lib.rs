@@ -108,6 +108,7 @@ impl AppState {
             execution.clone(),
             runtime.clone(),
             unit_of_work.clone(),
+            operations.clone(),
         );
         let application = Application::new(ApplicationDependencies {
             unit_of_work: unit_of_work.clone(),

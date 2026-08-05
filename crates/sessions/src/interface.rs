@@ -25,8 +25,8 @@ pub use super::types::{
     QueuedTurnItem, ReasoningEffort, RecordedTurnInput, RecoveredTurn, ReplaceToolResultInput,
     SessionCommandState, SessionModelPreference, SessionSummary, SessionsError, SteerResult,
     TerminalSettlement, TimelineItemView, TimelinePage, TimelineTurnStatus, TurnBlockerOutcome,
-    TurnBlockers, TurnModelAttempt, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTransition,
-    UploadAttachmentInput,
+    TurnBlockers, TurnModelAttempt, TurnModelCandidateSnapshot, TurnModelSnapshot, TurnStatus,
+    TurnSummary, TurnTransition, UploadAttachmentInput,
 };
 
 #[derive(Clone)]

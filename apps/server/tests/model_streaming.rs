@@ -399,6 +399,7 @@ async fn openai_assembler_unit_parse() {
         )
         .expect("test value");
     assert_eq!(e2.len(), 2);
+    a.ingest_data("att-1", "[DONE]").expect("terminal sentinel");
     match a.finish("att-1") {
         ModelStreamEvent::Completed { text, usage, .. } => {
             assert_eq!(text, "AB");

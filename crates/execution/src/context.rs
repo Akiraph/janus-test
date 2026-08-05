@@ -42,18 +42,6 @@ Stop rules:
 - If evidence is insufficient to support a conclusion, say so explicitly rather than guessing; ask only for information that cannot be safely discovered.
 - Do not broaden the requested scope without user authorization."#;
 
-#[cfg(test)]
-mod tests {
-    use super::SYSTEM_PROMPT;
-
-    #[test]
-    fn system_prompt_names_the_workspace_path_boundary() {
-        assert!(SYSTEM_PROMPT.contains("/workspace"));
-        assert!(SYSTEM_PROMPT.contains("/dev/null"));
-        assert!(SYSTEM_PROMPT.contains("outside"));
-    }
-}
-
 /// Record one `context_versions` row for a Session/Turn and return its id.
 /// `estimated_input_tokens` is a coarse token estimate used to drive later
 /// automatic Compact scheduling; it is a rough `chars/4` of the
@@ -158,5 +146,17 @@ pub async fn latest_compact_summary(
         Ok(Some((v, last)))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SYSTEM_PROMPT;
+
+    #[test]
+    fn system_prompt_names_the_workspace_path_boundary() {
+        assert!(SYSTEM_PROMPT.contains("/workspace"));
+        assert!(SYSTEM_PROMPT.contains("/dev/null"));
+        assert!(SYSTEM_PROMPT.contains("outside"));
     }
 }

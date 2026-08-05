@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -12,14 +12,18 @@ use janus_infrastructure::unit_of_work::{UnitOfWork, UnitOfWorkTransaction};
 use janus_infrastructure::{
     events::NewEvent,
     id::{CorrelationId, JobId, SessionId, TurnId},
+    operations::OperationInterface,
 };
 use janus_models::interface::{ModelPreference, ModelsError, ModelsInterface};
 use janus_projects::interface::{ProjectsError, ProjectsInterface};
 use janus_runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
 use janus_sessions::interface::{
     ReasoningEffort, ReplaceToolResultInput, SessionModelPreference, SessionsError,
-    SessionsInterface, TurnBlockerOutcome, TurnBlockers, TurnModelSnapshot, TurnStatus,
+    SessionsInterface, TurnBlockerOutcome, TurnBlockers, TurnModelCandidateSnapshot,
+    TurnModelSnapshot, TurnStatus,
 };
+
+use super::operation_kinds::KIND_TURN_WAKE;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TurnExecutionError {
@@ -49,7 +53,8 @@ pub(crate) struct ExecutionCoordinator {
     execution: ExecutionInterface,
     runtime: RuntimeInterface,
     unit_of_work: UnitOfWork,
-    active_turns: Arc<Mutex<HashSet<TurnId>>>,
+    operations: OperationInterface,
+    active_turns: Arc<Mutex<HashMap<TurnId, bool>>>,
 }
 
 pub(crate) struct ToolResultRecord<'a> {
@@ -69,6 +74,7 @@ impl ExecutionCoordinator {
         execution: ExecutionInterface,
         runtime: RuntimeInterface,
         unit_of_work: UnitOfWork,
+        operations: OperationInterface,
     ) -> Self {
         Self {
             models,
@@ -77,84 +83,118 @@ impl ExecutionCoordinator {
             execution,
             runtime,
             unit_of_work,
-            active_turns: Arc::new(Mutex::new(HashSet::new())),
+            operations,
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(crate) fn schedule(&self, turn_id: TurnId) {
+        let _ = self.schedule_and_wait(turn_id);
+    }
+
+    /// Schedule a Turn and return its runner handle when this call acquired a
+    /// new in-memory claim. A `None` result means an active runner recorded the
+    /// wake as pending and will consume it before releasing its claim.
+    pub(crate) fn schedule_and_wait(
+        &self,
+        turn_id: TurnId,
+    ) -> Option<tokio::task::JoinHandle<Result<(), TurnExecutionError>>> {
         let Some(claim) = self.claim(turn_id) else {
-            debug!(%turn_id, "Turn execution wake coalesced");
-            return;
+            debug!(%turn_id, "Turn execution wake recorded for active runner");
+            return None;
         };
         let coordinator = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = coordinator.run_claimed(claim).await {
+        Some(tokio::spawn(async move {
+            let result = coordinator.run_claimed(claim).await;
+            if let Err(error) = &result {
                 error!(%error, %turn_id, "Execution coordinator failed");
             }
-        });
+            result
+        }))
     }
 
     async fn run_claimed(&self, mut claim: TurnClaim) -> Result<(), TurnExecutionError> {
         loop {
-            let turn_id = claim.turn_id;
-            let before = match self.sessions.execution_turn(turn_id).await {
-                Ok(state) => state,
-                Err(SessionsError::NotFound) => {
-                    debug!(%turn_id, "dropping execution wake for deleted Turn");
-                    return Ok(());
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if before.status.is_active() {
-                if !before.active {
-                    return Ok(());
-                }
-                let execution = match self.execution.execute_turn(turn_id).await {
-                    Ok(execution) => execution,
-                    Err(execution_error) => {
-                        // Preserve the provider or tool error as the Turn's
-                        // completion reason so operators can act on the real cause.
-                        let reason = execution_error.to_string();
-                        warn!(%execution_error, %turn_id, "settling unexpected execution failure");
-                        self.execution
-                            .settle_execution_failure(turn_id, &reason)
-                            .await?;
-                        return Err(execution_error.into());
+            let pass = self.run_claimed_pass(&claim).await;
+            match pass {
+                Ok(Some(next_turn)) => {
+                    if self.release_claim(&claim) {
+                        continue;
                     }
-                };
-                if let Some(wait) = execution.coordination {
-                    let session_id = before.session_id;
-                    if self.coordinate_wait(session_id, turn_id, wait).await? {
+                    let Some(next_claim) = self.claim(next_turn) else {
+                        debug!(%next_turn, "promoted Turn already has an execution owner");
+                        return Ok(());
+                    };
+                    claim = next_claim;
+                }
+                Ok(None) => {
+                    if self.release_claim(&claim) {
                         continue;
                     }
                     return Ok(());
                 }
-            }
-
-            let after = match self.sessions.execution_turn(turn_id).await {
-                Ok(state) => state,
-                Err(SessionsError::NotFound) => {
-                    debug!(%turn_id, "Turn deleted while execution was settling");
-                    return Ok(());
+                Err(error) => {
+                    if self.release_claim(&claim) {
+                        continue;
+                    }
+                    return Err(error);
                 }
-                Err(error) => return Err(error.into()),
-            };
-            let next_turn = if after.status.advances_queue() {
-                self.activate_next_queued_after(turn_id, after.session_id)
-                    .await?
-            } else {
-                None
-            };
-            let Some(next_turn) = next_turn else {
-                return Ok(());
-            };
-            let Some(next_claim) = self.claim(next_turn) else {
-                debug!(%next_turn, "promoted Turn already has an execution owner");
-                return Ok(());
-            };
-            drop(claim);
-            claim = next_claim;
+            }
         }
+    }
+
+    async fn run_claimed_pass(
+        &self,
+        claim: &TurnClaim,
+    ) -> Result<Option<TurnId>, TurnExecutionError> {
+        let turn_id = claim.turn_id;
+        let before = match self.sessions.execution_turn(turn_id).await {
+            Ok(state) => state,
+            Err(SessionsError::NotFound) => {
+                debug!(%turn_id, "dropping execution wake for deleted Turn");
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if before.status.is_active() {
+            if !before.active {
+                return Ok(None);
+            }
+            let execution = match self.execution.execute_turn(turn_id).await {
+                Ok(execution) => execution,
+                Err(execution_error) => {
+                    // Preserve the provider or tool error as the Turn's
+                    // completion reason so operators can act on the real cause.
+                    let reason = execution_error.to_string();
+                    warn!(%execution_error, %turn_id, "settling unexpected execution failure");
+                    self.execution
+                        .settle_execution_failure(turn_id, &reason)
+                        .await?;
+                    return Err(execution_error.into());
+                }
+            };
+            if let Some(wait) = execution.coordination {
+                let session_id = before.session_id;
+                if self.coordinate_wait(session_id, turn_id, wait).await? {
+                    return Ok(Some(turn_id));
+                }
+                return Ok(None);
+            }
+        }
+
+        let after = match self.sessions.execution_turn(turn_id).await {
+            Ok(state) => state,
+            Err(SessionsError::NotFound) => {
+                debug!(%turn_id, "Turn deleted while execution was settling");
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !after.status.advances_queue() {
+            return Ok(None);
+        }
+        self.activate_next_queued_after(turn_id, after.session_id)
+            .await
     }
 
     fn claim(&self, turn_id: TurnId) -> Option<TurnClaim> {
@@ -162,10 +202,54 @@ impl ExecutionCoordinator {
             Ok(active) => active,
             Err(poisoned) => poisoned.into_inner(),
         };
-        active.insert(turn_id).then(|| TurnClaim {
+        if let Some(pending) = active.get_mut(&turn_id) {
+            *pending = true;
+            return None;
+        }
+        active.insert(turn_id, false);
+        Some(TurnClaim {
             turn_id,
             active_turns: self.active_turns.clone(),
         })
+    }
+
+    /// Release a runner unless a wake arrived while its final state was being
+    /// observed. Returning true retains the claim so the caller can run again.
+    fn release_claim(&self, claim: &TurnClaim) -> bool {
+        let mut active = match self.active_turns.lock() {
+            Ok(active) => active,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(pending) = active.get_mut(&claim.turn_id) else {
+            return false;
+        };
+        if *pending {
+            *pending = false;
+            true
+        } else {
+            active.remove(&claim.turn_id);
+            false
+        }
+    }
+
+    async fn enqueue_turn_wake_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        turn_id: TurnId,
+    ) -> Result<(), TurnExecutionError> {
+        self.operations
+            .enqueue_work_in_tx(
+                work,
+                KIND_TURN_WAKE,
+                serde_json::json!({"turn_id": turn_id.to_string()}),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                TurnExecutionError::Event(anyhow::anyhow!(
+                    "enqueue Turn wake for {turn_id}: {error}"
+                ))
+            })
     }
 
     pub(crate) async fn resolve_model_snapshot_in_tx(
@@ -199,20 +283,45 @@ impl ExecutionCoordinator {
         let Some(model) = model else {
             return Ok(None);
         };
-        let mut parameters = model.parameters;
-        if let Some(preference) = preference {
-            let map = parameters
-                .as_object_mut()
-                .ok_or(TurnExecutionError::InvalidModelPreference)?;
-            if preference.reasoning_effort == ReasoningEffort::None {
-                map.remove("reasoning_effort");
-            } else {
-                map.insert(
-                    "reasoning_effort".into(),
-                    serde_json::Value::String(preference.reasoning_effort.as_str().to_owned()),
-                );
-            }
-        }
+        let primary_model_id = model.model_id.clone();
+        let failover = self
+            .models
+            .failover_candidates_in_tx(tx, &project.owner_id, &primary_model_id)
+            .await?;
+        let apply_preference =
+            |mut parameters: serde_json::Value| -> Result<serde_json::Value, TurnExecutionError> {
+                let Some(preference) = preference else {
+                    return Ok(parameters);
+                };
+                let map = parameters
+                    .as_object_mut()
+                    .ok_or(TurnExecutionError::InvalidModelPreference)?;
+                if preference.reasoning_effort == ReasoningEffort::None {
+                    map.remove("reasoning_effort");
+                } else {
+                    map.insert(
+                        "reasoning_effort".into(),
+                        serde_json::Value::String(preference.reasoning_effort.as_str().to_owned()),
+                    );
+                }
+                Ok(parameters)
+            };
+        let parameters = apply_preference(model.parameters)?;
+        let failover = failover
+            .into_iter()
+            .map(|candidate| {
+                Ok(TurnModelCandidateSnapshot {
+                    model_id: candidate.model_id,
+                    provider_id: candidate.provider_id,
+                    display_name: candidate.display_name,
+                    upstream_model_id: candidate.upstream_model_id,
+                    context_limit: candidate.context_limit,
+                    supports_images: candidate.supports_images,
+                    supports_tools: candidate.supports_tools,
+                    parameters: apply_preference(candidate.parameters)?,
+                })
+            })
+            .collect::<Result<Vec<_>, TurnExecutionError>>()?;
         Ok(Some(TurnModelSnapshot {
             model_id: model.model_id,
             provider_id: model.provider_id,
@@ -222,6 +331,7 @@ impl ExecutionCoordinator {
             supports_images: model.supports_images,
             supports_tools: model.supports_tools,
             parameters,
+            failover,
         }))
     }
 
@@ -277,6 +387,8 @@ impl ExecutionCoordinator {
             }),
         })
         .await?;
+        self.enqueue_turn_wake_in_tx(&mut work, candidate.turn_id)
+            .await?;
         work.commit().await?;
         Ok(Some(candidate.turn_id))
     }
@@ -434,6 +546,9 @@ impl ExecutionCoordinator {
         let runnable_turn = transition
             .filter(|transition| transition.to_status == TurnStatus::Running)
             .map(|_| job.controlling_turn_id);
+        if let Some(turn_id) = runnable_turn {
+            self.enqueue_turn_wake_in_tx(&mut work, turn_id).await?;
+        }
         work.commit().await?;
         Ok(runnable_turn)
     }
@@ -568,7 +683,7 @@ impl ExecutionCoordinator {
 
 struct TurnClaim {
     turn_id: TurnId,
-    active_turns: Arc<Mutex<HashSet<TurnId>>>,
+    active_turns: Arc<Mutex<HashMap<TurnId, bool>>>,
 }
 
 impl Drop for TurnClaim {

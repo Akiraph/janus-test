@@ -71,6 +71,15 @@ struct ExecutedToolCall {
     message: ChatMessage,
 }
 
+type SettledAskToolCallRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
 enum CompleteTurnOutcome {
     Completed,
     WaitingForJob,
@@ -205,11 +214,14 @@ impl ExecutionInterface {
                 .await?;
             return Ok(TurnExecutionOutcome::default());
         };
-        let provider_id = model_snapshot.provider_id.clone();
-        let upstream_model_id = model_snapshot.upstream_model_id.clone();
+        let supports_images = model_snapshot.supports_images
+            || model_snapshot
+                .failover
+                .iter()
+                .any(|candidate| candidate.supports_images);
 
         let (mut chat, mut input_cursor) = self
-            .load_chat_history(session_id, turn_id, model_snapshot.supports_images)
+            .load_chat_history(session_id, turn_id, supports_images)
             .await?;
         // Ensure system prefix once.
         if !chat
@@ -262,12 +274,7 @@ impl ExecutionInterface {
             }
 
             let (turn_inputs, next_cursor) = self
-                .load_turn_inputs_after(
-                    session_id,
-                    turn_id,
-                    input_cursor,
-                    model_snapshot.supports_images,
-                )
+                .load_turn_inputs_after(session_id, turn_id, input_cursor, supports_images)
                 .await?;
             chat.extend(turn_inputs);
             input_cursor = next_cursor;
@@ -289,11 +296,12 @@ impl ExecutionInterface {
                  (id, turn_id, sequence, context_version, status, candidate_snapshot_json, \
                   final_attempt_id, output_summary_json, input_tokens, output_tokens, \
                   stop_reason, version, created_at, updated_at) \
-                 VALUES (?, ?, ?, '1', 'running', NULL, NULL, NULL, 0, 0, NULL, ?, ?, ?)",
+                 VALUES (?, ?, ?, '1', 'running', ?, NULL, NULL, 0, 0, NULL, ?, ?, ?)",
             )
             .bind(round_id.to_string())
             .bind(turn_id.to_string())
             .bind(round_seq)
+            .bind(serde_json::to_string(&model_snapshot.failover)?)
             .bind(&version)
             .bind(&now)
             .bind(&now)
@@ -319,10 +327,11 @@ impl ExecutionInterface {
             .await?;
             work.commit().await?;
 
-            let req = ModelRequest {
+            let mut candidate_requests = Vec::with_capacity(1 + model_snapshot.failover.len());
+            candidate_requests.push(ModelRequest {
                 owner_id: owner_id.clone(),
-                provider_id: provider_id.clone(),
-                upstream_model_id: upstream_model_id.clone(),
+                provider_id: model_snapshot.provider_id.clone(),
+                upstream_model_id: model_snapshot.upstream_model_id.clone(),
                 parameters: model_snapshot.parameters.clone(),
                 messages: chat.clone(),
                 tools: tools.clone(),
@@ -330,7 +339,21 @@ impl ExecutionInterface {
                 project_id: Some(turn.project_id.to_string()),
                 session_id: Some(session_id.to_string()),
                 turn_id: Some(turn_id.to_string()),
-            };
+            });
+            candidate_requests.extend(model_snapshot.failover.iter().map(|candidate| {
+                ModelRequest {
+                    owner_id: owner_id.clone(),
+                    provider_id: candidate.provider_id.clone(),
+                    upstream_model_id: candidate.upstream_model_id.clone(),
+                    parameters: candidate.parameters.clone(),
+                    messages: chat.clone(),
+                    tools: tools.clone(),
+                    round_id: Some(round_id.to_string()),
+                    project_id: Some(turn.project_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    turn_id: Some(turn_id.to_string()),
+                }
+            }));
 
             let stream_events = self.events.clone();
             let stream_actor = actor.clone();
@@ -426,7 +449,7 @@ impl ExecutionInterface {
                 }
             };
             let events = self
-                .try_round_stream(req, &mut publish_stream_event)
+                .try_round_stream(candidate_requests, &mut publish_stream_event)
                 .await?;
             if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
                 return Ok(TurnExecutionOutcome::default());
@@ -885,12 +908,10 @@ impl ExecutionInterface {
     }
 
     /// Run one Round's model stream with bounded retry policy applied to a
-    /// single candidate (the resolved primary model). Failover across
-    /// `model_failover` candidates is resolved by the model capability; this
-    /// loop honors `MAX_ATTEMPTS_PER_CANDIDATE` and the
-    /// `RetryDecision` classifier so a transient fault (429/503/timeout)
-    /// retries in place with bounded backoff before bubbling `Failed` up to the
-    /// caller (which then parks the Turn on `waiting_for_model`).
+    /// ordered candidates. Each candidate gets bounded in-place retries before
+    /// a transient exhaustion moves to the next candidate. A configuration
+    /// error never fails over because resending an invalid request cannot fix
+    /// the route.
     ///
     /// Provisional attempts that fail never contribute tool calls; their only
     /// durable footprint is the `model_attempts` rows the stream layer already
@@ -898,7 +919,7 @@ impl ExecutionInterface {
     /// in its `Completed` event and aggregated normally.
     async fn try_round_stream<F, Fut>(
         &self,
-        req: ModelRequest,
+        requests: Vec<ModelRequest>,
         on_event: &mut F,
     ) -> Result<Vec<ModelStreamEvent>, ExecutionError>
     where
@@ -906,51 +927,52 @@ impl ExecutionInterface {
         Fut: Future<Output = ()>,
     {
         let mut last_events: Vec<ModelStreamEvent> = Vec::new();
-        // `attempt` is the *attempt* index, 0-based: 0 is the initial attempt,
-        // 1..=5 are the retries surfaced to the UI as "Reconnecting (X/5)".
-        for attempt in 0..MAX_ATTEMPTS_PER_CANDIDATE {
-            let events = self
-                .models
-                .stream_completion_with(req.clone(), on_event)
-                .await?;
-            // Success / non-retryable-config: stop.
-            let failed = events.iter().rev().find_map(|e| match e {
-                ModelStreamEvent::Failed {
-                    attempt_id,
-                    code,
-                    detail,
-                } => Some((attempt_id.clone(), code.clone(), detail.clone())),
-                _ => None,
-            });
-            let Some((attempt_id, code, detail)) = failed else {
-                return Ok(events); // Completed; normal path.
-            };
-            let retry_attempt = attempt + 1; // retry index the UI surfaces
-            let decision = classify(&code, &detail, retry_attempt);
-            last_events = events.clone();
-            match decision.class {
-                FaultClass::Config => {
-                    // Deterministic fault; re-sending cannot help. Bubble the
-                    // Failed up so the caller parks/fails the Turn.
+        let candidate_count = requests.len();
+        for (candidate_index, req) in requests.into_iter().enumerate() {
+            let candidate_order = i64::try_from(candidate_index).map_err(|_| {
+                ExecutionError::Internal(anyhow::anyhow!("candidate index overflow"))
+            })?;
+            // `attempt` is the *attempt* index, 0-based: 0 is the initial
+            // attempt, 1..=5 are retries surfaced to the UI.
+            for attempt in 0..MAX_ATTEMPTS_PER_CANDIDATE {
+                let events = self
+                    .models
+                    .stream_completion_with_candidate(req.clone(), candidate_order, on_event)
+                    .await?;
+                let failed = events.iter().rev().find_map(|e| match e {
+                    ModelStreamEvent::Failed {
+                        attempt_id,
+                        code,
+                        detail,
+                    } => Some((attempt_id.clone(), code.clone(), detail.clone())),
+                    _ => None,
+                });
+                let Some((attempt_id, code, detail)) = failed else {
                     return Ok(events);
-                }
-                FaultClass::Transient => {
-                    if retry_attempt >= MAX_ATTEMPTS_PER_CANDIDATE {
-                        // Out of retries; bubble the Failed up so the caller
-                        // parks on waiting_for_model with the reason.
-                        return Ok(events);
+                };
+                let retry_attempt = attempt + 1;
+                let decision = classify(&code, &detail, retry_attempt);
+                last_events = events.clone();
+                match decision.class {
+                    FaultClass::Config => return Ok(events),
+                    FaultClass::Transient => {
+                        if retry_attempt >= MAX_ATTEMPTS_PER_CANDIDATE {
+                            if candidate_index + 1 == candidate_count {
+                                return Ok(events);
+                            }
+                            // The next configured candidate gets its own
+                            // bounded retry budget and durable attempt rows.
+                            break;
+                        }
+                        let retrying = ModelStreamEvent::Retrying {
+                            attempt_id: attempt_id.clone(),
+                            attempt: retry_attempt,
+                            detail: detail.clone(),
+                            retry_after_ms: decision.retry_after.as_millis() as u64,
+                        };
+                        on_event(retrying).await;
+                        tokio::time::sleep(decision.retry_after).await;
                     }
-                    // Surface the retry to the UI *before* sleeping, so the
-                    // status row reads "Reconnecting ({retry_attempt}/5): {detail}"
-                    // while the backoff elapses, not only after it.
-                    let retrying = ModelStreamEvent::Retrying {
-                        attempt_id: attempt_id.clone(),
-                        attempt: retry_attempt,
-                        detail: detail.clone(),
-                        retry_after_ms: decision.retry_after.as_millis() as u64,
-                    };
-                    on_event(retrying).await;
-                    tokio::time::sleep(decision.retry_after).await;
                 }
             }
         }
@@ -994,49 +1016,6 @@ impl ExecutionInterface {
         .await?;
         work.commit().await?;
         Ok(())
-    }
-
-    /// Resume a `waiting_for_model` Turn to `running` without executing it.
-    ///
-    /// Application schedules the Turn through `ExecutionCoordinator` after this command
-    /// commits. Idempotent: already-`running` returns `true` so a coalesced wake
-    /// can still claim execution; non-waiting states return `false`.
-    pub async fn retry_model(&self, turn_id: TurnId) -> Result<bool, ExecutionError> {
-        let turn = self.load_turn(turn_id).await?;
-        if turn.status == TurnStatus::Running {
-            return Ok(turn.active);
-        }
-        if turn.status != TurnStatus::WaitingForModel {
-            return Ok(false);
-        }
-        let session_id = turn.session_id;
-        let now = now_utc_str();
-        let mut work = self.unit_of_work.begin().await?;
-        let transition = self
-            .sessions
-            .retry_waiting_model_in_tx(work.connection(), session_id, turn_id, &now)
-            .await?;
-        let Some(transition) = transition else {
-            work.rollback().await?;
-            return Ok(false);
-        };
-        work.append_event(NewEvent {
-            event_type: "turn.status_changed".into(),
-            actor: json!({"kind": "execution"}),
-            resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
-            correlation_id: CorrelationId::new().to_string(),
-            causation_id: None,
-            payload: json!({
-                "turn_id": turn_id.to_string(),
-                "from": transition.from_status.as_str(),
-                "to": transition.to_status.as_str(),
-                "route": "retry_model",
-                "session_version": transition.session_version,
-            }),
-        })
-        .await?;
-        work.commit().await?;
-        Ok(transition.to_status == TurnStatus::Running)
     }
 
     async fn accept_round_response(
@@ -1849,6 +1828,32 @@ impl ExecutionInterface {
         Ok(())
     }
 
+    /// Return the subset of candidate Turns that never created an
+    /// Execution-owned Round. The candidate list is supplied by the Sessions
+    /// owner so this capability never reads Session tables directly.
+    ///
+    /// Recovery uses this query to distinguish a crash before execution began
+    /// from a crash in an already materialized Round. The Sessions capability
+    /// receives the result instead of reading the `rounds` table itself.
+    pub async fn unstarted_active_turn_ids_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        candidate_turn_ids: &HashSet<TurnId>,
+    ) -> Result<HashSet<TurnId>, ExecutionError> {
+        let mut unstarted = HashSet::new();
+        for turn_id in candidate_turn_ids {
+            let has_round: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rounds WHERE turn_id = ?)")
+                    .bind(turn_id.to_string())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if !has_round {
+                unstarted.insert(*turn_id);
+            }
+        }
+        Ok(unstarted)
+    }
+
     pub async fn cancel_execution_in_tx(
         &self,
         tx: &mut SqliteConnection,
@@ -2108,14 +2113,7 @@ impl ExecutionInterface {
         ask_status: AskStatus,
         now: &str,
     ) -> Result<ToolCallSettlement, ExecutionError> {
-        let row: Option<(
-            String,
-            String,
-            String,
-            Option<String>,
-            String,
-            Option<String>,
-        )> = sqlx::query_as(
+        let row: Option<SettledAskToolCallRow> = sqlx::query_as(
             "SELECT ask.turn_id, ask.tool_call_id, call.tool_name, call.provider_call_id, \
                     call.input_json, ask.answer_json \
              FROM asks AS ask \

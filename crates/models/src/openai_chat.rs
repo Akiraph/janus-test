@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::stream_types::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
     StreamChannel, TokenUsage, ToolCallDelta, ToolSpec, append_reasoning_summary,
+    truncated_stream_event,
 };
 
 pub fn build_chat_body(req: &ModelRequest) -> Value {
@@ -134,6 +135,7 @@ pub struct OpenaiChatAssembler {
     pub usage: Option<TokenUsage>,
     pub finish_reason: Option<String>,
     pub reasoning_duration_ms: Option<u64>,
+    saw_terminal: bool,
     tool_names: HashMap<String, String>,
 }
 
@@ -154,6 +156,7 @@ impl OpenaiChatAssembler {
         data: &str,
     ) -> Result<Vec<ModelStreamEvent>, String> {
         if data.trim() == "[DONE]" {
+            self.saw_terminal = true;
             return Ok(Vec::new());
         }
         let v: Value = serde_json::from_str(data).map_err(|e| format!("openai chunk json: {e}"))?;
@@ -280,6 +283,9 @@ impl OpenaiChatAssembler {
     }
 
     pub fn finish(&self, attempt_id: &str) -> ModelStreamEvent {
+        if !self.saw_terminal {
+            return truncated_stream_event(attempt_id);
+        }
         let tool_calls = self
             .tool_args
             .iter()
@@ -328,4 +334,39 @@ fn openai_tool_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenaiChatAssembler;
+    use crate::stream_types::ModelStreamEvent;
+
+    #[test]
+    fn eof_without_done_is_failed() {
+        let mut assembler = OpenaiChatAssembler::default();
+        assembler
+            .ingest_data(
+                "attempt",
+                r#"{"choices":[{"delta":{"content":"partial"},"index":0}]}"#,
+            )
+            .expect("valid event");
+
+        assert!(matches!(
+            assembler.finish("attempt"),
+            ModelStreamEvent::Failed { ref code, .. } if code == "PROVIDER_STREAM_FAILED"
+        ));
+    }
+
+    #[test]
+    fn done_is_required_for_completion() {
+        let mut assembler = OpenaiChatAssembler::default();
+        assembler
+            .ingest_data("attempt", "[DONE]")
+            .expect("valid terminal sentinel");
+
+        assert!(matches!(
+            assembler.finish("attempt"),
+            ModelStreamEvent::Completed { .. }
+        ));
+    }
 }

@@ -104,7 +104,7 @@ impl TurnStatus {
     }
 
     pub const fn advances_queue(self) -> bool {
-        matches!(self, Self::Completed | Self::Canceled)
+        matches!(self, Self::Completed | Self::Failed | Self::Canceled)
     }
 
     pub const fn can_transition_to(self, target: Self) -> bool {
@@ -274,6 +274,20 @@ pub struct TurnModelSnapshot {
     pub supports_images: bool,
     pub supports_tools: bool,
     pub parameters: serde_json::Value,
+    #[serde(default)]
+    pub failover: Vec<TurnModelCandidateSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TurnModelCandidateSnapshot {
+    pub model_id: String,
+    pub provider_id: String,
+    pub display_name: String,
+    pub upstream_model_id: String,
+    pub context_limit: u32,
+    pub supports_images: bool,
+    pub supports_tools: bool,
+    pub parameters: serde_json::Value,
 }
 
 impl TurnModelSnapshot {
@@ -424,6 +438,7 @@ pub struct RecoveredTurn {
     pub from_status: TurnStatus,
     pub turn_version: String,
     pub session_version: Option<String>,
+    pub wake_required: bool,
 }
 
 #[derive(Debug, Clone)]

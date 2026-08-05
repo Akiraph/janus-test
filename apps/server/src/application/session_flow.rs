@@ -97,6 +97,11 @@ impl Application {
                     .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
             })
             .transpose()?;
+        if let Some(turn_id) = scheduled_turn {
+            self.enqueue_turn_wake_in_tx(&mut work, turn_id)
+                .await
+                .map_err(SessionsError::Internal)?;
+        }
         work.commit().await?;
         if let Some(turn_id) = scheduled_turn {
             self.execution_coordinator().schedule(turn_id);
@@ -605,6 +610,11 @@ impl Application {
                 resumed_original.then_some(answered.turn_id),
             )
         };
+        if let Some(turn_id) = schedule {
+            self.enqueue_turn_wake_in_tx(&mut work, turn_id)
+                .await
+                .map_err(SessionsError::Internal)?;
+        }
         work.commit().await?;
         if let Some(turn_id) = schedule {
             self.execution_coordinator().schedule(turn_id);
@@ -695,6 +705,11 @@ impl Application {
                     schedule.push(turn_id);
                 }
             }
+        }
+        for turn_id in &schedule {
+            self.enqueue_turn_wake_in_tx(&mut work, *turn_id)
+                .await
+                .map_err(SessionsError::Internal)?;
         }
         work.commit().await?;
         for turn_id in schedule {
@@ -797,8 +812,19 @@ impl Application {
             .await
             .map_err(SessionsError::Internal)?;
         }
+        if transition
+            .as_ref()
+            .is_some_and(|transition| transition.to_status == TurnStatus::Canceled)
+        {
+            self.enqueue_turn_wake_in_tx(&mut work, turn_id)
+                .await
+                .map_err(SessionsError::Internal)?;
+        }
         work.commit().await?;
-        if transition.is_some_and(|transition| transition.to_status == TurnStatus::Canceled) {
+        if transition
+            .as_ref()
+            .is_some_and(|transition| transition.to_status == TurnStatus::Canceled)
+        {
             // Terminal canceled Turns advance the FIFO queue through the runner
             // without re-entering model execution for the canceled Turn.
             self.execution_coordinator().schedule(turn_id);
@@ -928,19 +954,46 @@ impl Application {
     /// Resume a Turn parked on `waiting_for_model` and schedule execution through
     /// the application Turn runner. Returns whether a runnable wake was scheduled.
     pub(crate) async fn retry_waiting_model(&self, turn_id: TurnId) -> Result<bool, SessionsError> {
-        let runnable =
-            self.execution()
-                .retry_model(turn_id)
-                .await
-                .map_err(|error| match error {
-                    ExecutionError::TurnNotFound => SessionsError::NotFound,
-                    error => {
-                        SessionsError::Internal(anyhow::anyhow!("retry waiting model: {error}"))
-                    }
-                })?;
-        if runnable {
-            self.execution_coordinator().schedule(turn_id);
+        let current = self.sessions().execution_turn(turn_id).await?;
+        if current.status == TurnStatus::Running {
+            return Ok(current.active);
         }
-        Ok(runnable)
+        if current.status != TurnStatus::WaitingForModel {
+            return Ok(false);
+        }
+
+        let now = now_utc_str();
+        let mut work = self.unit_of_work().begin().await?;
+        let transition = self
+            .sessions()
+            .retry_waiting_model_in_tx(work.connection(), current.session_id, turn_id, &now)
+            .await?;
+        let Some(transition) = transition else {
+            work.rollback().await?;
+            return Ok(false);
+        };
+        let correlation_id = CorrelationId::new().to_string();
+        work.append_event(NewEvent {
+            event_type: "turn.status_changed".into(),
+            actor: json!({"kind": "execution"}),
+            resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
+            correlation_id,
+            causation_id: None,
+            payload: json!({
+                "turn_id": turn_id.to_string(),
+                "from": transition.from_status.as_str(),
+                "to": transition.to_status.as_str(),
+                "route": "retry_model",
+                "session_version": transition.session_version,
+            }),
+        })
+        .await
+        .map_err(SessionsError::Internal)?;
+        self.enqueue_turn_wake_in_tx(&mut work, turn_id)
+            .await
+            .map_err(SessionsError::Internal)?;
+        work.commit().await?;
+        self.execution_coordinator().schedule(turn_id);
+        Ok(true)
     }
 }

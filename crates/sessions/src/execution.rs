@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use janus_infrastructure::clock::now_utc_str;
 use serde_json::json;
 use sqlx::{Row, SqliteConnection};
@@ -186,13 +188,29 @@ impl SessionsInterface {
         })
     }
 
+    pub async fn running_turn_ids_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+    ) -> Result<HashSet<TurnId>, SessionsError> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM turns WHERE status = 'running'")
+            .fetch_all(&mut *tx)
+            .await?;
+        rows.into_iter()
+            .map(|(id,)| {
+                id.parse::<TurnId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
+            })
+            .collect()
+    }
+
     pub async fn interrupt_active_turns_in_tx(
         &self,
         tx: &mut SqliteConnection,
         now: &str,
+        wake_required: &HashSet<TurnId>,
     ) -> Result<Vec<RecoveredTurn>, SessionsError> {
         let rows = sqlx::query(
-            "SELECT id, session_id, status FROM turns \
+            "SELECT id, session_id, status, version FROM turns \
              WHERE status IN ('running', 'waiting_for_job', 'waiting_for_ask', \
                               'waiting_for_model', 'canceling') \
              ORDER BY session_id, sequence",
@@ -213,6 +231,18 @@ impl SessionsInterface {
                 .try_get::<String, _>("status")?
                 .parse::<TurnStatus>()
                 .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+            let stored_turn_version = row.try_get::<String, _>("version")?;
+            if from_status == TurnStatus::Running && wake_required.contains(&turn_id) {
+                recovered.push(RecoveredTurn {
+                    turn_id,
+                    session_id,
+                    from_status,
+                    turn_version: stored_turn_version,
+                    session_version: None,
+                    wake_required: true,
+                });
+                continue;
+            }
             let turn_version = format!("v_{}", TurnId::new());
             let changed = sqlx::query(
                 "UPDATE turns SET status = 'interrupted', \
@@ -247,6 +277,7 @@ impl SessionsInterface {
                 from_status,
                 turn_version,
                 session_version: (released.rows_affected() == 1).then_some(next_session_version),
+                wake_required: false,
             });
         }
         Ok(recovered)
@@ -1524,7 +1555,7 @@ impl SessionsInterface {
              JOIN sessions AS session ON session.id = terminal_turn.session_id \
              JOIN turns AS next_turn ON next_turn.session_id = terminal_turn.session_id \
              WHERE terminal_turn.id = ? AND terminal_turn.session_id = ? \
-               AND terminal_turn.status IN ('completed', 'canceled') \
+               AND terminal_turn.status IN ('completed', 'failed', 'canceled') \
                AND session.active_turn_id IS NULL \
                AND next_turn.status = 'queued' \
                AND next_turn.sequence = (SELECT MIN(sequence) FROM turns \

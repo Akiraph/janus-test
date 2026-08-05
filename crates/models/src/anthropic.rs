@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::stream_types::{
     ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent, StreamChannel,
-    TokenUsage, ToolCallDelta, append_reasoning_summary,
+    TokenUsage, ToolCallDelta, append_reasoning_summary, truncated_stream_event,
 };
 
 pub fn build_messages_body(req: &ModelRequest) -> Value {
@@ -140,6 +140,7 @@ pub struct AnthropicAssembler {
     pub usage: Option<TokenUsage>,
     pub stop_reason: Option<String>,
     pub reasoning_duration_ms: Option<u64>,
+    saw_terminal: bool,
 }
 
 impl AnthropicAssembler {
@@ -274,6 +275,9 @@ impl AnthropicAssembler {
                     self.stop_reason = Some(sr.to_owned());
                 }
             }
+            "message_stop" => {
+                self.saw_terminal = true;
+            }
             "message_start" => {
                 if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
                     let cache_tokens = usage
@@ -316,6 +320,9 @@ impl AnthropicAssembler {
     }
 
     pub fn finish(&self, attempt_id: &str) -> ModelStreamEvent {
+        if !self.saw_terminal {
+            return truncated_stream_event(attempt_id);
+        }
         let tool_calls = self
             .tool_args
             .iter()
@@ -342,5 +349,41 @@ impl AnthropicAssembler {
             reasoning: self.reasoning.clone(),
             reasoning_duration_ms: self.reasoning_duration_ms,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AnthropicAssembler;
+    use crate::stream_types::ModelStreamEvent;
+
+    #[test]
+    fn eof_without_message_stop_is_failed() {
+        let mut assembler = AnthropicAssembler::default();
+        assembler
+            .ingest(
+                "attempt",
+                "content_block_delta",
+                r#"{"delta":{"type":"text_delta","text":"partial"}}"#,
+            )
+            .expect("valid event");
+
+        assert!(matches!(
+            assembler.finish("attempt"),
+            ModelStreamEvent::Failed { ref code, .. } if code == "PROVIDER_STREAM_FAILED"
+        ));
+    }
+
+    #[test]
+    fn message_stop_is_required_for_completion() {
+        let mut assembler = AnthropicAssembler::default();
+        assembler
+            .ingest("attempt", "message_stop", r#"{"type":"message_stop"}"#)
+            .expect("valid terminal event");
+
+        assert!(matches!(
+            assembler.finish("attempt"),
+            ModelStreamEvent::Completed { .. }
+        ));
     }
 }

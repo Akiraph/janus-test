@@ -1186,7 +1186,7 @@ fn workspace_redaction_values(workspace_root: &Path) -> Vec<String> {
         }
     }
     values.retain(|value| !value.is_empty());
-    values.sort_by(|left, right| right.len().cmp(&left.len()));
+    values.sort_by_key(|right| std::cmp::Reverse(right.len()));
     values.dedup();
     values
 }
@@ -1205,7 +1205,7 @@ fn runtime_redaction_values(workspace_root: &Path) -> Vec<String> {
             }
         }
     }
-    values.sort_by(|left, right| right.len().cmp(&left.len()));
+    values.sort_by_key(|right| std::cmp::Reverse(right.len()));
     values.dedup();
     values
 }

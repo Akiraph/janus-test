@@ -1245,16 +1245,16 @@ async fn tool_bash(ctx: &ToolContext<'_>, input: &Value) -> Result<ToolOutcome, 
         Err(error) => return Err(ExecutionError::Runtime(error)),
     };
 
-    bash_outcome(
-        display_command,
-        result.exit.exit_code,
-        result.timed_out,
-        result.duration_ms,
-        result.truncated,
-        &result.stdout,
-        &result.stderr,
-        &repo,
-    )
+    bash_outcome(BashOutcomeInput {
+        command: display_command,
+        exit_code: result.exit.exit_code,
+        timed_out: result.timed_out,
+        duration_ms: result.duration_ms,
+        truncated: result.truncated,
+        stdout: &result.stdout,
+        stderr: &result.stderr,
+        workspace_root: &repo,
+    })
 }
 
 /// async bash mode: a finite background Job. Requires a bound Runtime because
@@ -1367,16 +1367,16 @@ async fn run_local_sync(
         Err(_) => (true, None, String::new(), String::new()),
     };
     let duration_ms = started.elapsed().as_millis() as u64;
-    bash_outcome(
-        display_command,
+    bash_outcome(BashOutcomeInput {
+        command: display_command,
         exit_code,
         timed_out,
         duration_ms,
-        false,
-        &stdout,
-        &stderr,
+        truncated: false,
+        stdout: &stdout,
+        stderr: &stderr,
         workspace_root,
-    )
+    })
 }
 
 fn local_working_directory(
@@ -1599,16 +1599,28 @@ fn apply_fallback_environment(command: &mut tokio::process::Command, workspace_r
 
 /// Build a ToolOutcome from a completed (sync) bash run. Shared by the
 /// Runtime path and the local fallback.
-fn bash_outcome(
-    command: &str,
+struct BashOutcomeInput<'a> {
+    command: &'a str,
     exit_code: Option<i32>,
     timed_out: bool,
     duration_ms: u64,
     truncated: bool,
-    stdout: &str,
-    stderr: &str,
-    workspace_root: &Path,
-) -> Result<ToolOutcome, ExecutionError> {
+    stdout: &'a str,
+    stderr: &'a str,
+    workspace_root: &'a Path,
+}
+
+fn bash_outcome(input: BashOutcomeInput<'_>) -> Result<ToolOutcome, ExecutionError> {
+    let BashOutcomeInput {
+        command,
+        exit_code,
+        timed_out,
+        duration_ms,
+        truncated,
+        stdout,
+        stderr,
+        workspace_root,
+    } = input;
     let command = sanitize_workspace_text(command, workspace_root);
     let stdout = sanitize_workspace_text(stdout, workspace_root);
     let stderr = sanitize_workspace_text(stderr, workspace_root);
@@ -1679,7 +1691,7 @@ fn sanitize_workspace_text(text: &str, workspace_root: &Path) -> String {
         variants.extend(drive_variants);
     }
     variants.retain(|value| !value.is_empty());
-    variants.sort_by(|left, right| right.len().cmp(&left.len()));
+    variants.sort_by_key(|right| std::cmp::Reverse(right.len()));
     variants.dedup();
     for variant in variants {
         sanitized = sanitized.replace(&variant, "/workspace");
@@ -1704,12 +1716,6 @@ fn sanitize_workspace_text(text: &str, workspace_root: &Path) -> String {
             output.push_str("[runtime artifact hidden]");
         } else if is_git_bash_host_identity_line(content) {
             output.push_str("[host detail hidden]");
-        } else if let Some(redacted) = redact_host_path_fragments(content) {
-            output.push_str(&redacted);
-        } else if is_runtime_identity_line(content) {
-            let leading = &content[..content.len() - content.trim_start().len()];
-            output.push_str(leading);
-            output.push_str("Janus");
         } else if let Some(key) = sensitive_environment_key(content) {
             let leading = &content[..content.len() - content.trim_start().len()];
             output.push_str(leading);
@@ -1719,6 +1725,12 @@ fn sanitize_workspace_text(text: &str, workspace_root: &Path) -> String {
             } else {
                 output.push_str("=[redacted]");
             }
+        } else if let Some(redacted) = redact_host_path_fragments(content) {
+            output.push_str(&redacted);
+        } else if is_runtime_identity_line(content) {
+            let leading = &content[..content.len() - content.trim_start().len()];
+            output.push_str(leading);
+            output.push_str("Janus");
         } else {
             output.push_str(content);
         }
@@ -2311,11 +2323,13 @@ mod tests {
     #[test]
     fn workspace_command_guard_rejects_escape_vectors() {
         assert_eq!(
-            validate_workspace_command("cat /etc/passwd").unwrap_err(),
+            validate_workspace_command("cat /etc/passwd")
+                .expect_err("absolute host path must be rejected"),
             "Bash blocked: absolute path `/etc/passwd` is outside the Session workspace; use `/workspace/...` or a workspace-relative path.",
         );
         assert_eq!(
-            validate_workspace_command("cat /workspace/../outside").unwrap_err(),
+            validate_workspace_command("cat /workspace/../outside")
+                .expect_err("workspace traversal must be rejected"),
             "Bash blocked: path `/workspace/../outside` traverses outside the Session workspace; remove `..` and use a workspace-relative path.",
         );
         for command in [

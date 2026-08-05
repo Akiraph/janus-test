@@ -21,6 +21,15 @@ pub use super::stream_types::{
     StreamChannel, TokenUsage, ToolCallDelta, ToolSpec,
 };
 
+pub(crate) struct AttemptFinalization<'a> {
+    pub(crate) status: &'a str,
+    pub(crate) input_tokens: Option<i64>,
+    pub(crate) output_tokens: Option<i64>,
+    pub(crate) cache_tokens: Option<i64>,
+    pub(crate) error_json: Option<&'a serde_json::Value>,
+    pub(crate) request: &'a ModelRequest,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -310,6 +319,57 @@ impl ModelsInterface {
             .await?
         };
         row.map(resolved_model).transpose()
+    }
+
+    /// Resolve the configured fallback chain at Turn creation time. The
+    /// resulting ids are later embedded in the Turn snapshot so a running
+    /// Turn does not silently change route when model configuration changes.
+    pub async fn failover_candidates_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        owner_id: &str,
+        primary_model_id: &str,
+    ) -> Result<Vec<ResolvedModel>, ModelsError> {
+        let candidate_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT candidate_model_id FROM model_failover \
+             WHERE primary_model_id = ? ORDER BY ordinal",
+        )
+        .bind(primary_model_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut candidates = Vec::with_capacity(candidate_ids.len());
+        for candidate_id in candidate_ids {
+            if let Some(model) = self
+                .resolve_model_id_in_tx(tx, owner_id, &candidate_id)
+                .await?
+            {
+                candidates.push(model);
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn resolve_model_id_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        owner_id: &str,
+        model_id: &str,
+    ) -> Result<Option<ResolvedModel>, ModelsError> {
+        sqlx::query_as::<_, ModelRow>(
+            "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
+                    model.context_limit, model.supports_images, model.supports_tools, \
+                    model.parameters_json, model.enabled, model.created_at, model.updated_at \
+             FROM models AS model \
+             JOIN model_providers AS provider ON provider.id = model.provider_id \
+             WHERE provider.owner_id = ? AND model.id = ? \
+               AND provider.enabled = 1 AND model.enabled = 1",
+        )
+        .bind(owner_id)
+        .bind(model_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(resolved_model)
+        .transpose()
     }
 
     pub async fn set_failover(
@@ -623,6 +683,7 @@ impl ModelsInterface {
         round_id: &str,
         provider_id: &str,
         upstream_model_id: &str,
+        candidate_order: i64,
         created_at: &str,
     ) -> Result<(), ModelsError> {
         sqlx::query(
@@ -630,10 +691,11 @@ impl ModelsInterface {
              (id, round_id, candidate_order, provider_id, upstream_model_id, attempt_type, \
               status, normalized_error_json, upstream_request_id, input_tokens, output_tokens, \
               created_at, ended_at) \
-             VALUES (?, ?, 0, ?, ?, 'normal', 'running', NULL, NULL, NULL, NULL, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, 'normal', 'running', NULL, NULL, NULL, NULL, ?, NULL)",
         )
         .bind(attempt_id)
         .bind(round_id)
+        .bind(candidate_order)
         .bind(provider_id)
         .bind(upstream_model_id)
         .bind(created_at)
@@ -645,13 +707,16 @@ impl ModelsInterface {
     pub(crate) async fn finalize_attempt(
         &self,
         attempt_id: &str,
-        status: &str,
-        input_tokens: Option<i64>,
-        output_tokens: Option<i64>,
-        cache_tokens: Option<i64>,
-        error_json: Option<&serde_json::Value>,
-        req: &super::stream_types::ModelRequest,
+        finalization: AttemptFinalization<'_>,
     ) -> Result<(), ModelsError> {
+        let AttemptFinalization {
+            status,
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+            error_json,
+            request: req,
+        } = finalization;
         let ended = now_utc_str();
         let changed = sqlx::query(
             "UPDATE model_attempts SET status = ?, input_tokens = ?, output_tokens = ?, \

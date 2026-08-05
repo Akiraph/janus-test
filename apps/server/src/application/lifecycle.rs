@@ -18,8 +18,8 @@ use janus_infrastructure::{
     events::NewEvent,
     id::{CorrelationId, ProjectId, SessionId},
     operations::{
-        CreateOperation, CreateWork, IdempotencyRequest, OperationError, OperationInterface,
-        OperationStatus, OperationView, StepState,
+        CreateOperation, CreateWork, IdempotencyRequest, OperationCompletion, OperationError,
+        OperationInterface, OperationStatus, OperationView, StepState, WorkClaim,
     },
 };
 use janus_models::interface::ModelsError;
@@ -111,13 +111,27 @@ pub(crate) async fn recover_execution_state(application: &Application) -> anyhow
         .execution()
         .interrupt_execution_in_tx(work.connection(), &now)
         .await?;
+    let running_turns = application
+        .sessions()
+        .running_turn_ids_in_tx(work.connection())
+        .await?;
+    let wake_required = application
+        .execution()
+        .unstarted_active_turn_ids_in_tx(work.connection(), &running_turns)
+        .await?;
     let recovered = application
         .sessions()
-        .interrupt_active_turns_in_tx(work.connection(), &now)
+        .interrupt_active_turns_in_tx(work.connection(), &now, &wake_required)
         .await?;
     let correlation_id = CorrelationId::new().to_string();
     let actor = json!({"kind": "system", "reason": "control_plane_restart"});
     for turn in &recovered {
+        if turn.wake_required {
+            application
+                .enqueue_turn_wake_in_tx(&mut work, turn.turn_id)
+                .await?;
+            continue;
+        }
         work.append_event(NewEvent {
             event_type: "turn.status_changed".into(),
             actor: actor.clone(),
@@ -239,6 +253,8 @@ pub(crate) async fn request_session_deletion(
 pub(crate) async fn run_session_creation_operation(
     state: &Application,
     payload: &Value,
+    work_id: &str,
+    work_nonce: &str,
 ) -> Result<(), SessionLifecycleError> {
     let input: CreateSessionWork = serde_json::from_value(payload.clone())?;
     let Some((operation, correlation_id)) =
@@ -246,12 +262,23 @@ pub(crate) async fn run_session_creation_operation(
     else {
         return Ok(());
     };
-    let result = execute_session_creation(state, &input, correlation_id).await;
+    let result = execute_session_creation(
+        state,
+        &input,
+        correlation_id,
+        WorkClaim {
+            id: work_id,
+            nonce: work_nonce,
+        },
+    )
+    .await;
     finish_session_operation(
         state.operations(),
         &operation.id,
         correlation_id,
         result.map(|session_id| json!({"session_id": session_id})),
+        work_id,
+        work_nonce,
     )
     .await
 }
@@ -259,6 +286,8 @@ pub(crate) async fn run_session_creation_operation(
 pub(crate) async fn run_session_deletion_operation(
     state: &Application,
     payload: &Value,
+    work_id: &str,
+    work_nonce: &str,
 ) -> Result<(), SessionLifecycleError> {
     let input: DeleteSessionWork = serde_json::from_value(payload.clone())?;
     let Some((operation, correlation_id)) =
@@ -266,12 +295,23 @@ pub(crate) async fn run_session_deletion_operation(
     else {
         return Ok(());
     };
-    let result = execute_session_deletion(state, &input, correlation_id).await;
+    let result = execute_session_deletion(
+        state,
+        &input,
+        correlation_id,
+        WorkClaim {
+            id: work_id,
+            nonce: work_nonce,
+        },
+    )
+    .await;
     finish_session_operation(
         state.operations(),
         &operation.id,
         correlation_id,
         result.map(|session_id| json!({"session_id": session_id})),
+        work_id,
+        work_nonce,
     )
     .await
 }
@@ -301,18 +341,27 @@ async fn finish_session_operation(
     operation_id: &str,
     correlation_id: CorrelationId,
     result: Result<Value, SessionLifecycleError>,
+    work_id: &str,
+    work_nonce: &str,
 ) -> Result<(), SessionLifecycleError> {
     match result {
         Ok(result) => {
-            operations
-                .finish(
+            let applied = operations
+                .finish_claimed(
                     operation_id,
-                    OperationStatus::Succeeded,
-                    Some(result),
-                    None,
-                    correlation_id,
+                    work_id,
+                    work_nonce,
+                    OperationCompletion {
+                        status: OperationStatus::Succeeded,
+                        result: Some(result),
+                        problem: None,
+                        correlation_id,
+                    },
                 )
                 .await?;
+            if !applied {
+                warn!(%operation_id, %work_id, "stale worker could not finish Session Operation");
+            }
         }
         Err(error) => {
             let status = if error.requires_attention() {
@@ -320,15 +369,22 @@ async fn finish_session_operation(
             } else {
                 OperationStatus::Failed
             };
-            operations
-                .finish(
+            let applied = operations
+                .finish_claimed(
                     operation_id,
-                    status,
-                    None,
-                    Some(json!({"code": error.code(), "detail": error.to_string()})),
-                    correlation_id,
+                    work_id,
+                    work_nonce,
+                    OperationCompletion {
+                        status,
+                        result: None,
+                        problem: Some(json!({"code": error.code(), "detail": error.to_string()})),
+                        correlation_id,
+                    },
                 )
                 .await?;
+            if !applied {
+                warn!(%operation_id, %work_id, "stale worker could not fail Session Operation");
+            }
         }
     }
     Ok(())
@@ -338,6 +394,7 @@ async fn execute_session_creation(
     state: &Application,
     input: &CreateSessionWork,
     correlation_id: CorrelationId,
+    claim: WorkClaim<'_>,
 ) -> Result<SessionId, SessionLifecycleError> {
     let session_id: SessionId = input
         .session_id
@@ -350,7 +407,8 @@ async fn execute_session_creation(
     if matches!(
         state
             .operations()
-            .begin_step(
+            .begin_step_claimed(
+                claim,
                 &input.operation_id,
                 "validate_project",
                 json!({"project_id": project_id}),
@@ -364,13 +422,14 @@ async fn execute_session_creation(
             .await?;
         state
             .operations()
-            .complete_step(&input.operation_id, "validate_project", None)
+            .complete_step_claimed(claim, &input.operation_id, "validate_project", None)
             .await?;
     }
 
     let workspace_step = state
         .operations()
-        .begin_step(
+        .begin_step_claimed(
+            claim,
             &input.operation_id,
             "create_workspace",
             json!({"session_id": session_id, "project_id": project_id}),
@@ -383,7 +442,8 @@ async fn execute_session_creation(
     if matches!(workspace_step, StepState::Running) {
         state
             .operations()
-            .complete_step(
+            .complete_step_claimed(
+                claim,
                 &input.operation_id,
                 "create_workspace",
                 Some(&copy.revision.0),
@@ -394,7 +454,8 @@ async fn execute_session_creation(
     if matches!(
         state
             .operations()
-            .begin_step(
+            .begin_step_claimed(
+                claim,
                 &input.operation_id,
                 "record_session",
                 json!({"session_id": session_id}),
@@ -434,7 +495,7 @@ async fn execute_session_creation(
         work.commit().await?;
         state
             .operations()
-            .complete_step(&input.operation_id, "record_session", None)
+            .complete_step_claimed(claim, &input.operation_id, "record_session", None)
             .await?;
     }
     Ok(session_id)
@@ -444,6 +505,7 @@ async fn execute_session_deletion(
     state: &Application,
     input: &DeleteSessionWork,
     correlation_id: CorrelationId,
+    claim: WorkClaim<'_>,
 ) -> Result<SessionId, SessionLifecycleError> {
     let session_id: SessionId = input
         .session_id
@@ -456,6 +518,7 @@ async fn execute_session_deletion(
         &input.expected_version,
         &input.actor,
         correlation_id,
+        claim,
     )
     .await?;
     Ok(session_id)
@@ -468,12 +531,14 @@ async fn execute_session_deletion_steps(
     expected_version: &str,
     actor: &Value,
     correlation_id: CorrelationId,
+    claim: WorkClaim<'_>,
 ) -> Result<(), SessionLifecycleError> {
     let step_key = |name: &str| format!("session:{session_id}:{name}");
     let step_input = || json!({"session_id": session_id});
 
     run_operation_step(
         state.operations(),
+        claim,
         operation_id,
         &step_key("mark_deleting"),
         step_input(),
@@ -489,6 +554,7 @@ async fn execute_session_deletion_steps(
     .await?;
     run_operation_step(
         state.operations(),
+        claim,
         operation_id,
         &step_key("stop_runtime"),
         step_input(),
@@ -497,6 +563,7 @@ async fn execute_session_deletion_steps(
     .await?;
     run_operation_step(
         state.operations(),
+        claim,
         operation_id,
         &step_key("delete_runtime_logs"),
         step_input(),
@@ -508,6 +575,7 @@ async fn execute_session_deletion_steps(
     .await?;
     run_operation_step(
         state.operations(),
+        claim,
         operation_id,
         &step_key("delete_workspace"),
         step_input(),
@@ -519,6 +587,7 @@ async fn execute_session_deletion_steps(
     .await?;
     run_operation_step(
         state.operations(),
+        claim,
         operation_id,
         &step_key("delete_records"),
         step_input(),
@@ -529,6 +598,7 @@ async fn execute_session_deletion_steps(
 
 async fn run_operation_step(
     operations: &OperationInterface,
+    claim: WorkClaim<'_>,
     operation_id: &str,
     step_key: &str,
     input_summary: Value,
@@ -536,13 +606,13 @@ async fn run_operation_step(
 ) -> Result<(), SessionLifecycleError> {
     if matches!(
         operations
-            .begin_step(operation_id, step_key, input_summary)
+            .begin_step_claimed(claim, operation_id, step_key, input_summary)
             .await?,
         StepState::Running
     ) {
         step.await?;
         operations
-            .complete_step(operation_id, step_key, None)
+            .complete_step_claimed(claim, operation_id, step_key, None)
             .await?;
     }
     Ok(())
@@ -647,6 +717,8 @@ pub(crate) async fn delete_project_with_runtime(
     state: &Application,
     project_id: &str,
     operation_id: &str,
+    work_id: &str,
+    work_nonce: &str,
 ) -> Result<(), SessionLifecycleError> {
     let project: ProjectId = project_id
         .parse()
@@ -670,6 +742,10 @@ pub(crate) async fn delete_project_with_runtime(
             &session.version,
             &actor,
             correlation_id,
+            WorkClaim {
+                id: work_id,
+                nonce: work_nonce,
+            },
         )
         .await?;
     }

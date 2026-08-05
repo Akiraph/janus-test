@@ -36,12 +36,19 @@ async fn main() -> anyhow::Result<()> {
     // remove crash leftovers and make interrupted Operations explicit so a
     // client can retry instead of the control plane guessing their outcome.
     // Runtime and execution recovery already ran during AppState::initialize.
-    if let Err(error) = state.blobs().clean_incoming().await {
-        warn!(%error, "clean incoming objects on startup");
-    }
-    for op_id in state.operations().stale_running().await.unwrap_or_default() {
+    state
+        .blobs()
+        .clean_incoming()
+        .await
+        .context("clean incoming objects on startup")?;
+    for op_id in state
+        .operations()
+        .stale_running()
+        .await
+        .context("list stale operations on startup")?
+    {
         warn!(%op_id, "marking stale running operation as needs_attention");
-        let _ = state
+        state
             .operations()
             .finish(
                 &op_id,
@@ -50,7 +57,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(json!({"code": "OPERATION_INTERRUPTED", "detail": "process restarted while operation was running"})),
                 CorrelationId::new(),
             )
-            .await;
+            .await
+            .with_context(|| format!("mark operation {op_id} as needs_attention"))?;
     }
     state.mark_recovery_complete();
 

@@ -1,6 +1,12 @@
-﻿use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use janus_infrastructure::id::{ProjectId, SessionId, TurnId};
+use janus_infrastructure::{
+    id::{CorrelationId, ProjectId, SessionId, TurnId},
+    operations::{
+        CreateOperation, CreateWork, OperationCompletion, OperationStatus, StepState, WorkClaim,
+        WorkFailureDisposition,
+    },
+};
 use janus_server::{
     AppState,
     config::{Config, RunMode},
@@ -136,6 +142,273 @@ async fn seed_session(
         active_turn_id,
         queued_turn_id,
     })
+}
+
+#[tokio::test]
+async fn restart_persists_wake_for_unstarted_turn() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let active_turn_id;
+    {
+        let state = AppState::initialize(test_config(directory.path().into())).await?;
+        active_turn_id = seed_session(&state, false).await?.active_turn_id;
+    }
+
+    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let (status, active_session_turn): (String, Option<String>) = sqlx::query_as(
+        "SELECT turns.status, sessions.active_turn_id \
+         FROM turns JOIN sessions ON sessions.id = turns.session_id \
+         WHERE turns.id = ?",
+    )
+    .bind(active_turn_id.to_string())
+    .fetch_one(state.database().pool())
+    .await?;
+    assert_eq!(status, "running");
+    assert_eq!(
+        active_session_turn.as_deref(),
+        Some(active_turn_id.to_string().as_str())
+    );
+
+    let (handler_kind, payload_json): (String, String) = sqlx::query_as(
+        "SELECT handler_kind, payload_json FROM work_items \
+         WHERE handler_kind = 'turn.execute' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(state.database().pool())
+    .await?;
+    assert_eq!(handler_kind, "turn.execute");
+    let payload: Value = serde_json::from_str(&payload_json)?;
+    assert_eq!(payload["turn_id"], active_turn_id.to_string());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let now = janus_infrastructure::clock::now_utc_str();
+    sqlx::query(
+        "INSERT INTO work_items \
+         (id, handler_kind, payload_json, not_before, lease_nonce, lease_expires_at, \
+          attempts, dead, created_at) \
+         VALUES ('bounded-work', 'test.failure', '{}', ?, NULL, NULL, 0, 0, ?)",
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(state.database().pool())
+    .await?;
+
+    for expected_attempt in 1..=5_i64 {
+        let claimed = state
+            .operations()
+            .claim_work("test.failure", 60)
+            .await?
+            .expect("work item should remain claimable until the fifth attempt");
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT attempts FROM work_items WHERE id = 'bounded-work'")
+                .fetch_one(state.database().pool())
+                .await?;
+        assert_eq!(attempts, expected_attempt);
+        assert!(
+            state
+                .operations()
+                .fail_work(&claimed.id, &claimed.nonce, WorkFailureDisposition::Retry,)
+                .await?
+        );
+        if expected_attempt < 5 {
+            // Bypass the real delay so the test exercises the bound quickly.
+            sqlx::query("UPDATE work_items SET not_before = ? WHERE id = 'bounded-work'")
+                .bind(janus_infrastructure::clock::now_utc_str())
+                .execute(state.database().pool())
+                .await?;
+        }
+    }
+
+    let (attempts, dead): (i64, i64) =
+        sqlx::query_as("SELECT attempts, dead FROM work_items WHERE id = 'bounded-work'")
+            .fetch_one(state.database().pool())
+            .await?;
+    assert_eq!(attempts, 5);
+    assert_eq!(dead, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_operation_worker_cannot_publish_terminal_state() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let created = state
+        .operations()
+        .create(
+            CreateOperation {
+                kind: "test.operation",
+                actor: json!({"kind": "test"}),
+                target_kind: "test_target",
+                target_id: Some("target-1"),
+                conditions: json!({}),
+                correlation_id: CorrelationId::new(),
+                idempotency: None,
+            },
+            Some(CreateWork {
+                handler_kind: "test.operation",
+                payload: json!({"target": "target-1"}),
+            }),
+        )
+        .await?;
+    let first_claim = state
+        .operations()
+        .claim_work("test.operation", 60)
+        .await?
+        .expect("first worker should claim the operation");
+    assert!(matches!(
+        state
+            .operations()
+            .begin_step_claimed(
+                WorkClaim {
+                    id: &first_claim.id,
+                    nonce: &first_claim.nonce,
+                },
+                &created.operation.id,
+                "external_effect",
+                json!({"target": "target-1"}),
+            )
+            .await?,
+        StepState::Running
+    ));
+    assert!(
+        state
+            .operations()
+            .renew_work(&first_claim.id, &first_claim.nonce, 60)
+            .await?
+    );
+
+    sqlx::query("UPDATE work_items SET lease_expires_at = '2000-01-01T00:00:00.000Z'")
+        .execute(state.database().pool())
+        .await?;
+    assert!(
+        !state
+            .operations()
+            .renew_work(&first_claim.id, &first_claim.nonce, 60)
+            .await?
+    );
+    assert!(
+        !state
+            .operations()
+            .finish_claimed(
+                &created.operation.id,
+                &first_claim.id,
+                &first_claim.nonce,
+                OperationCompletion {
+                    status: OperationStatus::Succeeded,
+                    result: Some(json!({"worker": "expired"})),
+                    problem: None,
+                    correlation_id: CorrelationId::new(),
+                },
+            )
+            .await?
+    );
+    assert!(
+        state
+            .operations()
+            .complete_step_claimed(
+                WorkClaim {
+                    id: &first_claim.id,
+                    nonce: &first_claim.nonce,
+                },
+                &created.operation.id,
+                "external_effect",
+                None,
+            )
+            .await
+            .is_err()
+    );
+    let second_claim = state
+        .operations()
+        .claim_work("test.operation", 60)
+        .await?
+        .expect("expired work should be reclaimable");
+    assert_ne!(first_claim.nonce, second_claim.nonce);
+    assert!(matches!(
+        state
+            .operations()
+            .begin_step_claimed(
+                WorkClaim {
+                    id: &second_claim.id,
+                    nonce: &second_claim.nonce,
+                },
+                &created.operation.id,
+                "external_effect",
+                json!({"target": "target-1"}),
+            )
+            .await?,
+        StepState::Running
+    ));
+
+    assert!(
+        !state
+            .operations()
+            .finish_claimed(
+                &created.operation.id,
+                &second_claim.id,
+                &first_claim.nonce,
+                OperationCompletion {
+                    status: OperationStatus::Succeeded,
+                    result: Some(json!({"worker": "stale"})),
+                    problem: None,
+                    correlation_id: CorrelationId::new(),
+                },
+            )
+            .await?
+    );
+    assert_eq!(
+        state
+            .operations()
+            .get(&created.operation.id)
+            .await?
+            .expect("operation remains durable")
+            .status,
+        "running"
+    );
+
+    state
+        .operations()
+        .complete_step_claimed(
+            WorkClaim {
+                id: &second_claim.id,
+                nonce: &second_claim.nonce,
+            },
+            &created.operation.id,
+            "external_effect",
+            None,
+        )
+        .await?;
+    assert!(
+        state
+            .operations()
+            .finish_claimed(
+                &created.operation.id,
+                &second_claim.id,
+                &second_claim.nonce,
+                OperationCompletion {
+                    status: OperationStatus::Succeeded,
+                    result: Some(json!({"worker": "current"})),
+                    problem: None,
+                    correlation_id: CorrelationId::new(),
+                },
+            )
+            .await?
+    );
+    assert_eq!(
+        state
+            .operations()
+            .get(&created.operation.id)
+            .await?
+            .expect("operation has terminal state")
+            .status,
+        "succeeded"
+    );
+
+    Ok(())
 }
 
 fn cancel_url(server: &LiveServer, session_id: SessionId, turn_id: TurnId) -> String {

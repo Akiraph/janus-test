@@ -2349,10 +2349,22 @@ export interface components {
       detail?: string | null;
       status: components["schemas"]["ModelAttemptStatus"];
     };
+    TurnModelCandidateSnapshot: {
+      /** Format: int32 */
+      context_limit: number;
+      display_name: string;
+      model_id: string;
+      parameters: unknown;
+      provider_id: string;
+      supports_images: boolean;
+      supports_tools: boolean;
+      upstream_model_id: string;
+    };
     TurnModelSnapshot: {
       /** Format: int32 */
       context_limit: number;
       display_name: string;
+      failover?: components["schemas"]["TurnModelCandidateSnapshot"][];
       model_id: string;
       parameters: unknown;
       provider_id: string;

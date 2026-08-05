@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use super::stream_types::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
     StreamChannel, TokenUsage, ToolCallDelta, ToolSpec, append_reasoning_summary,
+    truncated_stream_event,
 };
 
 pub fn build_responses_body(req: &ModelRequest) -> Value {
@@ -129,6 +130,7 @@ pub struct OpenaiResponsesAssembler {
     pub usage: Option<TokenUsage>,
     pub reasoning_duration_ms: Option<u64>,
     pub failed: Option<(String, String)>,
+    saw_terminal: bool,
     tools: Vec<ResponseToolCall>,
     tool_indexes: HashMap<String, usize>,
     tool_names: HashMap<String, String>,
@@ -159,6 +161,7 @@ impl OpenaiResponsesAssembler {
         data: &str,
     ) -> Result<Vec<ModelStreamEvent>, String> {
         if data.trim() == "[DONE]" {
+            self.saw_terminal = true;
             return Ok(Vec::new());
         }
         let value: Value = serde_json::from_str(data)
@@ -181,6 +184,7 @@ impl OpenaiResponsesAssembler {
                 Ok(Vec::new())
             }
             "response.completed" => {
+                self.saw_terminal = true;
                 if let Some(response) = value.get("response") {
                     self.update_usage(response);
                     self.output_items(response.get("output"));
@@ -346,6 +350,9 @@ impl OpenaiResponsesAssembler {
     }
 
     pub fn finish(&self, attempt_id: &str) -> ModelStreamEvent {
+        if !self.saw_terminal {
+            return truncated_stream_event(attempt_id);
+        }
         let tool_calls = self
             .tools
             .iter()
@@ -448,35 +455,42 @@ mod tests {
                 "response.reasoning_summary_text.delta",
                 r#"{"delta":"Summarizing the workspace state"}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
         assembler
             .ingest_event(
                 "attempt",
                 "response.reasoning_summary_text.delta",
                 r#"{"delta":"Detailing the relevant files"}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
         assembler
             .ingest_event(
                 "attempt",
                 "response.output_text.delta",
                 r#"{"delta":"done"}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
         assembler
             .ingest_event(
                 "attempt",
                 "response.output_item.added",
                 r#"{"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":""}}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
         assembler
             .ingest_event(
                 "attempt",
                 "response.function_call_arguments.delta",
                 r#"{"item_id":"fc_1","delta":"{\"path\":\"README.md\"}"}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.completed",
+                r#"{"type":"response.completed"}"#,
+            )
+            .expect("valid Responses SSE event");
 
         let completed = assembler.finish("attempt");
         match completed {
@@ -507,7 +521,7 @@ mod tests {
                 "response.failed",
                 r#"{"error":{"message":"invalid request"}}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
 
         assert!(matches!(
             events.as_slice(),
@@ -525,7 +539,7 @@ mod tests {
                 "response.completed",
                 r#"{"response":{"usage":{"input_tokens":100,"output_tokens":8,"input_tokens_details":{"cached_tokens":60}}}}"#,
             )
-            .unwrap();
+            .expect("valid Responses SSE event");
 
         match assembler.finish("attempt") {
             crate::stream_types::ModelStreamEvent::Completed { usage, .. } => {
@@ -535,5 +549,40 @@ mod tests {
             }
             other => panic!("expected completed response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn eof_without_response_completed_is_failed() {
+        let mut assembler = OpenaiResponsesAssembler::default();
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.output_text.delta",
+                r#"{"delta":"partial"}"#,
+            )
+            .expect("valid event");
+
+        assert!(matches!(
+            assembler.finish("attempt"),
+            crate::stream_types::ModelStreamEvent::Failed { ref code, .. }
+                if code == "PROVIDER_STREAM_FAILED"
+        ));
+    }
+
+    #[test]
+    fn response_completed_is_required_for_completion() {
+        let mut assembler = OpenaiResponsesAssembler::default();
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.completed",
+                r#"{"type":"response.completed"}"#,
+            )
+            .expect("valid terminal event");
+
+        assert!(matches!(
+            assembler.finish("attempt"),
+            crate::stream_types::ModelStreamEvent::Completed { .. }
+        ));
     }
 }

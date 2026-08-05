@@ -68,7 +68,7 @@ mod tests {
         let p = resolve_session_path(root, "/workspace/src/lib.rs").expect("valid path");
         assert!(p.ends_with("src/lib.rs") || p.ends_with(r"src\lib.rs"));
         assert_eq!(
-            normalize_session_path("/workspace/src/lib.rs").unwrap(),
+            normalize_session_path("/workspace/src/lib.rs").expect("valid workspace path"),
             "src/lib.rs"
         );
         assert!(resolve_session_path(root, "/workspace/../outside").is_err());

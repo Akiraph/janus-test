@@ -10,18 +10,23 @@
 use std::{sync::Arc, time::Duration};
 
 use serde_json::Value;
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::JoinHandle, time::MissedTickBehavior};
 use tracing::{error, info, warn};
 
 use crate::application::Application;
 use crate::application::operation_kinds::{
-    KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION,
+    KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION, KIND_TURN_WAKE,
 };
-use janus_infrastructure::operations::OperationStatus;
+use janus_infrastructure::id::TurnId;
+use janus_infrastructure::operations::{
+    OperationCompletion, OperationInterface, OperationStatus, WorkFailureDisposition,
+};
 
 /// Lease TTL for a claimed work item: short enough that a dead worker's lease
 /// is reclaimed quickly, long enough for a clone to finish.
 const LEASE_TTL_SECONDS: i64 = 120;
+const MAX_CONCURRENT_WORK: usize = 4;
+const LEASE_RENEW_INTERVAL_SECONDS: u64 = 30;
 
 /// Session creation and deletion both update Git worktree administration and
 /// the same workspace-owned tables. Keep those filesystem operations single
@@ -36,15 +41,45 @@ const HANDLED_KINDS: &[&str] = &[
     KIND_DELETE_PROJECT,
     KIND_CREATE_SESSION,
     KIND_DELETE_SESSION,
+    KIND_TURN_WAKE,
 ];
+
+#[derive(Debug)]
+struct WorkFailure {
+    error: anyhow::Error,
+    disposition: WorkFailureDisposition,
+}
+
+impl WorkFailure {
+    fn retry(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            error: error.into(),
+            disposition: WorkFailureDisposition::Retry,
+        }
+    }
+
+    fn dead_letter(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            error: error.into(),
+            disposition: WorkFailureDisposition::DeadLetter,
+        }
+    }
+}
+
+impl From<anyhow::Error> for WorkFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::retry(error)
+    }
+}
 
 /// Spawn the background worker. Runs until the runtime shuts down.
 pub fn spawn(state: Application) {
     let session_lifecycle = Arc::new(Semaphore::new(1));
+    let work_concurrency = Arc::new(Semaphore::new(MAX_CONCURRENT_WORK));
     tokio::spawn(async move {
         info!("janus worker started");
         loop {
-            if let Err(error) = run_once(&state, &session_lifecycle).await {
+            if let Err(error) = run_once(&state, &session_lifecycle, &work_concurrency).await {
                 error!(%error, "worker iteration failed");
             }
             // Idle pause between sweeps; claim_work returns None when the queue
@@ -103,15 +138,26 @@ pub fn spawn_ask_expiry(state: Application) {
     });
 }
 
-async fn run_once(state: &Application, session_lifecycle: &Arc<Semaphore>) -> anyhow::Result<()> {
+async fn run_once(
+    state: &Application,
+    session_lifecycle: &Arc<Semaphore>,
+    work_concurrency: &Arc<Semaphore>,
+) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
+        let work_permit = match work_concurrency.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
         let session_permit = if matches!(*kind, KIND_CREATE_SESSION | KIND_DELETE_SESSION) {
             // Do not claim work while the single session lifecycle slot is
             // occupied. Leaving the item queued preserves FIFO ordering and
             // lets the next sweep retry it without a lease timeout.
             match session_lifecycle.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
-                Err(_) => continue,
+                Err(_) => {
+                    drop(work_permit);
+                    continue;
+                }
             }
         } else {
             None
@@ -126,27 +172,62 @@ async fn run_once(state: &Application, session_lifecycle: &Arc<Semaphore>) -> an
         };
         let worker_state = state.clone();
         let worker_kind = (*kind).to_owned();
+        let work_id = claimed.id.clone();
+        let work_nonce = claimed.nonce.clone();
         tokio::spawn(async move {
+            let _work_permit = work_permit;
             let _session_permit = session_permit;
-            let outcome = dispatch(&worker_state, &worker_kind, &claimed.payload).await;
+            let lease_heartbeat = spawn_lease_heartbeat(
+                worker_state.operations().clone(),
+                work_id.clone(),
+                work_nonce.clone(),
+            );
+            let outcome = dispatch(
+                &worker_state,
+                &worker_kind,
+                &claimed.payload,
+                &work_id,
+                &work_nonce,
+            )
+            .await;
+            lease_heartbeat.abort();
+            let _ = lease_heartbeat.await;
             match outcome {
                 Ok(()) => {
                     if let Err(error) = worker_state
                         .operations()
-                        .complete_work(&claimed.id, &claimed.nonce)
+                        .complete_work(&work_id, &work_nonce)
                         .await
                     {
                         warn!(%error, kind = %worker_kind, "complete work item failed");
                     }
                 }
-                Err(error) => {
-                    warn!(%error, kind = %worker_kind, "work item failed");
-                    // Non-fatal errors stay claimable for retry; fatal ones are
-                    // marked dead so a poison item does not loop forever.
-                    let dead = is_fatal(&error);
+                Err(failure) => {
+                    warn!(error = %failure.error, kind = %worker_kind, "work item failed");
+                    let will_dead_letter = match worker_state
+                        .operations()
+                        .work_will_dead_letter(&work_id, &work_nonce, failure.disposition)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!(%error, kind = %worker_kind, "work item attempt check failed");
+                            false
+                        }
+                    };
+                    if will_dead_letter {
+                        mark_operation_needs_attention(
+                            &worker_state,
+                            &claimed.payload,
+                            &work_id,
+                            &work_nonce,
+                            &failure.error,
+                        )
+                        .await;
+                    }
                     if let Err(fail_error) = worker_state
                         .operations()
-                        .fail_work(&claimed.id, &claimed.nonce, dead)
+                        .fail_work(&work_id, &work_nonce, failure.disposition)
                         .await
                     {
                         warn!(%fail_error, kind = %worker_kind, "fail work item update failed");
@@ -158,19 +239,26 @@ async fn run_once(state: &Application, session_lifecycle: &Arc<Semaphore>) -> an
     Ok(())
 }
 
-async fn dispatch(state: &Application, kind: &str, payload: &Value) -> anyhow::Result<()> {
+async fn dispatch(
+    state: &Application,
+    kind: &str,
+    payload: &Value,
+    work_id: &str,
+    work_nonce: &str,
+) -> Result<(), WorkFailure> {
     match kind {
         KIND_CLONE => {
             let project_id = payload_string(payload, "project_id")?;
             match state.projects().run_clone(project_id).await {
                 Ok(()) => {
-                    record_operation_success(state, kind, project_id, payload).await;
+                    record_operation_success(state, kind, project_id, payload, work_id, work_nonce)
+                        .await;
                     Ok(())
                 }
-                Err(error) => {
-                    record_operation_failure(state, kind, project_id, payload, &error).await;
-                    Err(anyhow::anyhow!("clone failed: {error}"))
-                }
+                Err(error) => Err(WorkFailure {
+                    error: anyhow::anyhow!("clone failed: {error}"),
+                    disposition: project_failure_disposition(&error),
+                }),
             }
         }
         KIND_DELETE_PROJECT => {
@@ -178,51 +266,69 @@ async fn dispatch(state: &Application, kind: &str, payload: &Value) -> anyhow::R
             let operation_id = payload
                 .get("operation_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("project delete work item missing operation_id"))?;
+                .ok_or_else(|| {
+                    WorkFailure::dead_letter(anyhow::anyhow!(
+                        "project delete work item missing operation_id"
+                    ))
+                })?;
             match crate::application::lifecycle::delete_project_with_runtime(
                 state,
                 project_id,
                 operation_id,
+                work_id,
+                work_nonce,
             )
             .await
             {
                 Ok(()) => {
-                    record_operation_success(state, kind, project_id, payload).await;
+                    record_operation_success(state, kind, project_id, payload, work_id, work_nonce)
+                        .await;
                     Ok(())
                 }
-                Err(error) => {
-                    // record_operation_failure expects a ProjectsError-shaped
-                    // display; wrap as a generic failure so the Operation still
-                    // lands in needs_attention / failed.
-                    record_operation_failure(
-                        state,
-                        kind,
-                        project_id,
-                        payload,
-                        &janus_projects::interface::ProjectsError::Validation(error.to_string()),
-                    )
-                    .await;
-                    Err(error.into())
-                }
+                Err(error) => Err(WorkFailure::retry(error)),
             }
         }
         KIND_CREATE_SESSION => {
-            crate::application::lifecycle::run_session_creation_operation(state, payload).await?;
+            crate::application::lifecycle::run_session_creation_operation(
+                state, payload, work_id, work_nonce,
+            )
+            .await
+            .map_err(WorkFailure::retry)?;
             Ok(())
         }
         KIND_DELETE_SESSION => {
-            crate::application::lifecycle::run_session_deletion_operation(state, payload).await?;
+            crate::application::lifecycle::run_session_deletion_operation(
+                state, payload, work_id, work_nonce,
+            )
+            .await
+            .map_err(WorkFailure::retry)?;
             Ok(())
         }
-        other => Err(anyhow::anyhow!("no handler for kind {other}")),
+        KIND_TURN_WAKE => {
+            let turn_id = payload_string(payload, "turn_id")?
+                .parse::<TurnId>()
+                .map_err(|error| {
+                    WorkFailure::dead_letter(anyhow::anyhow!("invalid Turn id in wake: {error}"))
+                })?;
+            if let Some(handle) = state.execution_coordinator().schedule_and_wait(turn_id) {
+                handle
+                    .await
+                    .map_err(|error| anyhow::anyhow!("Turn runner task failed: {error}"))?
+                    .map_err(|error| anyhow::anyhow!("Turn execution failed: {error}"))?;
+            }
+            Ok(())
+        }
+        other => Err(WorkFailure::dead_letter(anyhow::anyhow!(
+            "no handler for kind {other}"
+        ))),
     }
 }
 
-fn payload_string<'a>(payload: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+fn payload_string<'a>(payload: &'a Value, field: &str) -> Result<&'a str, WorkFailure> {
     payload
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("work item missing {field}"))
+        .ok_or_else(|| WorkFailure::dead_letter(anyhow::anyhow!("work item missing {field}")))
 }
 
 /// Resolve the Operation id from the work payload when present; otherwise fall
@@ -253,67 +359,120 @@ async fn record_operation_success(
     kind: &str,
     project_id: &str,
     payload: &Value,
+    work_id: &str,
+    work_nonce: &str,
 ) {
     let Some(op_id) = resolve_operation_id(state, kind, project_id, payload).await else {
         return;
     };
     let correlation = janus_infrastructure::id::CorrelationId::new();
-    let _ = state
+    match state
         .operations()
-        .finish(
+        .finish_claimed(
             &op_id,
-            OperationStatus::Succeeded,
-            Some(serde_json::json!({"project_id": project_id})),
-            None,
-            correlation,
+            work_id,
+            work_nonce,
+            OperationCompletion {
+                status: OperationStatus::Succeeded,
+                result: Some(serde_json::json!({"project_id": project_id})),
+                problem: None,
+                correlation_id: correlation,
+            },
         )
-        .await;
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(%op_id, %work_id, "stale worker could not finish Operation"),
+        Err(error) => warn!(%error, %op_id, "finish Operation failed"),
+    }
 }
 
-/// Mark the Operation backing this work item as failed so the client can read
-/// the failure from `GET /operations/{id}`.
-async fn record_operation_failure(
-    state: &Application,
-    kind: &str,
-    project_id: &str,
-    payload: &Value,
+fn project_failure_disposition(
     error: &janus_projects::interface::ProjectsError,
+) -> WorkFailureDisposition {
+    use janus_projects::interface::{GitError, ProjectsError};
+
+    match error {
+        ProjectsError::Git(
+            GitError::RemoteUnavailable | GitError::CommandFailed(_) | GitError::BadOutput(_),
+        )
+        | ProjectsError::Workspace(_)
+        | ProjectsError::Operation(_)
+        | ProjectsError::Storage(_)
+        | ProjectsError::Serde(_)
+        | ProjectsError::Io(_)
+        | ProjectsError::Internal(_) => WorkFailureDisposition::Retry,
+        ProjectsError::Validation(_)
+        | ProjectsError::NotFound
+        | ProjectsError::CredentialNotFound
+        | ProjectsError::ConflictNotFound
+        | ProjectsError::RevisionMismatch { .. }
+        | ProjectsError::InvalidPath(_)
+        | ProjectsError::NotEditable(_)
+        | ProjectsError::Git(_) => WorkFailureDisposition::DeadLetter,
+    }
+}
+
+fn spawn_lease_heartbeat(
+    operations: OperationInterface,
+    work_id: String,
+    work_nonce: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(LEASE_RENEW_INTERVAL_SECONDS));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match operations
+                .renew_work(&work_id, &work_nonce, LEASE_TTL_SECONDS)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(%work_id, "work lease could not be renewed");
+                    break;
+                }
+                Err(error) => {
+                    warn!(%error, %work_id, "work lease renewal failed");
+                }
+            }
+        }
+    })
+}
+
+async fn mark_operation_needs_attention(
+    state: &Application,
+    payload: &Value,
+    work_id: &str,
+    work_nonce: &str,
+    error: &anyhow::Error,
 ) {
-    // A miss is not fatal: the Project state itself already records the error
-    // (clone -> `error` state).
-    let Some(op_id) = resolve_operation_id(state, kind, project_id, payload).await else {
+    let Some(operation_id) = payload.get("operation_id").and_then(Value::as_str) else {
         return;
     };
-    let correlation = janus_infrastructure::id::CorrelationId::new();
-    let _ = state
+    match state
         .operations()
-        .finish(
-            &op_id,
-            OperationStatus::Failed,
-            None,
-            Some(serde_json::json!({"code": error.code(), "detail": error.to_string()})),
-            correlation,
+        .finish_claimed(
+            operation_id,
+            work_id,
+            work_nonce,
+            OperationCompletion {
+                status: OperationStatus::NeedsAttention,
+                result: None,
+                problem: Some(serde_json::json!({
+                    "code": "WORK_ITEM_DEAD_LETTERED",
+                    "detail": error.to_string(),
+                })),
+                correlation_id: janus_infrastructure::id::CorrelationId::new(),
+            },
         )
-        .await;
-}
-
-fn is_fatal(error: &anyhow::Error) -> bool {
-    // Auth/unreachable failures are recorded on the Project (`error` state) and
-    // should not be retried blindly; the user retries explicitly. Validation
-    // is fatal. Transient issues can be retried by the lease loop.
-    let s = error.to_string();
-    s.contains("validation") || s.contains("GIT_AUTH_FAILED") || s.contains("not creating")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_fatal;
-    use anyhow::anyhow;
-
-    #[test]
-    fn validation_and_auth_are_fatal() {
-        assert!(is_fatal(&anyhow!("validation failed: name is required")));
-        assert!(is_fatal(&anyhow!("clone failed: GIT_AUTH_FAILED")));
-        assert!(!is_fatal(&anyhow!("transient timeout")));
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => warn!(%operation_id, %work_id, "dead work item could not update Operation"),
+        Err(finish_error) => {
+            warn!(%finish_error, %operation_id, "dead work item Operation update failed")
+        }
     }
 }

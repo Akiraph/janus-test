@@ -451,8 +451,23 @@ impl RuntimeInterface {
                 let this = self.clone();
                 let job_id = job.id;
                 tokio::spawn(async move {
-                    if let Ok(completion) = this.executor.wait_job(job_id, &runtime_nonce).await {
-                        let _ = this.finalize_job(job_id, completion, None).await;
+                    match this.executor.wait_job(job_id, &runtime_nonce).await {
+                        Ok(completion) => {
+                            if let Err(error) = this.finalize_job(job_id, completion, None).await {
+                                tracing::warn!(%error, %job_id, "finalize Job after wait failed");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, %job_id, "wait Job failed; marking it lost");
+                            if let Err(mark_error) = this.mark_job_lost(job_id, "wait_failed").await
+                            {
+                                tracing::error!(
+                                    %mark_error,
+                                    %job_id,
+                                    "mark Job lost after wait failure failed"
+                                );
+                            }
+                        }
                     }
                 });
                 Ok(job)
@@ -570,20 +585,44 @@ impl RuntimeInterface {
                 let this = self.clone();
                 let service_id = service.id;
                 tokio::spawn(async move {
-                    if let Ok(completion) =
-                        this.executor.wait_service(service_id, &runtime_nonce).await
-                    {
-                        let _ = this.finalize_service(service_id, completion, None).await;
+                    match this.executor.wait_service(service_id, &runtime_nonce).await {
+                        Ok(completion) => {
+                            if let Err(error) =
+                                this.finalize_service(service_id, completion, None).await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    %service_id,
+                                    "finalize Service after wait failed"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                %service_id,
+                                "wait Service failed; marking it failed"
+                            );
+                            if let Err(mark_error) =
+                                this.mark_service_failed(service_id, "wait_failed").await
+                            {
+                                tracing::error!(
+                                    %mark_error,
+                                    %service_id,
+                                    "mark Service failed after wait failure failed"
+                                );
+                            }
+                        }
                     }
                 });
                 Ok(service)
             }
             Ok(_) => {
-                self.mark_service_failed_by_log(log.id).await?;
+                self.mark_service_failed(service_id, "start_failed").await?;
                 Err(RuntimeError::RuntimeUnavailable)
             }
             Err(error) => {
-                self.mark_service_failed_by_log(log.id).await?;
+                self.mark_service_failed(service_id, "start_failed").await?;
                 Err(error)
             }
         }
@@ -872,10 +911,34 @@ impl RuntimeInterface {
                 let terminal_id = terminal.id;
                 let nonce = runtime_nonce;
                 tokio::spawn(async move {
-                    if let Ok(completion) =
-                        this.executor.await_terminal_exit(terminal_id, &nonce).await
-                    {
-                        let _ = this.finalize_terminal(terminal_id, completion).await;
+                    match this.executor.await_terminal_exit(terminal_id, &nonce).await {
+                        Ok(completion) => {
+                            if let Err(error) =
+                                this.finalize_terminal(terminal_id, completion).await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    %terminal_id,
+                                    "finalize Terminal after wait failed"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                %terminal_id,
+                                "wait Terminal failed; marking it lost"
+                            );
+                            if let Err(mark_error) =
+                                this.mark_terminal_lost(terminal_id, "wait_failed").await
+                            {
+                                tracing::error!(
+                                    %mark_error,
+                                    %terminal_id,
+                                    "mark Terminal lost after wait failure failed"
+                                );
+                            }
+                        }
                     }
                 });
                 Ok(terminal)
@@ -1522,19 +1585,65 @@ impl RuntimeInterface {
         Ok(())
     }
 
-    async fn mark_service_failed_by_log(&self, id: LogStreamId) -> Result<(), RuntimeError> {
-        sqlx::query(
+    async fn mark_service_failed(&self, id: ServiceId, reason: &str) -> Result<(), RuntimeError> {
+        let log_stream_id = self
+            .service_row(id)
+            .await?
+            .log_stream_id
+            .parse::<LogStreamId>()
+            .map_err(storage_error)?;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+        let changed = sqlx::query(
             "UPDATE services SET status = 'failed', exit_json = ?, version = ?, ended_at = ? \
-             WHERE log_stream_id = ? AND status IN ('starting', 'running')",
+             WHERE id = ? AND status IN ('starting', 'running', 'unhealthy')",
         )
-        .bind(json!({"exit_code": null, "signal": "start_failed"}).to_string())
+        .bind(json!({"exit_code": null, "signal": reason}).to_string())
         .bind(new_version())
         .bind(now_utc_str())
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(work.connection())
         .await
-        .map_err(storage_error)?;
-        let _ = self.logs.close(id).await;
+        .map_err(storage_error)?
+        .rows_affected();
+        if changed != 0 {
+            self.append_service_changed_in_tx(&mut work, id).await?;
+            work.commit().await.map_err(storage_error)?;
+        } else {
+            work.rollback().await.map_err(storage_error)?;
+        }
+        let _ = self.logs.close(log_stream_id).await;
+        Ok(())
+    }
+
+    async fn mark_terminal_lost(&self, id: TerminalId, reason: &str) -> Result<(), RuntimeError> {
+        let scrollback_stream_id = self
+            .terminal_row(id)
+            .await?
+            .scrollback_stream_id
+            .parse::<LogStreamId>()
+            .map_err(storage_error)?;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+        let changed = sqlx::query(
+            "UPDATE terminals SET status = 'lost', exit_json = ?, version = ?, \
+             updated_at = ?, ended_at = ? WHERE id = ? \
+             AND status IN ('starting', 'running', 'closing')",
+        )
+        .bind(json!({"exit_code": null, "signal": reason}).to_string())
+        .bind(new_version())
+        .bind(now_utc_str())
+        .bind(now_utc_str())
+        .bind(id.to_string())
+        .execute(work.connection())
+        .await
+        .map_err(storage_error)?
+        .rows_affected();
+        if changed != 0 {
+            self.append_terminal_changed_in_tx(&mut work, id).await?;
+            work.commit().await.map_err(storage_error)?;
+        } else {
+            work.rollback().await.map_err(storage_error)?;
+        }
+        let _ = self.logs.close(scrollback_stream_id).await;
         Ok(())
     }
 }

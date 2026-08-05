@@ -223,6 +223,14 @@ pub enum ModelStreamEvent {
     },
 }
 
+pub(crate) fn truncated_stream_event(attempt_id: &str) -> ModelStreamEvent {
+    ModelStreamEvent::Failed {
+        attempt_id: attempt_id.to_owned(),
+        code: "PROVIDER_STREAM_FAILED".into(),
+        detail: "provider stream ended before its terminal frame".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{thread, time::Duration};
