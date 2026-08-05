@@ -20,9 +20,7 @@ use crate::{
         request_id::RequestContext,
     },
 };
-use janus_infrastructure::{
-    id::CorrelationId, managed_storage::BlobReference, operations::OperationView,
-};
+use janus_infrastructure::{id::CorrelationId, operations::OperationView};
 use janus_sessions::interface::{
     AttachmentView, CancelResult, MAX_ATTACHMENT_BYTES, MessageRouteResult, QueuedTurnItem,
     SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage, TurnSummary,
@@ -376,21 +374,7 @@ pub async fn upload_attachment(
         .unwrap_or("application/octet-stream");
     let upload_id = UploadId::new();
     let attachment_id = AttachmentId::new();
-    let reference = BlobReference::new(
-        "sessions",
-        "attachment",
-        &attachment_id.to_string(),
-        "content",
-    );
-    let blob_sha = state
-        .blobs()
-        .write(body.as_ref(), reference.clone())
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "store attachment bytes");
-            Problem::from_code(codes::INTERNAL_ERROR, "attachment could not be stored")
-        })?;
-    let attachment = match state
+    let attachment = state
         .sessions()
         .create_upload_attachment(UploadAttachmentInput {
             owner_id: &auth.owner_id,
@@ -400,16 +384,10 @@ pub async fn upload_attachment(
             name,
             mime,
             byte_size: body.len() as u64,
-            blob_sha: blob_sha.as_str(),
+            bytes: body.as_ref(),
         })
         .await
-    {
-        Ok(attachment) => attachment,
-        Err(error) => {
-            let _ = state.blobs().drop_reference(&reference).await;
-            return Err(sessions_problem(error));
-        }
-    };
+        .map_err(sessions_problem)?;
     Ok((StatusCode::CREATED, Json(DataResponse { data: attachment })))
 }
 
@@ -436,15 +414,6 @@ pub async fn delete_attachment(
         .delete_draft_attachment(session_id, attachment_id)
         .await
         .map_err(sessions_problem)?;
-    let reference = BlobReference::new(
-        "sessions",
-        "attachment",
-        &attachment_id.to_string(),
-        "content",
-    );
-    if let Err(error) = state.blobs().drop_reference(&reference).await {
-        tracing::warn!(%error, %attachment_id, "drop deleted attachment reference");
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 

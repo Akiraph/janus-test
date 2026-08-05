@@ -54,6 +54,8 @@ pub(crate) enum SessionLifecycleError {
     Internal(#[from] anyhow::Error),
     #[error("invalid lifecycle work item: {0}")]
     InvalidWork(String),
+    #[error("operation step requires external-effect reconciliation: {0}")]
+    StepNeedsReconciliation(String),
 }
 
 impl SessionLifecycleError {
@@ -65,6 +67,7 @@ impl SessionLifecycleError {
             Self::Runtime(error) => error.code().as_str(),
             Self::Workspace(WorkspaceError::RevisionMismatch { .. }) => "RESOURCE_VERSION_MISMATCH",
             Self::InvalidWork(_) => "INVALID_WORK_ITEM",
+            Self::StepNeedsReconciliation(_) => "OPERATION_STEP_NEEDS_RECONCILIATION",
             _ => "INTERNAL_ERROR",
         }
     }
@@ -101,7 +104,7 @@ pub(crate) async fn recover_execution_state(application: &Application) -> anyhow
     let mut work = application.unit_of_work().begin().await?;
     application
         .runtime()
-        .recover_uncertain_in_tx(work.connection(), &now)
+        .recover_uncertain_in_tx(&mut work, &now)
         .await?;
     application
         .models()
@@ -171,6 +174,47 @@ pub(crate) async fn recover_execution_state(application: &Application) -> anyhow
         "execution recovery committed"
     );
     Ok(recovered.len())
+}
+
+pub(crate) async fn recover_workspace_mutations(
+    application: &Application,
+) -> anyhow::Result<usize> {
+    let recovered = application
+        .workspace()
+        .recover_uncertain_file_mutations()
+        .await?;
+    let count = recovered.len();
+    for mutation in recovered {
+        let mut payload = mutation.event.payload;
+        if mutation.event.event_type == "project.main_revision_changed"
+            && let serde_json::Value::Object(ref mut object) = payload
+        {
+            object.insert(
+                "main_revision".into(),
+                serde_json::Value::String(mutation.revision.0.clone()),
+            );
+        }
+        let mut work = application.unit_of_work().begin().await?;
+        work.append_event(NewEvent {
+            event_type: mutation.event.event_type,
+            actor: mutation.event.actor,
+            resource: Some(mutation.event.resource),
+            correlation_id: mutation.event.correlation_id,
+            causation_id: mutation.event.causation_id,
+            payload,
+        })
+        .await?;
+        application
+            .workspace()
+            .acknowledge_file_mutation_event_in_tx(
+                work.connection(),
+                &mutation.intent_id,
+                &mutation.revision,
+            )
+            .await?;
+        work.commit().await?;
+    }
+    Ok(count)
 }
 
 pub(crate) async fn request_session_creation(
@@ -404,26 +448,33 @@ async fn execute_session_creation(
         .project_id
         .parse()
         .map_err(|error| SessionLifecycleError::InvalidWork(format!("project id: {error}")))?;
-    if matches!(
-        state
-            .operations()
-            .begin_step_claimed(
-                claim,
-                &input.operation_id,
-                "validate_project",
-                json!({"project_id": project_id}),
-            )
-            .await?,
-        StepState::Running
-    ) {
-        state
-            .projects()
-            .ensure_ready(&input.owner_id, project_id)
-            .await?;
-        state
-            .operations()
-            .complete_step_claimed(claim, &input.operation_id, "validate_project", None)
-            .await?;
+    let validation_step = state
+        .operations()
+        .begin_step_claimed(
+            claim,
+            &input.operation_id,
+            "validate_project",
+            json!({"project_id": project_id}),
+        )
+        .await?;
+    match validation_step {
+        StepState::Running => {
+            state.operations().assert_claimed(claim).await?;
+            state
+                .projects()
+                .ensure_ready(&input.owner_id, project_id)
+                .await?;
+            state
+                .operations()
+                .complete_step_claimed(claim, &input.operation_id, "validate_project", None)
+                .await?;
+        }
+        StepState::AlreadySucceeded => {}
+        StepState::NeedsReconciliation => {
+            return Err(SessionLifecycleError::StepNeedsReconciliation(
+                "validate_project".into(),
+            ));
+        }
     }
 
     let workspace_step = state
@@ -435,6 +486,14 @@ async fn execute_session_creation(
             json!({"session_id": session_id, "project_id": project_id}),
         )
         .await?;
+    if matches!(workspace_step, StepState::NeedsReconciliation) {
+        return Err(SessionLifecycleError::StepNeedsReconciliation(
+            "create_workspace".into(),
+        ));
+    }
+    if matches!(workspace_step, StepState::Running) {
+        state.operations().assert_claimed(claim).await?;
+    }
     let copy = state
         .workspace()
         .ensure_session_copy(project_id, session_id, None, input.actor.clone())
@@ -451,52 +510,59 @@ async fn execute_session_creation(
             .await?;
     }
 
-    if matches!(
-        state
-            .operations()
-            .begin_step_claimed(
-                claim,
-                &input.operation_id,
-                "record_session",
-                json!({"session_id": session_id}),
-            )
-            .await?,
-        StepState::Running
-    ) {
-        let mut work = state.unit_of_work().begin().await?;
-        let record = state
-            .sessions()
-            .create_session_in_tx(
-                work.connection(),
-                session_id,
-                project_id,
-                input.title.clone(),
-                &copy.handle,
-                &copy.source_main_revision.0,
-            )
-            .await?;
-        if record.created {
-            work.append_event(NewEvent {
-                event_type: "session.changed".into(),
-                actor: input.actor.clone(),
-                resource: Some(json!({"kind": "session", "id": session_id})),
-                correlation_id: correlation_id.to_string(),
-                causation_id: Some(input.operation_id.clone()),
-                payload: json!({
-                    "session_id": session_id,
-                    "project_id": project_id,
-                    "state": "ready",
-                    "version": record.version,
-                    "workspace_revision": copy.revision.0,
-                }),
-            })
-            .await?;
+    let record_step = state
+        .operations()
+        .begin_step_claimed(
+            claim,
+            &input.operation_id,
+            "record_session",
+            json!({"session_id": session_id}),
+        )
+        .await?;
+    match record_step {
+        StepState::NeedsReconciliation => {
+            return Err(SessionLifecycleError::StepNeedsReconciliation(
+                "record_session".into(),
+            ));
         }
-        work.commit().await?;
-        state
-            .operations()
-            .complete_step_claimed(claim, &input.operation_id, "record_session", None)
-            .await?;
+        StepState::AlreadySucceeded => {}
+        StepState::Running => {
+            state.operations().assert_claimed(claim).await?;
+            let mut work = state.unit_of_work().begin().await?;
+            let record = state
+                .sessions()
+                .create_session_in_tx(
+                    work.connection(),
+                    session_id,
+                    project_id,
+                    input.title.clone(),
+                    &copy.handle,
+                    &copy.source_main_revision.0,
+                )
+                .await?;
+            if record.created {
+                work.append_event(NewEvent {
+                    event_type: "session.changed".into(),
+                    actor: input.actor.clone(),
+                    resource: Some(json!({"kind": "session", "id": session_id})),
+                    correlation_id: correlation_id.to_string(),
+                    causation_id: Some(input.operation_id.clone()),
+                    payload: json!({
+                        "session_id": session_id,
+                        "project_id": project_id,
+                        "state": "ready",
+                        "version": record.version,
+                        "workspace_revision": copy.revision.0,
+                    }),
+                })
+                .await?;
+            }
+            work.commit().await?;
+            state
+                .operations()
+                .complete_step_claimed(claim, &input.operation_id, "record_session", None)
+                .await?;
+        }
     }
     Ok(session_id)
 }
@@ -604,16 +670,23 @@ async fn run_operation_step(
     input_summary: Value,
     step: impl std::future::Future<Output = Result<(), SessionLifecycleError>>,
 ) -> Result<(), SessionLifecycleError> {
-    if matches!(
-        operations
-            .begin_step_claimed(claim, operation_id, step_key, input_summary)
-            .await?,
-        StepState::Running
-    ) {
-        step.await?;
-        operations
-            .complete_step_claimed(claim, operation_id, step_key, None)
-            .await?;
+    match operations
+        .begin_step_claimed(claim, operation_id, step_key, input_summary)
+        .await?
+    {
+        StepState::AlreadySucceeded => {}
+        StepState::NeedsReconciliation => {
+            return Err(SessionLifecycleError::StepNeedsReconciliation(
+                step_key.to_owned(),
+            ));
+        }
+        StepState::Running => {
+            operations.assert_claimed(claim).await?;
+            step.await?;
+            operations
+                .complete_step_claimed(claim, operation_id, step_key, None)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -749,10 +822,55 @@ pub(crate) async fn delete_project_with_runtime(
         )
         .await?;
     }
-    cleanup_project_terminals(state, project).await?;
-    state.runtime().delete_project_log_files(project).await?;
-    state.runtime().delete_project_resources(project).await?;
-    state.projects().run_delete(project_id).await?;
+    let claim = WorkClaim {
+        id: work_id,
+        nonce: work_nonce,
+    };
+    run_operation_step(
+        state.operations(),
+        claim,
+        operation_id,
+        &format!("project:{project_id}:delete_terminals"),
+        json!({"project_id": project_id}),
+        cleanup_project_terminals(state, project),
+    )
+    .await?;
+    run_operation_step(
+        state.operations(),
+        claim,
+        operation_id,
+        &format!("project:{project_id}:delete_runtime_logs"),
+        json!({"project_id": project_id}),
+        async {
+            state.runtime().delete_project_log_files(project).await?;
+            Ok(())
+        },
+    )
+    .await?;
+    run_operation_step(
+        state.operations(),
+        claim,
+        operation_id,
+        &format!("project:{project_id}:delete_runtime_resources"),
+        json!({"project_id": project_id}),
+        async {
+            state.runtime().delete_project_resources(project).await?;
+            Ok(())
+        },
+    )
+    .await?;
+    run_operation_step(
+        state.operations(),
+        claim,
+        operation_id,
+        &format!("project:{project_id}:delete_workspace"),
+        json!({"project_id": project_id}),
+        async {
+            state.projects().run_delete(project_id).await?;
+            Ok::<(), SessionLifecycleError>(())
+        },
+    )
+    .await?;
     Ok(())
 }
 

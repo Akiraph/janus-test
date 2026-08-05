@@ -10,5 +10,3 @@ owned_tables = [
 ]
 publishes = ["model_config.changed"]
 allowed_module_dependencies = []
-specs = []
-tests = []

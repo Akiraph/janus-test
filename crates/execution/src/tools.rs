@@ -336,8 +336,7 @@ fn fail_text(msg: &str, code: &str) -> ToolOutcome {
     }
 }
 
-fn map_path_err(e: PathError) -> ToolOutcome {
-    let _ = e;
+fn map_path_err(_error: PathError) -> ToolOutcome {
     fail_text("invalid path", "TOOL_PATH_INVALID")
 }
 

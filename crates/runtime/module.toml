@@ -9,7 +9,5 @@ owned_tables = [
   "terminals",
   "runtime_access_tickets",
 ]
-publishes = ["job.changed", "service.changed", "terminal.changed"]
+publishes = ["runtime.changed", "job.changed", "service.changed", "terminal.changed"]
 allowed_module_dependencies = []
-specs = []
-tests = []

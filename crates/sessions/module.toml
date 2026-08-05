@@ -20,5 +20,3 @@ publishes = [
   "checkpoint.created",
 ]
 allowed_module_dependencies = ["workspace"]
-specs = []
-tests = []

@@ -13,6 +13,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use janus_infrastructure::{
     events::{EventStore, NewEvent},
     id::{AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
+    managed_storage::{BlobReference, BlobStore},
     unit_of_work::UnitOfWork,
 };
 use janus_workspace::interface::{WorkspaceHandle, WorkspaceInterface};
@@ -34,6 +35,7 @@ pub struct SessionsInterface {
     pub(super) pool: SqlitePool,
     pub(super) unit_of_work: UnitOfWork,
     pub(super) workspace: WorkspaceInterface,
+    pub(super) blobs: BlobStore,
 }
 
 #[derive(Debug, Clone)]
@@ -56,13 +58,30 @@ pub struct SessionDeletionPlan {
     pub turn_ids: Vec<TurnId>,
 }
 
+struct PersistUploadAttachment<'a> {
+    owner_id: &'a str,
+    session_id: SessionId,
+    upload_id: janus_infrastructure::id::UploadId,
+    attachment_id: AttachmentId,
+    name: &'a str,
+    mime: &'a str,
+    byte_size: u64,
+    blob_sha: &'a str,
+}
+
 impl SessionsInterface {
-    pub fn new(pool: SqlitePool, events: EventStore, workspace: WorkspaceInterface) -> Self {
+    pub fn new(
+        pool: SqlitePool,
+        events: EventStore,
+        workspace: WorkspaceInterface,
+        blobs: BlobStore,
+    ) -> Self {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Self {
             pool,
             unit_of_work,
             workspace,
+            blobs,
         }
     }
 
@@ -205,6 +224,55 @@ impl SessionsInterface {
             name,
             mime,
             byte_size,
+            bytes,
+        } = input;
+        let reference = BlobReference::new(
+            "sessions",
+            "attachment",
+            &attachment_id.to_string(),
+            "content",
+        );
+        let blob_sha = self
+            .blobs
+            .write(bytes, reference.clone())
+            .await
+            .map_err(SessionsError::Internal)?;
+        let result = self
+            .persist_upload_attachment(PersistUploadAttachment {
+                owner_id,
+                session_id,
+                upload_id,
+                attachment_id,
+                name,
+                mime,
+                byte_size,
+                blob_sha: blob_sha.as_str(),
+            })
+            .await;
+        if result.is_err()
+            && let Err(error) = self.blobs.drop_reference(&reference).await
+        {
+            tracing::error!(
+                %error,
+                attachment_id = %attachment_id,
+                "blob reference compensation was deferred or failed"
+            );
+        }
+        result
+    }
+
+    async fn persist_upload_attachment(
+        &self,
+        input: PersistUploadAttachment<'_>,
+    ) -> Result<AttachmentView, SessionsError> {
+        let PersistUploadAttachment {
+            owner_id,
+            session_id,
+            upload_id,
+            attachment_id,
+            name,
+            mime,
+            byte_size,
             blob_sha,
         } = input;
         let available: i64 = sqlx::query_scalar(
@@ -267,10 +335,10 @@ impl SessionsInterface {
         &self,
         session_id: SessionId,
         attachment_id: AttachmentId,
-    ) -> Result<String, SessionsError> {
+    ) -> Result<(), SessionsError> {
         let mut work = self.unit_of_work.begin().await?;
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT attachment.blob_sha, attachment.upload_id FROM attachments AS attachment \
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT attachment.upload_id FROM attachments AS attachment \
              WHERE attachment.id = ? AND attachment.session_id = ? \
                AND attachment.lifecycle = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM message_attachments AS message_attachment \
@@ -280,7 +348,7 @@ impl SessionsInterface {
         .bind(session_id.to_string())
         .fetch_optional(work.connection())
         .await?;
-        let Some((blob_sha, upload_id)) = row else {
+        let Some(upload_id) = row else {
             work.rollback().await?;
             return Err(SessionsError::Validation(
                 "attachment is missing or is already referenced by a message".into(),
@@ -297,7 +365,22 @@ impl SessionsInterface {
                 .await?;
         }
         work.commit().await?;
-        Ok(blob_sha)
+        let reference = BlobReference::new(
+            "sessions",
+            "attachment",
+            &attachment_id.to_string(),
+            "content",
+        );
+        // Database ownership is authoritative. If reference cleanup is
+        // interrupted, BlobStore persists a retryable cleanup intent.
+        if let Err(error) = self.blobs.drop_reference(&reference).await {
+            tracing::error!(
+                %error,
+                attachment_id = %attachment_id,
+                "blob reference cleanup was deferred or failed"
+            );
+        }
+        Ok(())
     }
 
     pub async fn list_attachments(

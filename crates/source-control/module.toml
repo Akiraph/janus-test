@@ -3,5 +3,3 @@ public_root = "interface.rs"
 owned_tables = []
 publishes = []
 allowed_module_dependencies = []
-specs = []
-tests = []

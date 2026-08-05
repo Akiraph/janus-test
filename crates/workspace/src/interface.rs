@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Display,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -27,8 +27,8 @@ pub use super::diff::{
     PropagationResult, line_hunks,
 };
 use super::manifest::{
-    ManifestNode, ManifestRoot, NodeKind, collect_manifest as walk_manifest,
-    is_workspace_internal_path,
+    ManifestNode, ManifestRoot, NodeKind, collect_manifest as walk_manifest, hash_file_node,
+    is_text_bytes, is_workspace_internal_path,
 };
 pub use super::path::{PathError, validate_workspace_path};
 use super::session_copy::{
@@ -51,7 +51,7 @@ pub enum PropagationError {
 
 /// Opaque handle for a workspace copy, stored in `workspace_copies.handle`.
 /// Main: `main:<project-id>`; Session: `session:<session-id>`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(transparent)]
 pub struct WorkspaceHandle(pub String);
 
@@ -70,7 +70,7 @@ impl WorkspaceHandle {
 }
 
 /// Content Revision identity exposed as opaque `rev_<uuid>` string.
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(transparent)]
 pub struct RevisionRef(pub String);
 
@@ -136,9 +136,22 @@ type ExistingSessionCopy = (
     Option<String>,
 );
 
+type StoredFileMutationIntentRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+);
+
 struct CopyRoots {
     session_handle: WorkspaceHandle,
     main_handle: WorkspaceHandle,
+    project_id: String,
     session_dir: PathBuf,
     main_dir: PathBuf,
 }
@@ -157,6 +170,78 @@ struct PropagationBaseline {
     main_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PropagationIntent {
+    direction: PropagationDirection,
+    actor: serde_json::Value,
+    baseline: PropagationBaseline,
+    main_head: String,
+    session_head: String,
+    paths: Vec<String>,
+    #[serde(default)]
+    source_preimage: BTreeMap<String, Option<ManifestNode>>,
+    #[serde(default)]
+    target_preimage: BTreeMap<String, Option<ManifestNode>>,
+}
+
+struct PropagationFinalizeRequest<'a> {
+    session_id: &'a str,
+    roots: &'a CopyRoots,
+    direction: PropagationDirection,
+    next_baseline: &'a PropagationBaseline,
+    session_after: &'a ManifestRoot,
+    main_after: &'a ManifestRoot,
+    actor: &'a serde_json::Value,
+    transfer_paths: &'a [String],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMutationEventContext {
+    pub event_type: String,
+    pub actor: serde_json::Value,
+    pub resource: serde_json::Value,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredFileMutationIntent {
+    id: String,
+    handle: WorkspaceHandle,
+    project_id: String,
+    mutation: FileMutation,
+    expected_revision: Option<RevisionRef>,
+    cause: String,
+    actor: serde_json::Value,
+    pre_manifest: ManifestRoot,
+    event: Option<FileMutationEventContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedFileMutation {
+    intent: StoredFileMutationIntent,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppliedFileMutation {
+    pub intent_id: String,
+    pub manifest_root_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredFileMutation {
+    pub intent_id: String,
+    pub revision: RevisionRef,
+    pub event: FileMutationEventContext,
+}
+
+impl PreparedFileMutation {
+    pub fn intent_id(&self) -> &str {
+        &self.intent.id
+    }
 }
 
 impl PropagationBaseline {
@@ -182,6 +267,18 @@ impl PropagationBaseline {
 }
 
 static HEAD_MANIFESTS: OnceLock<Mutex<HashMap<String, ManifestRoot>>> = OnceLock::new();
+static WORKSPACE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+/// Exclusive in-process ownership of one project's Main and Session copies.
+///
+/// The durable revision precondition remains authoritative across processes;
+/// this guard closes the local race between filesystem transfer and its
+/// revision transaction.
+pub struct WorkspaceMutationGuard {
+    project_id: String,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
 
 const SESSION_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -208,8 +305,22 @@ fn cache_head_manifest(head: &str, manifest: &ManifestRoot) {
     }
 }
 
+fn workspace_lock(data_root: &Path, project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let key = format!("{}:{project_id}", data_root.to_string_lossy());
+    let locks = WORKSPACE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
 /// Agent / tool file mutation against a Session (or, later, any) copy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FileMutation {
     /// Create or overwrite a file with the given bytes.
     Write { path: String, content: Vec<u8> },
@@ -222,6 +333,15 @@ pub enum FileMutation {
     DeleteTree { path: String },
     /// Rename a file or directory inside one workspace copy.
     Move { from: String, to: String },
+}
+
+pub struct FileMutationRequest<'a> {
+    pub handle: &'a WorkspaceHandle,
+    pub mutation: FileMutation,
+    pub expected: Option<&'a RevisionRef>,
+    pub cause: &'a str,
+    pub actor: serde_json::Value,
+    pub event: Option<FileMutationEventContext>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -260,8 +380,35 @@ impl WorkspaceInterface {
         }
     }
 
-    pub fn data_root(&self) -> &Path {
-        &self.data_root
+    /// Acquire the exclusive project lock used by filesystem mutations and
+    /// propagation. Callers that also write a related projection can hold it
+    /// across their Unit of Work transaction.
+    pub async fn acquire_mutation_lock(
+        &self,
+        handle: &WorkspaceHandle,
+    ) -> Result<WorkspaceMutationGuard, WorkspaceError> {
+        let project_id: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
+                .bind(handle.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        let project_id = project_id.ok_or(WorkspaceError::NotFound)?;
+        Ok(self.lock_project(&project_id).await)
+    }
+
+    pub async fn acquire_project_mutation_lock(
+        &self,
+        project_id: impl Display,
+    ) -> Result<WorkspaceMutationGuard, WorkspaceError> {
+        Ok(self.lock_project(&project_id.to_string()).await)
+    }
+
+    async fn lock_project(&self, project_id: &str) -> WorkspaceMutationGuard {
+        let lock = workspace_lock(&self.data_root, project_id);
+        WorkspaceMutationGuard {
+            project_id: project_id.to_owned(),
+            _guard: lock.lock_owned().await,
+        }
     }
 
     pub fn session_repo_path(&self, session_id: impl Display) -> PathBuf {
@@ -284,6 +431,7 @@ impl WorkspaceInterface {
         raw_path: &str,
     ) -> Result<FileMetaView, WorkspaceError> {
         let rel = validate_workspace_path(raw_path)?;
+        let _lock = self.acquire_mutation_lock(handle).await?;
         let abs = self.workspace_root(handle).await?.join(&rel);
         let meta = tokio::fs::metadata(&abs)
             .await
@@ -308,6 +456,7 @@ impl WorkspaceInterface {
         raw_path: &str,
     ) -> Result<Vec<u8>, WorkspaceError> {
         let rel = validate_workspace_path(raw_path)?;
+        let _lock = self.acquire_mutation_lock(handle).await?;
         let abs = self.workspace_root(handle).await?.join(rel);
         tokio::fs::read(&abs)
             .await
@@ -324,6 +473,7 @@ impl WorkspaceInterface {
         } else {
             validate_workspace_path(raw_path)?
         };
+        let _lock = self.acquire_mutation_lock(handle).await?;
         let abs = self.workspace_root(handle).await?.join(&rel);
         let mut entries = tokio::fs::read_dir(&abs)
             .await
@@ -368,6 +518,8 @@ impl WorkspaceInterface {
         cause: &str,
         actor: serde_json::Value,
     ) -> Result<RevisionRef, WorkspaceError> {
+        let project_id = project_id.to_string();
+        let _lock = self.lock_project(&project_id).await;
         let handle = WorkspaceHandle::main(&project_id);
         let now = now_utc_str();
 
@@ -393,7 +545,7 @@ impl WorkspaceInterface {
              VALUES (?, ?, NULL, 'main', ?, ?, 0, 0, ?, ?, ?)",
         )
         .bind(handle.as_str())
-        .bind(project_id.to_string())
+        .bind(&project_id)
         .bind(managed_dir)
         .bind(revision_ref.0.clone())
         .bind(&copy_version)
@@ -481,18 +633,6 @@ impl WorkspaceInterface {
             .await
     }
 
-    pub async fn bump_revision_in_tx(
-        &self,
-        tx: &mut SqliteConnection,
-        handle: &WorkspaceHandle,
-        expected: Option<&RevisionRef>,
-        cause: &str,
-        actor: serde_json::Value,
-    ) -> Result<RevisionRef, WorkspaceError> {
-        self.advance_revision_in_tx(tx, handle, expected, cause, actor, None)
-            .await
-    }
-
     /// Create a Session workspace copy from Project Main.
     ///
     /// Idempotent: if the Session handle already exists, returns the existing
@@ -507,6 +647,8 @@ impl WorkspaceInterface {
         source_main_revision: Option<&RevisionRef>,
         actor: serde_json::Value,
     ) -> Result<SessionCopyResult, WorkspaceError> {
+        let project_id = project_id.to_string();
+        let _lock = self.lock_project(&project_id).await;
         let session_id = session_id.to_string();
         let handle = WorkspaceHandle::session(&session_id);
         let existing: Option<ExistingSessionCopy> = sqlx::query_as(
@@ -692,14 +834,102 @@ impl WorkspaceInterface {
         })
     }
 
-    /// Apply a file mutation to a Session copy, then full-rescan the Merkle
-    /// tree and bump the Content Revision.
-    ///
-    /// ABA: even if content returns to a previous root hash, a new
-    /// `revision_id` is always allocated (monotonic identity).
-    ///
-    /// The current implementation uses a full rescan after every mutation;
-    /// incremental ancestor rehashing is an internal optimization left for later.
+    /// Remove Session worktree directories that were created before their
+    /// `workspace_copies` row committed. The directory is Workspace-owned, so
+    /// an absent registration is sufficient evidence that it is recoverable
+    /// startup debris rather than a user-managed path.
+    pub async fn recover_orphan_session_worktrees(&self) -> Result<usize, WorkspaceError> {
+        let registered: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT session_id FROM workspace_copies \
+             WHERE kind = 'session' AND session_id IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect();
+        let sessions_root = self.data_root.join("workspaces").join("sessions");
+        let mut entries = match tokio::fs::read_dir(&sessions_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(WorkspaceError::Internal(error.into())),
+        };
+        let mut removed = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| WorkspaceError::Internal(error.into()))?
+        {
+            if !entry
+                .file_type()
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            if registered.contains(&session_id) {
+                continue;
+            }
+            let data_root = self.data_root.clone();
+            tokio::task::spawn_blocking(move || remove_session_tree(&data_root, &session_id))
+                .await
+                .map_err(|error| WorkspaceError::Internal(anyhow!(error.to_string())))?
+                .map_err(WorkspaceError::Internal)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Remove Main clone directories that exist without a registered Main copy.
+    /// This covers a crash after `git clone` and before the first Workspace
+    /// revision transaction commits.
+    pub async fn recover_orphan_main_worktrees(&self) -> Result<usize, WorkspaceError> {
+        let registered: BTreeSet<String> =
+            sqlx::query_scalar("SELECT managed_dir FROM workspace_copies WHERE kind = 'main'")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .filter_map(|managed_dir: String| {
+                    Path::new(&managed_dir)
+                        .parent()
+                        .and_then(Path::file_name)
+                        .map(|name| name.to_string_lossy().to_string())
+                })
+                .collect();
+        let main_root = self.data_root.join("workspaces").join("main");
+        let mut entries = match tokio::fs::read_dir(&main_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(WorkspaceError::Internal(error.into())),
+        };
+        let mut removed = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| WorkspaceError::Internal(error.into()))?
+        {
+            if !entry
+                .file_type()
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let project_id = entry.file_name().to_string_lossy().to_string();
+            if registered.contains(&project_id) {
+                continue;
+            }
+            tokio::fs::remove_dir_all(entry.path())
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Apply one filesystem mutation through its durable journal.
     pub async fn apply_file_mutation(
         &self,
         handle: &WorkspaceHandle,
@@ -708,117 +938,426 @@ impl WorkspaceInterface {
         cause: &str,
         actor: serde_json::Value,
     ) -> Result<RevisionRef, WorkspaceError> {
-        let managed_dir = self.managed_dir_for(handle).await?;
-        let root = self.data_root.join(&managed_dir);
+        let lock = self.acquire_mutation_lock(handle).await?;
+        let prepared = self
+            .prepare_file_mutation(
+                &lock,
+                FileMutationRequest {
+                    handle,
+                    mutation,
+                    expected,
+                    cause,
+                    actor,
+                    event: None,
+                },
+            )
+            .await?;
+        let applied = self.apply_prepared_file_mutation(&lock, &prepared).await?;
+        let mut tx = self.pool.begin().await?;
+        let revision = self
+            .finalize_file_mutation_in_tx(&lock, &mut tx, &prepared, &applied)
+            .await?;
+        tx.commit().await?;
+        Ok(revision)
+    }
 
-        match &mutation {
-            FileMutation::Write { path, content } => {
-                let rel = validate_workspace_path(path)?;
-                if is_git_path(&rel) {
-                    return Err(WorkspaceError::InvalidPath(PathError::Invalid));
-                }
-                let abs = root.join(&rel);
-                if let Some(parent) = abs.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| WorkspaceError::Internal(anyhow!("mkdir: {e}")))?;
-                }
-                atomic_write(&abs, content).await?;
-            }
-            FileMutation::Patch { path, content } => {
-                let rel = validate_workspace_path(path)?;
-                if is_git_path(&rel) {
-                    return Err(WorkspaceError::InvalidPath(PathError::Invalid));
-                }
-                let abs = root.join(&rel);
-                if !abs.is_file() {
-                    return Err(WorkspaceError::PathNotFound(path.clone()));
-                }
-                atomic_write(&abs, content).await?;
-            }
-            FileMutation::Delete { path } => {
-                let rel = validate_workspace_path(path)?;
-                if is_git_path(&rel) {
-                    return Err(WorkspaceError::InvalidPath(PathError::Invalid));
-                }
-                let abs = root.join(&rel);
-                if abs.is_file() {
-                    tokio::fs::remove_file(&abs)
-                        .await
-                        .map_err(|e| WorkspaceError::Internal(anyhow!("remove file: {e}")))?;
-                } else if abs.is_dir() {
-                    // Only empty dirs (non-recursive by default).
-                    tokio::fs::remove_dir(&abs)
-                        .await
-                        .map_err(|e| WorkspaceError::Internal(anyhow!("remove dir: {e}")))?;
-                } else {
-                    return Err(WorkspaceError::PathNotFound(path.clone()));
-                }
-            }
-            FileMutation::DeleteTree { path } => {
-                let rel = validate_workspace_path(path)?;
-                if is_git_path(&rel) {
-                    return Err(WorkspaceError::InvalidPath(PathError::Invalid));
-                }
-                let abs = root.join(&rel);
-                if abs.is_dir() {
-                    tokio::fs::remove_dir_all(&abs)
-                        .await
-                        .map_err(|e| WorkspaceError::Internal(anyhow!("remove tree: {e}")))?;
-                } else if abs.is_file() {
-                    tokio::fs::remove_file(&abs)
-                        .await
-                        .map_err(|e| WorkspaceError::Internal(anyhow!("remove file: {e}")))?;
-                } else {
-                    return Err(WorkspaceError::PathNotFound(path.clone()));
-                }
-            }
-            FileMutation::Move { from, to } => {
-                let from_rel = validate_workspace_path(from)?;
-                let to_rel = validate_workspace_path(to)?;
-                if is_git_path(&from_rel) || is_git_path(&to_rel) {
-                    return Err(WorkspaceError::InvalidPath(PathError::Invalid));
-                }
-                let source = root.join(&from_rel);
-                let target = root.join(&to_rel);
-                if !source.exists() {
-                    return Err(WorkspaceError::PathNotFound(from.clone()));
-                }
-                if let Some(parent) = target.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| WorkspaceError::Internal(anyhow!("mkdir: {e}")))?;
-                }
-                tokio::fs::rename(&source, &target)
-                    .await
-                    .map_err(|e| WorkspaceError::Internal(anyhow!("move: {e}")))?;
+    /// Commit a pending filesystem mutation intent before running its effect.
+    pub async fn prepare_file_mutation(
+        &self,
+        lock: &WorkspaceMutationGuard,
+        request: FileMutationRequest<'_>,
+    ) -> Result<PreparedFileMutation, WorkspaceError> {
+        self.assert_guard_handle(lock, request.handle).await?;
+        let managed_dir = self.managed_dir_for(request.handle).await?;
+        let root = self.data_root.join(&managed_dir);
+        validate_file_mutation(&root, &request.mutation).await?;
+        let pre_manifest = hash_working_tree(&root)
+            .await
+            .map_err(WorkspaceError::Internal)?;
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM workspace_mutation_intents \
+             WHERE workspace_handle = ? AND state IN ('pending', 'applied', 'awaiting_event') \
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(request.handle.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(existing) = existing {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "workspace mutation {existing} requires reconciliation"
+            )));
+        }
+        let intent = StoredFileMutationIntent {
+            id: format!("mutation_{}", Uuid::now_v7()),
+            handle: request.handle.clone(),
+            project_id: lock.project_id.clone(),
+            mutation: request.mutation,
+            expected_revision: request.expected.cloned(),
+            cause: request.cause.to_owned(),
+            actor: request.actor,
+            pre_manifest,
+            event: request.event,
+        };
+        let now = now_utc_str();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.check_expected_revision_in_tx(
+            &mut tx,
+            &intent.handle,
+            intent.expected_revision.as_ref(),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO workspace_mutation_intents \
+             (id, workspace_handle, project_id, mutation_json, expected_revision_id, cause, \
+              actor_json, pre_manifest_json, event_json, state, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+        )
+        .bind(&intent.id)
+        .bind(intent.handle.as_str())
+        .bind(&intent.project_id)
+        .bind(serde_json::to_string(&intent.mutation)?)
+        .bind(
+            intent
+                .expected_revision
+                .as_ref()
+                .map(|revision| &revision.0),
+        )
+        .bind(&intent.cause)
+        .bind(serde_json::to_string(&intent.actor)?)
+        .bind(serde_json::to_string(&intent.pre_manifest)?)
+        .bind(
+            intent
+                .event
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(PreparedFileMutation { intent })
+    }
+
+    /// Run a prepared filesystem effect outside any database write transaction.
+    pub async fn apply_prepared_file_mutation(
+        &self,
+        lock: &WorkspaceMutationGuard,
+        prepared: &PreparedFileMutation,
+    ) -> Result<AppliedFileMutation, WorkspaceError> {
+        self.assert_guard_handle(lock, &prepared.intent.handle)
+            .await?;
+        let managed_dir = self.managed_dir_for(&prepared.intent.handle).await?;
+        let root = self.data_root.join(&managed_dir);
+        apply_file_mutation_fs(&root, &prepared.intent.mutation).await?;
+        let manifest = hash_working_tree(&root)
+            .await
+            .map_err(WorkspaceError::Internal)?;
+        let changed = sqlx::query(
+            "UPDATE workspace_mutation_intents SET state = 'applied', \
+             observed_manifest_root_hash = ?, updated_at = ? \
+             WHERE id = ? AND state = 'pending'",
+        )
+        .bind(&manifest.root_hash)
+        .bind(now_utc_str())
+        .bind(&prepared.intent.id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "workspace mutation {} is no longer pending",
+                prepared.intent.id
+            )));
+        }
+        Ok(AppliedFileMutation {
+            intent_id: prepared.intent.id.clone(),
+            manifest_root_hash: manifest.root_hash,
+        })
+    }
+
+    /// Finalize revision identity and caller-owned events in one short transaction.
+    pub async fn finalize_file_mutation_in_tx(
+        &self,
+        lock: &WorkspaceMutationGuard,
+        tx: &mut SqliteConnection,
+        prepared: &PreparedFileMutation,
+        applied: &AppliedFileMutation,
+    ) -> Result<RevisionRef, WorkspaceError> {
+        self.assert_guard_handle_in_tx(lock, tx, &prepared.intent.handle)
+            .await?;
+        if prepared.intent.id != applied.intent_id {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "workspace mutation intent mismatch"
+            )));
+        }
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
+                .bind(&prepared.intent.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if !matches!(state.as_deref(), Some("applied")) {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "workspace mutation {} is not applied",
+                prepared.intent.id
+            )));
+        }
+        let revision = self
+            .advance_revision_in_tx(
+                tx,
+                &prepared.intent.handle,
+                prepared.intent.expected_revision.as_ref(),
+                &prepared.intent.cause,
+                prepared.intent.actor.clone(),
+                Some((&applied.manifest_root_hash, "tool_write")),
+            )
+            .await?;
+        let state = if prepared.intent.event.is_some() {
+            "awaiting_event"
+        } else {
+            "completed"
+        };
+        sqlx::query(
+            "UPDATE workspace_mutation_intents SET state = ?, revision_id = ?, updated_at = ? \
+             WHERE id = ? AND state = 'applied'",
+        )
+        .bind(state)
+        .bind(&revision.0)
+        .bind(now_utc_str())
+        .bind(&prepared.intent.id)
+        .execute(&mut *tx)
+        .await?;
+        Ok(revision)
+    }
+
+    pub async fn acknowledge_file_mutation_event_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        intent_id: &str,
+        revision: &RevisionRef,
+    ) -> Result<(), WorkspaceError> {
+        let changed = sqlx::query(
+            "UPDATE workspace_mutation_intents SET state = 'completed', updated_at = ? \
+             WHERE id = ? AND state = 'awaiting_event' AND revision_id = ?",
+        )
+        .bind(now_utc_str())
+        .bind(intent_id)
+        .bind(&revision.0)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "workspace mutation event acknowledgement lost for {intent_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reconcile effects left by a process restart. Main editor events are
+    /// returned to the application seam after the revision transaction commits.
+    pub async fn recover_uncertain_file_mutations(
+        &self,
+    ) -> Result<Vec<RecoveredFileMutation>, WorkspaceError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM workspace_mutation_intents \
+             WHERE state IN ('pending', 'applied', 'awaiting_event') \
+             ORDER BY updated_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut recovered = Vec::new();
+        for id in rows {
+            let intent = self.load_file_mutation_intent(&id).await?;
+            let lock = self.lock_project(&intent.project_id).await;
+            if let Some(event) = self.reconcile_file_mutation_locked(&lock, &intent).await? {
+                recovered.push(event);
             }
         }
+        Ok(recovered)
+    }
 
-        // The filesystem mutation happens before the short revision transaction.
-        // Reuse the persisted propagation baseline and rehash only Git-changed
-        // paths for Session writes. If the expected revision loses a race,
-        // bytes stay on disk but the identity does not advance.
-        let manifest = if let Some(session_id) = handle.as_str().strip_prefix("session:") {
-            let baseline = self.ensure_propagation_base(session_id, &root).await?;
-            let previous = baseline.manifest();
-            refresh_manifest(&root, &previous, baseline.session_head.as_deref())
-                .await?
-                .0
-        } else {
-            hash_working_tree(&root)
-                .await
-                .map_err(WorkspaceError::Internal)?
+    async fn reconcile_file_mutation_locked(
+        &self,
+        lock: &WorkspaceMutationGuard,
+        intent: &StoredFileMutationIntent,
+    ) -> Result<Option<RecoveredFileMutation>, WorkspaceError> {
+        let state = self.intent_state(&intent.id).await?;
+        if state.as_deref() == Some("awaiting_event") {
+            let revision = self.intent_revision(&intent.id).await?.ok_or_else(|| {
+                WorkspaceError::Internal(anyhow!("mutation {} has no revision", intent.id))
+            })?;
+            return Ok(intent.event.clone().map(|event| RecoveredFileMutation {
+                intent_id: intent.id.clone(),
+                revision: RevisionRef(revision),
+                event,
+            }));
+        }
+        self.assert_guard_handle(lock, &intent.handle).await?;
+        let managed_dir = self.managed_dir_for(&intent.handle).await?;
+        let root = self.data_root.join(&managed_dir);
+        let current = hash_working_tree(&root)
+            .await
+            .map_err(WorkspaceError::Internal)?;
+        let scope = mutation_scope(&intent.pre_manifest, &intent.mutation);
+        let expected_post = expected_post_manifest(&intent.pre_manifest, &intent.mutation)?;
+        if !manifests_match_scope(&current, &expected_post, &scope) {
+            if manifests_match_scope(&current, &intent.pre_manifest, &scope) {
+                apply_file_mutation_fs(&root, &intent.mutation).await?;
+            } else {
+                self.mark_file_mutation_attention(&intent.id, "workspace changed during recovery")
+                    .await?;
+                return Err(WorkspaceError::Internal(anyhow!(
+                    "workspace mutation {} needs attention",
+                    intent.id
+                )));
+            }
+        }
+        let observed = hash_working_tree(&root)
+            .await
+            .map_err(WorkspaceError::Internal)?;
+        let prepared = PreparedFileMutation {
+            intent: intent.clone(),
         };
-        self.advance_revision(
-            handle,
-            expected,
-            cause,
-            actor,
-            Some(manifest.root_hash.as_str()),
-            Some("tool_write"),
+        let applied = AppliedFileMutation {
+            intent_id: intent.id.clone(),
+            manifest_root_hash: observed.root_hash,
+        };
+        sqlx::query(
+            "UPDATE workspace_mutation_intents SET state = 'applied', \
+             observed_manifest_root_hash = ?, updated_at = ? \
+             WHERE id = ? AND state IN ('pending', 'applied')",
         )
-        .await
+        .bind(&applied.manifest_root_hash)
+        .bind(now_utc_str())
+        .bind(&intent.id)
+        .execute(&self.pool)
+        .await?;
+        let mut tx = self.pool.begin().await?;
+        let revision = self
+            .finalize_file_mutation_in_tx(lock, &mut tx, &prepared, &applied)
+            .await?;
+        tx.commit().await?;
+        Ok(intent.event.clone().map(|event| RecoveredFileMutation {
+            intent_id: intent.id.clone(),
+            revision,
+            event,
+        }))
+    }
+
+    async fn load_file_mutation_intent(
+        &self,
+        id: &str,
+    ) -> Result<StoredFileMutationIntent, WorkspaceError> {
+        let row: Option<StoredFileMutationIntentRow> = sqlx::query_as(
+            "SELECT id, workspace_handle, project_id, mutation_json, expected_revision_id, \
+             cause, actor_json, pre_manifest_json, event_json \
+             FROM workspace_mutation_intents WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((
+            id,
+            handle,
+            project_id,
+            mutation_json,
+            expected_revision_id,
+            cause,
+            actor_json,
+            pre_manifest_json,
+            event_json,
+        )) = row
+        else {
+            return Err(WorkspaceError::NotFound);
+        };
+        Ok(StoredFileMutationIntent {
+            id,
+            handle: WorkspaceHandle(handle),
+            project_id,
+            mutation: serde_json::from_str(&mutation_json)?,
+            expected_revision: expected_revision_id.map(RevisionRef),
+            cause,
+            actor: serde_json::from_str(&actor_json)?,
+            pre_manifest: serde_json::from_str(&pre_manifest_json)?,
+            event: event_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?,
+        })
+    }
+
+    async fn intent_state(&self, id: &str) -> Result<Option<String>, WorkspaceError> {
+        Ok(
+            sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn intent_revision(&self, id: &str) -> Result<Option<String>, WorkspaceError> {
+        Ok(
+            sqlx::query_scalar("SELECT revision_id FROM workspace_mutation_intents WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn mark_file_mutation_attention(
+        &self,
+        id: &str,
+        error: &str,
+    ) -> Result<(), WorkspaceError> {
+        sqlx::query(
+            "UPDATE workspace_mutation_intents SET state = 'needs_attention', error = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(error)
+        .bind(now_utc_str())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn assert_guard_handle(
+        &self,
+        lock: &WorkspaceMutationGuard,
+        handle: &WorkspaceHandle,
+    ) -> Result<(), WorkspaceError> {
+        let project_id: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
+                .bind(handle.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        if project_id.as_deref() != Some(lock.project_id.as_str()) {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "mutation guard does not own workspace handle {}",
+                handle.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn assert_guard_handle_in_tx(
+        &self,
+        lock: &WorkspaceMutationGuard,
+        tx: &mut SqliteConnection,
+        handle: &WorkspaceHandle,
+    ) -> Result<(), WorkspaceError> {
+        let project_id: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
+                .bind(handle.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if project_id.as_deref() != Some(lock.project_id.as_str()) {
+            return Err(WorkspaceError::Internal(anyhow!(
+                "mutation guard does not own workspace handle {}",
+                handle.as_str()
+            )));
+        }
+        Ok(())
     }
 
     /// Full Merkle scan of a workspace copy. Used by Diff and tests.
@@ -826,6 +1365,7 @@ impl WorkspaceInterface {
         &self,
         handle: &WorkspaceHandle,
     ) -> Result<ManifestRoot, WorkspaceError> {
+        let _lock = self.acquire_mutation_lock(handle).await?;
         let managed_dir = self.managed_dir_for(handle).await?;
         let root = self.data_root.join(&managed_dir);
         walk_manifest(&root, &self.blobs, handle.as_str())
@@ -840,6 +1380,12 @@ impl WorkspaceInterface {
     ) -> Result<DiffSummary, WorkspaceError> {
         let session_id = session_id.to_string();
         let roots = self.copy_roots(&session_id).await?;
+        let _lock = self.lock_project(&roots.project_id).await;
+        if let Some(intent_json) = self.pending_propagation_intent(&session_id).await? {
+            let _ = self
+                .recover_propagation_locked(&session_id, &roots, &intent_json)
+                .await?;
+        }
         let baseline = self
             .ensure_propagation_base(&session_id, &roots.session_dir)
             .await?;
@@ -872,6 +1418,14 @@ impl WorkspaceInterface {
     ) -> Result<PropagationResult, PropagationError> {
         let session_id = session_id.to_string();
         let roots = self.copy_roots(&session_id).await?;
+        let _lock = self.lock_project(&roots.project_id).await;
+        if let Some(intent_json) = self.pending_propagation_intent(&session_id).await?
+            && let Some(conflict) = self
+                .recover_propagation_locked(&session_id, &roots, &intent_json)
+                .await?
+        {
+            return Err(PropagationError::Conflict(conflict));
+        }
         let baseline = self
             .ensure_propagation_base(&session_id, &roots.session_dir)
             .await?;
@@ -982,6 +1536,38 @@ impl WorkspaceInterface {
             return Err(PropagationError::Conflict(conflict));
         }
 
+        let transfer_path_list = transfer_paths.iter().cloned().collect::<Vec<_>>();
+        let source_manifest = match direction {
+            PropagationDirection::Sync => &main,
+            PropagationDirection::Apply => &session,
+        };
+        let target_manifest = match direction {
+            PropagationDirection::Sync => &session,
+            PropagationDirection::Apply => &main,
+        };
+        let source_preimage = transfer_path_list
+            .iter()
+            .map(|path| (path.clone(), source_manifest.nodes.get(path).cloned()))
+            .collect();
+        let target_preimage = transfer_path_list
+            .iter()
+            .map(|path| (path.clone(), target_manifest.nodes.get(path).cloned()))
+            .collect();
+        self.store_propagation_intent(
+            &session_id,
+            &PropagationIntent {
+                direction,
+                actor: actor.clone(),
+                baseline: baseline.clone(),
+                main_head: main_head.clone(),
+                session_head: session_head.clone(),
+                paths: transfer_path_list.clone(),
+                source_preimage,
+                target_preimage,
+            },
+        )
+        .await?;
+
         if !transfer_paths.is_empty() {
             let source = match direction {
                 PropagationDirection::Sync => roots.main_dir.clone(),
@@ -991,9 +1577,9 @@ impl WorkspaceInterface {
                 PropagationDirection::Sync => roots.session_dir.clone(),
                 PropagationDirection::Apply => roots.main_dir.clone(),
             };
-            let transfer_path_list = transfer_paths.iter().cloned().collect::<Vec<_>>();
+            let transfer_paths_for_copy = transfer_path_list.clone();
             tokio::task::spawn_blocking(move || {
-                propagate_paths(&source, &target, &transfer_path_list)
+                propagate_paths(&source, &target, &transfer_paths_for_copy)
             })
             .await
             .map_err(|error| WorkspaceError::Internal(anyhow!(error.to_string())))?
@@ -1023,37 +1609,18 @@ impl WorkspaceInterface {
             merge_propagation_baseline(&previous_manifest, &main_after, &session_after);
         let next_baseline =
             PropagationBaseline::from_manifest(next_manifest, Some(main_head), Some(session_head));
-        self.store_propagation_baseline(&session_id, &next_baseline)
+        let (session_revision, main_revision) = self
+            .finalize_propagation(PropagationFinalizeRequest {
+                session_id: &session_id,
+                roots: &roots,
+                direction,
+                next_baseline: &next_baseline,
+                session_after: &session_after,
+                main_after: &main_after,
+                actor: &actor,
+                transfer_paths: &transfer_path_list,
+            })
             .await?;
-
-        let (session_revision, main_revision) = if transfer_paths.is_empty() {
-            (
-                self.current_revision(&roots.session_handle).await?,
-                self.current_revision(&roots.main_handle).await?,
-            )
-        } else {
-            let session_revision = self
-                .record_manifest_revision(
-                    &roots.session_handle,
-                    &session_after.root_hash,
-                    "workspace.propagation",
-                    actor.clone(),
-                )
-                .await?;
-            let main_revision = self
-                .record_manifest_revision(
-                    &roots.main_handle,
-                    &main_after.root_hash,
-                    "workspace.propagation",
-                    actor,
-                )
-                .await?;
-            (session_revision, main_revision)
-        };
-
-        self.update_propagation_cursor(&session_id, direction, &session_revision, &main_revision)
-            .await?;
-        self.clear_pending_conflict(&session_id).await?;
 
         Ok(PropagationResult {
             direction,
@@ -1061,6 +1628,281 @@ impl WorkspaceInterface {
             session_revision: session_revision.0,
             main_revision: main_revision.0,
         })
+    }
+
+    /// Replay propagation intents that were durably recorded before a process
+    /// restart. Copying the same paths is idempotent; finalization reuses an
+    /// existing revision with the same manifest root instead of allocating a
+    /// second identity.
+    pub async fn recover_uncertain_propagations(&self) -> Result<usize, WorkspaceError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT session_id, recovery_intent_json FROM propagation_links \
+             WHERE recovery_state = 'transferring' AND recovery_intent_json IS NOT NULL \
+             ORDER BY updated_at, session_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (session_id, intent_json) in &rows {
+            let roots = self.copy_roots(session_id).await?;
+            let _lock = self.lock_project(&roots.project_id).await;
+            let _ = self
+                .recover_propagation_locked(session_id, &roots, intent_json)
+                .await?;
+        }
+        Ok(rows.len())
+    }
+
+    async fn pending_propagation_intent(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, WorkspaceError> {
+        sqlx::query_scalar(
+            "SELECT recovery_intent_json FROM propagation_links \
+             WHERE session_id = ? AND recovery_state = 'transferring'",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(WorkspaceError::Storage)
+    }
+
+    async fn store_propagation_intent(
+        &self,
+        session_id: &str,
+        intent: &PropagationIntent,
+    ) -> Result<(), WorkspaceError> {
+        let now = now_utc_str();
+        let intent_json = serde_json::to_string(intent)?;
+        let result = sqlx::query(
+            "UPDATE propagation_links SET recovery_state = 'transferring', \
+             recovery_intent_json = ?, recovery_error = NULL, version = ?, updated_at = ? \
+             WHERE session_id = ?",
+        )
+        .bind(intent_json)
+        .bind(format!("v_{}", Uuid::now_v7()))
+        .bind(now)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(WorkspaceError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn clear_propagation_intent(&self, session_id: &str) -> Result<(), WorkspaceError> {
+        let result = sqlx::query(
+            "UPDATE propagation_links SET recovery_state = 'idle', \
+             recovery_intent_json = NULL, recovery_error = NULL, version = ?, updated_at = ? \
+             WHERE session_id = ?",
+        )
+        .bind(format!("v_{}", Uuid::now_v7()))
+        .bind(now_utc_str())
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(WorkspaceError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn clear_propagation_intent_with_error(
+        &self,
+        session_id: &str,
+        error: &str,
+    ) -> Result<(), WorkspaceError> {
+        let result = sqlx::query(
+            "UPDATE propagation_links SET recovery_state = 'idle', \
+             recovery_intent_json = NULL, recovery_error = ?, version = ?, updated_at = ? \
+             WHERE session_id = ?",
+        )
+        .bind(error)
+        .bind(format!("v_{}", Uuid::now_v7()))
+        .bind(now_utc_str())
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(WorkspaceError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn mark_propagation_recovery_error(
+        &self,
+        session_id: &str,
+        error: &str,
+    ) -> Result<(), WorkspaceError> {
+        let result = sqlx::query(
+            "UPDATE propagation_links SET recovery_error = ?, version = ?, updated_at = ? \
+             WHERE session_id = ? AND recovery_state = 'transferring'",
+        )
+        .bind(error)
+        .bind(format!("v_{}", Uuid::now_v7()))
+        .bind(now_utc_str())
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(WorkspaceError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn recover_propagation_locked(
+        &self,
+        session_id: &str,
+        roots: &CopyRoots,
+        intent_json: &str,
+    ) -> Result<Option<PropagationConflict>, WorkspaceError> {
+        let intent: PropagationIntent = serde_json::from_str(intent_json)?;
+        let (main_current, session_current) = tokio::join!(
+            hash_working_tree(&roots.main_dir),
+            hash_working_tree(&roots.session_dir),
+        );
+        let main_current = main_current.map_err(WorkspaceError::Internal)?;
+        let session_current = session_current.map_err(WorkspaceError::Internal)?;
+        if intent.paths.len() != intent.source_preimage.len()
+            || intent.paths.len() != intent.target_preimage.len()
+        {
+            self.mark_propagation_recovery_error(
+                session_id,
+                "propagation intent has no complete source/target preimage",
+            )
+            .await?;
+            return Err(WorkspaceError::Internal(anyhow!(
+                "propagation intent for {session_id} needs attention"
+            )));
+        }
+        let source_current = match intent.direction {
+            PropagationDirection::Sync => &main_current,
+            PropagationDirection::Apply => &session_current,
+        };
+        let target_current = match intent.direction {
+            PropagationDirection::Sync => &session_current,
+            PropagationDirection::Apply => &main_current,
+        };
+        let changed_paths = intent
+            .paths
+            .iter()
+            .filter(|path| {
+                !same_node(
+                    source_current.nodes.get(*path),
+                    intent.source_preimage.get(*path).and_then(Option::as_ref),
+                ) || !same_node(
+                    target_current.nodes.get(*path),
+                    intent.target_preimage.get(*path).and_then(Option::as_ref),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !changed_paths.is_empty() {
+            let conflict = PropagationConflict {
+                direction: intent.direction,
+                paths: changed_paths
+                    .iter()
+                    .map(|path| {
+                        conflict_path(
+                            path,
+                            intent.baseline.nodes.get(path),
+                            main_current.nodes.get(path),
+                            session_current.nodes.get(path),
+                        )
+                    })
+                    .collect(),
+            };
+            self.store_pending_conflict(session_id, roots, &conflict)
+                .await?;
+            self.clear_propagation_intent_with_error(
+                session_id,
+                "propagation recovery stopped because a source or target path changed",
+            )
+            .await?;
+            return Ok(Some(conflict));
+        }
+        let source = match intent.direction {
+            PropagationDirection::Sync => roots.main_dir.clone(),
+            PropagationDirection::Apply => roots.session_dir.clone(),
+        };
+        let target = match intent.direction {
+            PropagationDirection::Sync => roots.session_dir.clone(),
+            PropagationDirection::Apply => roots.main_dir.clone(),
+        };
+        if !intent.paths.is_empty() {
+            let paths = intent.paths.clone();
+            tokio::task::spawn_blocking(move || propagate_paths(&source, &target, &paths))
+                .await
+                .map_err(|error| WorkspaceError::Internal(anyhow!(error.to_string())))?
+                .map_err(WorkspaceError::Internal)?;
+        }
+        let (main_result, session_result) = tokio::join!(
+            hash_working_tree(&roots.main_dir),
+            hash_working_tree(&roots.session_dir),
+        );
+        let main_after = main_result.map_err(WorkspaceError::Internal)?;
+        let session_after = session_result.map_err(WorkspaceError::Internal)?;
+        let next_manifest =
+            merge_propagation_baseline(&intent.baseline.manifest(), &main_after, &session_after);
+        let next_baseline = PropagationBaseline::from_manifest(
+            next_manifest,
+            Some(intent.main_head),
+            Some(intent.session_head),
+        );
+        self.finalize_propagation(PropagationFinalizeRequest {
+            session_id,
+            roots,
+            direction: intent.direction,
+            next_baseline: &next_baseline,
+            session_after: &session_after,
+            main_after: &main_after,
+            actor: &intent.actor,
+            transfer_paths: &intent.paths,
+        })
+        .await?;
+        Ok(None)
+    }
+
+    async fn finalize_propagation(
+        &self,
+        request: PropagationFinalizeRequest<'_>,
+    ) -> Result<(RevisionRef, RevisionRef), WorkspaceError> {
+        self.store_propagation_baseline(request.session_id, request.next_baseline)
+            .await?;
+
+        let (session_revision, main_revision) = if request.transfer_paths.is_empty() {
+            (
+                self.current_revision(&request.roots.session_handle).await?,
+                self.current_revision(&request.roots.main_handle).await?,
+            )
+        } else {
+            let session_revision = self
+                .record_manifest_revision_if_needed(
+                    &request.roots.session_handle,
+                    &request.session_after.root_hash,
+                    request.actor.clone(),
+                )
+                .await?;
+            let main_revision = self
+                .record_manifest_revision_if_needed(
+                    &request.roots.main_handle,
+                    &request.main_after.root_hash,
+                    request.actor.clone(),
+                )
+                .await?;
+            (session_revision, main_revision)
+        };
+
+        self.update_propagation_cursor(
+            request.session_id,
+            request.direction,
+            &session_revision,
+            &main_revision,
+        )
+        .await?;
+        self.clear_pending_conflict(request.session_id).await?;
+        self.clear_propagation_intent(request.session_id).await?;
+        Ok((session_revision, main_revision))
     }
 
     async fn copy_roots(&self, session_id: &str) -> Result<CopyRoots, WorkspaceError> {
@@ -1078,7 +1920,8 @@ impl WorkspaceInterface {
         let (session_dir, main_dir, project_id) = row.ok_or(WorkspaceError::NotFound)?;
         Ok(CopyRoots {
             session_handle,
-            main_handle: WorkspaceHandle::main(project_id),
+            main_handle: WorkspaceHandle::main(&project_id),
+            project_id: project_id.clone(),
             session_dir: self.data_root.join(session_dir),
             main_dir: self.data_root.join(main_dir),
         })
@@ -1108,13 +1951,14 @@ impl WorkspaceInterface {
             .map_err(|error| WorkspaceError::Internal(error.into()))?
         {
             let source = session_dir.to_path_buf();
-            tokio::task::spawn_blocking(move || mirror_managed_tree(&source, &baseline_dir))
+            let destination = baseline_dir.clone();
+            tokio::task::spawn_blocking(move || mirror_managed_tree(&source, &destination))
                 .await
                 .map_err(|error| WorkspaceError::Internal(anyhow!(error.to_string())))?
                 .map_err(WorkspaceError::Internal)?;
         }
         let manifest = walk_manifest(
-            &propagation_base_abs(&self.data_root, session_id),
+            &baseline_dir,
             &self.blobs,
             &format!("workspace:propagation-base:{session_id}"),
         )
@@ -1303,6 +2147,26 @@ impl WorkspaceInterface {
         .await
     }
 
+    async fn record_manifest_revision_if_needed(
+        &self,
+        handle: &WorkspaceHandle,
+        manifest_root_hash: &str,
+        actor: serde_json::Value,
+    ) -> Result<RevisionRef, WorkspaceError> {
+        let current = self.current_revision(handle).await?;
+        let current_root: Option<String> = sqlx::query_scalar(
+            "SELECT manifest_root_hash FROM content_revisions WHERE revision_id = ?",
+        )
+        .bind(&current.0)
+        .fetch_one(&self.pool)
+        .await?;
+        if current_root.as_deref() == Some(manifest_root_hash) {
+            return Ok(current);
+        }
+        self.record_manifest_revision(handle, manifest_root_hash, "workspace.propagation", actor)
+            .await
+    }
+
     /// Cascade-delete a Session copy: directory tree + DB rows for that handle
     /// (workspace_copies cascades content_revisions/snapshots; links by session_id).
     /// Does **not** touch Main or Runtime.
@@ -1312,24 +2176,25 @@ impl WorkspaceInterface {
     ) -> Result<(), WorkspaceError> {
         let session_id = session_id.to_string();
         let handle = WorkspaceHandle::session(&session_id);
-        let exists: Option<String> =
-            sqlx::query_scalar("SELECT handle FROM workspace_copies WHERE handle = ?")
+        let project_id: Option<String> =
+            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
                 .bind(handle.as_str())
                 .fetch_optional(&self.pool)
                 .await?;
-        if exists.is_none() {
+        let Some(project_id) = project_id else {
             // Idempotent: already gone is success.
             self.cleanup_session_tree(&session_id).await;
             return Ok(());
-        }
+        };
+        let _lock = self.lock_project(&project_id).await;
 
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM workspace_propagation_conflicts WHERE session_id = ?")
-            .bind(session_id.to_string())
+            .bind(&session_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM propagation_links WHERE session_id = ?")
-            .bind(session_id.to_string())
+            .bind(&session_id)
             .execute(&mut *tx)
             .await?;
         // content_revisions / workspace_snapshots cascade from workspace_copies.
@@ -1399,6 +2264,32 @@ impl WorkspaceInterface {
             .await?;
         tx.commit().await?;
         Ok(revision)
+    }
+
+    async fn check_expected_revision_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        handle: &WorkspaceHandle,
+        expected: Option<&RevisionRef>,
+    ) -> Result<(), WorkspaceError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let current: Option<Option<String>> =
+            sqlx::query_scalar("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
+                .bind(handle.as_str())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current = current
+            .ok_or(WorkspaceError::NotFound)?
+            .ok_or_else(|| WorkspaceError::Internal(anyhow!("copy has no revision")))?;
+        if expected.0 != current {
+            return Err(WorkspaceError::RevisionMismatch {
+                expected: expected.0.clone(),
+                current,
+            });
+        }
+        Ok(())
     }
 
     async fn advance_revision_in_tx(
@@ -1481,6 +2372,285 @@ impl WorkspaceInterface {
         .await?;
         Ok(revision_ref)
     }
+}
+
+async fn validate_file_mutation(
+    root: &Path,
+    mutation: &FileMutation,
+) -> Result<(), WorkspaceError> {
+    match mutation {
+        FileMutation::Write { path, .. } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            if tokio::fs::try_exists(root.join(&rel))
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?
+                && tokio::fs::metadata(root.join(&rel))
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(error.into()))?
+                    .is_dir()
+            {
+                return Err(WorkspaceError::NotEditable(path.clone()));
+            }
+        }
+        FileMutation::Patch { path, .. } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            if !tokio::fs::metadata(root.join(&rel))
+                .await
+                .map_err(|_| WorkspaceError::PathNotFound(path.clone()))?
+                .is_file()
+            {
+                return Err(WorkspaceError::PathNotFound(path.clone()));
+            }
+        }
+        FileMutation::Delete { path } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            if !tokio::fs::try_exists(root.join(&rel))
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?
+            {
+                return Err(WorkspaceError::PathNotFound(path.clone()));
+            }
+        }
+        FileMutation::DeleteTree { path } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            if !tokio::fs::try_exists(root.join(&rel))
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?
+            {
+                return Err(WorkspaceError::PathNotFound(path.clone()));
+            }
+        }
+        FileMutation::Move { from, to } => {
+            let from_rel = validate_workspace_path(from)?;
+            let to_rel = validate_workspace_path(to)?;
+            reject_git_path(&from_rel)?;
+            reject_git_path(&to_rel)?;
+            if !tokio::fs::try_exists(root.join(&from_rel))
+                .await
+                .map_err(|error| WorkspaceError::Internal(error.into()))?
+            {
+                return Err(WorkspaceError::PathNotFound(from.clone()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_git_path(path: &Path) -> Result<(), WorkspaceError> {
+    if is_git_path(path) {
+        return Err(WorkspaceError::InvalidPath(PathError::Invalid));
+    }
+    Ok(())
+}
+
+async fn apply_file_mutation_fs(
+    root: &Path,
+    mutation: &FileMutation,
+) -> Result<(), WorkspaceError> {
+    match mutation {
+        FileMutation::Write { path, content } | FileMutation::Patch { path, content } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            let abs = root.join(&rel);
+            if matches!(mutation, FileMutation::Patch { .. }) && !abs.is_file() {
+                return Err(WorkspaceError::PathNotFound(path.clone()));
+            }
+            if let Some(parent) = abs.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(anyhow!("mkdir: {error}")))?;
+            }
+            atomic_write(&abs, content).await?;
+        }
+        FileMutation::Delete { path } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            let abs = root.join(&rel);
+            if abs.is_file() {
+                tokio::fs::remove_file(&abs)
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(anyhow!("remove file: {error}")))?;
+            } else if abs.is_dir() {
+                tokio::fs::remove_dir(&abs)
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(anyhow!("remove dir: {error}")))?;
+            } else {
+                return Err(WorkspaceError::PathNotFound(path.clone()));
+            }
+        }
+        FileMutation::DeleteTree { path } => {
+            let rel = validate_workspace_path(path)?;
+            reject_git_path(&rel)?;
+            let abs = root.join(&rel);
+            if abs.is_dir() {
+                tokio::fs::remove_dir_all(&abs)
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(anyhow!("remove tree: {error}")))?;
+            } else if abs.is_file() {
+                tokio::fs::remove_file(&abs)
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(anyhow!("remove file: {error}")))?;
+            } else {
+                return Err(WorkspaceError::PathNotFound(path.clone()));
+            }
+        }
+        FileMutation::Move { from, to } => {
+            let from_rel = validate_workspace_path(from)?;
+            let to_rel = validate_workspace_path(to)?;
+            reject_git_path(&from_rel)?;
+            reject_git_path(&to_rel)?;
+            let source = root.join(&from_rel);
+            let target = root.join(&to_rel);
+            if !source.exists() {
+                return Err(WorkspaceError::PathNotFound(from.clone()));
+            }
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|error| WorkspaceError::Internal(anyhow!("mkdir: {error}")))?;
+            }
+            tokio::fs::rename(&source, &target)
+                .await
+                .map_err(|error| WorkspaceError::Internal(anyhow!("move: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_mutation_path(path: &str) -> Result<String, WorkspaceError> {
+    Ok(validate_workspace_path(path)?
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
+fn path_matches(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn mutation_scope(pre: &ManifestRoot, mutation: &FileMutation) -> BTreeSet<String> {
+    let mut scope = BTreeSet::new();
+    let mut add = |prefix: &str| {
+        scope.insert(prefix.to_owned());
+        scope.extend(
+            pre.nodes
+                .keys()
+                .filter(|path| path_matches(path, prefix))
+                .cloned(),
+        );
+    };
+    match mutation {
+        FileMutation::Write { path, .. }
+        | FileMutation::Patch { path, .. }
+        | FileMutation::Delete { path }
+        | FileMutation::DeleteTree { path } => {
+            if let Ok(path) = normalize_mutation_path(path) {
+                add(&path);
+            }
+        }
+        FileMutation::Move { from, to } => {
+            if let Ok(from) = normalize_mutation_path(from) {
+                add(&from);
+            }
+            if let Ok(to) = normalize_mutation_path(to) {
+                add(&to);
+            }
+        }
+    }
+    scope
+}
+
+fn expected_post_manifest(
+    pre: &ManifestRoot,
+    mutation: &FileMutation,
+) -> Result<ManifestRoot, WorkspaceError> {
+    let mut nodes = pre.nodes.clone();
+    match mutation {
+        FileMutation::Write { path, content } | FileMutation::Patch { path, content } => {
+            let path = normalize_mutation_path(path)?;
+            nodes.retain(|candidate, _| !path_matches(candidate, &path));
+            let mode = pre
+                .nodes
+                .get(&path)
+                .map(|node| node.mode)
+                .unwrap_or(0o100644);
+            let is_text = is_text_bytes(content);
+            nodes.insert(
+                path,
+                ManifestNode {
+                    kind: NodeKind::File,
+                    mode,
+                    byte_len: content.len() as u64,
+                    blob_sha: None,
+                    node_hash: hash_file_node(mode, content, is_text),
+                    is_text,
+                },
+            );
+        }
+        FileMutation::Delete { path } | FileMutation::DeleteTree { path } => {
+            let path = normalize_mutation_path(path)?;
+            nodes.retain(|candidate, _| !path_matches(candidate, &path));
+        }
+        FileMutation::Move { from, to } => {
+            let from = normalize_mutation_path(from)?;
+            let to = normalize_mutation_path(to)?;
+            let moved: Vec<(String, ManifestNode)> = pre
+                .nodes
+                .iter()
+                .filter(|(path, _)| path_matches(path, &from))
+                .map(|(path, node)| {
+                    let suffix = path.strip_prefix(&from).unwrap_or_default();
+                    let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+                    let target = if suffix.is_empty() {
+                        to.clone()
+                    } else {
+                        format!("{to}/{suffix}")
+                    };
+                    (target, node.clone())
+                })
+                .collect();
+            nodes.retain(|candidate, _| {
+                !path_matches(candidate, &from) && !path_matches(candidate, &to)
+            });
+            nodes.extend(moved);
+        }
+    }
+    Ok(ManifestRoot {
+        root_hash: String::new(),
+        nodes,
+    })
+}
+
+fn manifests_match_scope(
+    current: &ManifestRoot,
+    expected: &ManifestRoot,
+    scope: &BTreeSet<String>,
+) -> bool {
+    let project = |manifest: &ManifestRoot| {
+        manifest
+            .nodes
+            .iter()
+            .filter(|(path, _)| scope.iter().any(|prefix| path_matches(path, prefix)))
+            .map(|(path, node)| {
+                (
+                    path.clone(),
+                    (
+                        node.kind.clone(),
+                        node.mode,
+                        node.byte_len,
+                        node.node_hash.clone(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    project(current) == project(expected)
 }
 
 async fn refresh_manifest(

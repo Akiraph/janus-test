@@ -90,7 +90,20 @@ impl AppState {
             &config.data_root,
             local_executor,
         );
-        let sessions = SessionsInterface::new(pool.clone(), events.clone(), workspace.clone());
+        let sessions = SessionsInterface::new(
+            pool.clone(),
+            events.clone(),
+            workspace.clone(),
+            blobs.clone(),
+        );
+        workspace
+            .recover_orphan_session_worktrees()
+            .await
+            .context("recover orphan session worktrees")?;
+        workspace
+            .recover_orphan_main_worktrees()
+            .await
+            .context("recover orphan main worktrees")?;
         let execution = ExecutionInterface::new(ExecutionDependencies {
             pool: pool.clone(),
             events: events.clone(),
@@ -121,6 +134,13 @@ impl AppState {
             execution: execution.clone(),
             execution_coordinator,
         });
+        workspace
+            .recover_uncertain_propagations()
+            .await
+            .context("recover interrupted workspace propagation")?;
+        application::lifecycle::recover_workspace_mutations(&application)
+            .await
+            .context("recover interrupted workspace mutations")?;
         application::lifecycle::recover_execution_state(&application).await?;
         Ok(Self {
             inner: Arc::new(AppStateInner {

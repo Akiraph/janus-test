@@ -15,10 +15,11 @@ server composes it with the Git adapter and durable operation worker.
 - Main Workspace file reads and directory listings keep the Project readiness
   check and Project error vocabulary, then delegate path validation and bytes
   to `janus-workspace`.
-- Main editor mutations advance the Workspace revision and append the
-  `project.main_revision_changed` event in the same short database transaction.
-  The filesystem write occurs before that transaction; a revision mismatch can
-  therefore leave the latest bytes on disk without advancing the identity.
+- Main editor mutations first commit a durable Workspace mutation intent, then
+  apply the filesystem effect outside a database write transaction, and finally
+  advance the revision plus append `project.main_revision_changed` in one short
+  transaction. Restart recovery replays only when affected paths still match
+  the recorded pre/post state; an unexpected edit becomes explicit attention.
 
 ## Boundaries
 

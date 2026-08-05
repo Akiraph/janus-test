@@ -493,9 +493,9 @@ pub struct RecordedTurnInput {
     pub display_order: i64,
 }
 
-/// All values needed to persist an uploaded attachment in one transaction.
-/// Keeping the owner, blob reference, and session together prevents callers
-/// from accidentally attaching bytes to a different session than the upload.
+/// All values needed to store and persist an uploaded attachment.
+/// Keeping the owner, bytes, and session together prevents callers from
+/// accidentally attaching bytes to a different session than the upload.
 pub struct UploadAttachmentInput<'a> {
     pub owner_id: &'a str,
     pub session_id: SessionId,
@@ -504,7 +504,7 @@ pub struct UploadAttachmentInput<'a> {
     pub name: &'a str,
     pub mime: &'a str,
     pub byte_size: u64,
-    pub blob_sha: &'a str,
+    pub bytes: &'a [u8],
 }
 
 /// Values for the user message and Turn rows created under one transaction.

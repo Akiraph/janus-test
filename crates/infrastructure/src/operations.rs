@@ -482,6 +482,11 @@ impl OperationInterface {
         .await?;
         let state = match existing {
             Some((status,)) if status == "succeeded" => StepState::AlreadySucceeded,
+            // A process can die after the external effect but before this
+            // row is completed. Re-running a non-idempotent effect here would
+            // be the most dangerous possible recovery policy, so leave the
+            // step for an explicit reconciliation decision.
+            Some((status,)) if status == "running" => StepState::NeedsReconciliation,
             Some(_) => StepState::Running,
             None => {
                 sqlx::query("INSERT INTO operation_steps (operation_id, step_key, attempts, status, input_summary, external_ref, compensation_json, created_at, updated_at) VALUES (?, ?, 1, 'running', ?, NULL, NULL, ?, ?)")
@@ -576,6 +581,17 @@ impl OperationInterface {
         if changed == 0 {
             return Err(OperationError::NotFound);
         }
+        if status == OperationStatus::NeedsAttention {
+            sqlx::query(
+                "UPDATE operation_steps SET status = 'failed', compensation_json = ?, updated_at = ? \
+                 WHERE operation_id = ? AND status = 'running'",
+            )
+            .bind(reconciliation_problem())
+            .bind(&now)
+            .bind(operation_id)
+            .execute(work.connection())
+            .await?;
+        }
         // Keep idempotency record in step with the terminal outcome.
         sqlx::query("UPDATE idempotency_records SET status = ? WHERE operation_id = ?")
             .bind(status.as_str())
@@ -661,6 +677,17 @@ impl OperationInterface {
             work.rollback().await?;
             return Ok(false);
         }
+        if completion.status == OperationStatus::NeedsAttention {
+            sqlx::query(
+                "UPDATE operation_steps SET status = 'failed', compensation_json = ?, updated_at = ? \
+                 WHERE operation_id = ? AND status = 'running'",
+            )
+            .bind(reconciliation_problem())
+            .bind(&now)
+            .bind(operation_id)
+            .execute(work.connection())
+            .await?;
+        }
         sqlx::query("UPDATE idempotency_records SET status = ? WHERE operation_id = ?")
             .bind(completion.status.as_str())
             .bind(operation_id)
@@ -677,6 +704,27 @@ impl OperationInterface {
         .await?;
         work.commit().await?;
         Ok(true)
+    }
+
+    /// Verify that a worker still owns its durable lease immediately before an
+    /// external effect. The completion update remains the final fence after the
+    /// effect, so a lease expiring during the effect becomes reconciliation work
+    /// instead of an invisible overwrite.
+    pub async fn assert_claimed(&self, claim: WorkClaim<'_>) -> Result<(), OperationError> {
+        let owned: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM work_items \
+             WHERE id = ? AND lease_nonce = ? AND dead = 0 \
+               AND lease_expires_at >= ?",
+        )
+        .bind(claim.id)
+        .bind(claim.nonce)
+        .bind(now_utc_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        if owned.is_none() {
+            return Err(OperationError::StaleWorkClaim);
+        }
+        Ok(())
     }
 
     pub async fn get(&self, operation_id: &str) -> Result<Option<OperationView>, OperationError> {
@@ -797,6 +845,9 @@ pub enum StepState {
     AlreadySucceeded,
     /// Step is now running; execute it.
     Running,
+    /// The previous worker may have completed an external effect before its
+    /// lease expired. Do not execute the effect again without reconciliation.
+    NeedsReconciliation,
 }
 
 pub struct CreatedOperation {
@@ -886,6 +937,14 @@ fn parse_json_opt(stored: Option<String>) -> Result<Option<Value>, serde_json::E
         Some(s) => serde_json::from_str(&s).map(Some),
         None => Ok(None),
     }
+}
+
+fn reconciliation_problem() -> String {
+    serde_json::json!({
+        "code": "OPERATION_STEP_REQUIRES_RECONCILIATION",
+        "detail": "the external effect may have completed before the worker lease expired",
+    })
+    .to_string()
 }
 
 /// A work item leased to a handler. The nonce is the holder's ownership proof.

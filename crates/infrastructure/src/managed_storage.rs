@@ -1,11 +1,14 @@
 //! Content-addressed blob store (SHA-256 CAS).
 //!
-//! Registers references for GC roots; mark-and-sweep collection lives elsewhere.
-//! Only unreferenced crash leftovers in `incoming/` are removed here.
+//! Registers references for GC roots and performs conservative mark-and-sweep
+//! collection. Only objects with no logical reference can reach `trash`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use crate::clock::now_utc_str;
+use crate::clock::{format_utc, now_utc, now_utc_str};
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
@@ -37,6 +40,7 @@ pub struct BlobStore {
     pool: SqlitePool,
     objects_root: PathBuf,
     incoming_root: PathBuf,
+    storage_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BlobStore {
@@ -51,6 +55,7 @@ impl BlobStore {
             pool,
             objects_root,
             incoming_root,
+            storage_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -60,6 +65,7 @@ impl BlobStore {
     /// the temporary and final paths on one filesystem makes the rename atomic;
     /// a crash can therefore leave recoverable debris but not a dangling reference.
     pub async fn write(&self, bytes: &[u8], reference: BlobReference) -> anyhow::Result<BlobSha> {
+        let _storage_lock = self.storage_lock.lock().await;
         let sha = hex_sha256(bytes);
         let target = object_path(&self.objects_root, &sha);
 
@@ -174,15 +180,170 @@ impl BlobStore {
 
     /// Remove a single logical reference. Returns true if the reference existed.
     pub async fn drop_reference(&self, reference: &BlobReference) -> anyhow::Result<bool> {
-        let changed = sqlx::query("DELETE FROM blob_references WHERE owner_module = ? AND owner_type = ? AND owner_id = ? AND purpose = ?")
+        let result = sqlx::query("DELETE FROM blob_references WHERE owner_module = ? AND owner_type = ? AND owner_id = ? AND purpose = ?")
             .bind(reference.owner_module)
             .bind(reference.owner_type)
             .bind(reference.owner_id.as_str())
             .bind(reference.purpose)
             .execute(&self.pool)
+            .await;
+        match result {
+            Ok(result) => Ok(result.rows_affected() > 0),
+            Err(error) => {
+                self.enqueue_cleanup(reference, &error.to_string()).await?;
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Retry durable reference deletions recorded after a failed cleanup.
+    /// Startup callers should fail readiness if this returns an error so a
+    /// database outage cannot silently accumulate ownership drift.
+    pub async fn recover_cleanup(&self) -> anyhow::Result<usize> {
+        let now = now_utc_str();
+        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT id, owner_module, owner_type, owner_id, purpose \
+             FROM blob_cleanup_intents WHERE next_attempt_at <= ? \
+             ORDER BY next_attempt_at, updated_at, id",
+        )
+        .bind(&now)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut recovered = 0;
+        for (id, owner_module, owner_type, owner_id, purpose) in rows {
+            match sqlx::query(
+                "DELETE FROM blob_references WHERE owner_module = ? AND owner_type = ? AND owner_id = ? AND purpose = ?",
+            )
+            .bind(&owner_module)
+            .bind(&owner_type)
+            .bind(&owner_id)
+            .bind(&purpose)
+            .execute(&self.pool)
+            .await
+            {
+                Ok(_) => {
+                    sqlx::query("DELETE FROM blob_cleanup_intents WHERE id = ?")
+                        .bind(&id)
+                        .execute(&self.pool)
+                        .await?;
+                    recovered += 1;
+                }
+                Err(error) => {
+                    let attempts: i64 = sqlx::query_scalar(
+                        "SELECT attempts FROM blob_cleanup_intents WHERE id = ?",
+                    )
+                    .bind(&id)
+                    .fetch_one(&self.pool)
+                    .await?;
+                    let next_attempt = format_utc(
+                        now_utc() + chrono::Duration::seconds((1_i64 << attempts.min(6)).min(60)),
+                    );
+                    sqlx::query(
+                        "UPDATE blob_cleanup_intents SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(next_attempt)
+                    .bind(error.to_string())
+                    .bind(now_utc_str())
+                    .bind(&id)
+                    .execute(&self.pool)
+                    .await?;
+                    return Err(anyhow::anyhow!(
+                        "blob cleanup intent {id} failed: {error}"
+                    ));
+                }
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Mark and sweep unreferenced CAS objects. Marking `trash` is durable so
+    /// a crash during physical deletion is retried on the next startup. The
+    /// shared storage lock prevents a concurrent write from racing the file
+    /// removal, and the final reference check protects a newly-created root.
+    pub async fn sweep_unreferenced(&self) -> anyhow::Result<usize> {
+        let _storage_lock = self.storage_lock.lock().await;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT object.sha256, object.storage_state FROM blob_objects AS object \
+             WHERE object.storage_state IN ('present', 'trash') \
+               AND NOT EXISTS (SELECT 1 FROM blob_references AS reference \
+                               WHERE reference.blob_sha = object.sha256) \
+             ORDER BY object.first_written_at, object.sha256",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut swept = 0;
+        for (sha, state) in rows {
+            let has_reference: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM blob_references WHERE blob_sha = ?)",
+            )
+            .bind(&sha)
+            .fetch_one(&self.pool)
+            .await?;
+            if has_reference {
+                sqlx::query("UPDATE blob_objects SET storage_state = 'present' WHERE sha256 = ?")
+                    .bind(&sha)
+                    .execute(&self.pool)
+                    .await?;
+                continue;
+            }
+            if state == "present" {
+                sqlx::query(
+                    "UPDATE blob_objects SET storage_state = 'trash' WHERE sha256 = ? AND storage_state = 'present'",
+                )
+                .bind(&sha)
+                .execute(&self.pool)
+                .await?;
+            }
+            let path = object_path(&self.objects_root, &sha);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    anyhow::bail!("sweep blob {}: {}", sha, error);
+                }
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM blob_objects WHERE sha256 = ? AND storage_state = 'trash' \
+                 AND NOT EXISTS (SELECT 1 FROM blob_references WHERE blob_sha = ?)",
+            )
+            .bind(&sha)
+            .bind(&sha)
+            .execute(&self.pool)
             .await?
             .rows_affected();
-        Ok(changed > 0)
+            if deleted > 0 {
+                swept += 1;
+            } else {
+                sqlx::query("UPDATE blob_objects SET storage_state = 'present' WHERE sha256 = ?")
+                    .bind(&sha)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(swept)
+    }
+
+    async fn enqueue_cleanup(&self, reference: &BlobReference, error: &str) -> anyhow::Result<()> {
+        let now = now_utc_str();
+        sqlx::query(
+            "INSERT INTO blob_cleanup_intents \
+             (id, owner_module, owner_type, owner_id, purpose, next_attempt_at, last_error, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(owner_module, owner_type, owner_id, purpose) DO UPDATE SET \
+             next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
+        )
+        .bind(format!("blob_cleanup_{}", uuid::Uuid::now_v7()))
+        .bind(reference.owner_module)
+        .bind(reference.owner_type)
+        .bind(&reference.owner_id)
+        .bind(reference.purpose)
+        .bind(&now)
+        .bind(error)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Remove temporary files left by interrupted writes. Committed objects are
@@ -196,7 +357,7 @@ impl BlobStore {
         while let Some(entry) = entries.next_entry().await? {
             // A successful write renames the temp out before committing its DB
             // reference, so a temp left here is safe to treat as crash debris.
-            let _ = tokio::fs::remove_file(entry.path()).await;
+            tokio::fs::remove_file(entry.path()).await?;
         }
         Ok(())
     }

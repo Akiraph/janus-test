@@ -341,7 +341,7 @@ async fn stale_operation_worker_cannot_publish_terminal_state() -> anyhow::Resul
                 json!({"target": "target-1"}),
             )
             .await?,
-        StepState::Running
+        StepState::NeedsReconciliation
     ));
 
     assert!(

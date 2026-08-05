@@ -220,6 +220,23 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
         state.runtime().runtime(runtime_id).await?.status,
         janus_runtime::interface::RuntimeStatus::Lost
     );
+    let recovery_events = state.events().after(0, 200).await?;
+    assert!(recovery_events.iter().any(|event| {
+        event.event_type == "runtime.changed"
+            && event
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource["id"] == runtime_id.to_string())
+            && event.payload["status"] == "lost"
+    }));
+    assert!(recovery_events.iter().any(|event| {
+        event.event_type == "job.changed"
+            && event
+                .resource
+                .as_ref()
+                .is_some_and(|resource| resource["id"] == stdin_id.to_string())
+            && event.payload["status"] == "lost"
+    }));
     Ok(())
 }
 

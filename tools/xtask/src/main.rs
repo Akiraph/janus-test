@@ -28,6 +28,7 @@ const PLATFORM_TABLES: &[&str] = &[
     "idempotency_records",
     "blob_objects",
     "blob_references",
+    "blob_cleanup_intents",
 ];
 
 #[derive(Debug, Parser)]
@@ -61,8 +62,6 @@ struct ModuleManifest {
     owned_tables: Vec<String>,
     publishes: Vec<String>,
     allowed_module_dependencies: Vec<String>,
-    specs: Vec<String>,
-    tests: Vec<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -230,7 +229,6 @@ fn check_architecture(root: &Path) -> anyhow::Result<()> {
                     bail!("event {event} has more than one publisher");
                 }
             }
-            let _ = (&manifest.specs, &manifest.tests);
             module_paths.insert(manifest.name.clone(), source_root);
             if manifests.insert(manifest.name.clone(), manifest).is_some() {
                 bail!("duplicate Module manifest name");

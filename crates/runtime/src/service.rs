@@ -1152,10 +1152,8 @@ impl RuntimeInterface {
         id: TerminalId,
         completion: ProcessCompletion,
     ) -> Result<(), RuntimeError> {
-        // Closing→Exited is the only durable transition here; the prior branch
-        // collapsed to the same status, so the distinction is dropped on the
-        // floor and the recorded completion decides the projection.
-        let _ = self.terminal_row(id).await.ok();
+        // Closing -> Exited is the only durable transition here; the recorded
+        // completion decides the final projection.
         let status = TerminalStatus::Exited;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
         let changed = sqlx::query(
@@ -1252,16 +1250,58 @@ impl RuntimeInterface {
 
     pub async fn recover_uncertain(&self) -> Result<(), RuntimeError> {
         let now = now_utc_str();
-        let mut tx = self.pool.begin().await.map_err(storage_error)?;
-        self.recover_uncertain_in_tx(&mut tx, &now).await?;
-        tx.commit().await.map_err(storage_error)
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
+        self.recover_uncertain_in_tx(&mut work, &now).await?;
+        work.commit().await.map_err(storage_error)
     }
 
     pub async fn recover_uncertain_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        work: &mut UnitOfWorkTransaction<'_>,
         now: &str,
     ) -> Result<(), RuntimeError> {
+        let runtime_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM runtimes \
+             WHERE status IN ('starting', 'ready', 'stopping') ORDER BY created_at, id",
+        )
+        .fetch_all(work.connection())
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(|id| id.parse::<RuntimeId>().map_err(storage_error))
+        .collect::<Result<Vec<_>, _>>()?;
+        let job_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM jobs WHERE status IN ('queued', 'running') ORDER BY created_at, id",
+        )
+        .fetch_all(work.connection())
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(|id| id.parse::<JobId>().map_err(storage_error))
+        .collect::<Result<Vec<_>, _>>()?;
+        let service_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM services \
+             WHERE status IN ('starting', 'running', 'unhealthy', 'stopping') \
+             ORDER BY created_at, id",
+        )
+        .fetch_all(work.connection())
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(|id| id.parse::<ServiceId>().map_err(storage_error))
+        .collect::<Result<Vec<_>, _>>()?;
+        let terminal_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM terminals \
+             WHERE status IN ('starting', 'running', 'closing') \
+             ORDER BY created_at, id",
+        )
+        .fetch_all(work.connection())
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(|id| id.parse::<TerminalId>().map_err(storage_error))
+        .collect::<Result<Vec<_>, _>>()?;
+
         sqlx::query(
             "UPDATE runtimes SET status = 'lost', stop_reason = 'control_plane_restart', \
              version = ?, updated_at = ?, stopped_at = ? \
@@ -1270,7 +1310,7 @@ impl RuntimeInterface {
         .bind(new_version())
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?;
         sqlx::query(
@@ -1280,7 +1320,7 @@ impl RuntimeInterface {
         .bind(json!({"exit_code": null, "signal": "control_plane_restart"}).to_string())
         .bind(new_version())
         .bind(now)
-        .execute(&mut *tx)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?;
         sqlx::query(
@@ -1290,7 +1330,7 @@ impl RuntimeInterface {
         .bind(json!({"exit_code": null, "signal": "control_plane_restart"}).to_string())
         .bind(new_version())
         .bind(now)
-        .execute(&mut *tx)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?;
         sqlx::query(
@@ -1300,18 +1340,66 @@ impl RuntimeInterface {
         .bind(new_version())
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?;
+        for id in &runtime_ids {
+            self.append_runtime_changed_in_tx(work, *id)
+                .await
+                .map_err(|error| {
+                    RuntimeError::unavailable(format!(
+                        "append runtime recovery event for {id}: {error}"
+                    ))
+                })?;
+        }
+        for id in &job_ids {
+            self.append_job_changed_in_tx(work, *id).await?;
+        }
+        for id in &service_ids {
+            self.append_service_changed_in_tx(work, *id).await?;
+        }
+        for id in &terminal_ids {
+            self.append_terminal_changed_in_tx(work, *id).await?;
+        }
         sqlx::query(
             "UPDATE runtime_access_tickets SET revoked_at = ? \
              WHERE consumed_at IS NULL AND revoked_at IS NULL",
         )
         .bind(now)
-        .execute(&mut *tx)
+        .execute(work.connection())
         .await
         .map_err(storage_error)?;
         Ok(())
+    }
+
+    async fn append_runtime_changed_in_tx(
+        &self,
+        work: &mut UnitOfWorkTransaction<'_>,
+        id: RuntimeId,
+    ) -> Result<RuntimeProjection, RuntimeError> {
+        let row = sqlx::query_as::<_, RuntimeRow>(RUNTIME_SELECT)
+            .bind(id.to_string())
+            .fetch_one(work.connection())
+            .await
+            .map_err(storage_error)?;
+        let runtime = runtime_projection(row)?;
+        work.append_event(NewEvent {
+            event_type: "runtime.changed".into(),
+            actor: json!({"kind": "runtime_system"}),
+            resource: Some(json!({"kind": "runtime", "id": runtime.id})),
+            correlation_id: format!("runtime-runtime-{}", runtime.id),
+            causation_id: None,
+            payload: json!({
+                "id": runtime.id,
+                "scope": runtime.scope,
+                "status": runtime.status,
+                "version": runtime.version,
+                "stopped_at": runtime.stopped_at,
+            }),
+        })
+        .await
+        .map_err(|error| RuntimeError::unavailable(format!("persist runtime event: {error}")))?;
+        Ok(runtime)
     }
 
     async fn finalize_job(
@@ -1741,13 +1829,33 @@ fn parse_iso(value: &str) -> Result<chrono::DateTime<chrono::Utc>, RuntimeError>
 }
 
 fn runtime_projection(row: RuntimeRow) -> Result<RuntimeProjection, RuntimeError> {
+    let id = row
+        .id
+        .parse()
+        .map_err(|_| RuntimeError::unavailable(format!("invalid runtime id={}", row.id)))?;
+    let scope = runtime_scope(&row.scope_kind, &row.scope_id).map_err(|_| {
+        RuntimeError::unavailable(format!(
+            "unknown runtime scope kind={} id={}",
+            row.scope_kind, row.scope_id
+        ))
+    })?;
+    let executor = parse_executor_kind(&row.executor_kind).map_err(|_| {
+        RuntimeError::unavailable(format!("unknown executor kind={}", row.executor_kind))
+    })?;
+    let status = parse_runtime_status(&row.status)
+        .map_err(|_| RuntimeError::unavailable(format!("unknown runtime status={}", row.status)))?;
+    let capabilities = serde_json::from_str(&row.capability_snapshot_json).map_err(|_| {
+        RuntimeError::unavailable(format!("invalid runtime capabilities for id={id}"))
+    })?;
+    let limits = serde_json::from_str::<ResourceLimits>(&row.limits_json)
+        .map_err(|_| RuntimeError::unavailable(format!("invalid runtime limits for id={id}")))?;
     Ok(RuntimeProjection {
-        id: row.id.parse().map_err(storage_error)?,
-        scope: runtime_scope(&row.scope_kind, &row.scope_id)?,
-        executor: parse_executor_kind(&row.executor_kind)?,
-        status: parse_runtime_status(&row.status)?,
-        capabilities: serde_json::from_str(&row.capability_snapshot_json).map_err(storage_error)?,
-        limits: serde_json::from_str::<ResourceLimits>(&row.limits_json).map_err(storage_error)?,
+        id,
+        scope,
+        executor,
+        status,
+        capabilities,
+        limits,
         version: row.version,
         created_at: row.created_at,
         updated_at: row.updated_at,

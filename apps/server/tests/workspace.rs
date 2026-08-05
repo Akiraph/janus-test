@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use janus_infrastructure::{
     database::Database,
     id::{ProjectId, SessionId},
-    managed_storage::BlobStore,
+    managed_storage::{BlobReference, BlobStore},
 };
 use janus_workspace::interface::{
     FileMutation, PropagationDirection, PropagationError, WorkspaceHandle, WorkspaceInterface,
@@ -72,6 +72,59 @@ impl Fixture {
             project_id,
         })
     }
+}
+
+#[tokio::test]
+async fn startup_recovery_removes_unregistered_session_worktrees() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let orphan = fx
+        .data_root
+        .join("workspaces")
+        .join("sessions")
+        .join("orphan-session")
+        .join("repo");
+    std::fs::create_dir_all(&orphan)?;
+    std::fs::write(orphan.join("leftover.txt"), b"crash debris")?;
+
+    assert_eq!(fx.sync.recover_orphan_session_worktrees().await?, 1);
+    assert!(!orphan.parent().expect("repo parent").exists());
+
+    let main_orphan = fx
+        .data_root
+        .join("workspaces")
+        .join("main")
+        .join("orphan-project")
+        .join("repo");
+    std::fs::create_dir_all(&main_orphan)?;
+    std::fs::write(main_orphan.join("leftover.txt"), b"crash debris")?;
+    assert_eq!(fx.sync.recover_orphan_main_worktrees().await?, 1);
+    assert!(!main_orphan.parent().expect("repo parent").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn blob_sweeper_removes_only_unreferenced_objects() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let blobs = BlobStore::new(fx.pool.clone(), &fx.data_root)?;
+    let reference = BlobReference::new("test", "sweep", "object-1", "content");
+    let sha = blobs.write(b"sweep me", reference.clone()).await?;
+    let object = fx
+        .data_root
+        .join("objects/sha256")
+        .join(&sha.to_string()[..2])
+        .join(sha.to_string());
+    assert!(object.exists());
+
+    assert!(blobs.drop_reference(&reference).await?);
+    assert!(blobs.sweep_unreferenced().await? >= 1);
+    assert!(!object.exists());
+    let object_row: Option<String> =
+        sqlx::query_scalar("SELECT sha256 FROM blob_objects WHERE sha256 = ?")
+            .bind(sha.to_string())
+            .fetch_optional(&fx.pool)
+            .await?;
+    assert!(object_row.is_none());
+    Ok(())
 }
 
 #[tokio::test]
@@ -256,6 +309,136 @@ async fn write_bumps_revision_and_changes_root() -> anyhow::Result<()> {
 
     let current = fx.sync.current_revision(&handle).await?;
     assert_eq!(current.0, rev2.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_file_mutation_is_replayed_during_recovery() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let handle = WorkspaceHandle::session(session_id);
+    let lock = fx.sync.acquire_mutation_lock(&handle).await?;
+    let prepared = fx
+        .sync
+        .prepare_file_mutation(
+            &lock,
+            janus_workspace::interface::FileMutationRequest {
+                handle: &handle,
+                mutation: FileMutation::Write {
+                    path: "recovered.txt".into(),
+                    content: b"replayed\n".to_vec(),
+                },
+                expected: None,
+                cause: "test.recovery",
+                actor: json!({"kind": "test"}),
+                event: None,
+            },
+        )
+        .await?;
+    drop(lock);
+
+    assert_eq!(fx.sync.recover_uncertain_file_mutations().await?.len(), 0);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
+            .bind(prepared.intent_id())
+            .fetch_one(&fx.pool)
+            .await?;
+    assert_eq!(state, "completed");
+    let path = fx
+        .data_root
+        .join("workspaces/sessions")
+        .join(session_id.to_string())
+        .join("repo/recovered.txt");
+    assert_eq!(std::fs::read(path)?, b"replayed\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn applied_file_mutation_is_only_finalized_during_recovery() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let handle = WorkspaceHandle::session(session_id);
+    let lock = fx.sync.acquire_mutation_lock(&handle).await?;
+    let prepared = fx
+        .sync
+        .prepare_file_mutation(
+            &lock,
+            janus_workspace::interface::FileMutationRequest {
+                handle: &handle,
+                mutation: FileMutation::Write {
+                    path: "applied.txt".into(),
+                    content: b"already applied\n".to_vec(),
+                },
+                expected: None,
+                cause: "test.recovery",
+                actor: json!({"kind": "test"}),
+                event: None,
+            },
+        )
+        .await?;
+    fx.sync
+        .apply_prepared_file_mutation(&lock, &prepared)
+        .await?;
+    drop(lock);
+
+    assert_eq!(fx.sync.recover_uncertain_file_mutations().await?.len(), 0);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
+            .bind(prepared.intent_id())
+            .fetch_one(&fx.pool)
+            .await?;
+    assert_eq!(state, "completed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unexpected_file_edit_stops_mutation_recovery() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let handle = WorkspaceHandle::session(session_id);
+    let lock = fx.sync.acquire_mutation_lock(&handle).await?;
+    let prepared = fx
+        .sync
+        .prepare_file_mutation(
+            &lock,
+            janus_workspace::interface::FileMutationRequest {
+                handle: &handle,
+                mutation: FileMutation::Write {
+                    path: "conflicted.txt".into(),
+                    content: b"janus intended\n".to_vec(),
+                },
+                expected: None,
+                cause: "test.recovery",
+                actor: json!({"kind": "test"}),
+                event: None,
+            },
+        )
+        .await?;
+    drop(lock);
+    let path = fx
+        .data_root
+        .join("workspaces/sessions")
+        .join(session_id.to_string())
+        .join("repo/conflicted.txt");
+    std::fs::write(&path, b"external edit\n")?;
+
+    assert!(fx.sync.recover_uncertain_file_mutations().await.is_err());
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
+            .bind(prepared.intent_id())
+            .fetch_one(&fx.pool)
+            .await?;
+    assert_eq!(state, "needs_attention");
+    assert_eq!(std::fs::read(path)?, b"external edit\n");
     Ok(())
 }
 
@@ -577,6 +760,49 @@ async fn sync_copies_main_only_changes_and_preserves_session_changes() -> anyhow
 }
 
 #[tokio::test]
+async fn concurrent_propagations_are_serialized_per_project() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let main = fx
+        .data_root
+        .join("workspaces")
+        .join("main")
+        .join(fx.project_id.to_string())
+        .join("repo")
+        .join("parallel.txt");
+    std::fs::write(main, b"from main\n")?;
+
+    let first = fx.sync.propagate(
+        session_id,
+        PropagationDirection::Sync,
+        json!({"kind": "test", "request": "first"}),
+    );
+    let second = fx.sync.propagate(
+        session_id,
+        PropagationDirection::Sync,
+        json!({"kind": "test", "request": "second"}),
+    );
+    let (first, second) = tokio::join!(first, second);
+    let first = first?;
+    let second = second?;
+    assert_eq!(
+        first.changed_paths.len() + second.changed_paths.len(),
+        1,
+        "one serialized propagation should perform the transfer"
+    );
+    let session_revision_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM content_revisions WHERE workspace_handle = ?")
+            .bind(WorkspaceHandle::session(session_id).as_str())
+            .fetch_one(&fx.pool)
+            .await?;
+    assert_eq!(session_revision_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn propagation_conflict_is_persisted_until_session_edit_then_apply() -> anyhow::Result<()> {
     let fx = Fixture::new().await?;
     let session_id = SessionId::new();
@@ -656,5 +882,78 @@ async fn propagation_conflict_is_persisted_until_session_edit_then_apply() -> an
     assert!(summary.pending_conflict.is_none());
     assert!(!summary.sync_enabled);
     assert!(!summary.apply_enabled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_propagation_intent_is_replayed_and_cleared() -> anyhow::Result<()> {
+    let fx = Fixture::new().await?;
+    let session_id = SessionId::new();
+    fx.sync
+        .ensure_session_copy(fx.project_id, session_id, None, json!({"kind": "test"}))
+        .await?;
+    let main = fx
+        .data_root
+        .join("workspaces")
+        .join("main")
+        .join(fx.project_id.to_string())
+        .join("repo")
+        .join("README.md");
+    std::fs::write(&main, b"# recovered main\n")?;
+    let baseline_json: String = sqlx::query_scalar(
+        "SELECT baseline_manifest_json FROM propagation_links WHERE session_id = ?",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&fx.pool)
+    .await?;
+    let baseline = serde_json::from_str::<serde_json::Value>(&baseline_json)?;
+    let main_manifest = fx
+        .sync
+        .collect_manifest(&WorkspaceHandle::main(fx.project_id))
+        .await?;
+    let session_manifest = fx
+        .sync
+        .collect_manifest(&WorkspaceHandle::session(session_id))
+        .await?;
+    let intent = json!({
+        "direction": "sync",
+        "actor": {"kind": "recovery-test"},
+        "baseline": baseline,
+        "main_head": "",
+        "session_head": "",
+        "paths": ["README.md"],
+        "source_preimage": {
+            "README.md": serde_json::to_value(main_manifest.nodes.get("README.md"))?
+        },
+        "target_preimage": {
+            "README.md": serde_json::to_value(session_manifest.nodes.get("README.md"))?
+        }
+    });
+    sqlx::query(
+        "UPDATE propagation_links SET recovery_state = 'transferring', \
+         recovery_intent_json = ? WHERE session_id = ?",
+    )
+    .bind(intent.to_string())
+    .bind(session_id.to_string())
+    .execute(&fx.pool)
+    .await?;
+
+    assert_eq!(fx.sync.recover_uncertain_propagations().await?, 1);
+    let session_file = fx
+        .data_root
+        .join("workspaces")
+        .join("sessions")
+        .join(session_id.to_string())
+        .join("repo")
+        .join("README.md");
+    assert_eq!(std::fs::read(session_file)?, b"# recovered main\n");
+    let (state, intent): (String, Option<String>) = sqlx::query_as(
+        "SELECT recovery_state, recovery_intent_json FROM propagation_links WHERE session_id = ?",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(&fx.pool)
+    .await?;
+    assert_eq!(state, "idle");
+    assert!(intent.is_none());
     Ok(())
 }

@@ -18,5 +18,3 @@ publishes = [
   "git.update_conflict_changed",
 ]
 allowed_module_dependencies = ["runtime", "workspace"]
-specs = []
-tests = []

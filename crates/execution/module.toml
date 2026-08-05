@@ -17,5 +17,3 @@ publishes = [
   "context.changed",
 ]
 allowed_module_dependencies = ["models", "projects", "runtime", "sessions", "workspace"]
-specs = []
-tests = []

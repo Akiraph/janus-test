@@ -39,8 +39,9 @@ pub use janus_source_control::{
     UpdateOutcome,
 };
 use janus_workspace::interface::{
-    DeleteFileInput, FileMetaView, FileTreeView, MoveFileInput, PathError, RevisionRef,
-    SaveTextInput, WorkspaceError, WorkspaceHandle, WorkspaceInterface, validate_workspace_path,
+    DeleteFileInput, FileMetaView, FileMutation, FileMutationEventContext, FileMutationRequest,
+    FileTreeView, MoveFileInput, PathError, RevisionRef, SaveTextInput, WorkspaceError,
+    WorkspaceHandle, WorkspaceInterface,
 };
 
 const REPO_KIND_PUBLIC: &str = "public_https";
@@ -343,7 +344,7 @@ pub enum ProjectsError {
     #[error("file is not editable: {0}")]
     NotEditable(String),
     #[error("git operation failed: {0}")]
-    Git(GitError),
+    Git(#[from] GitError),
     #[error("workspace sync error: {0}")]
     Workspace(#[from] WorkspaceError),
     #[error("operation error: {0}")]
@@ -356,12 +357,6 @@ pub enum ProjectsError {
     Io(#[from] std::io::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
-}
-
-impl From<GitError> for ProjectsError {
-    fn from(error: GitError) -> Self {
-        Self::Git(error)
-    }
 }
 
 impl From<PathError> for ProjectsError {
@@ -430,9 +425,7 @@ struct ProjectRow {
     updated_at: String,
 }
 
-/// The event metadata that must accompany every Main Workspace revision.
-/// Keeping it explicit prevents an editor path from committing a revision
-/// without the corresponding Project projection event.
+/// The event metadata shared by every Main Workspace file mutation.
 struct MainRevisionEvent<'a> {
     owner_id: &'a str,
     project_id: &'a str,
@@ -1582,35 +1575,46 @@ impl ProjectsInterface {
         }
         let access = RepoAccess::parse(&row.repo_access)
             .ok_or_else(|| ProjectsError::Internal(anyhow::anyhow!("bad repo access")))?;
-        let credential = match access {
-            RepoAccess::PublicHttps => GitCredential::None,
-            RepoAccess::GithubPrivate => {
-                let cred_id = row
-                    .github_credential_id
-                    .as_ref()
-                    .ok_or_else(|| ProjectsError::Validation("missing credential".into()))?;
-                let pat = self.pat_for(&owner_id, cred_id).await?;
-                GitCredential::HttpsBasic {
-                    username: "x-access-token".into(),
-                    password: pat.unwrap_or_default(),
-                }
-            }
-        };
+        let credential = self.credential_for_access(&owner_id, &row, access).await?;
 
+        let clone_lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dest = self.main_repo_dir(project_id);
-        let clone_result = GitRunner::clone(
-            self.git.as_ref(),
-            &row.repo_url,
-            row.repo_branch.as_deref(),
-            &dest,
-            &credential,
-        )
-        .await;
-        if let Err(error) = clone_result {
-            self.mark_project_state(project_id, "error", Some(error.to_string()))
-                .await?;
-            return Err(error.into());
+        let existing_clone = if dest.is_dir() {
+            self.git
+                .status(&dest)
+                .await
+                .ok()
+                .and_then(|status| status.head_sha)
+                .is_some()
+        } else {
+            false
+        };
+        if !existing_clone {
+            if dest.exists()
+                && let Err(error) = self.remove_main_workspace(project_id).await
+            {
+                drop(clone_lock);
+                return Err(error);
+            }
+            let clone_result = GitRunner::clone(
+                self.git.as_ref(),
+                &row.repo_url,
+                row.repo_branch.as_deref(),
+                &dest,
+                &credential,
+            )
+            .await;
+            if let Err(error) = clone_result {
+                drop(clone_lock);
+                self.mark_project_state(project_id, "error", Some(error.to_string()))
+                    .await?;
+                return Err(error.into());
+            }
         }
+        drop(clone_lock);
 
         // Clone succeeded: establish the Main copy + first Content Revision and
         // mark the Project ready. managed_dir is relative to the data root.
@@ -1618,8 +1622,7 @@ impl ProjectsInterface {
             .parse()
             .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("bad project id")))?;
         let managed_dir = format!("workspaces/main/{project_id}/repo");
-        let revision = self
-            .workspace
+        self.workspace
             .ensure_main_copy(
                 project_id_typed,
                 &managed_dir,
@@ -1627,7 +1630,7 @@ impl ProjectsInterface {
                 serde_json::json!({"kind": "owner", "id": owner_id}),
             )
             .await?;
-        self.mark_project_ready(project_id, revision.0).await?;
+        self.mark_project_ready(project_id).await?;
         Ok(())
     }
 
@@ -1636,10 +1639,14 @@ impl ProjectsInterface {
     /// or global model and identity state.
     pub async fn run_delete(&self, project_id: &str) -> Result<(), ProjectsError> {
         let owner_id = self.project_owner(project_id).await?;
-        // Remove the workspace dir on the same filesystem (best effort; the
-        // authoritative cleanup is the DB delete + tombstone in later milestones).
-        let dest = self.main_repo_dir(project_id);
-        let _ = tokio::fs::remove_dir_all(dest.parent().unwrap_or(&dest)).await;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
+        // Remove the workspace dir before metadata deletion. A failed
+        // filesystem delete leaves the Project in `deleting` so the durable
+        // Operation can retry instead of orphaning its Main copy.
+        self.remove_main_workspace(project_id).await?;
         // Cascade FKs (ON DELETE CASCADE) remove github_credentials refs,
         // project_git_state and git_update_conflicts*.
         sqlx::query("DELETE FROM projects WHERE id = ? AND owner_id = ?")
@@ -1678,11 +1685,7 @@ impl ProjectsInterface {
         Ok(())
     }
 
-    async fn mark_project_ready(
-        &self,
-        project_id: &str,
-        revision: String,
-    ) -> Result<(), ProjectsError> {
+    async fn mark_project_ready(&self, project_id: &str) -> Result<(), ProjectsError> {
         let handle = format!("main:{project_id}");
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
@@ -1696,7 +1699,6 @@ impl ProjectsInterface {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        let _ = revision; // emitted via workspace events in later milestones
         Ok(())
     }
 
@@ -1709,8 +1711,13 @@ impl ProjectsInterface {
             .join("repo")
     }
 
-    fn main_handle(&self, project_id: ProjectId) -> WorkspaceHandle {
-        WorkspaceHandle::main(project_id)
+    async fn remove_main_workspace(&self, project_id: &str) -> Result<(), ProjectsError> {
+        let repo = self.main_repo_dir(project_id);
+        match tokio::fs::remove_dir_all(repo.parent().unwrap_or(&repo)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ProjectsError::Io(error)),
+        }
     }
 
     async fn require_ready(&self, owner_id: &str, id: &str) -> Result<ProjectRow, ProjectsError> {
@@ -1760,53 +1767,17 @@ impl ProjectsInterface {
         actor: serde_json::Value,
         correlation_id: &str,
     ) -> Result<RevisionRef, ProjectsError> {
-        self.require_ready(owner_id, project_id).await?;
-        let handle = self.main_handle_for(project_id)?;
-
-        // Version precondition first: if the caller supplied an expected revision,
-        // reject before touching the working tree (`WS-REV-02`,
-        // RESOURCE_VERSION_MISMATCH). A late re-check still happens in
-        // bump_revision for the race window between check and write.
-        let expected = input
-            .expected_main_revision
-            .as_ref()
-            .map(|r| RevisionRef(r.clone()));
-        if let Some(expected_ref) = expected.as_ref() {
-            let current = self.workspace.current_revision(&handle).await?;
-            if current.0 != expected_ref.0 {
-                return Err(ProjectsError::RevisionMismatch {
-                    expected: expected_ref.0.clone(),
-                    current: current.0,
-                });
-            }
-        }
-        let rel = validate_workspace_path(&input.path)?;
-        let abs = self.main_repo_dir(project_id).join(&rel);
-
-        if let Some(parent) = abs.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        // Atomic write: temp file + rename so a crash never leaves a half file.
-        let tmp = abs.with_extension("janus-tmp");
-        tokio::fs::write(&tmp, input.content.as_bytes())
-            .await
-            .map_err(|e| ProjectsError::Internal(anyhow::anyhow!("write failed: {e}")))?;
-        tokio::fs::rename(&tmp, &abs)
-            .await
-            .map_err(|e| ProjectsError::Internal(anyhow::anyhow!("rename failed: {e}")))?;
-
-        // If the revision moved after the disk write, leave the on-disk file as
-        // the latest content but refuse to advance identity so the client must
-        // re-read. A true CAS would need content-level rollback, so this path
-        // fails closed on revision identity rather than hiding an ABA race.
-        self.commit_main_revision(
+        self.apply_main_file_mutation(
             MainRevisionEvent {
                 owner_id,
                 project_id,
                 correlation_id,
             },
-            &handle,
-            expected.as_ref(),
+            FileMutation::Write {
+                path: input.path,
+                content: input.content.into_bytes(),
+            },
+            input.expected_main_revision.map(RevisionRef),
             "editor.save",
             actor,
         )
@@ -1838,28 +1809,17 @@ impl ProjectsInterface {
         actor: serde_json::Value,
         correlation_id: &str,
     ) -> Result<RevisionRef, ProjectsError> {
-        self.require_ready(owner_id, project_id).await?;
-        let handle = self.main_handle_for(project_id)?;
-        let expected = input.expected_main_revision.map(RevisionRef);
-        let from_rel = validate_workspace_path(&input.from)?;
-        let to_rel = validate_workspace_path(&input.to)?;
-        let base = self.main_repo_dir(project_id);
-        let from = base.join(&from_rel);
-        let to = base.join(&to_rel);
-        if let Some(parent) = to.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        tokio::fs::rename(&from, &to)
-            .await
-            .map_err(|e| ProjectsError::Internal(anyhow::anyhow!("move failed: {e}")))?;
-        self.commit_main_revision(
+        self.apply_main_file_mutation(
             MainRevisionEvent {
                 owner_id,
                 project_id,
                 correlation_id,
             },
-            &handle,
-            expected.as_ref(),
+            FileMutation::Move {
+                from: input.from,
+                to: input.to,
+            },
+            input.expected_main_revision.map(RevisionRef),
             "editor.move",
             actor,
         )
@@ -1875,40 +1835,80 @@ impl ProjectsInterface {
         actor: serde_json::Value,
         correlation_id: &str,
     ) -> Result<RevisionRef, ProjectsError> {
-        self.require_ready(owner_id, project_id).await?;
-        let handle = self.main_handle_for(project_id)?;
-        let expected = input.expected_main_revision.map(RevisionRef);
-        let rel = validate_workspace_path(&input.path)?;
-        let abs = self.main_repo_dir(project_id).join(&rel);
-        let meta = tokio::fs::metadata(&abs)
-            .await
-            .map_err(|_| ProjectsError::Validation("path not found".into()))?;
-        if meta.is_dir() {
-            if !input.recursive {
-                return Err(ProjectsError::Validation(
-                    "recursive is required to delete a directory".into(),
-                ));
-            }
-            tokio::fs::remove_dir_all(&abs)
-                .await
-                .map_err(|e| ProjectsError::Internal(anyhow::anyhow!("delete dir failed: {e}")))?;
+        let mutation = if input.recursive {
+            FileMutation::DeleteTree { path: input.path }
         } else {
-            tokio::fs::remove_file(&abs)
-                .await
-                .map_err(|e| ProjectsError::Internal(anyhow::anyhow!("delete file failed: {e}")))?;
-        }
-        self.commit_main_revision(
+            FileMutation::Delete { path: input.path }
+        };
+        self.apply_main_file_mutation(
             MainRevisionEvent {
                 owner_id,
                 project_id,
                 correlation_id,
             },
-            &handle,
-            expected.as_ref(),
+            mutation,
+            input.expected_main_revision.map(RevisionRef),
             "editor.delete",
             actor,
         )
         .await
+    }
+
+    async fn apply_main_file_mutation(
+        &self,
+        event: MainRevisionEvent<'_>,
+        mutation: FileMutation,
+        expected: Option<RevisionRef>,
+        cause: &str,
+        actor: serde_json::Value,
+    ) -> Result<RevisionRef, ProjectsError> {
+        self.require_ready(event.owner_id, event.project_id).await?;
+        let handle = self.main_handle_for(event.project_id)?;
+        let lock = self.workspace.acquire_mutation_lock(&handle).await?;
+        let prepared = self
+            .workspace
+            .prepare_file_mutation(
+                &lock,
+                FileMutationRequest {
+                    handle: &handle,
+                    mutation,
+                    expected: expected.as_ref(),
+                    cause,
+                    actor,
+                    event: Some(main_revision_event_context(
+                        event.owner_id,
+                        event.project_id,
+                        event.correlation_id,
+                    )),
+                },
+            )
+            .await?;
+        let applied = self
+            .workspace
+            .apply_prepared_file_mutation(&lock, &prepared)
+            .await?;
+        let mut work = self.unit_of_work.begin().await?;
+        let revision = self
+            .workspace
+            .finalize_file_mutation_in_tx(&lock, work.connection(), &prepared, &applied)
+            .await?;
+        self.append_main_revision_changed_in_tx(
+            &mut work,
+            event.owner_id,
+            event.project_id,
+            &revision,
+            event.correlation_id,
+        )
+        .await?;
+        self.workspace
+            .acknowledge_file_mutation_event_in_tx(
+                work.connection(),
+                prepared.intent_id(),
+                &revision,
+            )
+            .await?;
+        work.commit().await?;
+        Ok(revision)
     }
 
     // ----- Git queries and user commands -----
@@ -1919,6 +1919,10 @@ impl ProjectsInterface {
         project_id: &str,
     ) -> Result<GitStatus, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.status(&dir).await?)
     }
@@ -1930,6 +1934,10 @@ impl ProjectsInterface {
         view: DiffView,
     ) -> Result<String, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.diff(&dir, view).await?)
     }
@@ -1941,6 +1949,10 @@ impl ProjectsInterface {
         limit: u32,
     ) -> Result<Vec<GitLogEntry>, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.log(&dir, limit).await?)
     }
@@ -1951,6 +1963,10 @@ impl ProjectsInterface {
         project_id: &str,
     ) -> Result<Vec<String>, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.branches(&dir).await?)
     }
@@ -1961,6 +1977,10 @@ impl ProjectsInterface {
         project_id: &str,
     ) -> Result<Vec<String>, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.remotes(&dir).await?)
     }
@@ -1988,6 +2008,10 @@ impl ProjectsInterface {
                 },
                 None,
             )
+            .await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
             .await?;
         let dir = self.main_repo_dir(project_id);
         if let Err(error) = self.git.fetch(&dir, remote, &credential).await {
@@ -2023,6 +2047,10 @@ impl ProjectsInterface {
         paths: &[String],
     ) -> Result<(), ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.stage(&dir, paths).await?)
     }
@@ -2034,6 +2062,10 @@ impl ProjectsInterface {
         paths: &[String],
     ) -> Result<(), ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         Ok(self.git.unstage(&dir, paths).await?)
     }
@@ -2046,6 +2078,10 @@ impl ProjectsInterface {
         correlation_id: CorrelationId,
     ) -> Result<String, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         let sha = self.git.commit(&dir, message).await?;
         self.refresh_git_state(owner_id, project_id, "commit", correlation_id)
@@ -2076,6 +2112,10 @@ impl ProjectsInterface {
             }, None)
             .await?;
         // Push executes inline (short) when possible; the Operation records it.
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let dir = self.main_repo_dir(project_id);
         if let Err(error) = self.git.push(&dir, remote, branch, &credential).await {
             self.operations
@@ -2133,6 +2173,10 @@ impl ProjectsInterface {
                 },
                 None,
             )
+            .await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
             .await?;
         let dir = self.main_repo_dir(project_id);
         let outcome = self
@@ -2266,6 +2310,10 @@ impl ProjectsInterface {
         correlation_id: CorrelationId,
     ) -> Result<GitUpdateConflictView, ProjectsError> {
         self.require_ready(owner_id, project_id).await?;
+        let _lock = self
+            .workspace
+            .acquire_project_mutation_lock(project_id)
+            .await?;
         let row: ConflictRow = sqlx::query_as(
             "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE id = ? AND project_id = ?",
         )
@@ -2455,8 +2503,21 @@ impl ProjectsInterface {
         project_id: &str,
     ) -> Result<GitCredential, ProjectsError> {
         let row = self.fetch_project(owner_id, project_id).await?;
-        match RepoAccess::parse(&row.repo_access) {
-            Some(RepoAccess::GithubPrivate) => {
+        let Some(access) = RepoAccess::parse(&row.repo_access) else {
+            return Ok(GitCredential::None);
+        };
+        self.credential_for_access(owner_id, &row, access).await
+    }
+
+    async fn credential_for_access(
+        &self,
+        owner_id: &str,
+        row: &ProjectRow,
+        access: RepoAccess,
+    ) -> Result<GitCredential, ProjectsError> {
+        match access {
+            RepoAccess::PublicHttps => Ok(GitCredential::None),
+            RepoAccess::GithubPrivate => {
                 let cred_id = row
                     .github_credential_id
                     .as_ref()
@@ -2467,7 +2528,6 @@ impl ProjectsInterface {
                     password: pat.unwrap_or_default(),
                 })
             }
-            _ => Ok(GitCredential::None),
         }
     }
 
@@ -2524,7 +2584,7 @@ impl ProjectsInterface {
         let project_id_typed: ProjectId = project_id
             .parse()
             .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("bad project id")))?;
-        Ok(self.main_handle(project_id_typed))
+        Ok(WorkspaceHandle::main(project_id_typed))
     }
 
     async fn persist_update_conflict(
@@ -2634,31 +2694,6 @@ impl ProjectsInterface {
         Ok(())
     }
 
-    async fn commit_main_revision(
-        &self,
-        event: MainRevisionEvent<'_>,
-        handle: &WorkspaceHandle,
-        expected: Option<&RevisionRef>,
-        cause: &str,
-        actor: serde_json::Value,
-    ) -> Result<RevisionRef, ProjectsError> {
-        let mut work = self.unit_of_work.begin().await?;
-        let revision = self
-            .workspace
-            .bump_revision_in_tx(work.connection(), handle, expected, cause, actor)
-            .await?;
-        self.append_main_revision_changed_in_tx(
-            &mut work,
-            event.owner_id,
-            event.project_id,
-            &revision,
-            event.correlation_id,
-        )
-        .await?;
-        work.commit().await?;
-        Ok(revision)
-    }
-
     async fn append_main_revision_changed_in_tx(
         &self,
         work: &mut UnitOfWorkTransaction<'_>,
@@ -2680,6 +2715,21 @@ impl ProjectsInterface {
         })
         .await?;
         Ok(())
+    }
+}
+
+fn main_revision_event_context(
+    owner_id: &str,
+    project_id: &str,
+    correlation_id: &str,
+) -> FileMutationEventContext {
+    FileMutationEventContext {
+        event_type: "project.main_revision_changed".into(),
+        actor: serde_json::json!({"kind": "owner", "id": owner_id}),
+        resource: serde_json::json!({"kind": "project", "id": project_id}),
+        correlation_id: correlation_id.to_owned(),
+        causation_id: None,
+        payload: serde_json::json!({"source": "editor"}),
     }
 }
 

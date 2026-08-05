@@ -13,5 +13,3 @@ owned_tables = [
 ]
 publishes = []
 allowed_module_dependencies = []
-specs = []
-tests = []

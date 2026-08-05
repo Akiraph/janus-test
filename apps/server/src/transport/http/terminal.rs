@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use axum::{
-    Extension, Json,
+    Json,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -33,7 +33,6 @@ use crate::{
         auth::authenticate,
         dto::DataResponse,
         problem::{Problem, codes, map_runtime_error},
-        request_id::RequestContext,
     },
 };
 
@@ -98,7 +97,6 @@ pub struct ConnectQuery {
 pub async fn create_terminal(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Extension(context): Extension<RequestContext>,
     Json(body): Json<CreateTerminalRequest>,
 ) -> Result<(StatusCode, Json<DataResponse<TerminalProjection>>), Problem> {
     let auth = authenticate(&state, &headers).await?;
@@ -116,7 +114,6 @@ pub async fn create_terminal(
         .unwrap_or_default();
     let environment = ExecutionEnvironment::new(ordinary, Vec::new())
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid environment"))?;
-    let _ = context;
     let data = state
         .application()
         .create_project_terminal(
@@ -181,7 +178,6 @@ pub struct ListTerminalsQuery {
 pub async fn issue_terminal_ticket(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Extension(context): Extension<RequestContext>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<(StatusCode, Json<DataResponse<TerminalTicket>>), Problem> {
     let auth = authenticate(&state, &headers).await?;
@@ -199,7 +195,6 @@ pub async fn issue_terminal_ticket(
         .issue_terminal_ticket(request)
         .await
         .map_err(map_runtime_error)?;
-    let _ = context;
     Ok((StatusCode::CREATED, Json(DataResponse { data })))
 }
 

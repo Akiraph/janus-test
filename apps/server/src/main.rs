@@ -38,6 +38,16 @@ async fn main() -> anyhow::Result<()> {
     // Runtime and execution recovery already ran during AppState::initialize.
     state
         .blobs()
+        .recover_cleanup()
+        .await
+        .context("recover durable blob reference cleanup")?;
+    state
+        .blobs()
+        .sweep_unreferenced()
+        .await
+        .context("sweep unreferenced blob objects")?;
+    state
+        .blobs()
         .clean_incoming()
         .await
         .context("clean incoming objects on startup")?;

@@ -6,8 +6,7 @@
 snapshots, manifests, diffs, propagation state, and controlled file mutations.
 New callers use `interface.rs`; Project, Session, and Execution do not read
 Workspace tables.
-The remaining Project editor write path is a compatibility boundary that still
-needs to move its filesystem mutation behind this interface.
+Project editor writes use the same guarded mutation path as Session tool writes.
 
 ## Observable behavior
 
@@ -31,13 +30,18 @@ needs to move its filesystem mutation behind this interface.
 - A propagation conflict remains durable until the Session is edited and a
   subsequent Apply succeeds, so a failed HTTP request or process restart does
   not lose the files that still need resolution.
+- Apply/Sync records a durable path intent before filesystem transfer. Startup
+  replays an interrupted intent only while both source and target paths still
+  match their recorded preimages; an unexpected edit becomes a durable
+  propagation conflict instead of being overwritten.
 - Workspace-relative paths reject absolute roots, drive or UNC prefixes, NULs,
   and `..` traversal. `.git` paths are not editable through file mutations.
 
 ## Invariants
 
-- `workspace_copies`, `content_revisions`, `workspace_snapshots`, and
-  `propagation_links`, and `workspace_propagation_conflicts` are owned here.
+- `workspace_copies`, `content_revisions`, `workspace_snapshots`,
+  `propagation_links`, `workspace_propagation_conflicts`, and
+  `workspace_mutation_intents` are owned here.
   Historical table names, event strings, and migration ownership remain
   unchanged during the crate move.
 - Manifest identity excludes symlink targets and special filesystem entries;
@@ -73,3 +77,7 @@ must remain outside this crate.
   copying the entire tree; legacy filesystem baselines are read once and
   migrated lazily. It advances only where Main and Session agree after a
   successful propagation.
+- A per-project mutation guard serializes Main edits, Session writes, copy
+  lifecycle, diff scans, and propagation inside one process. The revision
+  precondition and durable propagation intent remain the cross-process safety
+  boundary.
