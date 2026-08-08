@@ -3,7 +3,9 @@ mod conditions;
 pub mod dto;
 mod git;
 mod handlers;
+mod jobs;
 mod models;
+mod notifications;
 mod operations;
 mod problem;
 mod projects;
@@ -54,7 +56,10 @@ pub use problem::Problem;
         sessions::answer_ask, sessions::retry_model,
         terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
         terminal::resize_terminal, terminal::signal_terminal, terminal::close_terminal,
-        terminal::terminal_scrollback, terminal::connect_terminal
+        terminal::terminal_scrollback, terminal::connect_terminal,
+        jobs::list_jobs, jobs::job_log, jobs::cancel_job
+        , notifications::list_channels, notifications::create_channel,
+        notifications::update_channel, notifications::delete_channel, notifications::test_channel
     ),
     components(schemas(
         dto::LiveResponse,
@@ -84,6 +89,7 @@ pub use problem::Problem;
         janus_models::interface::ProviderInput,
         janus_models::interface::ProviderView,
         janus_models::interface::ProviderKind,
+        janus_models::interface::ModelClient,
         janus_models::interface::ProbeResult,
         janus_models::interface::ProbeStatus,
         janus_models::interface::EmbeddedModelInput,
@@ -105,10 +111,10 @@ pub use problem::Problem;
         janus_workspace::interface::MoveFileInput,
         janus_workspace::interface::DeleteFileInput,
         janus_projects::interface::RetryProjectInput,
-        janus_projects::interface::GitUpdateConflictView,
-        janus_projects::interface::GitUpdateConflictPathView,
-        janus_projects::interface::ResolveGitUpdateConflictInput,
-        janus_projects::interface::ResolveGitUpdateConflictPath,
+        janus_source_control::interface::GitUpdateConflictView,
+        janus_source_control::interface::GitUpdateConflictPathView,
+        janus_source_control::interface::ResolveGitUpdateConflictInput,
+        janus_source_control::interface::ResolveGitUpdateConflictPath,
         janus_infrastructure::operations::OperationView,
         janus_infrastructure::operations::OperationStatus,
         janus_workspace::interface::RevisionRef,
@@ -153,6 +159,13 @@ pub use problem::Problem;
         janus_runtime::interface::TerminalSignal,
         janus_runtime::interface::TerminalTicket,
         janus_runtime::interface::LogRange,
+        janus_runtime::interface::JobProjection,
+        janus_runtime::interface::DelegatedCliKind,
+        janus_notifications::interface::NotificationChannelKind,
+        janus_notifications::interface::NotificationEventKind,
+        janus_notifications::interface::NotificationTarget,
+        janus_notifications::interface::NotificationChannelInput,
+        janus_notifications::interface::NotificationChannelView,
         terminal::CreateTerminalRequest,
         terminal::TerminalSizeInput,
         terminal::EnvironmentInput,
@@ -170,6 +183,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/bootstrap", get(handlers::bootstrap))
         .route("/api/v1/system/info", get(handlers::system_info))
         .route("/api/v1/events", get(sse::events))
+        .route("/api/v1/sessions/{id}/jobs", get(jobs::list_jobs))
+        .route("/api/v1/jobs/{id}/log", get(jobs::job_log))
+        .route("/api/v1/jobs/{id}/cancel", post(jobs::cancel_job))
+        .route(
+            "/api/v1/notification-channels",
+            get(notifications::list_channels).post(notifications::create_channel),
+        )
+        .route(
+            "/api/v1/notification-channels/{id}",
+            patch(notifications::update_channel).delete(notifications::delete_channel),
+        )
+        .route(
+            "/api/v1/notification-channels/{id}/test",
+            post(notifications::test_channel),
+        )
         .route(
             "/api/v1/auth/initialize/options",
             post(auth::initialize_options),

@@ -67,28 +67,24 @@ async fn seed_session(
     state: &AppState,
     include_queued_turn: bool,
 ) -> anyhow::Result<SeededSession> {
-    let pool = state.database().pool();
+    let pool = state.pool();
     let project_id = ProjectId::new();
     let session_id = SessionId::new();
     let active_turn_id = TurnId::new();
     let queued_turn_id = include_queued_turn.then(TurnId::new);
 
-    sqlx::query("INSERT INTO tenants (id, created_at) VALUES ('tenant-cancel-test', ?)")
-        .bind(NOW)
-        .execute(pool)
-        .await?;
     sqlx::query(
-        "INSERT INTO owners (id, tenant_id, display_name, created_at) \
-         VALUES ('owner-cancel-test', 'tenant-cancel-test', 'Owner', ?)",
+        "INSERT INTO owners (id, display_name, created_at) \
+         VALUES ('owner-cancel-test', 'Owner', ?)",
     )
     .bind(NOW)
     .execute(pool)
     .await?;
     sqlx::query(
         "INSERT INTO projects \
-         (id, owner_id, tenant_id, name, state, repo_access, repo_url, version, \
+         (id, owner_id, name, state, repo_access, repo_url, version, \
           created_at, updated_at, last_activity_at) \
-         VALUES (?, 'owner-cancel-test', 'tenant-cancel-test', 'Project', 'ready', \
+         VALUES (?, 'owner-cancel-test', 'Project', 'ready', \
                  'public_https', 'https://example.com/repo.git', 'v_project', ?, ?, ?)",
     )
     .bind(project_id.to_string())
@@ -160,7 +156,7 @@ async fn restart_persists_wake_for_unstarted_turn() -> anyhow::Result<()> {
          WHERE turns.id = ?",
     )
     .bind(active_turn_id.to_string())
-    .fetch_one(state.database().pool())
+    .fetch_one(state.pool())
     .await?;
     assert_eq!(status, "running");
     assert_eq!(
@@ -172,7 +168,7 @@ async fn restart_persists_wake_for_unstarted_turn() -> anyhow::Result<()> {
         "SELECT handler_kind, payload_json FROM work_items \
          WHERE handler_kind = 'turn.execute' ORDER BY created_at DESC LIMIT 1",
     )
-    .fetch_one(state.database().pool())
+    .fetch_one(state.pool())
     .await?;
     assert_eq!(handler_kind, "turn.execute");
     let payload: Value = serde_json::from_str(&payload_json)?;
@@ -194,7 +190,7 @@ async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Resul
     )
     .bind(&now)
     .bind(&now)
-    .execute(state.database().pool())
+    .execute(state.pool())
     .await?;
 
     for expected_attempt in 1..=5_i64 {
@@ -205,7 +201,7 @@ async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Resul
             .expect("work item should remain claimable until the fifth attempt");
         let attempts: i64 =
             sqlx::query_scalar("SELECT attempts FROM work_items WHERE id = 'bounded-work'")
-                .fetch_one(state.database().pool())
+                .fetch_one(state.pool())
                 .await?;
         assert_eq!(attempts, expected_attempt);
         assert!(
@@ -218,14 +214,14 @@ async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Resul
             // Bypass the real delay so the test exercises the bound quickly.
             sqlx::query("UPDATE work_items SET not_before = ? WHERE id = 'bounded-work'")
                 .bind(janus_infrastructure::clock::now_utc_str())
-                .execute(state.database().pool())
+                .execute(state.pool())
                 .await?;
         }
     }
 
     let (attempts, dead): (i64, i64) =
         sqlx::query_as("SELECT attempts, dead FROM work_items WHERE id = 'bounded-work'")
-            .fetch_one(state.database().pool())
+            .fetch_one(state.pool())
             .await?;
     assert_eq!(attempts, 5);
     assert_eq!(dead, 1);
@@ -283,7 +279,7 @@ async fn stale_operation_worker_cannot_publish_terminal_state() -> anyhow::Resul
     );
 
     sqlx::query("UPDATE work_items SET lease_expires_at = '2000-01-01T00:00:00.000Z'")
-        .execute(state.database().pool())
+        .execute(state.pool())
         .await?;
     assert!(
         !state
@@ -472,7 +468,7 @@ async fn cancel_endpoint_validates_version_and_preserves_active_turn_when_cancel
         .expect("Session version in cancellation response");
     assert_ne!(next_version, "v_session");
 
-    let pool = state.database().pool();
+    let pool = state.pool();
     let queued_status: String = sqlx::query_scalar("SELECT status FROM turns WHERE id = ?")
         .bind(queued_turn_id.to_string())
         .fetch_one(pool)
@@ -523,7 +519,7 @@ async fn cancel_endpoint_settles_active_turn_and_releases_session() -> anyhow::R
         .expect("Session version in cancellation response");
     assert_ne!(next_version, "v_session");
 
-    let pool = state.database().pool();
+    let pool = state.pool();
     let turn: (String, Option<String>) =
         sqlx::query_as("SELECT status, cancellation_reason FROM turns WHERE id = ?")
             .bind(seeded.active_turn_id.to_string())
@@ -545,7 +541,7 @@ async fn a_new_turn_keeps_durable_messages_from_a_canceled_turn() -> anyhow::Res
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
     let seeded = seed_session(&state, false).await?;
-    let pool = state.database().pool();
+    let pool = state.pool();
     let prior_turn_id = seeded.active_turn_id;
     let next_turn_id = TurnId::new();
 

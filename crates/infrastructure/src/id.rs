@@ -53,7 +53,6 @@ typed_id!(WorkItemId);
 
 // Capability IDs remain technical UUID wrappers. Their owning tables and
 // domain rules live in the corresponding capability crate.
-typed_id!(TenantId);
 typed_id!(ActorId);
 typed_id!(OwnerId);
 typed_id!(PasskeyId);
@@ -89,6 +88,7 @@ typed_id!(AskId);
 typed_id!(PlanVersionId);
 typed_id!(ContextVersionId);
 typed_id!(CompactSummaryId);
+typed_id!(NotificationChannelId);
 
 /// A storage label returned by trusted blob operations; parsing it does not
 /// prove that the value is a SHA-256 digest or that the object exists.

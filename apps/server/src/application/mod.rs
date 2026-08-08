@@ -7,19 +7,25 @@
 
 use janus_execution::interface::ExecutionInterface;
 use janus_infrastructure::{
+    events::EventStore,
     id::TurnId,
     operations::OperationInterface,
+    state_broadcaster::StateBroadcaster,
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 use janus_models::interface::ModelsInterface;
+use janus_notifications::interface::NotificationsInterface;
 use janus_projects::interface::ProjectsInterface;
 use janus_runtime::interface::RuntimeInterface;
 use janus_sessions::interface::SessionsInterface;
+use janus_source_control::SourceControlInterface;
 use janus_workspace::interface::WorkspaceInterface;
 use serde_json::json;
 
 pub(crate) mod execution;
 pub mod lifecycle;
+pub mod notification_worker;
+pub mod state_worker;
 pub(crate) mod operation_kinds;
 pub(crate) mod project_terminal;
 pub(crate) mod session_flow;
@@ -40,10 +46,14 @@ pub struct Application {
     workspace: WorkspaceInterface,
     models: ModelsInterface,
     projects: ProjectsInterface,
+    source_control: SourceControlInterface,
     runtime: RuntimeInterface,
     sessions: SessionsInterface,
     execution: ExecutionInterface,
     execution_coordinator: ExecutionCoordinator,
+    state_broadcaster: StateBroadcaster,
+    events: EventStore,
+    notifications: NotificationsInterface,
 }
 
 pub(crate) struct ApplicationDependencies {
@@ -52,10 +62,14 @@ pub(crate) struct ApplicationDependencies {
     pub(crate) workspace: WorkspaceInterface,
     pub(crate) models: ModelsInterface,
     pub(crate) projects: ProjectsInterface,
+    pub(crate) source_control: SourceControlInterface,
     pub(crate) runtime: RuntimeInterface,
     pub(crate) sessions: SessionsInterface,
     pub(crate) execution: ExecutionInterface,
     pub(crate) execution_coordinator: ExecutionCoordinator,
+    pub(crate) state_broadcaster: StateBroadcaster,
+    pub(crate) events: EventStore,
+    pub(crate) notifications: NotificationsInterface,
 }
 
 impl Application {
@@ -66,10 +80,14 @@ impl Application {
             workspace: dependencies.workspace,
             models: dependencies.models,
             projects: dependencies.projects,
+            source_control: dependencies.source_control,
             runtime: dependencies.runtime,
             sessions: dependencies.sessions,
             execution: dependencies.execution,
             execution_coordinator: dependencies.execution_coordinator,
+            state_broadcaster: dependencies.state_broadcaster,
+            events: dependencies.events,
+            notifications: dependencies.notifications,
         }
     }
 
@@ -93,6 +111,10 @@ impl Application {
         &self.projects
     }
 
+    pub(crate) fn source_control(&self) -> &SourceControlInterface {
+        &self.source_control
+    }
+
     pub(crate) fn runtime(&self) -> &RuntimeInterface {
         &self.runtime
     }
@@ -107,6 +129,18 @@ impl Application {
 
     pub(crate) fn execution_coordinator(&self) -> &ExecutionCoordinator {
         &self.execution_coordinator
+    }
+
+    pub(crate) fn events(&self) -> &EventStore {
+        &self.events
+    }
+
+    pub(crate) fn notifications(&self) -> &NotificationsInterface {
+        &self.notifications
+    }
+
+    pub(crate) fn state_broadcaster(&self) -> &StateBroadcaster {
+        &self.state_broadcaster
     }
 
     pub(crate) async fn enqueue_turn_wake_in_tx(

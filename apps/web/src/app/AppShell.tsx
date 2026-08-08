@@ -5,6 +5,7 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import Server from "lucide-solid/icons/server";
 import Settings from "lucide-solid/icons/settings";
 import ShieldCheck from "lucide-solid/icons/shield-check";
+import Bell from "lucide-solid/icons/bell";
 import type { JSX } from "solid-js";
 import { Show, Suspense } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
@@ -46,9 +47,11 @@ export function AppShell(props: AppShellProps) {
     (location.pathname.startsWith("/settings") ||
       location.pathname.startsWith("/system") ||
       location.pathname.startsWith("/models") ||
-      location.pathname.startsWith("/security")) &&
+      location.pathname.startsWith("/security") ||
+      location.pathname === "/notifications") &&
     !isImmersive();
   const isModels = () => location.pathname === "/settings" || location.pathname === "/models";
+  const isNotifications = () => location.pathname === "/notifications";
 
   // Bootstrap pending: the Setup/Login/normal decision needs it. We do NOT
   // return a full-screen splash here as a gate — if bootstrap ever hung (HMR
@@ -96,6 +99,10 @@ export function AppShell(props: AppShellProps) {
                 <A href="/security" classList={{ active: location.pathname === "/security" }}>
                   <ShieldCheck size={16} />
                   Security
+                </A>
+                <A href="/notifications" classList={{ active: isNotifications() }}>
+                  <Bell size={16} />
+                  Notifications
                 </A>
               </nav>
               <div class="settings-content">

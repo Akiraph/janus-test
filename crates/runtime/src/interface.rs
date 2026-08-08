@@ -1,4 +1,4 @@
-﻿//! Public process-runtime lifecycle boundary.
+//! Public process-runtime lifecycle boundary.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -500,7 +500,89 @@ pub enum NetworkPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum DelegatedCliKind {
     ClaudeCode,
+    #[serde(rename = "codex")]
     Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedCliAccess {
+    ReadOnly,
+    FullAccess,
+}
+
+impl Default for DelegatedCliAccess {
+    fn default() -> Self {
+        Self::FullAccess
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedCliEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultracode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DelegatedCliLaunchOptions {
+    pub model: Option<String>,
+    pub effort: Option<DelegatedCliEffort>,
+    pub access: DelegatedCliAccess,
+}
+
+impl DelegatedCliLaunchOptions {
+    pub fn from_raw(
+        model: Option<&str>,
+        effort: Option<&str>,
+        access: Option<&str>,
+    ) -> Result<Self, RuntimeError> {
+        let model = model
+            .map(str::trim)
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty());
+        if let Some(value) = model.as_deref() {
+            if value.len() > 100
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._:/+-".contains(&byte))
+            {
+                return Err(RuntimeError::InvalidSpec(
+                    "model must contain 1-100 ASCII letters, digits, or ._:/+- characters".into(),
+                ));
+            }
+        }
+        let effort = match effort.map(str::trim).filter(|value| !value.is_empty()) {
+            None => None,
+            Some("low") => Some(DelegatedCliEffort::Low),
+            Some("medium") => Some(DelegatedCliEffort::Medium),
+            Some("high") => Some(DelegatedCliEffort::High),
+            Some("xhigh") => Some(DelegatedCliEffort::XHigh),
+            Some("max") => Some(DelegatedCliEffort::Max),
+            Some("ultracode") => Some(DelegatedCliEffort::Ultracode),
+            Some(value) => {
+                return Err(RuntimeError::InvalidSpec(format!(
+                    "effort must be low|medium|high|xhigh|max|ultracode, got {value:?}"
+                )));
+            }
+        };
+        let access = match access.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("full-access") => DelegatedCliAccess::FullAccess,
+            Some("read-only") => DelegatedCliAccess::ReadOnly,
+            Some(value) => {
+                return Err(RuntimeError::InvalidSpec(format!(
+                    "access must be read-only|full-access, got {value:?}"
+                )));
+            }
+        };
+        Ok(Self {
+            model,
+            effort,
+            access,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -574,6 +656,7 @@ pub enum CommandKind {
 pub struct ValidatedCommand {
     kind: CommandKind,
     input: String,
+    delegated_cli_options: Option<DelegatedCliLaunchOptions>,
 }
 
 impl ValidatedCommand {
@@ -586,13 +669,31 @@ impl ValidatedCommand {
         instruction: impl Into<String>,
         session_id: Option<CliSessionId>,
     ) -> Result<Self, RuntimeError> {
-        Self::new(
+        Self::delegated_cli_with_options(cli, instruction, session_id, None)
+    }
+
+    pub fn delegated_cli_with_options(
+        cli: DelegatedCliKind,
+        instruction: impl Into<String>,
+        session_id: Option<CliSessionId>,
+        options: Option<DelegatedCliLaunchOptions>,
+    ) -> Result<Self, RuntimeError> {
+        Self::new_with_options(
             CommandKind::DelegatedCli { cli, session_id },
             instruction.into(),
+            options,
         )
     }
 
     fn new(kind: CommandKind, input: String) -> Result<Self, RuntimeError> {
+        Self::new_with_options(kind, input, None)
+    }
+
+    fn new_with_options(
+        kind: CommandKind,
+        input: String,
+        delegated_cli_options: Option<DelegatedCliLaunchOptions>,
+    ) -> Result<Self, RuntimeError> {
         if input.trim().is_empty() {
             return Err(RuntimeError::InvalidSpec(
                 "command input cannot be empty".into(),
@@ -603,7 +704,16 @@ impl ValidatedCommand {
                 "command input exceeds the one MiB contract limit".into(),
             ));
         }
-        Ok(Self { kind, input })
+        if !matches!(kind, CommandKind::DelegatedCli { .. }) && delegated_cli_options.is_some() {
+            return Err(RuntimeError::InvalidSpec(
+                "CLI launch options require a delegated CLI command".into(),
+            ));
+        }
+        Ok(Self {
+            kind,
+            input,
+            delegated_cli_options,
+        })
     }
 
     pub fn kind(&self) -> &CommandKind {
@@ -612,6 +722,10 @@ impl ValidatedCommand {
 
     pub fn input(&self) -> &str {
         &self.input
+    }
+
+    pub fn delegated_cli_options(&self) -> Option<&DelegatedCliLaunchOptions> {
+        self.delegated_cli_options.as_ref()
     }
 }
 
@@ -1183,6 +1297,7 @@ pub struct JobProjection {
     pub runtime_id: RuntimeId,
     pub session_id: SessionId,
     pub controlling_turn_id: TurnId,
+    pub cli_kind: Option<DelegatedCliKind>,
     pub initiated_by_tool_call_id: ToolCallId,
     pub cli_session_id: Option<CliSessionId>,
     pub status: JobStatus,
@@ -1407,7 +1522,46 @@ impl RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::RelativeWorkingDirectory;
+    use super::{
+        DelegatedCliAccess, DelegatedCliEffort, DelegatedCliKind, DelegatedCliLaunchOptions,
+        RelativeWorkingDirectory, ValidatedCommand,
+    };
+
+    #[test]
+    fn validates_delegated_cli_launch_options() {
+        let options = DelegatedCliLaunchOptions::from_raw(
+            Some("gpt-5.1-codex"),
+            Some("ultracode"),
+            Some("read-only"),
+        )
+        .expect("reference CLI options should be accepted");
+        assert_eq!(options.model.as_deref(), Some("gpt-5.1-codex"));
+        assert_eq!(options.effort, Some(DelegatedCliEffort::Ultracode));
+        assert_eq!(options.access, DelegatedCliAccess::ReadOnly);
+        assert!(DelegatedCliLaunchOptions::from_raw(Some("中文"), None, None).is_err());
+        assert!(DelegatedCliLaunchOptions::from_raw(None, Some("unknown"), None).is_err());
+        assert!(DelegatedCliLaunchOptions::from_raw(None, None, Some("sandbox")).is_err());
+    }
+
+    #[test]
+    fn keeps_launch_options_on_delegated_commands_only() {
+        let options = DelegatedCliLaunchOptions::from_raw(Some("sonnet"), None, None)
+            .expect("valid model option");
+        let command = ValidatedCommand::delegated_cli_with_options(
+            DelegatedCliKind::ClaudeCode,
+            "inspect the workspace",
+            None,
+            Some(options.clone()),
+        )
+        .expect("delegated command should be valid");
+        assert_eq!(command.delegated_cli_options(), Some(&options));
+        assert!(
+            ValidatedCommand::shell("echo ok")
+                .expect("shell command should be valid")
+                .delegated_cli_options()
+                .is_none()
+        );
+    }
 
     #[test]
     fn accepts_the_logical_workspace_absolute_prefix() {

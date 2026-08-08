@@ -253,7 +253,7 @@
     display: grid;
     width: 100%;
     flex: none;
-    grid-template-columns: auto repeat(3, minmax(0, 1fr));
+    grid-template-columns: auto repeat(4, minmax(0, 1fr));
     padding: var(--space-2);
     border-right: 0;
     border-bottom: 1px solid var(--border);

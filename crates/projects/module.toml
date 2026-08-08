@@ -3,9 +3,6 @@ public_root = "interface.rs"
 owned_tables = [
   "projects",
   "github_credentials",
-  "project_git_state",
-  "git_update_conflicts",
-  "git_update_conflict_paths",
   "project_runtime_configs",
   "project_runtime_secrets",
   "project_egress_rules",
@@ -14,7 +11,5 @@ owned_tables = [
 publishes = [
   "project.changed",
   "project.main_revision_changed",
-  "git.state_changed",
-  "git.update_conflict_changed",
 ]
 allowed_module_dependencies = ["runtime", "workspace"]

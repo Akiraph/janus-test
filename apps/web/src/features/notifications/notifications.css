@@ -1,0 +1,62 @@
+.notification-settings .settings-group-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.notification-card {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.notification-card__main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.notification-card .record-copy small {
+  display: block;
+  margin-top: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.notification-events {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.notification-events__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.notification-event-option,
+.notification-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 560px) {
+  .notification-card__main {
+    flex-direction: column;
+  }
+
+  .notification-card .record-actions {
+    align-self: flex-end;
+  }
+
+  .notification-events__grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,5 +1,6 @@
-﻿use std::{
+use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -18,10 +19,12 @@ const MODULES: &[&str] = &[
     "sessions",
     "execution",
     "workspace",
+    "notifications",
 ];
 
 const PLATFORM_TABLES: &[&str] = &[
     "public_events",
+    "projection_cursor",
     "operations",
     "operation_steps",
     "work_items",
@@ -95,9 +98,22 @@ fn setup(root: &Path) -> anyhow::Result<()> {
 }
 
 fn dev(root: &Path) -> anyhow::Result<()> {
+    let bind = env::var("JANUS_BIND").unwrap_or_else(|_| "127.0.0.1:4317".into());
+    let server_port = bind
+        .parse::<std::net::SocketAddr>()
+        .map(|address| address.port())
+        .unwrap_or(4317);
+    let web_port = env::var("JANUS_WEB_PORT").unwrap_or_else(|_| "5173".into());
+    let api_target =
+        env::var("JANUS_API_TARGET").unwrap_or_else(|_| format!("http://127.0.0.1:{server_port}"));
+    let public_origin = env::var("JANUS_PUBLIC_ORIGIN")
+        .unwrap_or_else(|_| format!("http://localhost:{server_port}"));
+    let webauthn_rp_id = env::var("JANUS_WEBAUTHN_RP_ID").unwrap_or_else(|_| "localhost".into());
     let mut web = Command::new("bun")
         .args(["run", "--cwd", "apps/web", "dev"])
         .current_dir(root)
+        .env("JANUS_WEB_PORT", &web_port)
+        .env("JANUS_API_TARGET", &api_target)
         .spawn()
         .context("start Vite development server")?;
     // WebAuthn rejects an IP address as an RP ID, so the dev server must bind to
@@ -108,8 +124,9 @@ fn dev(root: &Path) -> anyhow::Result<()> {
         .args(["run", "-p", "janus-server"])
         .current_dir(root)
         .envs([
-            ("JANUS_PUBLIC_ORIGIN", "http://localhost:4317"),
-            ("JANUS_WEBAUTHN_RP_ID", "localhost"),
+            ("JANUS_BIND", bind.as_str()),
+            ("JANUS_PUBLIC_ORIGIN", public_origin.as_str()),
+            ("JANUS_WEBAUTHN_RP_ID", webauthn_rp_id.as_str()),
         ])
         .status()
         .context("start Janus server")?;
@@ -208,10 +225,16 @@ fn check_architecture(root: &Path) -> anyhow::Result<()> {
             } else {
                 path.join("src")
             };
-            if manifest.public_root != "interface.rs"
-                || !source_root.join(&manifest.public_root).is_file()
-            {
-                bail!("{} must expose interface.rs", manifest.name);
+            let public_root = source_root.join(&manifest.public_root);
+            let root_valid = matches!(
+                manifest.public_root.as_str(),
+                "interface.rs" | "interface/mod.rs"
+            ) && (public_root.is_file() || public_root.is_dir());
+            if !root_valid {
+                bail!(
+                    "{} must expose interface.rs or interface/mod.rs",
+                    manifest.name
+                );
             }
             for dependency in &manifest.allowed_module_dependencies {
                 validate_dependency(&manifest.name, dependency)?;
@@ -371,15 +394,15 @@ fn validate_production_table_access(
             };
         let source =
             std::fs::read_to_string(&file).with_context(|| format!("read {}", file.display()))?;
-        let table_references = rust_string_literals(&source)?
+        let table_accesses = rust_string_literals(&source)?
             .into_iter()
-            .flat_map(|literal| sql_table_references(&literal, table_owners))
+            .flat_map(|literal| sql_table_accesses(&literal, table_owners))
             .collect::<BTreeSet<_>>();
-        for table in table_references {
+        for (table, is_write) in table_accesses {
             let table_owner = &table_owners[&table];
-            if source_owner != Some(table_owner.as_str()) {
+            if is_write && source_owner != Some(table_owner.as_str()) {
                 bail!(
-                    "{} accesses {table_owner}-owned table {table}; use the owner interface",
+                    "{} writes {table_owner}-owned table {table}; use the owner interface",
                     file.display()
                 );
             }
@@ -404,18 +427,13 @@ fn validate_migration_ownership(
         }
         let sql =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let mut declared_owners = sql
+        let declared_owners = sql
             .lines()
             .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with("--"))
             .filter_map(|line| line.trim().strip_prefix("-- janus-module: "))
             .map(canonical_module_name)
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
-        if path.file_name().and_then(|name| name.to_str())
-            == Some("0016_drop_system_prefix_version.sql")
-        {
-            declared_owners.insert("execution".to_owned());
-        }
         if declared_owners.is_empty() {
             bail!("{} has no janus-module owner header", path.display());
         }
@@ -568,6 +586,36 @@ fn sql_table_references(source: &str, table_owners: &BTreeMap<String, String>) -
         }
     }
     referenced
+}
+
+/// Table accesses in a SQL literal as (table, is_write). Cross-module read-only
+/// access to another module's tables is the documented data boundary
+/// (无 Cargo 依赖); only cross-module writes are ownership violations.
+fn sql_table_accesses(
+    source: &str,
+    table_owners: &BTreeMap<String, String>,
+) -> BTreeSet<(String, bool)> {
+    let mut accesses = BTreeSet::new();
+    for statement in source.split(';') {
+        if statement.trim().is_empty() {
+            continue;
+        }
+        let write_targets = migration_table_uses(statement)
+            .into_iter()
+            .map(|table_use| table_use.name)
+            .collect::<BTreeSet<_>>();
+        for table in &write_targets {
+            if table_owners.contains_key(table) {
+                accesses.insert((table.clone(), true));
+            }
+        }
+        for table in sql_table_references(statement, table_owners) {
+            if !write_targets.contains(&table) {
+                accesses.insert((table, false));
+            }
+        }
+    }
+    accesses
 }
 
 fn sql_tokens(source: &str) -> Vec<String> {

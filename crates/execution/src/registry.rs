@@ -130,7 +130,10 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
                         "cli": {"type": "string", "enum": ["claude_code", "codex"]},
                         "instruction": {"type": "string"},
                         "working_directory": {"type": "string"},
-                        "cli_session_id": {"type": "string", "description": "Reuse an existing CLI session for follow-up"}
+                        "cli_session_id": {"type": "string", "description": "Reuse an existing CLI session for follow-up"},
+                        "model": {"type": "string", "description": "Optional CLI model id or alias"},
+                        "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"]},
+                        "access": {"type": "string", "enum": ["read-only", "full-access"], "default": "full-access"}
                     },
                     "required": ["cli", "instruction"]
                 }),

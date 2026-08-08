@@ -7,9 +7,9 @@ import X from "lucide-solid/icons/x";
 import { For, Show, Suspense } from "solid-js";
 import { EmptyState } from "../../../components/ui/EmptyState";
 import type { ProjectView } from "../../../lib/api";
-import { FileEditor } from "./FileEditor";
-import { SessionTabView } from "./SessionTabView";
-import { basename } from "./utils";
+import { FileEditor } from "../../file-editor/FileEditor";
+import { SessionTabView } from "../../session/SessionTabView";
+import { basename } from "../../../lib/utils";
 import type {
   FileDocument,
   SessionDocument,

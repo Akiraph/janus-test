@@ -21,6 +21,11 @@ The control plane listens on `http://127.0.0.1:4317` and the web app on
 `http://127.0.0.1:5173`. Runtime data defaults to `.janus-dev/`; set
 `JANUS_DATA_ROOT` to use another directory.
 
+To run a second web/control-plane pair alongside a Tauri client, set
+`JANUS_BIND`, `JANUS_PUBLIC_ORIGIN`, `JANUS_WEB_PORT`, and optionally
+`JANUS_API_TARGET` before `cargo xtask dev`. For example, use
+`127.0.0.1:4318` for the control plane and `5174` for the web app.
+
 ## Verify
 
 ```text

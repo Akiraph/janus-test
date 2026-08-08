@@ -19,6 +19,7 @@ janus-identity = { path = "../../crates/identity" }
 janus-infrastructure = { path = "../../crates/infrastructure" }
 janus-execution = { path = "../../crates/execution" }
 janus-models = { path = "../../crates/models" }
+janus-notifications = { path = "../../crates/notifications" }
 janus-projects = { path = "../../crates/projects" }
 janus-runtime = { path = "../../crates/runtime" }
 janus-sessions = { path = "../../crates/sessions" }

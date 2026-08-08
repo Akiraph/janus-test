@@ -173,7 +173,7 @@ async fn terminal_roundtrip_creates_issues_consumes_writes_and_closes() -> anyho
     assert_eq!(closed.status, TerminalStatus::Exited);
     assert!(!closed.writable);
 
-    let events = state.events().after(0, 100).await?;
+    let events = state.system().events_after(0, 100).await?;
     assert!(
         events
             .iter()
@@ -313,7 +313,7 @@ async fn terminal_recovery_converts_running_to_lost_and_revokes_tickets() -> any
     // then run recovery.
     sqlx::query("UPDATE terminals SET status = 'running' WHERE id = ?")
         .bind(terminal_id.to_string())
-        .execute(state.database().pool())
+        .execute(state.pool())
         .await?;
     state.runtime().recover_uncertain().await?;
     let recovered = state.runtime().terminal(terminal_id).await?;

@@ -1,4 +1,4 @@
-﻿use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use axum::{
     body::{Body, to_bytes},
@@ -102,7 +102,7 @@ async fn provider_embeds_models_and_masks_key_without_leaking() -> anyhow::Resul
         "SELECT api_key_ciphertext FROM model_providers WHERE id = ?",
     )
     .bind(provider_id)
-    .fetch_one(state.database().pool())
+    .fetch_one(state.pool())
     .await?
     .0;
     assert!(!String::from_utf8_lossy(&stored).contains(secret));
@@ -112,7 +112,7 @@ async fn provider_embeds_models_and_masks_key_without_leaking() -> anyhow::Resul
         "SELECT api_key_preview FROM model_providers WHERE id = ?",
     )
     .bind(provider_id)
-    .fetch_one(state.database().pool())
+    .fetch_one(state.pool())
     .await?
     .0;
     assert_eq!(stored_preview.as_deref(), Some(preview));
@@ -121,7 +121,7 @@ async fn provider_embeds_models_and_masks_key_without_leaking() -> anyhow::Resul
     let event_payloads: Vec<(String,)> = sqlx::query_as(
         "SELECT payload_json FROM public_events WHERE event_type = 'model_config.changed'",
     )
-    .fetch_all(state.database().pool())
+    .fetch_all(state.pool())
     .await?;
     assert!(!event_payloads.is_empty());
     let events = serde_json::to_string(&event_payloads)?;
@@ -195,6 +195,46 @@ async fn enabled_model_requires_enabled_provider() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
     let problem: Value = serde_json::from_str(&response)?;
     assert_eq!(problem["code"], "VALIDATION_FAILED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_provider_name_is_allowed_across_clients() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let app = router(state.clone());
+
+    let base = json!({
+        "kind": "openai_responses",
+        "display_name": "Shared",
+        "base_url": "http://127.0.0.1:8999/v1/",
+        "api_key": "sk-test-only-key",
+        "models": [
+            {
+                "display_name": "Same",
+                "upstream_model_id": "fixture-a",
+                "supports_1m": false,
+                "supports_images": false,
+                "enabled": true
+            }
+        ],
+        "enabled": true
+    });
+
+    // A supervisor provider named "Shared".
+    let (status, response) =
+        json_request(&app, "POST", "/api/v1/model-providers", base.clone()).await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+
+    // The same config under the codex client must not collide with the
+    // supervisor provider of the same name.
+    let mut codex = base.clone();
+    codex["client"] = json!("codex");
+    let (status, response) = json_request(&app, "POST", "/api/v1/model-providers", codex).await?;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let created: Value = serde_json::from_str(&response)?;
+    assert_eq!(created["data"]["client"], "codex");
+    assert_eq!(created["data"]["display_name"], "Shared");
     Ok(())
 }
 

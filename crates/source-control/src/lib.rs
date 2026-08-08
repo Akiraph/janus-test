@@ -1,12 +1,15 @@
-//! Source Control capability contracts.
+//! Source Control capability.
 //!
-//! This crate owns the narrow port used to drive Git. Project metadata,
-//! conflict persistence, and operation scheduling remain in their owning
-//! capabilities until those boundaries move in a later extraction.
+//! Owns the Git orchestration port (`GitRunner`) and the git state/conflict
+//! tables. Reads Project repo config and GitHub credentials from `projects`
+//! (read-only) only when resolving a repo to operate on; Project lifecycle
+//! states stay owned by `projects`.
 
+pub mod git;
 pub mod interface;
 
+pub use git::{system_runner, SystemGit};
 pub use interface::{
     DiffView, GitCredential, GitError, GitFuture, GitLogEntry, GitRunner, GitStatus,
-    UpdateConflictPath, UpdateOutcome,
+    SourceControlError, SourceControlInterface, UpdateConflictPath, UpdateOutcome,
 };

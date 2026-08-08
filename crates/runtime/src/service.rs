@@ -17,7 +17,7 @@ use super::{
     log_store::LogStore,
 };
 use janus_infrastructure::{
-    events::{EventStore, NewEvent},
+    events::{EventStore, EventType, NewEvent},
     id::{JobId, LogStreamId, ProjectId, RuntimeId, ServiceId, SessionId, TerminalId, TurnId},
     secrets::{purpose_hash, random_token},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
@@ -57,6 +57,7 @@ struct JobRow {
     session_id: String,
     initiated_by_tool_call_id: String,
     controlling_turn_id: String,
+    cli_kind: Option<String>,
     cli_session_id: Option<String>,
     command_summary: String,
     executor_nonce: String,
@@ -1230,7 +1231,7 @@ impl RuntimeInterface {
                 LogCursor::new(u64::try_from(next_cursor).map_err(storage_error)?);
         }
         work.append_event(NewEvent {
-            event_type: "terminal.changed".into(),
+            event_type: EventType::TerminalChanged,
             actor: json!({"kind": "runtime_system"}),
             resource: Some(json!({"kind": "terminal", "id": terminal.id})),
             correlation_id: format!("runtime-terminal-{}", terminal.id),
@@ -1384,7 +1385,7 @@ impl RuntimeInterface {
             .map_err(storage_error)?;
         let runtime = runtime_projection(row)?;
         work.append_event(NewEvent {
-            event_type: "runtime.changed".into(),
+            event_type: EventType::RuntimeChanged,
             actor: json!({"kind": "runtime_system"}),
             resource: Some(json!({"kind": "runtime", "id": runtime.id})),
             correlation_id: format!("runtime-runtime-{}", runtime.id),
@@ -1505,7 +1506,7 @@ impl RuntimeInterface {
         let job = job_projection(row)?;
         work
             .append_event(NewEvent {
-                event_type: "job.changed".into(),
+                event_type: EventType::JobChanged,
                 actor: json!({"kind": "runtime_system"}),
                 resource: Some(json!({"kind": "job", "id": job.id})),
                 correlation_id: format!("runtime-job-{}", job.id),
@@ -1530,7 +1531,7 @@ impl RuntimeInterface {
         let service = service_projection(row)?;
         work
             .append_event(NewEvent {
-                event_type: "service.changed".into(),
+                event_type: EventType::ServiceChanged,
                 actor: json!({"kind": "runtime_system"}),
                 resource: Some(json!({"kind": "service", "id": service.id})),
                 correlation_id: format!("runtime-service-{}", service.id),
@@ -1739,7 +1740,7 @@ impl RuntimeInterface {
 const RUNTIME_SELECT: &str = "SELECT id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
     capability_snapshot_json, status, version, created_at, updated_at, stopped_at FROM runtimes WHERE id = ?";
 const JOB_SELECT: &str = "SELECT id, runtime_id, session_id, initiated_by_tool_call_id, \
-    controlling_turn_id, cli_session_id, command_summary, executor_nonce, log_stream_id, status, exit_json, \
+    controlling_turn_id, cli_kind, cli_session_id, command_summary, executor_nonce, log_stream_id, status, exit_json, \
     usage_json, version, created_at, started_at, ended_at FROM jobs";
 const SERVICE_SELECT: &str = "SELECT id, runtime_id, session_id, initiated_by_tool_call_id, impact, \
     command_summary, executor_nonce, health_json, log_stream_id, status, exit_json, version, created_at, started_at, \
@@ -1877,6 +1878,11 @@ fn job_projection(row: JobRow) -> Result<JobProjection, RuntimeError> {
         runtime_id: row.runtime_id.parse().map_err(storage_error)?,
         session_id: row.session_id.parse().map_err(storage_error)?,
         controlling_turn_id: row.controlling_turn_id.parse().map_err(storage_error)?,
+        cli_kind: row
+            .cli_kind
+            .as_deref()
+            .map(parse_delegated_cli_kind)
+            .transpose()?,
         initiated_by_tool_call_id: row
             .initiated_by_tool_call_id
             .parse()
@@ -1958,6 +1964,16 @@ fn parse_job_status(value: &str) -> Result<JobStatus, RuntimeError> {
         "failed" => Ok(JobStatus::Failed),
         "canceled" => Ok(JobStatus::Canceled),
         "lost" => Ok(JobStatus::Lost),
+        _ => Err(RuntimeError::RuntimeUnavailable),
+    }
+}
+
+fn parse_delegated_cli_kind(
+    value: &str,
+) -> Result<super::interface::DelegatedCliKind, RuntimeError> {
+    match value {
+        "claude_code" => Ok(super::interface::DelegatedCliKind::ClaudeCode),
+        "codex" => serde_json::from_str("\"codex\"").map_err(|_| RuntimeError::RuntimeUnavailable),
         _ => Err(RuntimeError::RuntimeUnavailable),
     }
 }

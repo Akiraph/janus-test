@@ -4,6 +4,7 @@
 pub mod adapters;
 pub mod application;
 pub mod config;
+pub mod system;
 pub mod transport;
 
 use std::sync::{
@@ -15,16 +16,20 @@ use anyhow::Context;
 use application::{Application, ApplicationDependencies, execution::ExecutionCoordinator};
 use axum::Router;
 use config::Config;
+use system::SystemRead;
 use janus_execution::interface::{ExecutionDependencies, ExecutionInterface};
 use janus_identity::IdentityInterface;
 use janus_infrastructure::{
     database::Database, events::EventStore, managed_storage::BlobStore,
-    operations::OperationInterface, secrets::SecretCipher, unit_of_work::UnitOfWork,
+    operations::OperationInterface, secrets::SecretCipher, state_broadcaster::StateBroadcaster,
+    unit_of_work::UnitOfWork,
 };
 use janus_models::interface::ModelsInterface;
+use janus_notifications::interface::NotificationsInterface;
 use janus_projects::interface::ProjectsInterface;
 use janus_runtime::interface::RuntimeInterface;
 use janus_sessions::interface::SessionsInterface;
+use janus_source_control::SourceControlInterface;
 use janus_workspace::interface::WorkspaceInterface;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -39,11 +44,14 @@ pub struct AppState {
 
 struct AppStateInner {
     config: Config,
-    database: Database,
-    events: EventStore,
-    blobs: BlobStore,
+    /// Raw connection pool for test assertions and admin tooling. Transport
+    /// handlers must not reach SQL directly; they use the capability
+    /// interfaces or `system()`.
+    pool: sqlx::SqlitePool,
     identity: IdentityInterface,
     application: Application,
+    system: SystemRead,
+    state_broadcaster: StateBroadcaster,
     /// Set once startup recovery (runtime + execution + blob/ops) has finished.
     /// `/health/ready` stays 503 until this is true so clients never land on a
     /// half-recovered control plane.
@@ -57,6 +65,7 @@ impl AppState {
             .with_context(|| format!("initialize data root {}", config.data_root.display()))?;
         let pool = database.pool().clone();
         let events = EventStore::new(pool.clone());
+        let state_broadcaster = StateBroadcaster::new();
         let unit_of_work = UnitOfWork::new(pool.clone(), events.clone());
         let secrets = SecretCipher::load(
             &config.data_root,
@@ -73,7 +82,17 @@ impl AppState {
             config.development_auth,
         )?;
         let models = ModelsInterface::new(pool.clone(), secrets.clone(), events.clone())?;
+        let notifications =
+            NotificationsInterface::new(pool.clone(), secrets.clone(), events.clone())?;
         let projects = ProjectsInterface::new(
+            pool.clone(),
+            secrets.clone(),
+            operations.clone(),
+            workspace.clone(),
+            events.clone(),
+            &config.data_root,
+        );
+        let source_control = SourceControlInterface::new(
             pool.clone(),
             secrets.clone(),
             operations.clone(),
@@ -107,6 +126,7 @@ impl AppState {
         let execution = ExecutionInterface::new(ExecutionDependencies {
             pool: pool.clone(),
             events: events.clone(),
+            state_broadcaster: state_broadcaster.clone(),
             models: models.clone(),
             projects: projects.clone(),
             workspace: workspace.clone(),
@@ -129,10 +149,14 @@ impl AppState {
             workspace: workspace.clone(),
             models: models.clone(),
             projects: projects.clone(),
+            source_control: source_control.clone(),
             runtime: runtime.clone(),
             sessions: sessions.clone(),
             execution: execution.clone(),
             execution_coordinator,
+            state_broadcaster: state_broadcaster.clone(),
+            events: events.clone(),
+            notifications: notifications.clone(),
         });
         workspace
             .recover_uncertain_propagations()
@@ -145,11 +169,17 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(AppStateInner {
                 config,
-                database,
-                events,
-                blobs,
+                pool,
                 identity,
+                system: SystemRead::new(
+                    database,
+                    events,
+                    blobs,
+                    state_broadcaster.clone(),
+                    application.clone(),
+                ),
                 application,
+                state_broadcaster,
                 // main() flips this after the remaining recovery steps
                 // (incoming blobs + stale operations) complete, so unit tests
                 // that only call initialize() still see ready=true by default.
@@ -180,16 +210,16 @@ impl AppState {
         &self.inner.config
     }
 
-    pub fn database(&self) -> &Database {
-        &self.inner.database
+    /// Raw connection pool, reserved for test assertions. Transport handlers
+    /// must read through capability interfaces or `system()` instead.
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        &self.inner.pool
     }
 
-    pub fn events(&self) -> &EventStore {
-        &self.inner.events
-    }
-
-    pub fn blobs(&self) -> &BlobStore {
-        &self.inner.blobs
+    /// Narrow read-only facade over the database/event-store/application
+    /// plumbing, so health and SSE transports never hold the raw services.
+    pub fn system(&self) -> &SystemRead {
+        &self.inner.system
     }
 
     pub fn operations(&self) -> &OperationInterface {
@@ -198,6 +228,10 @@ impl AppState {
 
     pub fn workspace(&self) -> &WorkspaceInterface {
         self.inner.application.workspace()
+    }
+
+    pub fn state_broadcaster(&self) -> &StateBroadcaster {
+        &self.inner.state_broadcaster
     }
 
     pub fn identity(&self) -> &IdentityInterface {
@@ -212,6 +246,10 @@ impl AppState {
         self.inner.application.projects()
     }
 
+    pub fn source_control(&self) -> &SourceControlInterface {
+        self.inner.application.source_control()
+    }
+
     pub fn runtime(&self) -> &RuntimeInterface {
         self.inner.application.runtime()
     }
@@ -220,8 +258,25 @@ impl AppState {
         self.inner.application.sessions()
     }
 
+    /// Cross-capability read of a session's current context usage (sessions +
+    /// execution), kept behind AppState so the handler never reaches the whole
+    /// `Application`.
+    pub async fn session_context_usage(
+        &self,
+        session_id: janus_infrastructure::id::SessionId,
+    ) -> Result<
+        Option<janus_execution::interface::ContextUsageView>,
+        janus_sessions::interface::SessionsError,
+    > {
+        self.inner.application.session_context_usage(session_id).await
+    }
+
     pub fn application(&self) -> &Application {
         &self.inner.application
+    }
+
+    pub fn notifications(&self) -> &NotificationsInterface {
+        self.inner.application.notifications()
     }
 }
 

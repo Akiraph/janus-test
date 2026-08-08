@@ -228,6 +228,38 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/jobs/{id}/cancel": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["cancel_job"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/jobs/{id}/log": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["job_log"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/me": {
     parameters: {
       query?: never;
@@ -366,6 +398,54 @@ export interface paths {
     get?: never;
     put?: never;
     post: operations["probe_provider"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/notification-channels": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_channels"];
+    put?: never;
+    post: operations["create_channel"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/notification-channels/{id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post?: never;
+    delete: operations["delete_channel"];
+    options?: never;
+    head?: never;
+    patch: operations["update_channel"];
+    trace?: never;
+  };
+  "/api/v1/notification-channels/{id}/test": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["test_channel"];
     delete?: never;
     options?: never;
     head?: never;
@@ -868,6 +948,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/sessions/{id}/jobs": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_jobs"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/sessions/{id}/messages": {
     parameters: {
       query?: never;
@@ -1236,6 +1332,8 @@ export interface components {
       ceremony_id: string;
       public_key: unknown;
     };
+    /** Format: uuid */
+    CliSessionId: string;
     ContextUsageView: {
       compact_status: string;
       /** Format: int64 */
@@ -1384,6 +1482,26 @@ export interface components {
         version: string;
       };
     };
+    DataResponse_JobProjection: {
+      data: {
+        cli_kind?: null | components["schemas"]["DelegatedCliKind"];
+        cli_session_id?: null | components["schemas"]["CliSessionId"];
+        command_summary: string;
+        controlling_turn_id: components["schemas"]["TurnId"];
+        created_at: string;
+        ended_at?: string | null;
+        exit?: null | components["schemas"]["ExitSummary"];
+        id: components["schemas"]["JobId"];
+        initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
+        log_stream_id: components["schemas"]["LogStreamId"];
+        runtime_id: components["schemas"]["RuntimeId"];
+        session_id: components["schemas"]["SessionId"];
+        started_at?: string | null;
+        status: components["schemas"]["JobStatus"];
+        usage: components["schemas"]["ResourceUsage"];
+        version: string;
+      };
+    };
     DataResponse_LogRange: {
       data: {
         after: components["schemas"]["LogCursor"];
@@ -1399,6 +1517,20 @@ export interface components {
         route: string;
         session_version: string;
         turn_id: string;
+      };
+    };
+    DataResponse_NotificationChannelView: {
+      data: {
+        created_at: string;
+        display_name: string;
+        enabled: boolean;
+        endpoint_url: string;
+        events: components["schemas"]["NotificationEventKind"][];
+        id: string;
+        kind: components["schemas"]["NotificationChannelKind"];
+        secret_is_set: boolean;
+        target: components["schemas"]["NotificationTarget"];
+        updated_at: string;
       };
     };
     DataResponse_OperationView: {
@@ -1434,7 +1566,6 @@ export interface components {
         csrf_token: string;
         display_name: string;
         id: string;
-        tenant_id: string;
       };
     };
     DataResponse_PasskeyView: {
@@ -1485,6 +1616,7 @@ export interface components {
         api_key_is_set: boolean;
         api_key_preview?: string | null;
         base_url: string;
+        client: components["schemas"]["ModelClient"];
         created_at: string;
         display_name: string;
         enabled: boolean;
@@ -1630,6 +1762,40 @@ export interface components {
         version: string;
       }[];
     };
+    DataResponse_Vec_JobProjection: {
+      data: {
+        cli_kind?: null | components["schemas"]["DelegatedCliKind"];
+        cli_session_id?: null | components["schemas"]["CliSessionId"];
+        command_summary: string;
+        controlling_turn_id: components["schemas"]["TurnId"];
+        created_at: string;
+        ended_at?: string | null;
+        exit?: null | components["schemas"]["ExitSummary"];
+        id: components["schemas"]["JobId"];
+        initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
+        log_stream_id: components["schemas"]["LogStreamId"];
+        runtime_id: components["schemas"]["RuntimeId"];
+        session_id: components["schemas"]["SessionId"];
+        started_at?: string | null;
+        status: components["schemas"]["JobStatus"];
+        usage: components["schemas"]["ResourceUsage"];
+        version: string;
+      }[];
+    };
+    DataResponse_Vec_NotificationChannelView: {
+      data: {
+        created_at: string;
+        display_name: string;
+        enabled: boolean;
+        endpoint_url: string;
+        events: components["schemas"]["NotificationEventKind"][];
+        id: string;
+        kind: components["schemas"]["NotificationChannelKind"];
+        secret_is_set: boolean;
+        target: components["schemas"]["NotificationTarget"];
+        updated_at: string;
+      }[];
+    };
     DataResponse_Vec_PasskeyView: {
       data: {
         created_at: string;
@@ -1660,6 +1826,7 @@ export interface components {
         api_key_is_set: boolean;
         api_key_preview?: string | null;
         base_url: string;
+        client: components["schemas"]["ModelClient"];
         created_at: string;
         display_name: string;
         enabled: boolean;
@@ -1726,6 +1893,8 @@ export interface components {
       journal_mode: string;
       ready: boolean;
     };
+    /** @enum {string} */
+    DelegatedCliKind: "claude_code" | "codex";
     DeleteFileInput: {
       expected_main_revision?: string | null;
       path: string;
@@ -1921,6 +2090,28 @@ export interface components {
       display_name: string;
       initialization_token: string;
     };
+    /** Format: uuid */
+    JobId: string;
+    JobProjection: {
+      cli_kind?: null | components["schemas"]["DelegatedCliKind"];
+      cli_session_id?: null | components["schemas"]["CliSessionId"];
+      command_summary: string;
+      controlling_turn_id: components["schemas"]["TurnId"];
+      created_at: string;
+      ended_at?: string | null;
+      exit?: null | components["schemas"]["ExitSummary"];
+      id: components["schemas"]["JobId"];
+      initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
+      log_stream_id: components["schemas"]["LogStreamId"];
+      runtime_id: components["schemas"]["RuntimeId"];
+      session_id: components["schemas"]["SessionId"];
+      started_at?: string | null;
+      status: components["schemas"]["JobStatus"];
+      usage: components["schemas"]["ResourceUsage"];
+      version: string;
+    };
+    /** @enum {string} */
+    JobStatus: "queued" | "running" | "succeeded" | "failed" | "canceled" | "lost";
     LiveResponse: {
       status: string;
       version: string;
@@ -1963,10 +2154,54 @@ export interface components {
     };
     /** @enum {string} */
     ModelAttemptStatus: "running" | "succeeded" | "failed" | "canceled" | "interrupted";
+    /**
+     * @description The client surface a provider is intended to serve.
+     *
+     *     `claude-code` and `codex` are the public client identities used by the
+     *     Claude Code/Codex integrations. Existing providers remain Supervisor
+     *     providers through the migration default.
+     * @enum {string}
+     */
+    ModelClient: "supervisor" | "claude-code" | "codex";
     MoveFileInput: {
       expected_main_revision?: string | null;
       from: string;
       to: string;
+    };
+    NotificationChannelInput: {
+      display_name: string;
+      enabled?: boolean;
+      endpoint_url: string;
+      events?: components["schemas"]["NotificationEventKind"][];
+      kind: components["schemas"]["NotificationChannelKind"];
+      secret?: string | null;
+      target?: components["schemas"]["NotificationTarget"];
+    };
+    /** @enum {string} */
+    NotificationChannelKind: "webhook" | "qqbot";
+    NotificationChannelView: {
+      created_at: string;
+      display_name: string;
+      enabled: boolean;
+      endpoint_url: string;
+      events: components["schemas"]["NotificationEventKind"][];
+      id: string;
+      kind: components["schemas"]["NotificationChannelKind"];
+      secret_is_set: boolean;
+      target: components["schemas"]["NotificationTarget"];
+      updated_at: string;
+    };
+    /** @enum {string} */
+    NotificationEventKind:
+      | "turn_completed"
+      | "turn_failed"
+      | "ask_opened"
+      | "model_waiting"
+      | "job_completed"
+      | "test";
+    NotificationTarget: {
+      group_id?: string | null;
+      user_id?: string | null;
     };
     /**
      * @description Operation status. `needs_attention` means execution stopped at a decidable
@@ -1994,7 +2229,6 @@ export interface components {
       csrf_token: string;
       display_name: string;
       id: string;
-      tenant_id: string;
     };
     PasskeyOptionsRequest: {
       name: string;
@@ -2069,6 +2303,7 @@ export interface components {
     ProviderInput: {
       api_key?: string | null;
       base_url: string;
+      client?: components["schemas"]["ModelClient"];
       display_name: string;
       enabled?: boolean;
       kind: components["schemas"]["ProviderKind"];
@@ -2081,6 +2316,7 @@ export interface components {
       api_key_is_set: boolean;
       api_key_preview?: string | null;
       base_url: string;
+      client: components["schemas"]["ModelClient"];
       created_at: string;
       display_name: string;
       enabled: boolean;
@@ -2164,6 +2400,18 @@ export interface components {
       edited_text?: string | null;
       path: string;
     };
+    ResourceUsage: {
+      /**
+       * Format: int64
+       * @default 0
+       */
+      cpu_millis: number;
+      /**
+       * Format: int64
+       * @default 0
+       */
+      peak_memory_bytes: number;
+    };
     RetryProjectInput: {
       branch?: string | null;
       github_credential_id?: string | null;
@@ -2196,6 +2444,8 @@ export interface components {
       expected_main_revision?: string | null;
       path: string;
     };
+    /** Format: uuid */
+    SessionId: string;
     SessionModelPreference: {
       provider_id: string;
       reasoning_effort?: components["schemas"]["ReasoningEffort"];
@@ -2332,6 +2582,10 @@ export interface components {
       status: string;
       updated_at: string;
     };
+    /** Format: uuid */
+    ToolCallId: string;
+    /** Format: uuid */
+    TurnId: string;
     /**
      * @description The most recent model attempt for this Turn's active Round, projected onto
      *     `TurnSummary` so the UI can render the live retry counter
@@ -2703,7 +2957,7 @@ export interface operations {
   events: {
     parameters: {
       query?: {
-        /** @description Global event cursor */
+        /** @description Resume cursor; falls back to Last-Event-ID */
         after?: string;
       };
       header?: never;
@@ -2712,7 +2966,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      /** @description Persistent Janus event stream */
+      /** @description Janus state push stream */
       200: {
         headers: {
           [name: string]: unknown;
@@ -2721,15 +2975,8 @@ export interface operations {
           "text/event-stream": unknown;
         };
       };
+      /** @description Cursor mismatch or ahead of log */
       400: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -2974,6 +3221,67 @@ export interface operations {
         };
       };
       404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  cancel_job: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_JobProjection"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  job_log: {
+    parameters: {
+      query?: {
+        after?: string;
+        limit?: number;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_LogRange"];
+        };
+      };
+      401: {
         headers: {
           [name: string]: unknown;
         };
@@ -3320,6 +3628,151 @@ export interface operations {
         content: {
           "application/json": components["schemas"]["DataResponse_ProbeResult"];
         };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_channels: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_NotificationChannelView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  create_channel: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["NotificationChannelInput"];
+      };
+    };
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_NotificationChannelView"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  delete_channel: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  update_channel: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["NotificationChannelInput"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_NotificationChannelView"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  test_channel: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      204: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
       };
       404: {
         headers: {
@@ -4962,6 +5415,35 @@ export interface operations {
         };
       };
       404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_jobs: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_JobProjection"];
+        };
+      };
+      401: {
         headers: {
           [name: string]: unknown;
         };

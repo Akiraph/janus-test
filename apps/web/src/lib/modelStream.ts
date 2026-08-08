@@ -1,9 +1,7 @@
 import { createSignal } from "solid-js";
 
 export interface StreamUsage {
-  /** Provider input tokens excluding its cached-input portion. */
   inputTokens: number;
-  /** Provider output tokens. */
   outputTokens: number;
 }
 
@@ -13,24 +11,27 @@ export interface ModelStreamOutput {
   sequence: number;
   text: string;
   reasoning: string;
-  /** Total usage observed for this Turn, deduplicated by Round and attempt. */
   usage: StreamUsage | null;
-  /** Wall-clock ms (Date.now()) when the first reasoning delta arrived.
-   * Used to render "thinking for Xs" once the elapsed time exceeds 5s. */
   reasoningFirstSeenAt: number | null;
-  /** Wall-clock ms when the first assistant text delta arrived. */
   textFirstSeenAt: number | null;
+}
+
+export interface RetryState {
+  attemptId: string;
+  attempt: number;
+  maxAttempts: number;
+  detail: string;
+  retryAt: number;
 }
 
 const MAX_RETAINED_OUTPUTS = 32;
 const [outputs, setOutputs] = createSignal<ReadonlyMap<string, ModelStreamOutput>>(new Map());
+const [retryStates, setRetryStates] = createSignal<ReadonlyMap<string, RetryState>>(new Map());
 const usageByTurn = new Map<string, Map<string, StreamUsage>>();
 
 const SUMMARY_START =
   /^(?:summarizing|detailing|outlining|inspecting|reviewing|checking|planning|searching|reading|analyzing|comparing|verifying|tracing|exploring|preparing|updating|implementing|testing|running)\b/i;
 
-/** Join provider status-summary chunks without gluing two complete sentences
- * together. Tokenized reasoning still uses the provider's own whitespace. */
 export function appendReasoningDelta(previous: string, delta: string): string {
   if (!previous || !delta) return previous + delta;
   if (/^[\s\r\n]/.test(delta) || /[\s\r\n]$/.test(previous)) {
@@ -42,8 +43,6 @@ export function appendReasoningDelta(previous: string, delta: string): string {
   return previous + delta;
 }
 
-/** Repair already-persisted summary streams produced before the adapter
- * inserted boundaries between Responses status updates. */
 export function normalizeReasoningSummary(value: string): string {
   return value.replace(
     /([a-z0-9)])(?=(?:Summarizing|Detailing|Outlining|Inspecting|Reviewing|Checking|Planning|Searching|Reading|Analyzing|Comparing|Verifying|Tracing|Exploring|Preparing|Updating|Implementing|Testing|Running)\b)/g,
@@ -51,75 +50,107 @@ export function normalizeReasoningSummary(value: string): string {
   );
 }
 
-export function ingestModelStreamEvent(eventType: string | undefined, payload: unknown) {
-  if (eventType !== "model.stream_delta" || !isRecord(payload)) return;
-  const sessionId = stringValue(payload.session_id);
-  const turnId = stringValue(payload.turn_id);
-  const roundId = stringValue(payload.round_id);
-  const attemptId = stringValue(payload.attempt_id);
-  const delta = stringValue(payload.delta);
-  const sequence = numberValue(payload.sequence);
-  if (
-    !sessionId ||
-    !turnId ||
-    !roundId ||
-    !attemptId ||
-    sequence === null ||
-    (payload.channel !== "text" && payload.channel !== "reasoning_summary") ||
-    payload.provisional !== true
-  ) {
-    return;
-  }
+interface StreamTextPayload {
+  text?: string;
+  reasoning?: string;
+  seq?: number;
+  round_id?: string;
+  usage?: { input_tokens?: number; output_tokens?: number; cache_tokens?: number } | null;
+  retrying?: boolean;
+  attempt?: number;
+  detail?: string;
+  max_attempts?: number;
+  retry_after_ms?: number;
+  attempt_id?: string;
+}
 
-  const usage = parseUsage(payload.usage);
-  const isReasoning = payload.channel === "reasoning_summary";
+/** Listen for stream-text CustomEvents dispatched by useEventStream. */
+export function initStreamTextListener(eventTarget?: EventTarget) {
+  const target = eventTarget ?? (typeof window !== "undefined" ? window : null);
+  if (!target) return;
+  const handler = (event: Event) => {
+    const detail = (event as CustomEvent).detail as { id: string; data: StreamTextPayload } | undefined;
+    if (!detail) return;
+    const { id: key, data } = detail;
+    if (!key || !data) return;
+    const [sessionId, turnId] = key.split(":");
+    if (!sessionId || !turnId) return;
 
-  const key = outputKey(sessionId, turnId);
-  setOutputs((current) => {
-    const previous = current.get(key);
-    const sameAttempt = previous?.attemptId === attemptId && previous?.roundId === roundId;
-    // Same-attempt out-of-order or duplicate text deltas are dropped. Usage-only
-    // events are still accepted because providers may report a later snapshot
-    // without emitting more text.
-    if (sameAttempt && sequence <= previous.sequence && delta) {
-      return current;
+    if (data.retrying) {
+      // Retry state update
+      setRetryStates((current) => {
+        const next = new Map(current);
+        const k = retryKey(sessionId, turnId);
+        if (data.attempt && data.max_attempts && data.retry_after_ms != null && data.attempt_id) {
+          next.set(k, {
+            attemptId: data.attempt_id,
+            attempt: data.attempt,
+            maxAttempts: data.max_attempts,
+            detail: data.detail ?? "",
+            retryAt: Date.now() + data.retry_after_ms,
+          });
+        } else {
+          next.delete(k);
+        }
+        while (next.size > MAX_RETAINED_OUTPUTS) {
+          const oldest = next.keys().next().value as string | undefined;
+          if (!oldest) break;
+          next.delete(oldest);
+        }
+        return next;
+      });
+      // Reset text on retry
+      setOutputs((current) => {
+        const prev = current.get(key);
+        if (!prev) return current;
+        const next = new Map(current);
+        next.set(key, { ...prev, text: "", reasoning: "" });
+        return next;
+      });
+      return;
     }
 
-    const next = new Map(current);
-    next.delete(key);
+    // Regular stream delta — text is already accumulated from the server
+    const seq = data.seq ?? 0;
+    const fullText = data.text ?? "";
+    const fullReasoning = data.reasoning ?? "";
+    const usage = parseUsage(data.usage ?? null);
 
-    const previousText = sameAttempt ? previous.text : "";
-    const previousReasoning = sameAttempt ? previous.reasoning : "";
-    const previousReasoningAt = sameAttempt ? previous.reasoningFirstSeenAt : null;
-    const previousTextAt = sameAttempt ? previous.textFirstSeenAt : null;
-    const totalUsage = usage ? recordUsage(key, roundId, attemptId, usage) : usageTotal(key);
+    setOutputs((current) => {
+      const previous = current.get(key);
+      const next = new Map(current);
+      next.delete(key);
 
-    next.set(key, {
-      roundId,
-      attemptId,
-      sequence: sameAttempt ? Math.max(previous.sequence, sequence) : sequence,
-      text: sameAttempt ? previousText + (isReasoning ? "" : delta) : isReasoning ? "" : delta,
-      reasoning: sameAttempt
-        ? isReasoning
-          ? appendReasoningDelta(previousReasoning, delta)
-          : previousReasoning
-        : isReasoning
-          ? delta
-          : "",
-      usage: totalUsage,
-      reasoningFirstSeenAt:
-        isReasoning && previousReasoningAt === null ? Date.now() : previousReasoningAt,
-      textFirstSeenAt:
-        !isReasoning && delta && previousTextAt === null ? Date.now() : previousTextAt,
+      // Server pushes accumulated text, so we use it directly. The round_id is
+      // the same value the durable assistant timeline item carries, so once
+      // that item appears isModelStreamOutputDurable can retire this overlay.
+      const roundId = data.round_id ?? "stream";
+      const previousReasoningAt = previous?.reasoningFirstSeenAt ?? null;
+      const previousTextAt = previous?.textFirstSeenAt ?? null;
+      const totalUsage = usage ? recordUsage(key, "stream", "stream", usage) : usageTotal(key);
+
+      next.set(key, {
+        roundId,
+        attemptId: "stream",
+        sequence: seq,
+        text: fullText,
+        reasoning: fullReasoning,
+        usage: totalUsage,
+        reasoningFirstSeenAt: fullReasoning && previousReasoningAt === null ? Date.now() : previousReasoningAt,
+        textFirstSeenAt: fullText && previousTextAt === null ? Date.now() : previousTextAt,
+      });
+      while (next.size > MAX_RETAINED_OUTPUTS) {
+        const oldest = next.keys().next().value as string | undefined;
+        if (!oldest) break;
+        next.delete(oldest);
+        usageByTurn.delete(oldest);
+      }
+      return next;
     });
-    while (next.size > MAX_RETAINED_OUTPUTS) {
-      const oldest = next.keys().next().value as string | undefined;
-      if (!oldest) break;
-      next.delete(oldest);
-      usageByTurn.delete(oldest);
-    }
-    return next;
-  });
+  };
+
+  target.addEventListener("janus:stream-text", handler);
+  return () => target.removeEventListener("janus:stream-text", handler);
 }
 
 function parseUsage(value: unknown): StreamUsage | null {
@@ -127,21 +158,13 @@ function parseUsage(value: unknown): StreamUsage | null {
   const inputTokens = numberValue(value.input_tokens);
   const outputTokens = numberValue(value.output_tokens);
   if (inputTokens === null && outputTokens === null) return null;
-  // The server normalizes input_tokens before publishing the stream event.
-  // cache_tokens is intentionally ignored here: the indicator has one input
-  // count and must never add cached input a second time.
   return {
     inputTokens: inputTokens ?? 0,
     outputTokens: outputTokens ?? 0,
   };
 }
 
-function recordUsage(
-  key: string,
-  roundId: string,
-  attemptId: string,
-  usage: StreamUsage,
-): StreamUsage {
+function recordUsage(key: string, roundId: string, attemptId: string, usage: StreamUsage): StreamUsage {
   const attempts = usageByTurn.get(key) ?? new Map<string, StreamUsage>();
   const attemptKey = JSON.stringify([roundId, attemptId]);
   const previous = attempts.get(attemptKey);
@@ -165,18 +188,12 @@ function usageTotal(key: string): StreamUsage | null {
   return { inputTokens, outputTokens };
 }
 
-export function modelStreamOutput(
-  sessionId: string,
-  turnId: string | undefined,
-): ModelStreamOutput | null {
+export function modelStreamOutput(sessionId: string, turnId: string | undefined): ModelStreamOutput | null {
   if (!turnId) return null;
   return outputs().get(outputKey(sessionId, turnId)) ?? null;
 }
 
-export function isModelStreamOutputDurable(
-  output: ModelStreamOutput | null,
-  durableRoundIds: ReadonlySet<string>,
-): boolean {
+export function isModelStreamOutputDurable(output: ModelStreamOutput | null, durableRoundIds: ReadonlySet<string>): boolean {
   return output !== null && durableRoundIds.has(output.roundId);
 }
 
@@ -204,16 +221,32 @@ export function clearModelStreamUsage(sessionId: string, turnId: string | undefi
   });
 }
 
+export function retryState(sessionId: string, turnId: string | undefined): RetryState | null {
+  if (!turnId) return null;
+  return retryStates().get(retryKey(sessionId, turnId)) ?? null;
+}
+
+export function clearRetryState(sessionId: string, turnId: string | undefined): void {
+  if (!turnId) return;
+  const k = retryKey(sessionId, turnId);
+  setRetryStates((current) => {
+    if (!current.has(k)) return current;
+    const next = new Map(current);
+    next.delete(k);
+    return next;
+  });
+}
+
 function outputKey(sessionId: string, turnId: string): string {
+  return `${sessionId}:${turnId}`;
+}
+
+function retryKey(sessionId: string, turnId: string): string {
   return `${sessionId}:${turnId}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : "";
 }
 
 function numberValue(value: unknown): number | null {

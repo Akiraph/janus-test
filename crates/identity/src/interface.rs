@@ -17,7 +17,7 @@ use webauthn_rs::{
 };
 
 use janus_infrastructure::{
-    id::{OwnerId, PasskeyId, TenantId},
+    id::{OwnerId, PasskeyId},
     secrets::{purpose_hash, random_token},
 };
 
@@ -40,7 +40,6 @@ pub struct CeremonyOptions {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OwnerView {
     pub id: String,
-    pub tenant_id: String,
     pub display_name: String,
     pub authentication_mode: AuthenticationMode,
     pub csrf_token: String,
@@ -77,7 +76,6 @@ pub struct RecoveryGrant {
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub owner_id: String,
-    pub tenant_id: String,
     pub display_name: String,
     pub session_id: Option<String>,
     pub csrf_token: String,
@@ -140,7 +138,6 @@ struct AuthenticationState {
 #[derive(FromRow)]
 struct OwnerRow {
     id: String,
-    tenant_id: String,
     display_name: String,
 }
 
@@ -148,7 +145,6 @@ struct OwnerRow {
 struct SessionRow {
     id: String,
     owner_id: String,
-    tenant_id: String,
     display_name: String,
     csrf_token: String,
     expires_at: String,
@@ -262,7 +258,6 @@ impl IdentityInterface {
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
-        let tenant_id = TenantId::new().to_string();
         let session_token = random_token(32);
         let csrf_token = random_token(24);
         let recovery_codes = (0..10).map(|_| random_token(16)).collect::<Vec<_>>();
@@ -286,16 +281,10 @@ impl IdentityInterface {
         {
             return Err(IdentityError::InvalidInitializationToken);
         }
-        sqlx::query("INSERT INTO tenants (id, created_at) VALUES (?, ?)")
-            .bind(&tenant_id)
-            .bind(format_utc(now))
-            .execute(&mut *transaction)
-            .await?;
         sqlx::query(
-            "INSERT INTO owners (id, tenant_id, display_name, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)",
         )
         .bind(&state.owner_id)
-        .bind(&tenant_id)
         .bind(&state.display_name)
         .bind(format_utc(now))
         .execute(&mut *transaction)
@@ -321,7 +310,6 @@ impl IdentityInterface {
         Ok(AuthenticationGrant {
             owner: owner_view(
                 &state.owner_id,
-                &tenant_id,
                 &state.display_name,
                 csrf_token.clone(),
                 false,
@@ -408,7 +396,6 @@ impl IdentityInterface {
         Ok(AuthenticationGrant {
             owner: owner_view(
                 &owner.id,
-                &owner.tenant_id,
                 &owner.display_name,
                 csrf_token,
                 false,
@@ -427,7 +414,6 @@ impl IdentityInterface {
             let owner = self.owner().await?;
             return Ok(AuthContext {
                 owner_id: owner.id,
-                tenant_id: owner.tenant_id,
                 display_name: owner.display_name,
                 session_id: None,
                 csrf_token: "development".into(),
@@ -436,7 +422,7 @@ impl IdentityInterface {
         }
         let token = session_token.ok_or(IdentityError::AuthRequired)?;
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT s.id, s.owner_id, o.tenant_id, o.display_name, s.csrf_token, s.expires_at FROM login_sessions s JOIN owners o ON o.id = s.owner_id WHERE s.token_hash = ? AND s.revoked_at IS NULL",
+            "SELECT s.id, s.owner_id, o.display_name, s.csrf_token, s.expires_at FROM login_sessions s JOIN owners o ON o.id = s.owner_id WHERE s.token_hash = ? AND s.revoked_at IS NULL",
         )
         .bind(purpose_hash("login-session", token))
         .fetch_optional(&self.pool)
@@ -447,7 +433,6 @@ impl IdentityInterface {
         }
         Ok(AuthContext {
             owner_id: row.owner_id,
-            tenant_id: row.tenant_id,
             display_name: row.display_name,
             session_id: Some(row.id),
             csrf_token: row.csrf_token,
@@ -477,7 +462,6 @@ impl IdentityInterface {
     pub async fn me(&self, auth: &AuthContext, csrf_token: &str) -> OwnerView {
         owner_view(
             &auth.owner_id,
-            &auth.tenant_id,
             &auth.display_name,
             csrf_token.into(),
             auth.development,
@@ -748,7 +732,6 @@ impl IdentityInterface {
         Ok(AuthenticationGrant {
             owner: owner_view(
                 &owner.id,
-                &owner.tenant_id,
                 &owner.display_name,
                 csrf_token,
                 false,
@@ -847,7 +830,7 @@ impl IdentityInterface {
     }
 
     async fn owner(&self) -> Result<OwnerRow, IdentityError> {
-        sqlx::query_as::<_, OwnerRow>("SELECT id, tenant_id, display_name FROM owners LIMIT 1")
+        sqlx::query_as::<_, OwnerRow>("SELECT id, display_name FROM owners LIMIT 1")
             .fetch_optional(&self.pool)
             .await?
             .ok_or(IdentityError::AuthRequired)
@@ -858,15 +841,9 @@ impl IdentityInterface {
             return Ok(());
         }
         let now = now_utc_str();
-        let tenant_id = TenantId::new().to_string();
         let owner_id = OwnerId::new().to_string();
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("INSERT INTO tenants (id, created_at) VALUES (?, ?)")
-            .bind(&tenant_id)
-            .bind(&now)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::query("INSERT INTO owners (id, tenant_id, display_name, created_at) VALUES (?, ?, 'Development Owner', ?)").bind(owner_id).bind(tenant_id).bind(now).execute(&mut *transaction).await?;
+        sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Development Owner', ?)").bind(owner_id).bind(now).execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -896,14 +873,12 @@ fn normalize_name(value: &str, fallback: &str) -> Result<String, IdentityError> 
 
 fn owner_view(
     id: &str,
-    tenant_id: &str,
     display_name: &str,
     csrf_token: String,
     development: bool,
 ) -> OwnerView {
     OwnerView {
         id: id.into(),
-        tenant_id: tenant_id.into(),
         display_name: display_name.into(),
         authentication_mode: if development {
             AuthenticationMode::Development

@@ -1,5 +1,5 @@
 name = "workspace"
-public_root = "interface.rs"
+public_root = "interface/mod.rs"
 owned_tables = [
   "workspace_copies",
   "content_revisions",

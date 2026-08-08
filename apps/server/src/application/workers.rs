@@ -249,7 +249,7 @@ async fn dispatch(
     match kind {
         KIND_CLONE => {
             let project_id = payload_string(payload, "project_id")?;
-            match state.projects().run_clone(project_id).await {
+            match run_project_clone(state, project_id).await {
                 Ok(()) => {
                     record_operation_success(state, kind, project_id, payload, work_id, work_nonce)
                         .await;
@@ -257,7 +257,7 @@ async fn dispatch(
                 }
                 Err(error) => Err(WorkFailure {
                     error: anyhow::anyhow!("clone failed: {error}"),
-                    disposition: project_failure_disposition(&error),
+                    disposition: clone_failure_disposition(&error),
                 }),
             }
         }
@@ -387,30 +387,72 @@ async fn record_operation_success(
     }
 }
 
-fn project_failure_disposition(
-    error: &janus_projects::interface::ProjectsError,
-) -> WorkFailureDisposition {
-    use janus_projects::interface::{GitError, ProjectsError};
-
-    match error {
-        ProjectsError::Git(
-            GitError::RemoteUnavailable | GitError::CommandFailed(_) | GitError::BadOutput(_),
-        )
-        | ProjectsError::Workspace(_)
-        | ProjectsError::Operation(_)
-        | ProjectsError::Storage(_)
-        | ProjectsError::Serde(_)
-        | ProjectsError::Io(_)
-        | ProjectsError::Internal(_) => WorkFailureDisposition::Retry,
-        ProjectsError::Validation(_)
-        | ProjectsError::NotFound
-        | ProjectsError::CredentialNotFound
-        | ProjectsError::ConflictNotFound
-        | ProjectsError::RevisionMismatch { .. }
-        | ProjectsError::InvalidPath(_)
-        | ProjectsError::NotEditable(_)
-        | ProjectsError::Git(_) => WorkFailureDisposition::DeadLetter,
+/// Clone orchestration: the source-control capability runs the git clone into
+/// the Main workspace dir, then the projects capability establishes the Main
+/// copy/revision and flips state to `ready`. A git-clone failure marks the
+/// Project `error` (retryable/deletable); other failures leave it `creating`
+/// for the worker to retry.
+async fn run_project_clone(state: &Application, project_id: &str) -> Result<(), anyhow::Error> {
+    let owner_id = state
+        .projects()
+        .owner_id(project_id.parse()?)
+        .await?;
+    match state.source_control().clone_project(&owner_id, project_id).await {
+        Ok(()) => {}
+        Err(error @ janus_source_control::interface::SourceControlError::Git(_)) => {
+            state
+                .projects()
+                .fail_clone(project_id, &error.to_string())
+                .await?;
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
     }
+    state.projects().complete_clone(project_id).await?;
+    Ok(())
+}
+
+fn clone_failure_disposition(error: &anyhow::Error) -> WorkFailureDisposition {
+    use janus_projects::interface::ProjectsError;
+    use janus_source_control::interface::{GitError, SourceControlError};
+
+    if let Some(error) = error.downcast_ref::<SourceControlError>() {
+        return match error {
+            SourceControlError::Git(
+                GitError::RemoteUnavailable | GitError::CommandFailed(_) | GitError::BadOutput(_),
+            )
+            | SourceControlError::Workspace(_)
+            | SourceControlError::Operation(_)
+            | SourceControlError::Storage(_)
+            | SourceControlError::Serde(_)
+            | SourceControlError::Io(_)
+            | SourceControlError::Internal(_) => WorkFailureDisposition::Retry,
+            SourceControlError::Validation(_)
+            | SourceControlError::NotFound
+            | SourceControlError::CredentialNotFound
+            | SourceControlError::ConflictNotFound
+            | SourceControlError::RevisionMismatch { .. }
+            | SourceControlError::Git(_) => WorkFailureDisposition::DeadLetter,
+        };
+    }
+    if let Some(error) = error.downcast_ref::<ProjectsError>() {
+        return match error {
+            ProjectsError::Validation(_)
+            | ProjectsError::NotFound
+            | ProjectsError::CredentialNotFound
+            | ProjectsError::ConflictNotFound
+            | ProjectsError::RevisionMismatch { .. }
+            | ProjectsError::InvalidPath(_)
+            | ProjectsError::NotEditable(_) => WorkFailureDisposition::DeadLetter,
+            ProjectsError::Workspace(_)
+            | ProjectsError::Operation(_)
+            | ProjectsError::Storage(_)
+            | ProjectsError::Serde(_)
+            | ProjectsError::Io(_)
+            | ProjectsError::Internal(_) => WorkFailureDisposition::Retry,
+        };
+    }
+    WorkFailureDisposition::Retry
 }
 
 fn spawn_lease_heartbeat(

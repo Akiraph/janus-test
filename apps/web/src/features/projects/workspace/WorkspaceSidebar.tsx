@@ -1,8 +1,8 @@
 import { Match, Show, Switch } from "solid-js";
-import { FileTreePanel } from "./FileTreePanel";
-import { LazyTerminalPanel } from "./LazyTerminalPanel";
-import { ScmPanel } from "./ScmPanel";
-import { SessionsPanel } from "./SessionsPanel";
+import { FileTreePanel } from "../../file-editor/FileTreePanel";
+import { LazyTerminalPanel } from "../../terminal/LazyTerminalPanel";
+import { ScmPanel } from "../../source-control/ScmPanel";
+import { SessionsPanel } from "../../session/SessionsPanel";
 import type { WorkspaceActivity } from "./workspaceState";
 
 interface WorkspaceSidebarProps {

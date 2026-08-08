@@ -10,12 +10,13 @@ use url::Url;
 use utoipa::ToSchema;
 
 use janus_infrastructure::{
-    events::{EventStore, NewEvent},
+    events::{EventStore, EventType, NewEvent},
     id::{AttemptId, ModelId, ProviderId, RoundId},
     secrets::{Secret, SecretCipher, fingerprint, mask_key},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 
+pub use super::openai_chat::OpenaiChatAssembler;
 pub use super::stream_types::{
     ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
     StreamChannel, TokenUsage, ToolCallDelta, ToolSpec,
@@ -38,8 +39,25 @@ pub enum ProviderKind {
     OpenaiResponses,
 }
 
+/// The client surface a provider is intended to serve.
+///
+/// `claude-code` and `codex` are the public client identities used by the
+/// Claude Code/Codex integrations. Existing providers remain Supervisor
+/// providers through the migration default.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelClient {
+    #[default]
+    Supervisor,
+    ClaudeCode,
+    #[serde(rename = "codex")]
+    Codex,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProviderInput {
+    #[serde(default)]
+    pub client: ModelClient,
     pub kind: ProviderKind,
     pub display_name: String,
     pub base_url: String,
@@ -54,6 +72,7 @@ pub struct ProviderInput {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProviderView {
     pub id: String,
+    pub client: ModelClient,
     pub kind: ProviderKind,
     pub display_name: String,
     pub base_url: String,
@@ -190,6 +209,7 @@ pub struct ModelsInterface {
 #[derive(FromRow)]
 pub(crate) struct ProviderRow {
     pub id: String,
+    pub client: String,
     pub kind: String,
     pub display_name: String,
     pub base_url: String,
@@ -232,7 +252,7 @@ impl ModelsInterface {
     }
 
     pub async fn providers(&self, owner_id: &str) -> Result<Vec<ProviderView>, ModelsError> {
-        let rows = sqlx::query_as::<_, ProviderRow>("SELECT id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE owner_id = ? ORDER BY display_name")
+        let rows = sqlx::query_as::<_, ProviderRow>("SELECT id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE owner_id = ? ORDER BY display_name")
             .bind(owner_id).fetch_all(&self.pool).await?;
         rows.into_iter().map(provider_view).collect()
     }
@@ -281,7 +301,7 @@ impl ModelsInterface {
                         model.parameters_json, model.enabled, model.created_at, model.updated_at \
                  FROM models AS model \
                  JOIN model_providers AS provider ON provider.id = model.provider_id \
-                 WHERE provider.owner_id = ? AND provider.id = ? \
+                 WHERE provider.owner_id = ? AND provider.id = ? AND provider.client = 'supervisor' \
                    AND model.upstream_model_id = ? AND provider.enabled = 1 AND model.enabled = 1 \
                  ORDER BY model.display_name, model.id LIMIT 1",
             )
@@ -297,7 +317,7 @@ impl ModelsInterface {
                         model.parameters_json, model.enabled, model.created_at, model.updated_at \
                  FROM models AS model \
                  JOIN model_providers AS provider ON provider.id = model.provider_id \
-                 WHERE provider.owner_id = ? AND model.id = ? \
+                 WHERE provider.owner_id = ? AND model.id = ? AND provider.client = 'supervisor' \
                    AND provider.enabled = 1 AND model.enabled = 1",
             )
             .bind(owner_id)
@@ -311,7 +331,8 @@ impl ModelsInterface {
                         model.parameters_json, model.enabled, model.created_at, model.updated_at \
                  FROM models AS model \
                  JOIN model_providers AS provider ON provider.id = model.provider_id \
-                 WHERE provider.owner_id = ? AND provider.enabled = 1 AND model.enabled = 1 \
+                 WHERE provider.owner_id = ? AND provider.client = 'supervisor' \
+                   AND provider.enabled = 1 AND model.enabled = 1 \
                  ORDER BY provider.display_name, model.display_name, model.id LIMIT 1",
             )
             .bind(owner_id)
@@ -361,7 +382,7 @@ impl ModelsInterface {
                     model.parameters_json, model.enabled, model.created_at, model.updated_at \
              FROM models AS model \
              JOIN model_providers AS provider ON provider.id = model.provider_id \
-             WHERE provider.owner_id = ? AND model.id = ? \
+              WHERE provider.owner_id = ? AND model.id = ? AND provider.client = 'supervisor' \
                AND provider.enabled = 1 AND model.enabled = 1",
         )
         .bind(owner_id)
@@ -399,7 +420,7 @@ impl ModelsInterface {
             let belongs: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM models AS model JOIN model_providers AS provider \
                  ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ? \
-                 AND model.enabled = 1 AND provider.enabled = 1)",
+                  AND provider.client = 'supervisor' AND model.enabled = 1 AND provider.enabled = 1)",
             )
             .bind(id)
             .bind(owner_id)
@@ -452,7 +473,8 @@ impl ModelsInterface {
     ) -> Result<ModelFailoverView, ModelsError> {
         let belongs: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM models AS model JOIN model_providers AS provider \
-             ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ?)",
+             ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ? \
+              AND provider.client = 'supervisor')",
         )
         .bind(primary_model_id)
         .bind(owner_id)
@@ -493,8 +515,8 @@ impl ModelsInterface {
                 .collect::<Vec<_>>(),
         )?;
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query("INSERT INTO model_providers (id, owner_id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&id).bind(owner_id).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(work.connection()).await?;
+        sqlx::query("INSERT INTO model_providers (id, owner_id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&id).bind(owner_id).bind(client_str(input.client)).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(work.connection()).await?;
         self.sync_normalized_models(work.connection(), &id, &input.models, &now)
             .await?;
         self.append_config_changed_in_tx(
@@ -541,8 +563,8 @@ impl ModelsInterface {
         )?;
         let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query("UPDATE model_providers SET kind=?, display_name=?, base_url=?, api_key_ciphertext=?, api_key_fingerprint=?, api_key_preview=?, models_json=?, enabled=?, updated_at=? WHERE id=? AND owner_id=?")
-            .bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(work.connection()).await?.rows_affected();
+        let changed = sqlx::query("UPDATE model_providers SET client=?, kind=?, display_name=?, base_url=?, api_key_ciphertext=?, api_key_fingerprint=?, api_key_preview=?, models_json=?, enabled=?, updated_at=? WHERE id=? AND owner_id=?")
+            .bind(client_str(input.client)).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(work.connection()).await?.rows_affected();
         if changed == 0 {
             work.rollback().await?;
             return Err(ModelsError::ProviderNotFound);
@@ -658,7 +680,7 @@ impl ModelsInterface {
         owner_id: &str,
         id: &str,
     ) -> Result<ProviderRow, ModelsError> {
-        sqlx::query_as::<_, ProviderRow>("SELECT id, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE id=? AND owner_id=?").bind(id).bind(owner_id).fetch_optional(&self.pool).await?.ok_or(ModelsError::ProviderNotFound)
+        sqlx::query_as::<_, ProviderRow>("SELECT id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE id=? AND owner_id=?").bind(id).bind(owner_id).fetch_optional(&self.pool).await?.ok_or(ModelsError::ProviderNotFound)
     }
 
     pub(crate) fn cipher_ref(&self) -> &SecretCipher {
@@ -807,29 +829,6 @@ impl ModelsInterface {
         Ok(canceled)
     }
 
-    pub async fn attempt_ids_for_rounds_in_tx(
-        &self,
-        tx: &mut SqliteConnection,
-        round_ids: &[RoundId],
-    ) -> Result<Vec<AttemptId>, ModelsError> {
-        let mut attempts = Vec::new();
-        for round_id in round_ids {
-            let rows = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM model_attempts WHERE round_id = ? ORDER BY created_at",
-            )
-            .bind(round_id.to_string())
-            .fetch_all(&mut *tx)
-            .await?;
-            for id in rows {
-                attempts.push(
-                    id.parse::<AttemptId>()
-                        .map_err(|error| ModelsError::Internal(anyhow::anyhow!(error)))?,
-                );
-            }
-        }
-        Ok(attempts)
-    }
-
     pub async fn delete_attempts_for_rounds_in_tx(
         &self,
         tx: &mut SqliteConnection,
@@ -952,7 +951,7 @@ impl ModelsInterface {
         correlation_id: &str,
     ) -> Result<(), ModelsError> {
         work.append_event(NewEvent {
-            event_type: "model_config.changed".into(),
+            event_type: EventType::ModelConfigChanged,
             actor: serde_json::json!({"kind": "owner", "id": owner_id}),
             resource: Some(serde_json::json!({"kind": resource_kind, "id": resource_id})),
             correlation_id: correlation_id.to_owned(),
@@ -989,6 +988,21 @@ type EncryptedKeyMaterial = (Option<Vec<u8>>, Option<String>, Option<String>);
 fn default_true() -> bool {
     true
 }
+fn client_str(client: ModelClient) -> &'static str {
+    match client {
+        ModelClient::Supervisor => "supervisor",
+        ModelClient::ClaudeCode => "claude-code",
+        ModelClient::Codex => "codex",
+    }
+}
+fn parse_client(value: &str) -> Result<ModelClient, ModelsError> {
+    match value {
+        "supervisor" => Ok(ModelClient::Supervisor),
+        "claude-code" => Ok(ModelClient::ClaudeCode),
+        "codex" => Ok(ModelClient::Codex),
+        _ => Err(ModelsError::Validation("unknown model client".into())),
+    }
+}
 fn kind_str(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Anthropic => "anthropic",
@@ -1007,6 +1021,11 @@ fn parse_kind(value: &str) -> Result<ProviderKind, ModelsError> {
 fn validate_provider(input: &ProviderInput) -> Result<(), ModelsError> {
     if input.display_name.trim().is_empty() {
         return Err(ModelsError::Validation("display_name is required".into()));
+    }
+    if input.client == ModelClient::Codex && input.kind != ProviderKind::OpenaiResponses {
+        return Err(ModelsError::Validation(
+            "codex providers must use the OpenAI Responses API".into(),
+        ));
     }
     normalize_url(input.kind, &input.base_url)?;
     Ok(())
@@ -1100,6 +1119,7 @@ fn provider_view(row: ProviderRow) -> Result<ProviderView, ModelsError> {
     let models: Vec<EmbeddedModelView> = serde_json::from_str(&row.models_json)?;
     Ok(ProviderView {
         id: row.id,
+        client: parse_client(&row.client)?,
         kind: parse_kind(&row.kind)?,
         display_name: row.display_name,
         base_url: row.base_url,

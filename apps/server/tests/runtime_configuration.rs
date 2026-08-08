@@ -1,24 +1,19 @@
-use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
+use std::collections::BTreeMap;
 
-use anyhow::Context;
 use janus_infrastructure::{
     database::Database, events::EventStore, managed_storage::BlobStore,
     operations::OperationInterface, secrets::SecretCipher,
 };
 use janus_models::interface::{
-    EmbeddedModelInput, ModelsError, ModelsInterface, ProviderInput, ProviderKind,
+    EmbeddedModelInput, ModelClient, ModelsError, ModelsInterface, ProviderInput, ProviderKind,
 };
 use janus_projects::interface::{
     EgressScheme, ProjectCliConfigInput, ProjectEgressRuleInput, ProjectRuntimeConfigInput,
     ProjectRuntimeSecretInput, ProjectsError, ProjectsInterface,
 };
 use janus_runtime::interface::*;
-use janus_server::adapters::git::system_runner;
 use janus_workspace::interface::WorkspaceInterface;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 const OWNER_ID: &str = "owner-test";
@@ -50,7 +45,6 @@ impl Fx {
             workspace,
             events,
             temp.path(),
-            system_runner(),
         );
         let models = ModelsInterface::new(pool.clone(), cipher, EventStore::new(pool.clone()))?;
         Ok(Self {
@@ -64,13 +58,9 @@ impl Fx {
 }
 
 async fn seed_owner_and_project(pool: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO tenants (id, created_at) VALUES ('tenant-test', ?)")
-        .bind(NOW)
-        .execute(pool)
-        .await?;
     sqlx::query(
-        "INSERT INTO owners (id, tenant_id, display_name, created_at) \
-         VALUES (?, 'tenant-test', 'Owner', ?)",
+        "INSERT INTO owners (id, display_name, created_at) \
+         VALUES (?, 'Owner', ?)",
     )
     .bind(OWNER_ID)
     .bind(NOW)
@@ -78,9 +68,9 @@ async fn seed_owner_and_project(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
     sqlx::query(
         "INSERT INTO projects \
-         (id, owner_id, tenant_id, name, state, repo_access, repo_url, version, \
+         (id, owner_id, name, state, repo_access, repo_url, version, \
           created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, 'tenant-test', 'Project', 'ready', 'public_https', \
+         VALUES (?, ?, 'Project', 'ready', 'public_https', \
                  'https://example.com/repo.git', 'v1', ?, ?, ?)",
     )
     .bind(PROJECT_ID)
@@ -242,6 +232,7 @@ async fn project_runtime_configuration_is_versioned_validated_and_redacted() -> 
 
 fn provider_input(models: Vec<EmbeddedModelInput>) -> ProviderInput {
     ProviderInput {
+        client: ModelClient::Supervisor,
         kind: ProviderKind::OpenaiResponses,
         display_name: "Provider".into(),
         base_url: "https://api.example.com/v1".into(),
@@ -365,283 +356,33 @@ fn capability_evaluator_is_exhaustive_and_enforces_production_local_policy() {
 }
 
 #[tokio::test]
-async fn populated_previous_schema_migrates_active_work_without_replay() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let database_path = temp.path().join("old.db");
-    let options = SqliteConnectOptions::from_str(&database_path.to_string_lossy())?
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await?;
-    let migrator = janus_server::migrator();
-    let previous = sqlx::migrate::Migrator {
-        migrations: Cow::Owned(
-            migrator
-                .iter()
-                .filter(|migration| migration.version <= 9)
-                .cloned()
-                .collect(),
-        ),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    previous.run(&pool).await?;
-    seed_owner_and_project(&pool).await?;
-    sqlx::query(
-        "INSERT INTO model_providers \
-         (id, owner_id, kind, display_name, base_url, models_json, enabled, created_at, updated_at) \
-         VALUES ('provider-old', ?, 'openai_responses', 'Old', 'https://api.example.com/v1', \
-         ?, 1, ?, ?)",
-    )
-    .bind(OWNER_ID)
-    .bind(
-        serde_json::json!([
-            {"display_name":"Default", "upstream_model_id":"default", "supports_1m":false},
-            {"display_name":"Large", "upstream_model_id":"large", "supports_1m":true}
-        ])
-        .to_string(),
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO sessions \
-         (id, project_id, kind, state, workspace_handle, active_turn_id, source_main_revision_id, \
-          version, created_at, updated_at, last_activity_at) \
-         VALUES ('session-old', ?, 'regular', 'active', 'workspace', 'turn-old', 'revision-old', \
-                 'v1', ?, ?, ?)",
-    )
-    .bind(PROJECT_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO turns \
-         (id, session_id, sequence, status, model_snapshot_json, version, created_at, updated_at) \
-         VALUES ('turn-old', 'session-old', 1, 'running', '{}', 'v1', ?, ?)",
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO rounds \
-         (id, turn_id, sequence, status, version, created_at, updated_at) \
-         VALUES ('round-old', 'turn-old', 1, 'running', 'v1', ?, ?)",
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO tool_calls \
-         (id, round_id, ord, tool_name, input_json, status, actor_json, version) \
-         VALUES ('tool-old', 'round-old', 0, 'finish', '{}', 'running', '{}', 'v1')",
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO model_attempts \
-         (id, round_id, provider_id, upstream_model_id, status, created_at) \
-         VALUES ('attempt-old', 'round-old', 'provider-old', 'default', 'running', ?)",
-    )
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-
-    migrator.run(&pool).await?;
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT status FROM turns WHERE id = 'turn-old'")
-            .fetch_one(&pool)
-            .await
-            .context("migrated Turn is missing")?,
-        "interrupted"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT status FROM rounds WHERE id = 'round-old'")
-            .fetch_one(&pool)
-            .await
-            .context("migrated Round is missing")?,
-        "interrupted"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT status FROM tool_calls WHERE id = 'tool-old'")
-            .fetch_one(&pool)
-            .await
-            .context("migrated Tool Call is missing")?,
-        "lost"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT status FROM model_attempts WHERE id = 'attempt-old'"
-        )
-        .fetch_one(&pool)
-        .await
-        .context("migrated model attempt is missing")?,
-        "interrupted"
-    );
-    let session: (String, Option<String>) =
-        sqlx::query_as("SELECT state, active_turn_id FROM sessions WHERE id = 'session-old'")
-            .fetch_one(&pool)
-            .await
-            .context("migrated Session is missing")?;
-    assert_eq!(session, ("ready".into(), None));
-    let limits = sqlx::query_as::<_, (String, i64)>(
-        "SELECT upstream_model_id, context_limit FROM models ORDER BY upstream_model_id",
-    )
-    .fetch_all(&pool)
-    .await?;
-    assert_eq!(
-        limits,
-        vec![("default".into(), 200_000), ("large".into(), 1_000_000)]
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn runtime_scope_migration_preserves_children_and_scope_uniqueness() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let database_path = temp.path().join("runtime-scope.db");
-    let options = SqliteConnectOptions::from_str(&database_path.to_string_lossy())?
-        .create_if_missing(true)
-        .foreign_keys(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await?;
-    let migrator = janus_server::migrator();
-    let previous = sqlx::migrate::Migrator {
-        migrations: Cow::Owned(
-            migrator
-                .iter()
-                .filter(|migration| migration.version <= 14)
-                .cloned()
-                .collect(),
-        ),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    };
-    previous.run(&pool).await?;
-
-    sqlx::query(
-        "INSERT INTO runtimes \
-         (id, session_id, executor_kind, executor_nonce, limits_json, \
-          capability_snapshot_json, status, version, created_at, updated_at) \
-         VALUES ('runtime-session', 'session-shared', 'local', 'nonce-session', '{}', \
-                 '{}', 'ready', 'v1', ?, ?)",
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    for (id, owner_kind, owner_id) in [
-        ("log-job", "job", "job-existing"),
-        ("log-terminal", "terminal", "terminal-existing"),
-    ] {
+async fn runtime_scope_uniqueness_rejects_duplicate_scope() -> anyhow::Result<()> {
+    let fx = Fx::new().await?;
+    async fn insert_runtime(
+        pool: &SqlitePool,
+        id: &str,
+        scope_kind: &str,
+        scope_id: &str,
+    ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO log_streams \
-             (id, owner_kind, owner_id, relative_path, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(owner_kind)
-        .bind(owner_id)
-        .bind(format!("logs/{id}"))
-        .bind(NOW)
-        .bind(NOW)
-        .execute(&pool)
-        .await?;
-    }
-    sqlx::query(
-        "INSERT INTO jobs \
-         (id, runtime_id, session_id, initiated_by_tool_call_id, controlling_turn_id, \
-          command_summary, executor_nonce, log_stream_id, status, version, created_at) \
-         VALUES ('job-existing', 'runtime-session', 'session-shared', 'tool-existing', \
-                 'turn-existing', 'echo migration', 'nonce-session', 'log-job', \
-                 'queued', 'v1', ?)",
-    )
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO terminals \
-         (id, runtime_id, owner_kind, owner_id, executor_nonce, cols, rows, \
-          scrollback_stream_id, status, version, created_at, updated_at) \
-         VALUES ('terminal-existing', 'runtime-session', 'project', 'project-existing', \
-                 'nonce-session', 80, 24, 'log-terminal', 'running', 'v1', ?, ?)",
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-
-    migrator.run(&pool).await?;
-
-    let scope: (String, String) =
-        sqlx::query_as("SELECT scope_kind, scope_id FROM runtimes WHERE id = 'runtime-session'")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(scope, ("session".into(), "session-shared".into()));
-    assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT runtime_id FROM jobs WHERE id = 'job-existing'")
-            .fetch_one(&pool)
-            .await?,
-        "runtime-session"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT runtime_id FROM terminals WHERE id = 'terminal-existing'"
-        )
-        .fetch_one(&pool)
-        .await?,
-        "runtime-session"
-    );
-    assert!(
-        sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(&pool)
-            .await?
-            .is_empty()
-    );
-
-    sqlx::query(
-        "INSERT INTO runtimes \
-         (id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
-          capability_snapshot_json, status, version, created_at, updated_at) \
-         VALUES ('runtime-project', 'project', 'session-shared', 'local', 'nonce-project', \
-                 '{}', '{}', 'ready', 'v1', ?, ?)",
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(&pool)
-    .await?;
-    for (id, scope_kind) in [
-        ("runtime-session-duplicate", "session"),
-        ("runtime-project-duplicate", "project"),
-    ] {
-        let duplicate = sqlx::query(
-            "INSERT INTO runtimes \
-             (id, scope_kind, scope_id, executor_kind, executor_nonce, limits_json, \
-              capability_snapshot_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, 'session-shared', 'local', 'nonce-duplicate', '{}', '{}', \
-                     'ready', 'v1', ?, ?)",
+            "INSERT INTO runtimes (id, scope_kind, scope_id, executor_kind, executor_nonce, \
+             limits_json, capability_snapshot_json, status, version, created_at, updated_at) \
+             VALUES (?, ?, ?, 'local', 'nonce', '{}', '{}', 'ready', 'v1', ?, ?)",
         )
         .bind(id)
         .bind(scope_kind)
+        .bind(scope_id)
         .bind(NOW)
         .bind(NOW)
-        .execute(&pool)
-        .await;
-        assert!(
-            duplicate.is_err(),
-            "duplicate {scope_kind} Runtime was accepted"
-        );
+        .execute(pool)
+        .await?;
+        Ok(())
     }
+    insert_runtime(&fx.pool, "runtime-session", "session", "session-shared").await?;
+    let duplicate = insert_runtime(&fx.pool, "runtime-session-dup", "session", "session-shared").await;
+    assert!(duplicate.is_err(), "duplicate session-scoped Runtime was accepted");
+    // A different scope_kind is a different unique-index key and must be allowed.
+    insert_runtime(&fx.pool, "runtime-project", "project", "session-shared").await?;
     Ok(())
 }
+

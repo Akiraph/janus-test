@@ -9,6 +9,11 @@ const ModelsRoute = lazy(() =>
 const SecurityRoute = lazy(() =>
   import("../features/security/SecuritySettings").then((m) => ({ default: m.SecuritySettings })),
 );
+const NotificationsRoute = lazy(() =>
+  import("../features/notifications/NotificationsSettings").then((m) => ({
+    default: m.NotificationsSettings,
+  })),
+);
 const SystemRoute = lazy(() =>
   import("../features/system/SystemStatus").then((m) => ({ default: m.SystemStatus })),
 );
@@ -29,6 +34,7 @@ export function App() {
       <Route path="/system" component={SystemRoute} />
       <Route path="/models" component={ModelsRoute} />
       <Route path="/security" component={SecurityRoute} />
+      <Route path="/notifications" component={NotificationsRoute} />
     </Router>
   );
 }

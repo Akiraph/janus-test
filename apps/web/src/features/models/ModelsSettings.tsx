@@ -22,7 +22,32 @@ import {
 import { useProviders } from "../../lib/queries";
 import "./models.css";
 
+type ProviderClient = NonNullable<ProviderInput["client"]>;
 type ProviderKind = ProviderInput["kind"];
+
+type ProviderSection = {
+  client: ProviderClient;
+  title: string;
+  description: string;
+};
+
+const PROVIDER_SECTIONS: readonly ProviderSection[] = [
+  {
+    client: "supervisor",
+    title: "Supervisor",
+    description: "Models used directly by the Supervisor.",
+  },
+  {
+    client: "claude-code",
+    title: "Claude Code",
+    description: "Claude Code providers used by delegated jobs.",
+  },
+  {
+    client: "codex",
+    title: "Codex",
+    description: "Codex providers used by delegated jobs.",
+  },
+];
 
 const KIND_OPTIONS: readonly SelectOption[] = [
   { value: "anthropic", label: "Anthropic Messages" },
@@ -48,12 +73,23 @@ function emptyModel(): ModelRow {
   };
 }
 
+function clientLabel(client: ProviderClient): string {
+  if (client === "claude-code") return "Claude Code";
+  if (client === "codex") return "Codex";
+  return "Supervisor";
+}
+
 export function ModelsSettings() {
   const providers = useProviders();
   const queryClient = useQueryClient();
   const notify = useNotifications().notify;
-  const [providersOpen, setProvidersOpen] = createSignal(true);
+  const [openSections, setOpenSections] = createStore<Record<ProviderClient, boolean>>({
+    supervisor: true,
+    "claude-code": true,
+    codex: true,
+  });
   const [editing, setEditing] = createSignal<ProviderView | null>(null);
+  const [formClient, setFormClient] = createSignal<ProviderClient>("supervisor");
   const [formOpen, setFormOpen] = createSignal(false);
 
   async function refresh() {
@@ -80,144 +116,164 @@ export function ModelsSettings() {
     }
   }
 
-  function openCreate() {
+  function openCreate(client: ProviderClient) {
     setEditing(null);
+    setFormClient(client);
     setFormOpen(true);
   }
 
   function openEdit(provider: ProviderView) {
     setEditing(provider);
+    setFormClient(provider.client);
     setFormOpen(true);
   }
 
+  function providersFor(client: ProviderClient): ProviderView[] {
+    return (providers.data ?? []).filter((provider) => provider.client === client);
+  }
+
   return (
-    <div class="panel">
-      <section class="settings-group">
-        <button
-          class="settings-group-trigger"
-          type="button"
-          aria-expanded={providersOpen()}
-          onClick={() => setProvidersOpen(!providersOpen())}
-        >
-          <ChevronDown classList={{ collapsed: !providersOpen() }} size={16} />
-          <div>
-            <span class="settings-group-title">
-              Model Providers
-            </span>
-            <small>Connections used to access upstream model APIs.</small>
-          </div>
-        </button>
+    <div class="panel model-provider-settings">
+      <div class="provider-section-stack">
+        <For each={PROVIDER_SECTIONS}>
+          {(section) => (
+            <section class="settings-group provider-client-section">
+              <div class="provider-client-section-header">
+                <button
+                  class="settings-group-trigger"
+                  type="button"
+                  aria-expanded={openSections[section.client]}
+                  aria-controls={`provider-section-body-${section.client}`}
+                  onClick={() => setOpenSections(section.client, !openSections[section.client])}
+                >
+                  <ChevronDown classList={{ collapsed: !openSections[section.client] }} size={16} />
+                  <div>
+                    <span class="settings-group-title">{section.title}</span>
+                    <small>{section.description}</small>
+                  </div>
+                </button>
+                <Button
+                  variant="outline"
+                  class="provider-client-section-add"
+                  onClick={() => openCreate(section.client)}
+                >
+                  <Plus size={16} />
+                  Add {section.title} provider
+                </Button>
+              </div>
 
-        <Show when={providersOpen()}>
-          <div class="settings-group-body">
-            <Show
-              when={!providers.isPending}
-              fallback={
-                <p class="surface-note" role="status" aria-label="Loading...">
-                  Loading...
-                </p>
-              }
-            >
-              <Show
-                when={(providers.data?.length ?? 0) > 0}
-                fallback={
-                  <EmptyState
-                    icon={Plus}
-                    title="No model providers"
-                    description="Add a provider to enable model API access."
-                  />
-                }
-              >
-                <div class="record-list">
-                  <For each={providers.data}>
-                    {(provider) => (
-                      <article class="record-card provider-card">
-                        <div class="provider-card-main">
-                          <div class="record-copy">
-                            <div class="record-title">
-                              <h3>{provider.display_name}</h3>
-                            </div>
-                            <p>{provider.base_url}</p>
-                          </div>
-                          <div class="record-actions">
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => void probe(provider.id)}
-                            >
-                              <Activity size={14} />
-                              Test
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              iconOnly
-                              aria-label={`Edit ${provider.display_name}`}
-                              onClick={() => openEdit(provider)}
-                            >
-                              <Pencil size={16} />
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              iconOnly
-                              aria-label={`Delete ${provider.display_name}`}
-                              onClick={() => void removeProvider(provider.id)}
-                            >
-                              <Trash2 size={16} />
-                            </Button>
-                          </div>
-                        </div>
-
-                        <div class="provider-models">
-                          <div class="provider-models-heading">
-                            <span>Models</span>
-                          </div>
-                          <Show
-                            when={provider.models.length > 0}
-                            fallback={<p class="provider-model-empty">No models configured.</p>}
-                          >
-                            <div class="provider-model-list">
-                              <For each={provider.models}>
-                                {(model) => (
-                                  <div class="provider-model-row">
-                                    <div class="model-map-chip">
-                                      <strong>{model.display_name}</strong>
-                                      <span aria-hidden>→</span>
-                                      <span>{model.upstream_model_id}</span>
-                                    </div>
-                                    <div class="record-chips">
-                                      <Show when={model.supports_1m}>
-                                        <span>1M</span>
-                                      </Show>
-                                      <Show when={model.supports_images}>
-                                        <span>images</span>
-                                      </Show>
-                                    </div>
+              <Show when={openSections[section.client]}>
+                <div class="settings-group-body" id={`provider-section-body-${section.client}`}>
+                  <Show
+                    when={!providers.isPending}
+                    fallback={
+                      <p class="surface-note" role="status" aria-label="Loading...">
+                        Loading...
+                      </p>
+                    }
+                  >
+                    <Show
+                      when={providersFor(section.client).length > 0}
+                      fallback={
+                        <EmptyState
+                          icon={Plus}
+                          title={`No ${section.title} providers`}
+                          description={`Add a ${section.title} provider for this client.`}
+                        />
+                      }
+                    >
+                      <div class="record-list">
+                        <For each={providersFor(section.client)}>
+                          {(provider) => (
+                            <article class="record-card provider-card">
+                              <div class="provider-card-main">
+                                <div class="record-copy">
+                                  <div class="record-title">
+                                    <h3>{provider.display_name}</h3>
+                                    <span class="record-chip">{clientLabel(provider.client)}</span>
                                   </div>
-                                )}
-                              </For>
-                            </div>
-                          </Show>
-                        </div>
-                      </article>
-                    )}
-                  </For>
+                                  <p>{provider.base_url}</p>
+                                </div>
+                                <div class="record-actions">
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() => void probe(provider.id)}
+                                  >
+                                    <Activity size={14} />
+                                    Test
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    iconOnly
+                                    aria-label={`Edit ${provider.display_name}`}
+                                    onClick={() => openEdit(provider)}
+                                  >
+                                    <Pencil size={16} />
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    iconOnly
+                                    aria-label={`Delete ${provider.display_name}`}
+                                    onClick={() => void removeProvider(provider.id)}
+                                  >
+                                    <Trash2 size={16} />
+                                  </Button>
+                                </div>
+                              </div>
+
+                              <div class="provider-models">
+                                <div class="provider-models-heading">
+                                  <span>Models</span>
+                                </div>
+                                <Show
+                                  when={provider.models.length > 0}
+                                  fallback={
+                                    <p class="provider-model-empty">No models configured.</p>
+                                  }
+                                >
+                                  <div class="provider-model-list">
+                                    <For each={provider.models}>
+                                      {(model) => (
+                                        <div class="provider-model-row">
+                                          <div class="model-map-chip">
+                                            <strong>{model.display_name}</strong>
+                                            <span aria-hidden>→</span>
+                                            <span>{model.upstream_model_id}</span>
+                                          </div>
+                                          <div class="record-chips">
+                                            <Show when={model.supports_1m}>
+                                              <span>1M</span>
+                                            </Show>
+                                            <Show when={model.supports_images}>
+                                              <span>images</span>
+                                            </Show>
+                                          </div>
+                                        </div>
+                                      )}
+                                    </For>
+                                  </div>
+                                </Show>
+                              </div>
+                            </article>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                  </Show>
                 </div>
               </Show>
-            </Show>
-
-            <Button variant="outline" class="add-record" onClick={openCreate}>
-              <Plus size={16} />
-              Add Model Provider
-            </Button>
-          </div>
-        </Show>
-      </section>
+            </section>
+          )}
+        </For>
+      </div>
 
       <Show when={formOpen()}>
         <ProviderForm
           provider={editing()}
+          client={formClient()}
           close={() => setFormOpen(false)}
           saved={async () => {
             setFormOpen(false);
@@ -231,6 +287,7 @@ export function ModelsSettings() {
 
 interface ProviderFormProps {
   provider: ProviderView | null;
+  client: ProviderClient;
   close: () => void;
   saved: () => Promise<void>;
 }
@@ -241,6 +298,7 @@ function ProviderForm(props: ProviderFormProps) {
   const hasKey = () => props.provider?.api_key_is_set ?? false;
 
   const [name, setName] = createSignal("");
+  const [client, setClient] = createSignal<ProviderClient>(props.provider?.client ?? props.client);
   const [kind, setKind] = createSignal<ProviderKind>("anthropic");
   const [url, setUrl] = createSignal("");
   const [key, setKey] = createSignal("");
@@ -253,6 +311,7 @@ function ProviderForm(props: ProviderFormProps) {
   const seed = (provider: ProviderView | null) => {
     if (provider) {
       setName(provider.display_name);
+      setClient(provider.client);
       setKind(provider.kind);
       setUrl(provider.base_url);
       setEditingKey(false);
@@ -270,6 +329,7 @@ function ProviderForm(props: ProviderFormProps) {
       );
     } else {
       setName("");
+      setClient(props.client);
       setKind("anthropic");
       setUrl("");
       setEditingKey(false);
@@ -303,6 +363,7 @@ function ProviderForm(props: ProviderFormProps) {
       .filter((row) => row.display_name && row.upstream_model_id);
 
     const input: ProviderInput = {
+      client: client(),
       kind: kind(),
       display_name: name().trim(),
       base_url: url().trim(),
@@ -345,7 +406,11 @@ function ProviderForm(props: ProviderFormProps) {
 
   return (
     <Dialog
-      title={isEditing() ? "Edit model provider" : "Add model provider"}
+      title={
+        isEditing()
+          ? `Edit ${clientLabel(client())} provider`
+          : `Add ${clientLabel(client())} provider`
+      }
       description="Configure the upstream endpoint, API credential, and models."
       close={props.close}
     >

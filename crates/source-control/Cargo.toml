@@ -5,8 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+janus-infrastructure = { path = "../infrastructure" }
+janus-workspace = { path = "../workspace" }
+rand.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+utoipa.workspace = true
 
 [lints]
 workspace = true

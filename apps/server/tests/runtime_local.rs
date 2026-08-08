@@ -194,7 +194,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
         .context("stop service")?;
     assert_eq!(stopped.status, ServiceStatus::Stopped);
 
-    let events = state.events().after(0, 100).await?;
+    let events = state.system().events_after(0, 100).await?;
     assert!(events.iter().any(|event| event.event_type == "job.changed"));
     assert!(
         events
@@ -204,11 +204,11 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
 
     sqlx::query("UPDATE runtimes SET status = 'ready' WHERE id = ?")
         .bind(runtime_id.to_string())
-        .execute(state.database().pool())
+        .execute(state.pool())
         .await?;
     sqlx::query("UPDATE jobs SET status = 'running', ended_at = NULL WHERE id = ?")
         .bind(stdin_id.to_string())
-        .execute(state.database().pool())
+        .execute(state.pool())
         .await?;
     state
         .runtime()
@@ -220,7 +220,7 @@ async fn local_runtime_persists_sync_jobs_services_events_and_recovery() -> anyh
         state.runtime().runtime(runtime_id).await?.status,
         janus_runtime::interface::RuntimeStatus::Lost
     );
-    let recovery_events = state.events().after(0, 200).await?;
+    let recovery_events = state.system().events_after(0, 200).await?;
     assert!(recovery_events.iter().any(|event| {
         event.event_type == "runtime.changed"
             && event

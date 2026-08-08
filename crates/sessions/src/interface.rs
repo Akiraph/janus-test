@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use janus_infrastructure::{
-    events::{EventStore, NewEvent},
+    events::{EventStore, EventType, NewEvent},
     id::{AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
     managed_storage::{BlobReference, BlobStore},
     unit_of_work::UnitOfWork,
@@ -462,7 +462,7 @@ impl SessionsInterface {
         }
 
         work.append_event(NewEvent {
-            event_type: "session.changed".into(),
+            event_type: EventType::SessionChanged,
             actor,
             resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
             correlation_id: CorrelationId::new().to_string(),
@@ -619,7 +619,7 @@ impl SessionsInterface {
             .await?;
         let correlation_id = CorrelationId::new().to_string();
         work.append_event(NewEvent {
-            event_type: "timeline.item_created".into(),
+            event_type: EventType::TimelineItemCreated,
             actor: actor.clone(),
             resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
             correlation_id: correlation_id.clone(),
@@ -633,7 +633,7 @@ impl SessionsInterface {
         })
         .await?;
         work.append_event(NewEvent {
-            event_type: "session.changed".into(),
+            event_type: EventType::SessionChanged,
             actor,
             resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
             correlation_id,
@@ -678,7 +678,7 @@ impl SessionsInterface {
             return Err(SessionsError::TurnTerminal);
         };
         work.append_event(NewEvent {
-            event_type: "turn.status_changed".into(),
+            event_type: EventType::TurnStatusChanged,
             actor,
             resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
             correlation_id: CorrelationId::new().to_string(),
@@ -869,6 +869,19 @@ impl SessionsInterface {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
+    }
+
+    /// Resolve a Turn id to its owning Session for application-level
+    /// coordination. The caller still uses `get_session` to cross the
+    /// Session-to-Project ownership boundary.
+    pub async fn session_id_for_turn(&self, turn_id: TurnId) -> Result<SessionId, SessionsError> {
+        let id = sqlx::query_scalar::<_, String>("SELECT session_id FROM turns WHERE id = ?")
+            .bind(turn_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        id.parse::<SessionId>()
+            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
     }
 
     /// Queued Turns for the conversation's QueuedMessagesBar. Each row pairs a

@@ -383,7 +383,7 @@
           {
             "name": "after",
             "in": "query",
-            "description": "Global event cursor",
+            "description": "Resume cursor; falls back to Last-Event-ID",
             "required": false,
             "schema": {
               "type": "string"
@@ -392,23 +392,13 @@
         ],
         "responses": {
           "200": {
-            "description": "Persistent Janus event stream",
+            "description": "Janus state push stream",
             "content": {
               "text/event-stream": {}
             }
           },
           "400": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "",
+            "description": "Cursor mismatch or ahead of log",
             "content": {
               "application/json": {
                 "schema": {
@@ -719,6 +709,103 @@
             }
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/cancel": {
+      "post": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "cancel_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_JobProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{id}/log": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "job_log",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_LogRange"
+                }
+              }
+            }
+          },
+          "401": {
             "description": "",
             "content": {
               "application/json": {
@@ -1150,6 +1237,188 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notification-channels": {
+      "get": {
+        "tags": [
+          "notifications"
+        ],
+        "operationId": "list_channels",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_NotificationChannelView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "operationId": "create_channel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationChannelInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_NotificationChannelView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notification-channels/{id}": {
+      "delete": {
+        "tags": [
+          "notifications"
+        ],
+        "operationId": "delete_channel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "notifications"
+        ],
+        "operationId": "update_channel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationChannelInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_NotificationChannelView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/notification-channels/{id}/test": {
+      "post": {
+        "tags": [
+          "notifications"
+        ],
+        "operationId": "test_channel",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
           },
           "404": {
             "description": "",
@@ -3433,6 +3702,46 @@
         }
       }
     },
+    "/api/v1/sessions/{id}/jobs": {
+      "get": {
+        "tags": [
+          "jobs"
+        ],
+        "operationId": "list_jobs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_JobProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sessions/{id}/messages": {
       "post": {
         "tags": [
@@ -4504,6 +4813,10 @@
           "public_key": {}
         }
       },
+      "CliSessionId": {
+        "type": "string",
+        "format": "uuid"
+      },
       "ContextUsageView": {
         "type": "object",
         "required": [
@@ -5083,6 +5396,107 @@
           }
         }
       },
+      "DataResponse_JobProjection": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "runtime_id",
+              "session_id",
+              "controlling_turn_id",
+              "initiated_by_tool_call_id",
+              "status",
+              "command_summary",
+              "log_stream_id",
+              "usage",
+              "version",
+              "created_at"
+            ],
+            "properties": {
+              "cli_kind": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/DelegatedCliKind"
+                  }
+                ]
+              },
+              "cli_session_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CliSessionId"
+                  }
+                ]
+              },
+              "command_summary": {
+                "type": "string"
+              },
+              "controlling_turn_id": {
+                "$ref": "#/components/schemas/TurnId"
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "ended_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "exit": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExitSummary"
+                  }
+                ]
+              },
+              "id": {
+                "$ref": "#/components/schemas/JobId"
+              },
+              "initiated_by_tool_call_id": {
+                "$ref": "#/components/schemas/ToolCallId"
+              },
+              "log_stream_id": {
+                "$ref": "#/components/schemas/LogStreamId"
+              },
+              "runtime_id": {
+                "$ref": "#/components/schemas/RuntimeId"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/SessionId"
+              },
+              "started_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "$ref": "#/components/schemas/JobStatus"
+              },
+              "usage": {
+                "$ref": "#/components/schemas/ResourceUsage"
+              },
+              "version": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
       "DataResponse_LogRange": {
         "type": "object",
         "required": [
@@ -5145,6 +5559,64 @@
                 "type": "string"
               },
               "turn_id": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_NotificationChannelView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "kind",
+              "display_name",
+              "endpoint_url",
+              "secret_is_set",
+              "target",
+              "events",
+              "enabled",
+              "created_at",
+              "updated_at"
+            ],
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "display_name": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "endpoint_url": {
+                "type": "string"
+              },
+              "events": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/NotificationEventKind"
+                }
+              },
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "$ref": "#/components/schemas/NotificationChannelKind"
+              },
+              "secret_is_set": {
+                "type": "boolean"
+              },
+              "target": {
+                "$ref": "#/components/schemas/NotificationTarget"
+              },
+              "updated_at": {
                 "type": "string"
               }
             }
@@ -5263,7 +5735,6 @@
             "type": "object",
             "required": [
               "id",
-              "tenant_id",
               "display_name",
               "authentication_mode",
               "csrf_token"
@@ -5279,9 +5750,6 @@
                 "type": "string"
               },
               "id": {
-                "type": "string"
-              },
-              "tenant_id": {
                 "type": "string"
               }
             }
@@ -5476,6 +5944,7 @@
             "type": "object",
             "required": [
               "id",
+              "client",
               "kind",
               "display_name",
               "base_url",
@@ -5503,6 +5972,9 @@
               },
               "base_url": {
                 "type": "string"
+              },
+              "client": {
+                "$ref": "#/components/schemas/ModelClient"
               },
               "created_at": {
                 "type": "string"
@@ -6074,6 +6546,171 @@
           }
         }
       },
+      "DataResponse_Vec_JobProjection": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "runtime_id",
+                "session_id",
+                "controlling_turn_id",
+                "initiated_by_tool_call_id",
+                "status",
+                "command_summary",
+                "log_stream_id",
+                "usage",
+                "version",
+                "created_at"
+              ],
+              "properties": {
+                "cli_kind": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DelegatedCliKind"
+                    }
+                  ]
+                },
+                "cli_session_id": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/CliSessionId"
+                    }
+                  ]
+                },
+                "command_summary": {
+                  "type": "string"
+                },
+                "controlling_turn_id": {
+                  "$ref": "#/components/schemas/TurnId"
+                },
+                "created_at": {
+                  "type": "string"
+                },
+                "ended_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "exit": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ExitSummary"
+                    }
+                  ]
+                },
+                "id": {
+                  "$ref": "#/components/schemas/JobId"
+                },
+                "initiated_by_tool_call_id": {
+                  "$ref": "#/components/schemas/ToolCallId"
+                },
+                "log_stream_id": {
+                  "$ref": "#/components/schemas/LogStreamId"
+                },
+                "runtime_id": {
+                  "$ref": "#/components/schemas/RuntimeId"
+                },
+                "session_id": {
+                  "$ref": "#/components/schemas/SessionId"
+                },
+                "started_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/components/schemas/JobStatus"
+                },
+                "usage": {
+                  "$ref": "#/components/schemas/ResourceUsage"
+                },
+                "version": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_Vec_NotificationChannelView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "kind",
+                "display_name",
+                "endpoint_url",
+                "secret_is_set",
+                "target",
+                "events",
+                "enabled",
+                "created_at",
+                "updated_at"
+              ],
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "display_name": {
+                  "type": "string"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "endpoint_url": {
+                  "type": "string"
+                },
+                "events": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/NotificationEventKind"
+                  }
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "$ref": "#/components/schemas/NotificationChannelKind"
+                },
+                "secret_is_set": {
+                  "type": "boolean"
+                },
+                "target": {
+                  "$ref": "#/components/schemas/NotificationTarget"
+                },
+                "updated_at": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
       "DataResponse_Vec_PasskeyView": {
         "type": "object",
         "required": [
@@ -6199,6 +6836,7 @@
               "type": "object",
               "required": [
                 "id",
+                "client",
                 "kind",
                 "display_name",
                 "base_url",
@@ -6226,6 +6864,9 @@
                 },
                 "base_url": {
                   "type": "string"
+                },
+                "client": {
+                  "$ref": "#/components/schemas/ModelClient"
                 },
                 "created_at": {
                   "type": "string"
@@ -6493,6 +7134,13 @@
             "type": "boolean"
           }
         }
+      },
+      "DelegatedCliKind": {
+        "type": "string",
+        "enum": [
+          "claude_code",
+          "codex"
+        ]
       },
       "DeleteFileInput": {
         "type": "object",
@@ -7198,6 +7846,114 @@
           }
         }
       },
+      "JobId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "JobProjection": {
+        "type": "object",
+        "required": [
+          "id",
+          "runtime_id",
+          "session_id",
+          "controlling_turn_id",
+          "initiated_by_tool_call_id",
+          "status",
+          "command_summary",
+          "log_stream_id",
+          "usage",
+          "version",
+          "created_at"
+        ],
+        "properties": {
+          "cli_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DelegatedCliKind"
+              }
+            ]
+          },
+          "cli_session_id": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CliSessionId"
+              }
+            ]
+          },
+          "command_summary": {
+            "type": "string"
+          },
+          "controlling_turn_id": {
+            "$ref": "#/components/schemas/TurnId"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExitSummary"
+              }
+            ]
+          },
+          "id": {
+            "$ref": "#/components/schemas/JobId"
+          },
+          "initiated_by_tool_call_id": {
+            "$ref": "#/components/schemas/ToolCallId"
+          },
+          "log_stream_id": {
+            "$ref": "#/components/schemas/LogStreamId"
+          },
+          "runtime_id": {
+            "$ref": "#/components/schemas/RuntimeId"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ResourceUsage"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "canceled",
+          "lost"
+        ]
+      },
       "LiveResponse": {
         "type": "object",
         "required": [
@@ -7353,6 +8109,15 @@
           "interrupted"
         ]
       },
+      "ModelClient": {
+        "type": "string",
+        "description": "The client surface a provider is intended to serve.\n\n`claude-code` and `codex` are the public client identities used by the\nClaude Code/Codex integrations. Existing providers remain Supervisor\nproviders through the migration default.",
+        "enum": [
+          "supervisor",
+          "claude-code",
+          "codex"
+        ]
+      },
       "MoveFileInput": {
         "type": "object",
         "required": [
@@ -7371,6 +8136,129 @@
           },
           "to": {
             "type": "string"
+          }
+        }
+      },
+      "NotificationChannelInput": {
+        "type": "object",
+        "required": [
+          "kind",
+          "display_name",
+          "endpoint_url"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint_url": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotificationEventKind"
+            }
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NotificationChannelKind"
+          },
+          "secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          },
+          "target": {
+            "$ref": "#/components/schemas/NotificationTarget"
+          }
+        }
+      },
+      "NotificationChannelKind": {
+        "type": "string",
+        "enum": [
+          "webhook",
+          "qqbot"
+        ]
+      },
+      "NotificationChannelView": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "display_name",
+          "endpoint_url",
+          "secret_is_set",
+          "target",
+          "events",
+          "enabled",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint_url": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotificationEventKind"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NotificationChannelKind"
+          },
+          "secret_is_set": {
+            "type": "boolean"
+          },
+          "target": {
+            "$ref": "#/components/schemas/NotificationTarget"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        }
+      },
+      "NotificationEventKind": {
+        "type": "string",
+        "enum": [
+          "turn_completed",
+          "turn_failed",
+          "ask_opened",
+          "model_waiting",
+          "job_completed",
+          "test"
+        ]
+      },
+      "NotificationTarget": {
+        "type": "object",
+        "properties": {
+          "group_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -7444,7 +8332,6 @@
         "type": "object",
         "required": [
           "id",
-          "tenant_id",
           "display_name",
           "authentication_mode",
           "csrf_token"
@@ -7460,9 +8347,6 @@
             "type": "string"
           },
           "id": {
-            "type": "string"
-          },
-          "tenant_id": {
             "type": "string"
           }
         }
@@ -7785,6 +8669,9 @@
           "base_url": {
             "type": "string"
           },
+          "client": {
+            "$ref": "#/components/schemas/ModelClient"
+          },
           "display_name": {
             "type": "string"
           },
@@ -7814,6 +8701,7 @@
         "type": "object",
         "required": [
           "id",
+          "client",
           "kind",
           "display_name",
           "base_url",
@@ -7841,6 +8729,9 @@
           },
           "base_url": {
             "type": "string"
+          },
+          "client": {
+            "$ref": "#/components/schemas/ModelClient"
           },
           "created_at": {
             "type": "string"
@@ -8125,6 +9016,23 @@
           }
         }
       },
+      "ResourceUsage": {
+        "type": "object",
+        "properties": {
+          "cpu_millis": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          },
+          "peak_memory_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "default": 0,
+            "minimum": 0
+          }
+        }
+      },
       "RetryProjectInput": {
         "type": "object",
         "properties": {
@@ -8228,6 +9136,10 @@
             "type": "string"
           }
         }
+      },
+      "SessionId": {
+        "type": "string",
+        "format": "uuid"
       },
       "SessionModelPreference": {
         "type": "object",
@@ -8699,6 +9611,14 @@
             "type": "string"
           }
         }
+      },
+      "ToolCallId": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "TurnId": {
+        "type": "string",
+        "format": "uuid"
       },
       "TurnModelAttempt": {
         "type": "object",

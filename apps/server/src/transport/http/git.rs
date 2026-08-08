@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use janus_source_control::{DiffView, GitLogEntry, GitStatus};
+use janus_source_control::interface::{
+    GitUpdateConflictView, GitUpdateInput, ResolveGitUpdateConflictInput,
+    ResolveGitUpdateConflictPath, SourceControlError,
+};
 
 use crate::{
     AppState,
@@ -29,9 +33,6 @@ use crate::{
     },
 };
 use janus_infrastructure::id::CorrelationId;
-use janus_projects::interface::{
-    GitUpdateConflictView, GitUpdateInput, ProjectsError, ResolveGitUpdateConflictInput,
-};
 
 // ----- Transport DTOs (adapters::git types do not derive ToSchema) --------
 
@@ -189,7 +190,7 @@ pub async fn git_status(
 ) -> Result<Json<DataResponse<GitStatusView>>, Problem> {
     let auth = authenticate(&state, &headers).await?;
     let status = state
-        .projects()
+        .source_control()
         .git_status(&auth.owner_id, &id)
         .await
         .map_err(problem)?;
@@ -220,7 +221,7 @@ pub async fn git_diff(
 ) -> Result<Response, Problem> {
     let auth = authenticate(&state, &headers).await?;
     let text = state
-        .projects()
+        .source_control()
         .git_diff(&auth.owner_id, &id, query.view.into_diff_view())
         .await
         .map_err(problem)?;
@@ -254,7 +255,7 @@ pub async fn git_log(
     let auth = authenticate(&state, &headers).await?;
     let limit = query.limit.unwrap_or(50);
     let entries = state
-        .projects()
+        .source_control()
         .git_log(&auth.owner_id, &id, limit)
         .await
         .map_err(problem)?;
@@ -283,7 +284,7 @@ pub async fn git_branches(
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
-            .projects()
+            .source_control()
             .git_branches(&auth.owner_id, &id)
             .await
             .map_err(problem)?,
@@ -309,7 +310,7 @@ pub async fn git_remotes(
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
-            .projects()
+            .source_control()
             .git_remotes(&auth.owner_id, &id)
             .await
             .map_err(problem)?,
@@ -361,7 +362,7 @@ pub async fn git_fetch(
         body.as_slice(),
     )?;
     let operation = state
-        .projects()
+        .source_control()
         .git_fetch(&auth.owner_id, &id, &input.remote, correlation_id)
         .await
         .map_err(problem)?;
@@ -389,10 +390,17 @@ pub async fn git_stage(
 ) -> Result<StatusCode, Problem> {
     let auth = authorized(&state, &headers).await?;
     state
-        .projects()
+        .source_control()
         .git_stage(&auth.owner_id, &id, &input.paths)
         .await
         .map_err(problem)?;
+    // Push git status after stage
+    if let Ok(status) = state.source_control().git_status(&auth.owner_id, &id).await {
+        let view: GitStatusView = status.into();
+        state
+            .state_broadcaster()
+            .push_git_status(&id, serde_json::to_value(&view).unwrap_or_default());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -417,10 +425,17 @@ pub async fn git_unstage(
 ) -> Result<StatusCode, Problem> {
     let auth = authorized(&state, &headers).await?;
     state
-        .projects()
+        .source_control()
         .git_unstage(&auth.owner_id, &id, &input.paths)
         .await
         .map_err(problem)?;
+    // Push git status after unstage
+    if let Ok(status) = state.source_control().git_status(&auth.owner_id, &id).await {
+        let view: GitStatusView = status.into();
+        state
+            .state_broadcaster()
+            .push_git_status(&id, serde_json::to_value(&view).unwrap_or_default());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -446,7 +461,7 @@ pub async fn git_commit(
     let auth = authorized(&state, &headers).await?;
     let correlation_id = CorrelationId::new();
     let sha = state
-        .projects()
+        .source_control()
         .git_commit(&auth.owner_id, &id, &input.message, correlation_id)
         .await
         .map_err(problem)?;
@@ -498,7 +513,7 @@ pub async fn git_push(
     // Resolve the Project's GitHub PAT (if any) inside the capability so private
     // push works without the transport layer ever seeing the secret.
     let operation = state
-        .projects()
+        .source_control()
         .git_push(
             &auth.owner_id,
             &id,
@@ -554,7 +569,7 @@ pub async fn git_update(
         body.as_slice(),
     )?;
     let operation = state
-        .projects()
+        .source_control()
         .git_update(
             &auth.owner_id,
             &id,
@@ -587,7 +602,7 @@ pub async fn list_update_conflicts(
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
-            .projects()
+            .source_control()
             .list_update_conflicts(&auth.owner_id, &id)
             .await
             .map_err(problem)?,
@@ -615,7 +630,7 @@ pub async fn get_update_conflict(
     let auth = authenticate(&state, &headers).await?;
     Ok(Json(DataResponse {
         data: state
-            .projects()
+            .source_control()
             .get_update_conflict(&auth.owner_id, &id, &conflict_id)
             .await
             .map_err(problem)?,
@@ -649,7 +664,7 @@ pub async fn resolve_update_conflict(
     let expected_version = if_match_version(&headers)?;
     let correlation_id = CorrelationId::new();
     let view = state
-        .projects()
+        .source_control()
         .resolve_update_conflict(
             &auth.owner_id,
             &id,
@@ -659,13 +674,11 @@ pub async fn resolve_update_conflict(
                 paths: input
                     .paths
                     .into_iter()
-                    .map(
-                        |p| janus_projects::interface::ResolveGitUpdateConflictPath {
-                            path: p.path,
-                            choice: p.choice,
-                            edited_text: p.edited_text,
-                        },
-                    )
+                    .map(|p| ResolveGitUpdateConflictPath {
+                        path: p.path,
+                        choice: p.choice,
+                        edited_text: p.edited_text,
+                    })
                     .collect(),
             },
             correlation_id,
@@ -677,7 +690,7 @@ pub async fn resolve_update_conflict(
 
 // ----- Problem mapping -----------------------------------------------------
 
-fn problem(error: ProjectsError) -> Problem {
+fn problem(error: SourceControlError) -> Problem {
     let code = error.code();
     let status = match code {
         "VALIDATION_FAILED" | "INVALID_PATH" | "FILE_NOT_EDITABLE" => {

@@ -182,7 +182,7 @@ pub async fn create_session(
         body.as_slice(),
     )?;
     let data = crate::application::lifecycle::request_session_creation(
-        state.application(),
+        state.operations(),
         &auth.owner_id,
         project_id,
         input.title,
@@ -234,7 +234,6 @@ pub async fn session_context(
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
     let data = state
-        .application()
         .session_context_usage(session_id)
         .await
         .map_err(sessions_problem)?
@@ -273,7 +272,7 @@ pub async fn delete_session(
         "request_id": context.request_id,
     });
     let data = crate::application::lifecycle::request_session_deletion(
-        state.application(),
+        state.operations(),
         session_id,
         expected_version,
         actor,

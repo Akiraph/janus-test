@@ -11,6 +11,7 @@ members = [
     "crates/sessions",
     "crates/source-control",
     "crates/workspace",
+    "crates/notifications",
     "tools/xtask",
     "tools/test-cli",
 ]

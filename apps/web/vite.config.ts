@@ -1,7 +1,16 @@
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import solid from "vite-plugin-solid";
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, ".", "");
+  const webPort = Number(env.JANUS_WEB_PORT ?? "5173");
+  const apiTarget = env.JANUS_API_TARGET ?? "http://127.0.0.1:4317";
+
+  if (!Number.isInteger(webPort) || webPort < 1 || webPort > 65_535) {
+    throw new Error(`JANUS_WEB_PORT must be a valid TCP port: ${env.JANUS_WEB_PORT}`);
+  }
+
+  return {
   plugins: [solid()],
   // Pre-bundle the heaviest deps so dev cold-visits of routes don't stall on
   // on-the-fly transpilation. vite-plugin-solid already handles solid-js; we
@@ -12,11 +21,11 @@ export default defineConfig({
     include: ["@solidjs/router", "@tanstack/solid-query", "lucide-solid"],
   },
   server: {
-    port: 5173,
+    port: webPort,
     strictPort: true,
     proxy: {
-      "/api": { target: "http://127.0.0.1:4317", ws: true },
-      "/health": "http://127.0.0.1:4317",
+      "/api": { target: apiTarget, ws: true },
+      "/health": apiTarget,
     },
     // Warm up the two most-used entry points as soon as the server starts, so
     // the very first browser visit already has them transpiled and cached.
@@ -32,4 +41,5 @@ export default defineConfig({
   build: {
     target: "es2022",
   },
+  };
 });

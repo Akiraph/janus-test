@@ -1,5 +1,5 @@
 name = "execution"
-public_root = "interface.rs"
+public_root = "interface/mod.rs"
 owned_tables = [
   "rounds",
   "tool_calls",
@@ -7,7 +7,6 @@ owned_tables = [
   "plan_versions",
   "compact_summaries",
   "context_versions",
-  "stream_diagnostics",
 ]
 publishes = [
   "round.changed",

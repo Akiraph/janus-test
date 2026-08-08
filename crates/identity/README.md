@@ -19,7 +19,7 @@ an authenticated actor may do.
 
 ## Invariants
 
-- The historical identity tables remain owned here: `tenants`, `owners`,
+- The historical identity tables remain owned here: `owners`,
   `initialization_tokens`, `passkeys`, `ceremonies`, `login_sessions`,
   `recovery_batches`, `recovery_codes`, `recovery_states`.
 - A final passkey cannot be removed. A ceremony or recovery state is consumed

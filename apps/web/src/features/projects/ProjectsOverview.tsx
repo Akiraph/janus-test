@@ -48,6 +48,7 @@ export function ProjectsOverview() {
     operationId: string;
     projectId?: string;
     name: string;
+    kind: "create" | "retry" | "delete";
   } | null>(null);
 
   async function refresh() {
@@ -75,8 +76,12 @@ export function ProjectsOverview() {
             projectId = list.find((item) => item.name === current.name)?.id;
           }
           setTracking(null);
+          if (current.kind === "delete") {
+            notify("Project deleted", { variant: "success" });
+            return;
+          }
           notify("Project ready", { variant: "success" });
-          if (projectId) navigate(`/projects/${projectId}`);
+          if (current.kind === "retry" && projectId) navigate(`/projects/${projectId}`);
           return;
         }
 
@@ -117,6 +122,7 @@ export function ProjectsOverview() {
         operationId: operation.id,
         projectId: project.id,
         name: project.name,
+        kind: "retry",
       });
       notify("Retry started");
       await refresh();
@@ -133,6 +139,7 @@ export function ProjectsOverview() {
         operationId: operation.id,
         projectId: project.id,
         name: project.name,
+        kind: "delete",
       });
       notify("Delete started");
       await refresh();
@@ -263,6 +270,7 @@ export function ProjectsOverview() {
               operationId: operation.id,
               ...(projectId ? { projectId } : {}),
               name: input.name,
+              kind: "create",
             });
             await refresh();
           }}

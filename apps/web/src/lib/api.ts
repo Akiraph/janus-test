@@ -50,6 +50,11 @@ export type TerminalSizeInput = components["schemas"]["TerminalSizeInput"];
 export type TerminalSignal = components["schemas"]["TerminalSignal"];
 export type CreateTerminalRequest = components["schemas"]["CreateTerminalRequest"];
 export type LogRange = components["schemas"]["LogRange"];
+export type JobProjection = components["schemas"]["JobProjection"];
+export type NotificationChannelInput = components["schemas"]["NotificationChannelInput"];
+export type NotificationChannelView = components["schemas"]["NotificationChannelView"];
+export type NotificationChannelKind = components["schemas"]["NotificationChannelKind"];
+export type NotificationEventKind = components["schemas"]["NotificationEventKind"];
 export type RuntimeCapability = components["schemas"]["RuntimeCapability"];
 
 export type AskAnswerResult = components["schemas"]["AnswerAskResult"];
@@ -471,6 +476,86 @@ export async function getTurn(sessionId: string, turnId: string): Promise<TurnSu
       isDataResponse,
     )
   ).data;
+}
+
+export async function listSessionJobs(sessionId: string): Promise<JobProjection[]> {
+  return (
+    await requestJson<{ data: JobProjection[] }>(
+      `/api/v1/sessions/${sessionId}/jobs`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getJobLog(
+  id: string,
+  opts: { after?: string; limit?: number } = {},
+): Promise<LogRange> {
+  const query = new URLSearchParams();
+  if (opts.after) query.set("after", opts.after);
+  if (opts.limit) query.set("limit", String(opts.limit));
+  const suffix = query.toString() ? `?${query}` : "";
+  return (
+    await requestJson<{ data: LogRange }>(
+      `/api/v1/jobs/${id}/log${suffix}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function cancelJob(id: string): Promise<JobProjection> {
+  return (
+    await requestJson<{ data: JobProjection }>(
+      `/api/v1/jobs/${id}/cancel`,
+      { method: "POST" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getNotificationChannels(): Promise<NotificationChannelView[]> {
+  return (
+    await requestJson<{ data: NotificationChannelView[] }>(
+      "/api/v1/notification-channels",
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function createNotificationChannel(
+  input: NotificationChannelInput,
+): Promise<NotificationChannelView> {
+  return (
+    await requestJson<{ data: NotificationChannelView }>(
+      "/api/v1/notification-channels",
+      { method: "POST", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function updateNotificationChannel(
+  id: string,
+  input: NotificationChannelInput,
+): Promise<NotificationChannelView> {
+  return (
+    await requestJson<{ data: NotificationChannelView }>(
+      `/api/v1/notification-channels/${id}`,
+      { method: "PATCH", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function deleteNotificationChannel(id: string): Promise<void> {
+  await requestJson(`/api/v1/notification-channels/${id}`, { method: "DELETE" }, () => true);
+}
+
+export async function testNotificationChannel(id: string): Promise<void> {
+  await requestJson(`/api/v1/notification-channels/${id}/test`, { method: "POST" }, () => true);
 }
 
 export async function listTerminals(projectId: string): Promise<TerminalProjection[]> {

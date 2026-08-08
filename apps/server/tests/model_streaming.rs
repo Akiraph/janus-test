@@ -9,9 +9,9 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use janus_infrastructure::{database::Database, events::EventStore, secrets::SecretCipher};
-use janus_models::interface::{ModelsInterface, ProviderInput, ProviderKind};
-use janus_models::stream_types::{
-    ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
+use janus_models::interface::{
+    ChatMessage, ChatRole, ContentPart, ModelClient, ModelRequest, ModelStreamEvent, ModelsInterface,
+    ProviderInput, ProviderKind,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -109,16 +109,9 @@ async fn models_with_root(temp: &TempDir) -> anyhow::Result<(Database, ModelsInt
     let database = Database::open(temp.path(), janus_server::migrator()).await?;
     let pool = database.pool().clone();
     let now = "2026-01-01T00:00:00.000Z";
-    let tenant_id = "tenant-test";
     let owner_id = "owner-test";
-    sqlx::query("INSERT INTO tenants (id, created_at) VALUES (?, ?)")
-        .bind(tenant_id)
-        .bind(now)
-        .execute(&pool)
-        .await?;
-    sqlx::query("INSERT INTO owners (id, tenant_id, display_name, created_at) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
         .bind(owner_id)
-        .bind(tenant_id)
         .bind("Test Owner")
         .bind(now)
         .execute(&pool)
@@ -149,6 +142,7 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
         .create_provider(
             &owner,
             ProviderInput {
+                client: ModelClient::Supervisor,
                 kind: ProviderKind::OpenaiChat,
                 display_name: "Local OpenAI".into(),
                 base_url: format!("http://{addr}/v1"),
@@ -252,6 +246,7 @@ async fn anthropic_messages_stream() -> anyhow::Result<()> {
         .create_provider(
             &owner,
             ProviderInput {
+                client: ModelClient::Supervisor,
                 kind: ProviderKind::Anthropic,
                 display_name: "Local Anthropic".into(),
                 base_url: format!("http://{addr}/v1"),
@@ -305,6 +300,7 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
         .create_provider(
             &owner,
             ProviderInput {
+                client: ModelClient::Supervisor,
                 kind: ProviderKind::OpenaiChat,
                 display_name: "Bad OpenAI".into(),
                 base_url: format!("http://{addr}/v1"),
@@ -383,7 +379,7 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn openai_assembler_unit_parse() {
-    use janus_models::openai_chat::OpenaiChatAssembler;
+    use janus_models::interface::OpenaiChatAssembler;
     let mut a = OpenaiChatAssembler::default();
     let e1 = a
         .ingest_data(

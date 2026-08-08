@@ -10,7 +10,7 @@ use janus_execution::interface::{
 };
 use janus_infrastructure::unit_of_work::{UnitOfWork, UnitOfWorkTransaction};
 use janus_infrastructure::{
-    events::NewEvent,
+    events::{EventType, NewEvent},
     id::{CorrelationId, JobId, SessionId, TurnId},
     operations::OperationInterface,
 };
@@ -366,7 +366,7 @@ impl ExecutionCoordinator {
             return Ok(None);
         };
         work.append_event(NewEvent {
-            event_type: "turn.status_changed".into(),
+            event_type: EventType::TurnStatusChanged,
             actor: serde_json::json!({"kind": "execution"}),
             resource: Some(serde_json::json!({
                 "kind": "turn",
@@ -421,7 +421,7 @@ impl ExecutionCoordinator {
                 return Ok(false);
             }
             work.append_event(NewEvent {
-                event_type: "ask.changed".into(),
+                event_type: EventType::AskChanged,
                 actor: actor.clone(),
                 resource: Some(serde_json::json!({
                     "kind": "ask",
@@ -456,7 +456,7 @@ impl ExecutionCoordinator {
                 return Ok(false);
             };
             work.append_event(NewEvent {
-                event_type: "turn.status_changed".into(),
+                event_type: EventType::TurnStatusChanged,
                 actor,
                 resource: Some(serde_json::json!({
                     "kind": "turn",
@@ -525,7 +525,7 @@ impl ExecutionCoordinator {
         if let Some(transition) = transition.as_ref() {
             let correlation_id = CorrelationId::new().to_string();
             work.append_event(NewEvent {
-                event_type: "turn.status_changed".into(),
+                event_type: EventType::TurnStatusChanged,
                 actor: serde_json::json!({"kind": "runtime"}),
                 resource: Some(serde_json::json!({
                     "kind": "turn",
@@ -636,12 +636,14 @@ impl ExecutionCoordinator {
             "status": settlement.status.as_str(),
             "summary": settlement.summary,
             "timeline_item_id": timeline_item_id,
+            "session_id": record.session_id.to_string(),
+            "turn_id": source_turn_id.to_string(),
         });
         if let Some(job_id) = record.job_id {
             payload["job_id"] = serde_json::Value::String(job_id.to_string());
         }
         work.append_event(NewEvent {
-            event_type: "tool_call.changed".into(),
+            event_type: EventType::ToolCallChanged,
             actor: record.actor.clone(),
             resource: Some(serde_json::json!({
                 "kind": "tool_call",
@@ -653,7 +655,7 @@ impl ExecutionCoordinator {
         })
         .await?;
         work.append_event(NewEvent {
-            event_type: "timeline.item_updated".into(),
+            event_type: EventType::TimelineItemUpdated,
             actor: record.actor.clone(),
             resource: Some(serde_json::json!({
                 "kind": "session",

@@ -65,6 +65,31 @@
   border-top: 1px solid var(--border);
 }
 
+.provider-section-stack {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.provider-client-section {
+  overflow: hidden;
+}
+
+.provider-client-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.provider-client-section-header .settings-group-trigger {
+  flex: 1;
+}
+
+.provider-client-section-add {
+  flex: none;
+  margin: var(--space-2) var(--space-3) var(--space-2) 0;
+}
+
 .record-card.provider-card {
   display: grid;
   gap: var(--space-3);
@@ -180,6 +205,7 @@
   white-space: nowrap;
 }
 
+
 .provider-form-models {
   display: grid;
   gap: var(--space-2);
@@ -239,6 +265,16 @@
 }
 
 @media (max-width: 560px) {
+  .provider-client-section-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .provider-client-section-add {
+    width: auto;
+    margin: 0 var(--space-3) var(--space-3);
+  }
+
   .provider-card-main {
     flex-direction: column;
   }

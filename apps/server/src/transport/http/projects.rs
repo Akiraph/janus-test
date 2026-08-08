@@ -136,13 +136,18 @@ pub async fn create_project(
         .projects()
         .create_project(
             &auth.owner_id,
-            &auth.tenant_id,
             input,
             correlation_id,
             Some(idempotency),
         )
         .await
         .map_err(problem)?;
+    // Push updated projects list
+    if let Ok(list) = state.projects().list_projects(&auth.owner_id, 100).await {
+        state
+            .state_broadcaster()
+            .push_projects(serde_json::to_value(&list).unwrap_or_default());
+    }
     Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
 }
 
@@ -205,6 +210,15 @@ pub async fn update_project(
         )
         .await
         .map_err(problem)?;
+    // Push updated project and projects list
+    state
+        .state_broadcaster()
+        .push_project(&id, serde_json::to_value(&view).unwrap_or_default());
+    if let Ok(list) = state.projects().list_projects(&auth.owner_id, 100).await {
+        state
+            .state_broadcaster()
+            .push_projects(serde_json::to_value(&list).unwrap_or_default());
+    }
     Ok(Json(DataResponse { data: view }))
 }
 

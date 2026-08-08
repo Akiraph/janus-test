@@ -1,9 +1,11 @@
-import { createQuery, useQueryClient } from "@tanstack/solid-query";
+import { createQuery } from "@tanstack/solid-query";
 import {
   getBootstrap,
   getMe,
   getProject,
   getProviders,
+  getNotificationChannels,
+  listSessionJobs,
   getQueuedTurns,
   getSession,
   getSessionContext,
@@ -17,10 +19,15 @@ import {
   listGithubCredentials,
   listProjects,
   listSessions,
-  type SessionSummary,
-  type TimelinePage,
 } from "./api";
-import { retainSessionTimeline, sessionTimelineRefetchInterval } from "./queryPolicy";
+
+// Real-time state converges exclusively over the SSE stream: every resource the
+// UI renders is projected to a complete `state` frame when it changes, and a
+// reconnect replays missed projections (Last-Event-ID) then a full snapshot.
+// No polling safety nets — they only masked a lossy push path that no longer
+// exists, and they caused the stale-until-refetch flicker users had to refresh
+// past. Terminal and operation state are still read on demand (they are not
+// projected on the SSE channel).
 
 export function useBootstrap() {
   return createQuery(() => ({
@@ -42,6 +49,13 @@ export function useMe() {
 
 export function useProviders() {
   return createQuery(() => ({ queryKey: ["model-providers"], queryFn: getProviders }));
+}
+
+export function useNotificationChannels() {
+  return createQuery(() => ({
+    queryKey: ["notification-channels"],
+    queryFn: getNotificationChannels,
+  }));
 }
 
 export function useProjects() {
@@ -124,10 +138,6 @@ export function useSession(
       queryKey: ["session", id],
       queryFn: () => getSession(id as string),
       enabled: Boolean(id) && shouldLoad(),
-      refetchInterval: (query) => {
-        const state = query.state.data?.state;
-        return state === "active" ? 1500 : false;
-      },
     };
   });
 }
@@ -150,26 +160,15 @@ export function useSessionTimeline(
   sessionId: () => string | undefined,
   shouldLoad: () => boolean = () => true,
 ) {
-  const queryClient = useQueryClient();
   return createQuery(() => {
     const id = sessionId();
     return {
       queryKey: ["session-timeline", id],
       queryFn: async () => {
-        const next = await getSessionTimeline(id as string, { limit: 100 });
-        const previous = queryClient.getQueryData<TimelinePage>(["session-timeline", id]);
-        const session = queryClient.getQueryData<SessionSummary>(["session", id]);
-        return retainSessionTimeline(previous, next, session);
+        return getSessionTimeline(id as string, { limit: 100 });
       },
       placeholderData: (previous) => previous,
       enabled: Boolean(id) && shouldLoad(),
-      // Poll only while a turn is running. Constant 3s polling on idle sessions
-      // burns requests and re-suspending the main surface for no benefit.
-      refetchInterval: (query) => {
-        const items = query.state.data?.items ?? [];
-        const session = queryClient.getQueryData<SessionSummary>(["session", id]);
-        return sessionTimelineRefetchInterval(items.length, session);
-      },
     };
   });
 }
@@ -198,26 +197,13 @@ export function useTurn(sessionId: () => string | undefined, turnId: () => strin
       queryFn: () => getTurn(sid as string, tid as string),
       placeholderData: (previous) => previous,
       enabled: Boolean(sid) && Boolean(tid),
-      refetchInterval: (query) => {
-        const status = query.state.data?.status;
-        if (
-          status === "running" ||
-          status === "waiting_for_job" ||
-          status === "waiting_for_ask" ||
-          status === "waiting_for_model" ||
-          status === "canceling"
-        ) {
-          return 1500;
-        }
-        return false;
-      },
     };
   });
 }
 
 export function useQueuedTurns(
   sessionId: () => string | undefined,
-  activeTurnId: () => string | null | undefined,
+  _activeTurnId: () => string | null | undefined,
   shouldLoad: () => boolean = () => true,
 ) {
   return createQuery(() => {
@@ -226,10 +212,21 @@ export function useQueuedTurns(
       queryKey: ["queued-turns", id],
       queryFn: () => getQueuedTurns(id as string),
       enabled: Boolean(id) && shouldLoad(),
-      // The queue only changes on send/cancel/promote, all of which emit SSE
-      // events that invalidate this query. Poll only while a turn is active
-      // as a fallback so the bar updates when promotion fires.
-      refetchInterval: activeTurnId() ? 3000 : false,
+    };
+  });
+}
+
+export function useSessionJobs(
+  sessionId: () => string | undefined,
+  shouldLoad: () => boolean = () => true,
+) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["jobs", id],
+      queryFn: () => listSessionJobs(id as string),
+      enabled: Boolean(id) && shouldLoad(),
+      placeholderData: (previous) => previous,
     };
   });
 }

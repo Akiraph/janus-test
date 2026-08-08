@@ -168,9 +168,12 @@ impl LocalExecutor {
                 }
                 shell_command(&command_input)
             }
-            CommandKind::DelegatedCli { cli, session_id } => {
-                delegated_cli_command(*cli, *session_id, spec.command().input())
-            }
+            CommandKind::DelegatedCli { cli, session_id } => delegated_cli_command(
+                *cli,
+                *session_id,
+                spec.command().input(),
+                spec.command().delegated_cli_options(),
+            ),
         };
         command
             .current_dir(&canonical_working)
@@ -1115,8 +1118,10 @@ fn delegated_cli_command(
     cli: janus_runtime::interface::DelegatedCliKind,
     session_id: Option<janus_infrastructure::id::CliSessionId>,
     input: &str,
+    options: Option<&janus_runtime::interface::DelegatedCliLaunchOptions>,
 ) -> Command {
-    use janus_runtime::interface::DelegatedCliKind;
+    use janus_runtime::interface::{DelegatedCliAccess, DelegatedCliKind};
+    let options = options.cloned().unwrap_or_default();
     match cli {
         DelegatedCliKind::ClaudeCode => {
             let mut command = Command::new("claude");
@@ -1124,6 +1129,19 @@ fn delegated_cli_command(
             if let Some(session_id) = session_id {
                 command.args(["--resume", &session_id.to_string()]);
             }
+            if let Some(model) = options.model.as_deref() {
+                command.args(["--model", model]);
+            }
+            if let Some(effort) = options.effort {
+                command.args(["--effort", claude_effort(effort)]);
+            }
+            command.args([
+                "--permission-mode",
+                match options.access {
+                    DelegatedCliAccess::ReadOnly => "plan",
+                    DelegatedCliAccess::FullAccess => "bypassPermissions",
+                },
+            ]);
             command
         }
         DelegatedCliKind::Codex => {
@@ -1131,10 +1149,50 @@ fn delegated_cli_command(
             if let Some(session_id) = session_id {
                 command.args(["exec", "resume", &session_id.to_string(), input]);
             } else {
-                command.args(["exec", "--json", input]);
+                command.args(["exec", "--json"]);
+                if let Some(model) = options.model.as_deref() {
+                    command.args(["-m", model]);
+                }
+                if let Some(effort) = options.effort {
+                    command.args([
+                        "-c",
+                        &format!("model_reasoning_effort=\"{}\"", effort_str(effort)),
+                    ]);
+                }
+                command.args([
+                    "-C",
+                    ".",
+                    "-s",
+                    match options.access {
+                        DelegatedCliAccess::ReadOnly => "read-only",
+                        DelegatedCliAccess::FullAccess => "danger-full-access",
+                    },
+                    "--",
+                    input,
+                ]);
             }
             command
         }
+    }
+}
+
+fn effort_str(effort: janus_runtime::interface::DelegatedCliEffort) -> &'static str {
+    use janus_runtime::interface::DelegatedCliEffort;
+    match effort {
+        DelegatedCliEffort::Low => "low",
+        DelegatedCliEffort::Medium => "medium",
+        DelegatedCliEffort::High => "high",
+        DelegatedCliEffort::XHigh => "xhigh",
+        DelegatedCliEffort::Max => "max",
+        DelegatedCliEffort::Ultracode => "ultracode",
+    }
+}
+
+fn claude_effort(effort: janus_runtime::interface::DelegatedCliEffort) -> &'static str {
+    use janus_runtime::interface::DelegatedCliEffort;
+    match effort {
+        DelegatedCliEffort::Ultracode => "max",
+        other => effort_str(other),
     }
 }
 

@@ -4,7 +4,7 @@ use anyhow::Context;
 use futures_util::StreamExt;
 use janus_infrastructure::{
     database::Database,
-    events::{EventEnvelope, NewEvent},
+    events::{EventEnvelope, EventType, NewEvent},
 };
 use janus_server::{
     AppState,
@@ -98,33 +98,49 @@ async fn event_stream_replays_committed_rows_and_validates_cursors() -> anyhow::
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
     let appended: EventEnvelope = state
-        .events()
+        .system()
         .append(NewEvent {
-            event_type: "system.started".into(),
-            actor: json!({"kind": "system", "display_name": "Janus"}),
+            event_type: EventType::ModelConfigChanged,
+            actor: json!({"kind": "user", "id": "owner-test", "display_name": "Test"}),
             resource: None,
             correlation_id: "test-correlation".into(),
             causation_id: None,
-            payload: json!({"ready": true}),
+            payload: json!({"config_name": "test-model-config"}),
         })
         .await?;
     let (base, task) = spawn(state).await?;
     let client = Client::new();
 
+    // A fresh client replays every committed event as a projection frame. The
+    // first `event: state` frame is the projected providers list carrying the
+    // cursor of the event that produced it.
     let response = client
         .get(format!("{base}/api/v1/events?after=0"))
         .send()
         .await?;
     assert!(response.status().is_success());
     let mut stream = response.bytes_stream();
-    let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .context("wait for replayed event")?;
-    let first = next.context("event stream ended")??;
-    let text = String::from_utf8_lossy(&first);
-    assert!(text.contains("event: janus"));
-    assert!(text.contains(&appended.event_id));
+    let mut text = String::new();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .context("wait for replayed projection")?
+            .context("event stream ended")??;
+        text.push_str(&String::from_utf8_lossy(&next));
+        if text.contains("event: state") {
+            break;
+        }
+    }
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("data: ") && line.contains("\"kind\""))
+        .context("replayed frame has no state data")?;
+    let replayed: Value =
+        serde_json::from_str(line.strip_prefix("data: ").context("data line")?)?;
+    assert_eq!(replayed["kind"], "providers");
+    assert_eq!(replayed["cursor"].as_str(), Some(appended.cursor.as_str()));
 
+    // Conflicting resume cursors are rejected.
     let mismatch = client
         .get(format!("{base}/api/v1/events?after=0"))
         .header("Last-Event-ID", "1")
@@ -141,6 +157,7 @@ async fn event_stream_replays_committed_rows_and_validates_cursors() -> anyhow::
     let problem: Value = mismatch.json().await?;
     assert_eq!(problem["code"], "CURSOR_MISMATCH");
 
+    // A cursor ahead of the committed log is rejected.
     let ahead = client
         .get(format!("{base}/api/v1/events?after=2"))
         .send()
@@ -242,6 +259,12 @@ fn openapi_contains_every_public_route() {
         "/api/v1/sessions/{id}/diff",
         "/api/v1/sessions/{id}/sync",
         "/api/v1/sessions/{id}/apply",
+        "/api/v1/sessions/{id}/jobs",
+        "/api/v1/jobs/{id}/log",
+        "/api/v1/jobs/{id}/cancel",
+        "/api/v1/notification-channels",
+        "/api/v1/notification-channels/{id}",
+        "/api/v1/notification-channels/{id}/test",
         "/api/v1/terminals",
         "/api/v1/terminals/{id}/scrollback",
         "/api/v1/terminals/{id}/tickets",

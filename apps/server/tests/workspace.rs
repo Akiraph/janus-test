@@ -169,30 +169,22 @@ async fn session_copy_includes_main_working_tree_content() -> anyhow::Result<()>
 
 async fn seed_project(pool: &SqlitePool, project_id: ProjectId) -> anyhow::Result<()> {
     let now = "2026-01-01T00:00:00.000Z";
-    let tenant_id = "tenant-test";
     let owner_id = "owner-test";
-    sqlx::query("INSERT INTO tenants (id, created_at) VALUES (?, ?)")
-        .bind(tenant_id)
-        .bind(now)
-        .execute(pool)
-        .await?;
-    sqlx::query("INSERT INTO owners (id, tenant_id, display_name, created_at) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
         .bind(owner_id)
-        .bind(tenant_id)
         .bind("Test Owner")
         .bind(now)
         .execute(pool)
         .await?;
     sqlx::query(
         "INSERT INTO projects \
-         (id, owner_id, tenant_id, name, state, repo_access, repo_url, \
+         (id, owner_id, name, state, repo_access, repo_url, \
           version, created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, ?, 'fixture', 'ready', 'public_https', 'https://example.com/r.git', \
+         VALUES (?, ?, 'fixture', 'ready', 'public_https', 'https://example.com/r.git', \
                  'v1', ?, ?, ?)",
     )
     .bind(project_id.to_string())
     .bind(owner_id)
-    .bind(tenant_id)
     .bind(now)
     .bind(now)
     .bind(now)

@@ -5,7 +5,6 @@ owned_tables = [
   "log_streams",
   "jobs",
   "services",
-  "runtime_ports",
   "terminals",
   "runtime_access_tickets",
 ]

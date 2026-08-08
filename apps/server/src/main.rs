@@ -1,5 +1,9 @@
 ﻿use anyhow::Context;
-use janus_infrastructure::{events::NewEvent, id::CorrelationId, operations::OperationStatus};
+use janus_infrastructure::{
+    events::{EventType, NewEvent},
+    id::CorrelationId,
+    operations::OperationStatus,
+};
 use janus_server::{AppState, application::workers, config::Config, router};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -37,20 +41,10 @@ async fn main() -> anyhow::Result<()> {
     // client can retry instead of the control plane guessing their outcome.
     // Runtime and execution recovery already ran during AppState::initialize.
     state
-        .blobs()
-        .recover_cleanup()
+        .system()
+        .recover_blobs()
         .await
-        .context("recover durable blob reference cleanup")?;
-    state
-        .blobs()
-        .sweep_unreferenced()
-        .await
-        .context("sweep unreferenced blob objects")?;
-    state
-        .blobs()
-        .clean_incoming()
-        .await
-        .context("clean incoming objects on startup")?;
+        .context("recover durable blobs on startup")?;
     for op_id in state
         .operations()
         .stale_running()
@@ -73,9 +67,9 @@ async fn main() -> anyhow::Result<()> {
     state.mark_recovery_complete();
 
     state
-        .events()
+        .system()
         .append(NewEvent {
-            event_type: "system.started".into(),
+            event_type: EventType::SystemStarted,
             actor: json!({ "kind": "system", "display_name": "Janus" }),
             resource: None,
             correlation_id: CorrelationId::new().to_string(),
@@ -88,6 +82,8 @@ async fn main() -> anyhow::Result<()> {
     workers::spawn(state.application().clone());
     workers::spawn_job_wake(state.application().clone());
     workers::spawn_ask_expiry(state.application().clone());
+    janus_server::application::notification_worker::spawn(state.application().clone());
+    janus_server::application::state_worker::spawn(state.application().clone());
 
     let listener = TcpListener::bind(bind)
         .await

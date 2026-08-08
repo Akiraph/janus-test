@@ -36,7 +36,7 @@ pub async fn live() -> Json<LiveResponse> {
     responses((status = 200, body = ReadyResponse), (status = 503, body = Problem))
 )]
 pub async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>, Problem> {
-    if !state.database().ready().await {
+    if !state.system().ready().await {
         return Err(Problem::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "SERVICE_NOT_READY",
@@ -52,7 +52,7 @@ pub async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>,
             "Startup recovery has not finished.",
         ));
     }
-    let schema_version = state.database().schema_version().await.map_err(|error| {
+    let schema_version = state.system().schema_version().await.map_err(|error| {
         tracing::error!(%error, "read schema version");
         Problem::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -113,11 +113,11 @@ pub async fn system_info(
     State(state): State<AppState>,
     Extension(context): Extension<RequestContext>,
 ) -> Result<(HeaderMap, Json<SystemInfoResponse>), Problem> {
-    let bounds = state.events().bounds().await.map_err(|error| {
+    let bounds = state.system().events_bounds().await.map_err(|error| {
         tracing::error!(request_id = %context.request_id, %error, "read event bounds");
         internal_problem(&context, "The event bounds could not be read.")
     })?;
-    let schema_version = state.database().schema_version().await.map_err(|error| {
+    let schema_version = state.system().schema_version().await.map_err(|error| {
         tracing::error!(request_id = %context.request_id, %error, "read schema version");
         internal_problem(&context, "The schema version could not be read.")
     })?;
@@ -133,7 +133,7 @@ pub async fn system_info(
                 database: DatabaseInfo {
                     engine: "sqlite",
                     journal_mode: "wal",
-                    ready: state.database().ready().await,
+                    ready: state.system().ready().await,
                 },
                 events: EventInfo {
                     min_cursor: bounds.min.to_string(),
@@ -151,8 +151,8 @@ pub async fn system_info(
 
 async fn high_water(state: &AppState, context: &RequestContext) -> Result<u64, Problem> {
     state
-        .events()
-        .bounds()
+        .system()
+        .events_bounds()
         .await
         .map(|bounds| bounds.max)
         .map_err(|error| {

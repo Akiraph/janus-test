@@ -2,7 +2,7 @@
 //!
 //! Not an internal command bus - modules must not use this to trigger each other's work.
 
-use std::sync::Arc;
+use std::{fmt, str::FromStr, sync::Arc};
 
 use crate::clock::now_utc_str;
 use anyhow::Context;
@@ -13,6 +13,136 @@ use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
 use crate::id::EventId;
+
+/// Canonical public event types. Every event appended anywhere in the system
+/// must use one of these variants, so consumers (notably the projection engine)
+/// can `match` exhaustively and the compiler flags a new event type that nobody
+/// projects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventType {
+    TurnCreated,
+    TurnStatusChanged,
+    SessionChanged,
+    SessionRevisionChanged,
+    SessionDeleted,
+    TimelineItemCreated,
+    TimelineItemUpdated,
+    ToolCallCreated,
+    ToolCallChanged,
+    RoundChanged,
+    AskChanged,
+    WorkspaceDiffChanged,
+    ProjectChanged,
+    ProjectMainRevisionChanged,
+    TerminalChanged,
+    ServiceChanged,
+    RuntimeChanged,
+    JobChanged,
+    OperationChanged,
+    NotificationChannelChanged,
+    ModelConfigChanged,
+    ModelStreamDelta,
+    ModelAttemptRetrying,
+    GitStateChanged,
+    CheckpointCreated,
+    SystemStarted,
+}
+
+impl EventType {
+    pub const fn as_str(self) -> &'static str {
+        use EventType::*;
+        match self {
+            TurnCreated => "turn.created",
+            TurnStatusChanged => "turn.status_changed",
+            SessionChanged => "session.changed",
+            SessionRevisionChanged => "session.revision_changed",
+            SessionDeleted => "session.deleted",
+            TimelineItemCreated => "timeline.item_created",
+            TimelineItemUpdated => "timeline.item_updated",
+            ToolCallCreated => "tool_call.created",
+            ToolCallChanged => "tool_call.changed",
+            RoundChanged => "round.changed",
+            AskChanged => "ask.changed",
+            WorkspaceDiffChanged => "workspace.diff_changed",
+            ProjectChanged => "project.changed",
+            ProjectMainRevisionChanged => "project.main_revision_changed",
+            TerminalChanged => "terminal.changed",
+            ServiceChanged => "service.changed",
+            RuntimeChanged => "runtime.changed",
+            JobChanged => "job.changed",
+            OperationChanged => "operation.changed",
+            NotificationChannelChanged => "notification_channel.changed",
+            ModelConfigChanged => "model_config.changed",
+            ModelStreamDelta => "model.stream_delta",
+            ModelAttemptRetrying => "model.attempt_retrying",
+            GitStateChanged => "git.state_changed",
+            CheckpointCreated => "checkpoint.created",
+            SystemStarted => "system.started",
+        }
+    }
+}
+
+impl FromStr for EventType {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        use EventType::*;
+        match value {
+            "turn.created" => Ok(TurnCreated),
+            "turn.status_changed" => Ok(TurnStatusChanged),
+            "session.changed" => Ok(SessionChanged),
+            "session.revision_changed" => Ok(SessionRevisionChanged),
+            "session.deleted" => Ok(SessionDeleted),
+            "timeline.item_created" => Ok(TimelineItemCreated),
+            "timeline.item_updated" => Ok(TimelineItemUpdated),
+            "tool_call.created" => Ok(ToolCallCreated),
+            "tool_call.changed" => Ok(ToolCallChanged),
+            "round.changed" => Ok(RoundChanged),
+            "ask.changed" => Ok(AskChanged),
+            "workspace.diff_changed" => Ok(WorkspaceDiffChanged),
+            "project.changed" => Ok(ProjectChanged),
+            "project.main_revision_changed" => Ok(ProjectMainRevisionChanged),
+            "terminal.changed" => Ok(TerminalChanged),
+            "service.changed" => Ok(ServiceChanged),
+            "runtime.changed" => Ok(RuntimeChanged),
+            "job.changed" => Ok(JobChanged),
+            "operation.changed" => Ok(OperationChanged),
+            "notification_channel.changed" => Ok(NotificationChannelChanged),
+            "model_config.changed" => Ok(ModelConfigChanged),
+            "model.stream_delta" => Ok(ModelStreamDelta),
+            "model.attempt_retrying" => Ok(ModelAttemptRetrying),
+            "git.state_changed" => Ok(GitStateChanged),
+            "checkpoint.created" => Ok(CheckpointCreated),
+            "system.started" => Ok(SystemStarted),
+            _ => Err("unknown event type"),
+        }
+    }
+}
+
+impl fmt::Display for EventType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for EventType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EventEnvelope {
@@ -30,7 +160,7 @@ pub struct EventEnvelope {
 
 #[derive(Debug, Clone)]
 pub struct NewEvent {
-    pub event_type: String,
+    pub event_type: EventType,
     pub actor: Value,
     pub resource: Option<Value>,
     pub correlation_id: String,
@@ -102,7 +232,7 @@ impl EventStore {
             "INSERT INTO public_events (event_id, event_type, schema_version, actor_json, resource_json, correlation_id, causation_id, payload_json, occurred_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&event_id)
-        .bind(&event.event_type)
+        .bind(event.event_type.as_str())
         .bind(serde_json::to_string(&event.actor)?)
         .bind(event.resource.as_ref().map(serde_json::to_string).transpose()?)
         .bind(&event.correlation_id)
@@ -118,7 +248,7 @@ impl EventStore {
             schema_version: 1,
             event_id,
             cursor: cursor.to_string(),
-            event_type: event.event_type,
+            event_type: event.event_type.to_string(),
             occurred_at,
             actor: event.actor,
             resource: event.resource,
@@ -156,6 +286,30 @@ impl EventStore {
         .await?;
 
         rows.into_iter().map(EventEnvelope::try_from).collect()
+    }
+
+    /// Last cursor the projection engine has processed. 0 means it has not
+    /// persisted a position yet.
+    pub async fn projection_cursor(&self) -> anyhow::Result<u64> {
+        let row = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT cursor FROM projection_cursor WHERE id = 1",
+        )
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        Ok(u64::try_from(row.flatten().unwrap_or(0))?)
+    }
+
+    /// Persist the projection engine's processed cursor. Called after each
+    /// batch so a restart can resume from exactly this position.
+    pub async fn set_projection_cursor(&self, cursor: u64) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO projection_cursor (id, cursor) VALUES (1, ?) \
+             ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor",
+        )
+        .bind(i64::try_from(cursor)?)
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(())
     }
 }
 

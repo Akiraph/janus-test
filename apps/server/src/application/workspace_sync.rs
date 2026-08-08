@@ -1,5 +1,5 @@
 use janus_infrastructure::{
-    events::NewEvent,
+    events::{EventType, NewEvent},
     id::{CorrelationId, SessionId},
 };
 use janus_sessions::interface::{SessionSummary, SessionsError};
@@ -83,7 +83,7 @@ impl Application {
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         work.append_event(NewEvent {
-            event_type: "workspace.diff_changed".into(),
+            event_type: EventType::WorkspaceDiffChanged,
             actor: actor.clone(),
             resource: Some(json!({"kind": "session", "id": session.id})),
             correlation_id: correlation_id.clone(),
@@ -100,7 +100,7 @@ impl Application {
         .await
         .map_err(WorkspacePropagationError::Internal)?;
         work.append_event(NewEvent {
-            event_type: "session.revision_changed".into(),
+            event_type: EventType::SessionRevisionChanged,
             actor: actor.clone(),
             resource: Some(json!({"kind": "session", "id": session.id})),
             correlation_id,
@@ -133,7 +133,7 @@ impl Application {
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         work.append_event(NewEvent {
-            event_type: "workspace.diff_changed".into(),
+            event_type: EventType::WorkspaceDiffChanged,
             actor: actor.clone(),
             resource: Some(json!({"kind": "session", "id": session.id})),
             correlation_id: CorrelationId::new().to_string(),

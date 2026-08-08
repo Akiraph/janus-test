@@ -20,7 +20,7 @@ use janus_execution::interface::{
 use janus_infrastructure::unit_of_work::UnitOfWorkTransaction;
 use janus_infrastructure::{
     clock::now_utc_str,
-    events::NewEvent,
+    events::{EventType, NewEvent},
     id::{AskId, AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
 };
 use janus_runtime::interface::JobStatus;
@@ -329,7 +329,7 @@ impl Application {
         let mut events = Vec::with_capacity(5);
         if let Some(checkpoint_id) = &created.checkpoint_id {
             events.push(NewEvent {
-                event_type: "checkpoint.created".into(),
+                event_type: EventType::CheckpointCreated,
                 actor: actor.clone(),
                 resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
                 correlation_id: correlation_id.clone(),
@@ -343,7 +343,7 @@ impl Application {
         }
         if let Some(predecessor) = predecessor {
             events.push(NewEvent {
-                event_type: "turn.status_changed".into(),
+                event_type: EventType::TurnStatusChanged,
                 actor: json!({"kind": "execution"}),
                 resource: Some(json!({"kind": "turn", "id": predecessor})),
                 correlation_id: correlation_id.clone(),
@@ -361,7 +361,7 @@ impl Application {
             "running"
         };
         events.push(NewEvent {
-            event_type: "turn.created".into(),
+            event_type: EventType::TurnCreated,
             actor: actor.clone(),
             resource: Some(json!({"kind": "turn", "id": created.turn_id})),
             correlation_id: correlation_id.clone(),
@@ -376,7 +376,7 @@ impl Application {
             }),
         });
         events.push(NewEvent {
-            event_type: "timeline.item_created".into(),
+            event_type: EventType::TimelineItemCreated,
             actor: actor.clone(),
             resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
             correlation_id: correlation_id.clone(),
@@ -399,7 +399,7 @@ impl Application {
             Some(created.turn_id.as_str())
         };
         events.push(NewEvent {
-            event_type: "session.changed".into(),
+            event_type: EventType::SessionChanged,
             actor,
             resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
             correlation_id,
@@ -521,7 +521,7 @@ impl Application {
         }
         if answered.disposition == AskAnswerDisposition::Accepted {
             work.append_event(NewEvent {
-                event_type: "ask.changed".into(),
+                event_type: EventType::AskChanged,
                 actor: actor.clone(),
                 resource: Some(json!({"kind": "ask", "id": answered.ask_id.to_string()})),
                 correlation_id: correlation_id.clone(),
@@ -547,7 +547,7 @@ impl Application {
         }
         if let Some((steered, timeline_item_id)) = &late_steer {
             work.append_event(NewEvent {
-                event_type: "timeline.item_created".into(),
+                event_type: EventType::TimelineItemCreated,
                 actor: actor.clone(),
                 resource: Some(json!({"kind": "session", "id": outcome.session_id.to_string()})),
                 correlation_id: correlation_id.clone(),
@@ -562,7 +562,7 @@ impl Application {
             .await
             .map_err(SessionsError::Internal)?;
             work.append_event(NewEvent {
-                event_type: "session.changed".into(),
+                event_type: EventType::SessionChanged,
                 actor: actor.clone(),
                 resource: Some(json!({"kind": "session", "id": outcome.session_id.to_string()})),
                 correlation_id: correlation_id.clone(),
@@ -678,7 +678,7 @@ impl Application {
                         ))
                     })?;
                 work.append_event(NewEvent {
-                    event_type: "ask.changed".into(),
+                    event_type: EventType::AskChanged,
                     actor: actor.clone(),
                     resource: Some(json!({"kind": "ask", "id": ask.ask_id.to_string()})),
                     correlation_id: correlation_id.clone(),
@@ -725,7 +725,7 @@ impl Application {
         correlation_id: &str,
     ) -> NewEvent {
         NewEvent {
-            event_type: "turn.status_changed".into(),
+            event_type: EventType::TurnStatusChanged,
             actor,
             resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
             correlation_id: correlation_id.to_owned(),
@@ -797,7 +797,7 @@ impl Application {
             .await
             .map_err(SessionsError::Internal)?;
             work.append_event(NewEvent {
-                event_type: "session.changed".into(),
+                event_type: EventType::SessionChanged,
                 actor,
                 resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
                 correlation_id,
@@ -974,7 +974,7 @@ impl Application {
         };
         let correlation_id = CorrelationId::new().to_string();
         work.append_event(NewEvent {
-            event_type: "turn.status_changed".into(),
+            event_type: EventType::TurnStatusChanged,
             actor: json!({"kind": "execution"}),
             resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
             correlation_id,

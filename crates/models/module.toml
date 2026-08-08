@@ -4,7 +4,6 @@ owned_tables = [
   "model_providers",
   "models",
   "model_failover",
-  "model_recovery_cooldowns",
   "model_attempts",
   "model_usage_ledger",
 ]

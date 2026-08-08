@@ -80,8 +80,16 @@ test("a browser message completes through live execution", async ({ page }) => {
 
   const userBubble = page.locator(".session-message__bubble").filter({ hasText: "你好" }).last();
   await expect(userBubble).toBeVisible();
-  const bubbleBox = await userBubble.boundingBox();
-  expect(bubbleBox?.width).toBeGreaterThan(bubbleBox?.height ?? Number.POSITIVE_INFINITY);
+  // The bubble swaps from a provisional optimistic rendering to the durable
+  // projection as soon as the server commits the message (instant under SSE
+  // convergence), so boundingBox() can hit a transient gap mid-swap. Poll until
+  // the durable bubble reports a box instead of measuring once.
+  await expect
+    .poll(async () => {
+      const box = await userBubble.boundingBox();
+      return box ? box.width > box.height : false;
+    }, { timeout: 5_000 })
+    .toBe(true);
 
   // Streaming provisional text renders as plain text (not parsed as markdown
   // while deltas arrive), then settles to the durable markdown once the Round
@@ -276,7 +284,13 @@ test("Main Terminal runs in the Project workspace through CLI and WebSocket", as
 
     const terminal = page.getByRole("application", { name: "Main Terminal" });
     await expect(terminal).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByText("live", { exact: true })).toBeVisible({ timeout: 15_000 });
+    // The "Send interrupt" button is enabled exactly when the terminal's
+    // WebSocket is live. A refactor removed the connection-status badge this
+    // test used to match on (`{status()}`), so gate on the enabled button
+    // instead of a label that no longer exists.
+    await expect(page.getByRole("button", { name: "Send interrupt" })).toBeEnabled({
+      timeout: 15_000,
+    });
     await terminal.click();
     await page.keyboard.type("pwd");
     await page.keyboard.press("Enter");

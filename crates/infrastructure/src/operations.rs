@@ -10,7 +10,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
 use super::{
-    events::{EventStore, NewEvent},
+    events::{EventStore, EventType, NewEvent},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 use crate::{
@@ -818,7 +818,7 @@ impl OperationInterface {
         correlation_id: &CorrelationId,
     ) -> Result<(), OperationError> {
         work.append_event(NewEvent {
-            event_type: "operation.changed".into(),
+            event_type: EventType::OperationChanged,
             actor: serde_json::json!({"kind": "system", "id": null, "display_name": "Janus"}),
             resource: Some(serde_json::json!({
                 "kind": "operation",
@@ -959,4 +959,262 @@ pub struct ClaimedWork {
 pub struct WorkClaim<'a> {
     pub id: &'a str,
     pub nonce: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        clock::{format_utc, now_utc, now_utc_str},
+        id::OwnerId,
+    };
+    use chrono::Duration;
+    use serde_json::json;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    /// In-memory SQLite with the real server migration, an owner row (for the
+    /// idempotency FK), and a bare OperationInterface.
+    async fn test_harness() -> (SqlitePool, OperationInterface, String) {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("../../apps/server/migrations")
+            .run(&pool)
+            .await
+            .unwrap();
+        let owner_id = OwnerId::new();
+        sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, 'test', ?)")
+            .bind(owner_id.to_string())
+            .bind(now_utc_str())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let ops = OperationInterface::new(pool.clone(), EventStore::new(pool.clone()));
+        (pool, ops, owner_id.to_string())
+    }
+
+    fn create_request<'a>(idem: Option<IdempotencyRequest>) -> CreateOperation<'a> {
+        CreateOperation {
+            kind: "project.create",
+            actor: json!({"kind": "system", "id": null, "display_name": "Janus"}),
+            target_kind: "project",
+            target_id: Some("p_1"),
+            conditions: json!({}),
+            correlation_id: CorrelationId::new(),
+            idempotency: idem,
+        }
+    }
+
+    fn create_work<'a>() -> CreateWork<'a> {
+        CreateWork {
+            handler_kind: "git.clone",
+            payload: json!({"url": "https://example.com/repo.git"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_renewal_and_expiry() {
+        let (pool, ops, _owner_id) = test_harness().await;
+        ops.create(create_request(None), Some(create_work()))
+            .await
+            .unwrap();
+        let claimed = ops.claim_work("git.clone", 60).await.unwrap().expect("claimable");
+        // Renew with the matching nonce while the lease is live.
+        assert!(ops.renew_work(&claimed.id, &claimed.nonce, 60).await.unwrap());
+        // A stale nonce cannot renew.
+        assert!(!ops.renew_work(&claimed.id, "wrong-nonce", 60).await.unwrap());
+        // Force the lease into the past.
+        sqlx::query("UPDATE work_items SET lease_expires_at = ? WHERE id = ?")
+            .bind(format_utc(now_utc() - Duration::seconds(10)))
+            .bind(&claimed.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Renewing an expired lease fails.
+        assert!(!ops.renew_work(&claimed.id, &claimed.nonce, 60).await.unwrap());
+        // The expired item is reclaimable with a new nonce.
+        let reclaimed = ops
+            .claim_work("git.clone", 60)
+            .await
+            .unwrap()
+            .expect("reclaimable");
+        assert_ne!(reclaimed.nonce, claimed.nonce);
+        // The old nonce can no longer complete the work.
+        assert!(!ops.complete_work(&reclaimed.id, &claimed.nonce).await.unwrap());
+        // The new nonce can.
+        assert!(ops.complete_work(&reclaimed.id, &reclaimed.nonce).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_dedup() {
+        let (_pool, ops, owner_id) = test_harness().await;
+        let key = "clone-project-p_1".to_owned();
+        let digest = "sha256:same".to_owned();
+        let make_idem = |digest: &str| IdempotencyRequest {
+            key: key.clone(),
+            owner_id: owner_id.clone(),
+            method: "POST".to_owned(),
+            normalized_route: "/api/projects".to_owned(),
+            digest: digest.to_owned(),
+            expires_at: format_utc(now_utc() + Duration::hours(1)),
+        };
+        let first = ops
+            .create(create_request(Some(make_idem(&digest))), None)
+            .await
+            .unwrap();
+        assert!(matches!(first.outcome, IdempotencyOutcome::New));
+        let op_id = first.operation.id.clone();
+        // Same key + same digest while in-flight -> Reused with the same operation.
+        let second = ops
+            .create(create_request(Some(make_idem(&digest))), None)
+            .await
+            .unwrap();
+        assert!(matches!(second.outcome, IdempotencyOutcome::Reused));
+        assert_eq!(second.operation.id, op_id);
+        // Terminal finish, then same key + same digest -> Stored.
+        ops.finish(
+            &op_id,
+            OperationStatus::Succeeded,
+            Some(json!({"ok": true})),
+            None,
+            CorrelationId::new(),
+        )
+        .await
+        .unwrap();
+        let third = ops
+            .create(create_request(Some(make_idem(&digest))), None)
+            .await
+            .unwrap();
+        assert!(matches!(third.outcome, IdempotencyOutcome::Stored));
+        assert_eq!(third.operation.id, op_id);
+        // Same key + different digest is a caller error.
+        let err = ops
+            .create(create_request(Some(make_idem("sha256:different"))), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("IDEMPOTENCY_KEY_REUSED"));
+    }
+
+    #[tokio::test]
+    async fn work_dead_letters_after_attempt_cap() {
+        let (pool, ops, _owner_id) = test_harness().await;
+        ops.create(create_request(None), Some(create_work()))
+            .await
+            .unwrap();
+        for attempt in 1..=MAX_WORK_ATTEMPTS {
+            let claimed = ops.claim_work("git.clone", 60).await.unwrap().expect("claimable");
+            let will_dl = ops
+                .work_will_dead_letter(&claimed.id, &claimed.nonce, WorkFailureDisposition::Retry)
+                .await
+                .unwrap();
+            assert_eq!(will_dl, attempt >= MAX_WORK_ATTEMPTS);
+            assert!(
+                ops.fail_work(&claimed.id, &claimed.nonce, WorkFailureDisposition::Retry)
+                    .await
+                    .unwrap()
+            );
+            // Make the item immediately eligible for the next claim.
+            sqlx::query("UPDATE work_items SET not_before = ? WHERE id = ?")
+                .bind(format_utc(now_utc() - Duration::seconds(30)))
+                .bind(&claimed.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // After the cap the item is dead and cannot be claimed again.
+        assert!(ops.claim_work("git.clone", 60).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_running_reports_expired_leases() {
+        let (pool, ops, _owner_id) = test_harness().await;
+        let created = ops
+            .create(create_request(None), Some(create_work()))
+            .await
+            .unwrap();
+        let op_id = created.operation.id.clone();
+        // Running with a live lease is not stale.
+        sqlx::query(
+            "UPDATE operations SET status = 'running', lease_nonce = 'x', lease_expires_at = ? \
+             WHERE id = ?",
+        )
+        .bind(format_utc(now_utc() + Duration::seconds(60)))
+        .bind(&op_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(ops.stale_running().await.unwrap().is_empty());
+        // Expiring the lease makes it stale.
+        sqlx::query("UPDATE operations SET lease_expires_at = ? WHERE id = ?")
+            .bind(format_utc(now_utc() - Duration::seconds(10)))
+            .bind(&op_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stale = ops.stale_running().await.unwrap();
+        assert!(stale.contains(&op_id));
+    }
+
+    #[tokio::test]
+    async fn step_replay_is_idempotent() {
+        let (_pool, ops, _owner_id) = test_harness().await;
+        let created = ops
+            .create(create_request(None), Some(create_work()))
+            .await
+            .unwrap();
+        let op_id = created.operation.id.clone();
+        let claimed = ops.claim_work("git.clone", 60).await.unwrap().expect("claimable");
+        let claim = WorkClaim {
+            id: &claimed.id,
+            nonce: &claimed.nonce,
+        };
+        // Fresh step starts running.
+        assert!(matches!(
+            ops.begin_step_claimed(claim, &op_id, "clone", json!({"repo": "x"}))
+                .await
+                .unwrap(),
+            StepState::Running
+        ));
+        // Complete it; replaying the same step returns AlreadySucceeded.
+        ops.complete_step_claimed(claim, &op_id, "clone", Some("refs/heads/main"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            ops.begin_step_claimed(claim, &op_id, "clone", json!({"repo": "x"}))
+                .await
+                .unwrap(),
+            StepState::AlreadySucceeded
+        ));
+        // A step left running mid-effect must not be silently re-executed.
+        assert!(matches!(
+            ops.begin_step_claimed(claim, &op_id, "update", json!({}))
+                .await
+                .unwrap(),
+            StepState::Running
+        ));
+        assert!(matches!(
+            ops.begin_step_claimed(claim, &op_id, "update", json!({}))
+                .await
+                .unwrap(),
+            StepState::NeedsReconciliation
+        ));
+        // A stale claim is rejected outright.
+        let stale = WorkClaim {
+            id: &claimed.id,
+            nonce: "stale-nonce",
+        };
+        assert!(matches!(
+            ops.begin_step_claimed(stale, &op_id, "delete", json!({}))
+                .await
+                .unwrap_err(),
+            OperationError::StaleWorkClaim
+        ));
+    }
 }

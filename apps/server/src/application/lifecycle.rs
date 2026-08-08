@@ -15,7 +15,7 @@ use crate::application::Application;
 use crate::application::operation_kinds::{KIND_CREATE_SESSION, KIND_DELETE_SESSION};
 use janus_execution::interface::ExecutionError;
 use janus_infrastructure::{
-    events::NewEvent,
+    events::{EventType, NewEvent},
     id::{CorrelationId, ProjectId, SessionId},
     operations::{
         CreateOperation, CreateWork, IdempotencyRequest, OperationCompletion, OperationError,
@@ -136,7 +136,7 @@ pub(crate) async fn recover_execution_state(application: &Application) -> anyhow
             continue;
         }
         work.append_event(NewEvent {
-            event_type: "turn.status_changed".into(),
+            event_type: EventType::TurnStatusChanged,
             actor: actor.clone(),
             resource: Some(json!({"kind": "turn", "id": turn.turn_id.to_string()})),
             correlation_id: correlation_id.clone(),
@@ -153,7 +153,7 @@ pub(crate) async fn recover_execution_state(application: &Application) -> anyhow
         .await?;
         if let Some(session_version) = &turn.session_version {
             work.append_event(NewEvent {
-                event_type: "session.changed".into(),
+                event_type: EventType::SessionChanged,
                 actor: actor.clone(),
                 resource: Some(json!({"kind": "session", "id": turn.session_id.to_string()})),
                 correlation_id: correlation_id.clone(),
@@ -186,7 +186,7 @@ pub(crate) async fn recover_workspace_mutations(
     let count = recovered.len();
     for mutation in recovered {
         let mut payload = mutation.event.payload;
-        if mutation.event.event_type == "project.main_revision_changed"
+        if mutation.event.event_type == EventType::ProjectMainRevisionChanged
             && let serde_json::Value::Object(ref mut object) = payload
         {
             object.insert(
@@ -218,7 +218,7 @@ pub(crate) async fn recover_workspace_mutations(
 }
 
 pub(crate) async fn request_session_creation(
-    state: &Application,
+    state: &OperationInterface,
     owner_id: &str,
     project_id: ProjectId,
     title: Option<String>,
@@ -228,7 +228,6 @@ pub(crate) async fn request_session_creation(
 ) -> Result<OperationView, SessionLifecycleError> {
     let session_id = SessionId::new();
     let created = state
-        .operations()
         .create(
             CreateOperation {
                 kind: KIND_CREATE_SESSION,
@@ -259,7 +258,7 @@ pub(crate) async fn request_session_creation(
 }
 
 pub(crate) async fn request_session_deletion(
-    state: &Application,
+    state: &OperationInterface,
     session_id: SessionId,
     expected_version: String,
     actor: Value,
@@ -267,7 +266,6 @@ pub(crate) async fn request_session_deletion(
     idempotency: IdempotencyRequest,
 ) -> Result<OperationView, SessionLifecycleError> {
     let created = state
-        .operations()
         .create(
             CreateOperation {
                 kind: KIND_DELETE_SESSION,
@@ -542,7 +540,7 @@ async fn execute_session_creation(
                 .await?;
             if record.created {
                 work.append_event(NewEvent {
-                    event_type: "session.changed".into(),
+                    event_type: EventType::SessionChanged,
                     actor: input.actor.clone(),
                     resource: Some(json!({"kind": "session", "id": session_id})),
                     correlation_id: correlation_id.to_string(),
@@ -706,7 +704,7 @@ async fn mark_session_deleting(
         .await?;
     if deleting.changed {
         work.append_event(NewEvent {
-            event_type: "session.changed".into(),
+            event_type: EventType::SessionChanged,
             actor: actor.clone(),
             resource: Some(json!({"kind": "session", "id": session_id})),
             correlation_id: correlation_id.to_string(),
@@ -744,17 +742,13 @@ async fn delete_session_records(
         .execution()
         .round_ids_for_turns_in_tx(work.connection(), &plan.turn_ids)
         .await?;
-    let attempt_ids = state
-        .models()
-        .attempt_ids_for_rounds_in_tx(work.connection(), &round_ids)
-        .await?;
     state
         .runtime()
         .delete_session_resources_in_tx(work.connection(), session_id)
         .await?;
     state
         .execution()
-        .delete_session_execution_in_tx(work.connection(), session_id, &plan.turn_ids, &attempt_ids)
+        .delete_session_execution_in_tx(work.connection(), session_id, &plan.turn_ids)
         .await?;
     state
         .models()
@@ -770,7 +764,7 @@ async fn delete_session_records(
         )));
     }
     work.append_event(NewEvent {
-        event_type: "session.deleted".into(),
+        event_type: EventType::SessionDeleted,
         actor: actor.clone(),
         resource: Some(json!({"kind": "session", "id": session_id})),
         correlation_id: correlation_id.to_string(),

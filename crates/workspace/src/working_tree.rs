@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    process::Command,
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -9,7 +10,6 @@ use futures_util::stream::{self, StreamExt};
 use super::path::validate_workspace_path;
 use super::{
     diff::{DiffChangeKind, DiffSummary, diff_file_maps, line_change_counts, line_hunks},
-    git_command,
     manifest::{
         ManifestNode, ManifestRoot, NodeKind, hash_dir_node, hash_file_node, is_link_or_reparse,
         is_text_bytes, is_workspace_internal_path,
@@ -419,6 +419,19 @@ fn path_has_link_or_reparse_component(root: &Path, rel: &Path) -> anyhow::Result
     Ok(false)
 }
 
+pub(super) fn git_command(root: &Path) -> Command {
+    let safe_directory = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg(format!("safe.directory={safe_directory}"));
+    command
+}
+
 fn git_text(root: &Path, args: &[&str]) -> anyhow::Result<String> {
     let output = git_output(root, args)?;
     String::from_utf8(output)
@@ -542,31 +555,6 @@ fn copy_dir_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mirror a legacy filesystem baseline while excluding VCS administration
-/// metadata. New propagation baselines are persisted as manifests; this path
-/// only supports lazy migration of rows created before that change.
-pub(crate) fn mirror_managed_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
-    remove_path(target)?;
-    std::fs::create_dir_all(target)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        let from = entry.path();
-        let to = target.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&from)?;
-        if metadata.file_type().is_symlink() {
-            copy_symlink(&from, &to)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&from, &to)?;
-        } else if metadata.is_dir() {
-            copy_dir_tree(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-
 /// Copy or remove selected managed paths. The Workspace interface advances the
 /// persisted manifest baseline after the filesystem operation succeeds. All
 /// paths have already been validated there; keeping the operation blocking and
@@ -676,6 +664,42 @@ mod tests {
                 .expect("copied link")
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    #[test]
+    fn git_command_allows_a_different_repository_owner() {
+        use std::process::Command;
+
+        let repo = tempfile::tempdir().expect("temporary repository");
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "janus@local"]);
+        run(&["config", "user.name", "Janus"]);
+        std::fs::write(repo.path().join("README.md"), b"# test\n").expect("write");
+        run(&["add", "README.md"]);
+        run(&["commit", "-m", "baseline"]);
+
+        let output = super::git_command(repo.path())
+            .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+            .arg("rev-parse")
+            .arg("HEAD")
+            .current_dir(repo.path())
+            .output()
+            .expect("git rev-parse");
+        assert!(
+            output.status.success(),
+            "git rejected the scoped safe.directory: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

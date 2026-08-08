@@ -5,7 +5,8 @@
 //! Handle: `session:<session-id>` (symmetric to Main `main:<project-id>`).
 //!
 //! Session copies are **git worktrees** of the Main clone, not file-tree
-//! copies. Main is itself a `git clone` result (see `projects::run_clone`), so
+//! copies. Main is itself a `git clone` result (see the source-control
+//! capability), so
 //! `git worktree add` shares Main's `.git` object database and checks out a
 //! working tree in seconds - no recursive file copy, no re-`git init`, and the
 //! Session inherits Main's full history instead of becoming an orphan repo.
@@ -15,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::git_command;
+use super::working_tree::git_command;
 
 /// Relative managed_dir stored in `workspace_copies.managed_dir`.
 pub fn session_managed_dir(session_id: impl Display) -> String {
@@ -34,19 +35,6 @@ pub fn session_repo_abs(data_root: &Path, session_id: impl Display) -> PathBuf {
             .join("sessions")
             .join(session_id.to_string())
             .join("repo"),
-    )
-}
-
-/// Absolute path to the legacy filesystem baseline for a Session.
-/// New propagation baselines are persisted as manifests; this path remains
-/// only for lazy migration of older workspace rows.
-pub fn propagation_base_abs(data_root: &Path, session_id: impl Display) -> PathBuf {
-    absoluteish(
-        data_root
-            .join("workspaces")
-            .join("sessions")
-            .join(session_id.to_string())
-            .join("base"),
     )
 }
 

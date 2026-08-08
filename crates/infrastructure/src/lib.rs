@@ -11,6 +11,7 @@ pub mod managed_storage;
 pub mod operations;
 pub mod secrets;
 pub mod shell;
+pub mod state_broadcaster;
 pub mod unit_of_work;
 
 /// Lease and step tokens are opaque capabilities, not domain IDs; UUID v7 keeps

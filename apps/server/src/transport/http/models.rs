@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     AppState,
     transport::http::{
         auth::{authenticate, authorized},
@@ -47,6 +47,12 @@ pub async fn create_provider(
         .create_provider(&auth.owner_id, input, &context.request_id)
         .await
         .map_err(problem)?;
+    // Push providers list
+    if let Ok(list) = state.models().providers(&auth.owner_id).await {
+        state
+            .state_broadcaster()
+            .push_providers(serde_json::to_value(&list).unwrap_or_default());
+    }
     Ok((StatusCode::CREATED, Json(DataResponse { data: view })))
 }
 #[utoipa::path(patch, path = "/api/v1/model-providers/{id}", params(("id" = String, Path)), request_body = ProviderInput, responses((status = 200, body = DataResponse<janus_models::interface::ProviderView>), (status = 404, body = Problem)))]
@@ -63,6 +69,12 @@ pub async fn update_provider(
         .update_provider(&auth.owner_id, &id, input, &context.request_id)
         .await
         .map_err(problem)?;
+    // Push providers list
+    if let Ok(list) = state.models().providers(&auth.owner_id).await {
+        state
+            .state_broadcaster()
+            .push_providers(serde_json::to_value(&list).unwrap_or_default());
+    }
     Ok(Json(DataResponse { data: view }))
 }
 #[utoipa::path(delete, path = "/api/v1/model-providers/{id}", params(("id" = String, Path)), responses((status = 204), (status = 404, body = Problem)))]
@@ -78,6 +90,12 @@ pub async fn delete_provider(
         .delete_provider(&auth.owner_id, &id, &context.request_id)
         .await
         .map_err(problem)?;
+    // Push providers list
+    if let Ok(list) = state.models().providers(&auth.owner_id).await {
+        state
+            .state_broadcaster()
+            .push_providers(serde_json::to_value(&list).unwrap_or_default());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(post, path = "/api/v1/model-providers/{id}/probe", params(("id" = String, Path)), responses((status = 200, body = DataResponse<janus_models::interface::ProbeResult>), (status = 404, body = Problem)))]
