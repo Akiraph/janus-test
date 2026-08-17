@@ -9,7 +9,7 @@ use std::{collections::HashSet, future::Future};
 use janus_infrastructure::clock::now_utc_str;
 use janus_infrastructure::{
     events::{EventStore, EventType, NewEvent},
-    id::{AskId, CorrelationId, JobId, RoundId, SessionId, ToolCallId, TurnId},
+    id::{CorrelationId, RoundId, SessionId, ToolCallId, TurnId},
     managed_storage::BlobStore,
     state_broadcaster::StateBroadcaster,
     unit_of_work::UnitOfWork,
@@ -19,10 +19,9 @@ use janus_models::interface::{
     ModelsInterface, StreamChannel, ToolSpec,
 };
 use janus_projects::interface::ProjectsInterface;
-use janus_runtime::interface::{JobProjection, JobStatus};
 use janus_sessions::interface::{
     ActiveTurnOutcome, AppendAssistantMessage, AppendToolResultInput, ExecutionTurn,
-    ModelAttemptStatus, SessionsInterface, TurnModelAttempt, TurnStatus,
+    ModelAttemptStatus, SessionsInterface, TurnModelAttempt, TurnStatus, TurnTokenExchange,
 };
 use janus_workspace::interface::WorkspaceInterface;
 use serde::Serialize;
@@ -30,16 +29,19 @@ use serde_json::{Value, json};
 use sqlx::{SqliteConnection, SqlitePool};
 
 use super::context::SYSTEM_PROMPT;
-pub use super::context::{latest_compact_summary, record_context_version, schedule_compact};
+pub use super::context::{
+    AUTO_COMPACT_THRESHOLD_PERCENT, DEFAULT_CONTEXT_LIMIT, ScheduleCompactInput,
+    context_usage_near_limit, latest_compact_summary, record_context_version,
+    record_context_version_in_tx, schedule_compact, schedule_compact_in_tx,
+};
 use super::registry::{SCHEMA_VERSION, available_tools};
-use super::retry::{FaultClass, MAX_ATTEMPTS_PER_CANDIDATE, classify, classify_fault};
+use super::retry::{FaultClass, classify};
 use super::tools::{
     ToolContext, attach_tool_display, execute_tool, read_attachment_bytes, supported_image_mime,
 };
 pub use super::types::{
-    AskAnswer, AskAnswerDisposition, AskClosure, AskMode, AskRequest, AskStatus, CompletionSummary,
-    ExecutionError, ExpiredAsk, ToolCallSettlement, ToolCallStatus, ToolExecutionDisposition,
-    ToolOutcome, ToolResultPart, TurnExecutionOutcome, TurnWait,
+    CompletionSummary, ExecutionError, ToolCallStatus, ToolExecutionDisposition, ToolOutcome,
+    ToolResultPart, TurnExecutionOutcome,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +50,30 @@ pub struct ContextUsageView {
     pub context_limit: i64,
     pub compact_status: String,
     pub created_at: String,
+}
+
+fn estimated_system_prompt_tokens() -> i64 {
+    i64::try_from(SYSTEM_PROMPT.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
+}
+
+/// Aggregate the durable model ledger into the one value exposed for a Turn.
+/// Ledger input is already provider-cache-free; only Janus's system prefix is
+/// removed here, once per model attempt. Failed attempts with reported usage
+/// remain part of the Turn exchange because the Owner paid for that request.
+fn aggregate_turn_token_exchange(
+    rows: &[(i64, i64)],
+    system_prompt_tokens: i64,
+) -> TurnTokenExchange {
+    let upload_tokens = rows.iter().fold(0_i64, |total, (input, _)| {
+        total.saturating_add(input.saturating_sub(system_prompt_tokens).max(0))
+    });
+    let download_tokens = rows
+        .iter()
+        .fold(0_i64, |total, (_, output)| total.saturating_add(*output));
+    TurnTokenExchange {
+        upload_tokens,
+        download_tokens,
+    }
 }
 
 #[derive(Clone)]
@@ -67,6 +93,9 @@ struct AcceptedRoundResponse<'a> {
     stop_reason: Option<&'a str>,
     text: &'a str,
     reasoning: &'a str,
+    /// Raw provider reasoning to echo back verbatim on the next request; the
+    /// display-formatted `reasoning` must not be used for echo-back.
+    reasoning_content: Option<&'a str>,
     reasoning_duration_ms: Option<u64>,
     tool_calls: &'a [CompletedToolCall],
     actor: &'a Value,
@@ -75,20 +104,6 @@ struct AcceptedRoundResponse<'a> {
 struct ExecutedToolCall {
     outcome: ToolOutcome,
     message: ChatMessage,
-}
-
-type SettledAskToolCallRow = (
-    String,
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-);
-
-enum CompleteTurnOutcome {
-    Completed,
-    WaitingForJob,
 }
 
 /// Dependencies assembled by the server composition root for one execution
@@ -147,23 +162,6 @@ impl ExecutionInterface {
             runtime,
         }
     }
-
-}
-
-/// Inspect the streamed events and return the fault class only when the stream
-/// ended in `Failed` (no `Completed`). Used by the Round-level posture: a
-/// `Transient` final failure (retries exhausted) parks the Turn on
-/// `waiting_for_model` so the UI can surface the reason; `Config` fails it.
-fn classify_failed(events: &[ModelStreamEvent]) -> Option<FaultClass> {
-    let failed = events.iter().rev().find_map(|e| match e {
-        ModelStreamEvent::Failed {
-            code,
-            detail,
-            attempt_id: _,
-        } => Some((code.clone(), detail.clone())),
-        _ => None,
-    })?;
-    Some(classify_fault(&failed.0, &failed.1))
 }
 
 fn tool_result_message(outcome: &ToolOutcome, provider_call_id: &str) -> (ChatMessage, Value) {
@@ -226,29 +224,8 @@ fn tool_result_message(outcome: &ToolOutcome, provider_call_id: &str) -> (ChatMe
             parts: model_parts,
             tool_call_id: Some(provider_call_id.to_owned()),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         },
         Value::Array(durable_parts),
     )
-}
-
-fn format_ask_answer(answer: &Value) -> String {
-    match answer {
-        Value::Null => "No answer was provided.".to_owned(),
-        Value::String(value) => value.clone(),
-        Value::Array(values) => {
-            let answer = values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if answer.is_empty() {
-                "No answer was provided.".to_owned()
-            } else {
-                answer
-            }
-        }
-        value => value.to_string(),
-    }
 }

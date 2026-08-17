@@ -16,7 +16,7 @@ use janus_infrastructure::{
 };
 use tokio::sync::broadcast;
 
-use crate::application::{state_worker::project_event, Application};
+use crate::application::{Application, state_worker::project_event};
 
 /// Read-only surface over the system plumbing. Transports never hold
 /// `Database`/`EventStore`/`Application`; they hold this.
@@ -90,11 +90,7 @@ impl SystemRead {
 
     /// Project one committed event into the state changes it drives, for the
     /// given owner (the SSE replay re-projects per authenticated owner).
-    pub async fn project(
-        &self,
-        owner: Option<&str>,
-        event: &EventEnvelope,
-    ) -> Vec<StateChange> {
+    pub async fn project(&self, owner: Option<&str>, event: &EventEnvelope) -> Vec<StateChange> {
         project_event(&self.application, owner, event).await
     }
 }

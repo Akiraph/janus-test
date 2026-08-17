@@ -1,10 +1,7 @@
-import CheckCircle2 from "lucide-solid/icons/check-circle-2";
-import ChevronRight from "lucide-solid/icons/chevron-right";
-import CircleDashed from "lucide-solid/icons/circle-dashed";
 import Database from "lucide-solid/icons/database";
 import Radio from "lucide-solid/icons/radio";
 import Server from "lucide-solid/icons/server";
-import { For, Match, Switch } from "solid-js";
+import { Match, Switch } from "solid-js";
 import { NotificationEvent } from "../../components/ui/notifications";
 import { getErrorMessage } from "../../lib/api";
 import { useSystemInfo } from "../../lib/queries";
@@ -22,7 +19,7 @@ export function SystemStatus() {
       />
       <div class="panel-heading">
         <h2 id="system-title">System</h2>
-        <p>Deployment status and capabilities</p>
+        <p>Deployment status</p>
       </div>
 
       <Switch>
@@ -35,48 +32,16 @@ export function SystemStatus() {
           {(response) => {
             const data = () => response().data;
             return (
-              <div class="system-columns">
-                <div class="system-section">
-                  <h2>Service</h2>
-                  <div class="detail-list">
-                    <DetailRow icon={Server} label="Version" value={data().version} />
-                    <DetailRow
-                      icon={Database}
-                      label="Schema"
-                      value={String(data().schema_version)}
-                    />
-                    <DetailRow
-                      icon={Radio}
-                      label="Event range"
-                      value={`${data().events.min_cursor} - ${data().events.max_cursor}`}
-                    />
-                  </div>
-                </div>
-
-                <div class="system-section">
-                  <h2>Capabilities</h2>
-                  <div class="capability-list">
-                    <For each={data().capabilities}>
-                      {(capability) => (
-                        <div class="capability-row">
-                          <span
-                            class={
-                              capability.state === "ready" ? "capability-ready" : "capability-muted"
-                            }
-                          >
-                            {capability.state === "ready" ? (
-                              <CheckCircle2 size={16} />
-                            ) : (
-                              <CircleDashed size={16} />
-                            )}
-                          </span>
-                          <span>{formatCapability(capability.id)}</span>
-                          <code>{capability.state}</code>
-                          <ChevronRight size={15} class="row-chevron" />
-                        </div>
-                      )}
-                    </For>
-                  </div>
+              <div class="system-section">
+                <h2>Service</h2>
+                <div class="detail-list">
+                  <DetailRow icon={Server} label="Version" value={data().version} />
+                  <DetailRow icon={Database} label="Schema" value={String(data().schema_version)} />
+                  <DetailRow
+                    icon={Radio}
+                    label="Event range"
+                    value={`${data().events.min_cursor} - ${data().events.max_cursor}`}
+                  />
                 </div>
               </div>
             );
@@ -101,12 +66,4 @@ function DetailRow(props: DetailRowProps) {
       <strong>{props.value}</strong>
     </div>
   );
-}
-
-function formatCapability(id: string): string {
-  return id
-    .replace("delegated_cli.", "")
-    .split("_")
-    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
-    .join(" ");
 }

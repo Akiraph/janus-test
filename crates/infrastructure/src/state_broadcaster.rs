@@ -1,6 +1,6 @@
 //! State broadcaster for real-time state push to SSE consumers.
 //!
-//! Unlike the legacy `EventStore` which emits "what changed" facts, this
+//! Unlike the durable `EventStore` which emits "what changed" facts, this
 //! channel broadcasts the *complete current projection* of a resource so
 //! consumers can `setQueryData` without invalidation or re-fetch.
 //!
@@ -27,8 +27,6 @@ pub enum StateKind {
     Session,
     /// Session timeline page (query key: ["session-timeline", session_id])
     SessionTimeline,
-    /// Session diff (query key: ["session-diff", session_id])
-    SessionDiff,
     /// Session context usage (query key: ["session-context", session_id])
     SessionContext,
     /// Turn summary (query key: ["turn", session_id, turn_id])
@@ -62,8 +60,8 @@ pub enum StateKind {
     StreamText,
     /// Session list for a project (query key: ["sessions", project_id])
     Sessions,
-    /// Runtime jobs list for a session (query key: ["jobs", session_id])
-    Jobs,
+    /// Global async task list (query key: ["async-tasks"])
+    AsyncTasks,
     /// Notification channel list (query key: ["notification-channels"])
     NotificationChannels,
     /// Operation (query key: ["operations", id])
@@ -242,11 +240,11 @@ impl StateBroadcaster {
         });
     }
 
-    /// Convenience: push runtime jobs for a session.
-    pub fn push_jobs(&self, session_id: &str, data: Value) {
+    /// Convenience: push the global async task list.
+    pub fn push_async_tasks(&self, data: Value) {
         self.push(StateChange {
-            kind: StateKind::Jobs,
-            id: Some(session_id.to_owned()),
+            kind: StateKind::AsyncTasks,
+            id: None,
             data,
             cursor: None,
         });
@@ -256,16 +254,6 @@ impl StateBroadcaster {
     pub fn push_timeline(&self, session_id: &str, data: Value) {
         self.push(StateChange {
             kind: StateKind::SessionTimeline,
-            id: Some(session_id.to_owned()),
-            data,
-            cursor: None,
-        });
-    }
-
-    /// Convenience: push session diff.
-    pub fn push_session_diff(&self, session_id: &str, data: Value) {
-        self.push(StateChange {
-            kind: StateKind::SessionDiff,
             id: Some(session_id.to_owned()),
             data,
             cursor: None,

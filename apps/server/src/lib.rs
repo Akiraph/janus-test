@@ -16,7 +16,6 @@ use anyhow::Context;
 use application::{Application, ApplicationDependencies, execution::ExecutionCoordinator};
 use axum::Router;
 use config::Config;
-use system::SystemRead;
 use janus_execution::interface::{ExecutionDependencies, ExecutionInterface};
 use janus_identity::IdentityInterface;
 use janus_infrastructure::{
@@ -31,6 +30,7 @@ use janus_runtime::interface::RuntimeInterface;
 use janus_sessions::interface::SessionsInterface;
 use janus_source_control::SourceControlInterface;
 use janus_workspace::interface::WorkspaceInterface;
+use system::SystemRead;
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub const fn migrator() -> &'static sqlx::migrate::Migrator {
@@ -102,6 +102,7 @@ impl AppState {
             adapters::git::system_runner(),
         );
         let runtime_logs = janus_runtime::interface::LogStore::new(pool.clone(), &config.data_root);
+        let sessions = SessionsInterface::new(pool.clone(), events.clone(), blobs.clone());
         let local_executor = Arc::new(adapters::runtime::local::LocalExecutor::new(runtime_logs));
         let runtime = RuntimeInterface::new(
             pool.clone(),
@@ -109,16 +110,6 @@ impl AppState {
             &config.data_root,
             local_executor,
         );
-        let sessions = SessionsInterface::new(
-            pool.clone(),
-            events.clone(),
-            workspace.clone(),
-            blobs.clone(),
-        );
-        workspace
-            .recover_orphan_session_worktrees()
-            .await
-            .context("recover orphan session worktrees")?;
         workspace
             .recover_orphan_main_worktrees()
             .await
@@ -138,8 +129,8 @@ impl AppState {
             models.clone(),
             projects.clone(),
             sessions.clone(),
+            workspace.clone(),
             execution.clone(),
-            runtime.clone(),
             unit_of_work.clone(),
             operations.clone(),
         );
@@ -158,10 +149,6 @@ impl AppState {
             events: events.clone(),
             notifications: notifications.clone(),
         });
-        workspace
-            .recover_uncertain_propagations()
-            .await
-            .context("recover interrupted workspace propagation")?;
         application::lifecycle::recover_workspace_mutations(&application)
             .await
             .context("recover interrupted workspace mutations")?;
@@ -268,7 +255,10 @@ impl AppState {
         Option<janus_execution::interface::ContextUsageView>,
         janus_sessions::interface::SessionsError,
     > {
-        self.inner.application.session_context_usage(session_id).await
+        self.inner
+            .application
+            .session_context_usage(session_id)
+            .await
     }
 
     pub fn application(&self) -> &Application {

@@ -23,6 +23,9 @@ fn test_config(data_root: PathBuf) -> Config {
         webauthn_rp_id: "localhost".into(),
         public_origin: url::Url::parse("http://localhost").expect("static test URL"),
         event_heartbeat: Duration::from_millis(50),
+        automation_webhook_enabled: false,
+        automation_webhook_secret: None,
+        automation_github_token: None,
     }
 }
 
@@ -199,7 +202,7 @@ async fn enabled_model_requires_enabled_provider() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn same_provider_name_is_allowed_across_clients() -> anyhow::Result<()> {
+async fn provider_names_are_unique_for_the_single_supervisor_client() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
     let app = router(state.clone());
@@ -226,15 +229,8 @@ async fn same_provider_name_is_allowed_across_clients() -> anyhow::Result<()> {
         json_request(&app, "POST", "/api/v1/model-providers", base.clone()).await?;
     assert_eq!(status, StatusCode::CREATED, "{response}");
 
-    // The same config under the codex client must not collide with the
-    // supervisor provider of the same name.
-    let mut codex = base.clone();
-    codex["client"] = json!("codex");
-    let (status, response) = json_request(&app, "POST", "/api/v1/model-providers", codex).await?;
-    assert_eq!(status, StatusCode::CREATED, "{response}");
-    let created: Value = serde_json::from_str(&response)?;
-    assert_eq!(created["data"]["client"], "codex");
-    assert_eq!(created["data"]["display_name"], "Shared");
+    let (status, response) = json_request(&app, "POST", "/api/v1/model-providers", base).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
     Ok(())
 }
 

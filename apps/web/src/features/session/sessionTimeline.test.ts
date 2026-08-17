@@ -3,6 +3,7 @@ import type { TimelineItemView } from "../../lib/api";
 import {
   decodeSessionTimeline,
   decodeSessionTimelineItem,
+  formatThoughtDuration,
   type SessionTimelineItem,
 } from "./sessionTimeline";
 import { compressTimeline } from "./sessionTimelineCompression";
@@ -68,6 +69,12 @@ function thoughtItem(id: string, durationMs: number): SessionTimelineItem {
 }
 
 describe("tool timeline presentation", () => {
+  test("completed thoughts always have a non-empty duration label", () => {
+    expect(formatThoughtDuration(null)).toBe("for a while");
+    expect(formatThoughtDuration(0)).toBe("for a while");
+    expect(formatThoughtDuration(4_200)).toBe("for 4s");
+  });
+
   test("reuses unchanged decoded timeline rows across polling", () => {
     const first = decodeSessionTimeline([toolItem({ tool_name: "bash", status: "succeeded" })]);
     const second = decodeSessionTimeline(
@@ -81,6 +88,42 @@ describe("tool timeline presentation", () => {
 
     expect(second[0]).toBe(first[0]);
     expect(changed[0]).not.toBe(second[0]);
+  });
+
+  test("rebuilds a row when only its joined Turn status changes", () => {
+    const base = toolItem({ tool_name: "bash", status: "succeeded" });
+    const first = decodeSessionTimeline([
+      {
+        ...base,
+        turn_status: {
+          id: "turn-1",
+          status: "running",
+          cancellation_reason: null,
+          completion_reason: null,
+          created_at: "2026-07-30T00:00:00Z",
+          updated_at: "2026-07-30T00:00:01Z",
+        },
+      },
+    ]);
+    const second = decodeSessionTimeline(
+      [
+        {
+          ...base,
+          turn_status: {
+            id: "turn-1",
+            status: "completed",
+            cancellation_reason: null,
+            completion_reason: "finish",
+            created_at: "2026-07-30T00:00:00Z",
+            updated_at: "2026-07-30T00:00:02Z",
+          },
+        },
+      ],
+      first,
+    );
+
+    expect(second[0]).not.toBe(first[0]);
+    expect(second[0]?.turnStatus?.status).toBe("completed");
   });
 
   test("reuses unchanged compressed groups across polling", () => {
@@ -159,18 +202,18 @@ describe("tool timeline presentation", () => {
     });
   });
 
-  test("legacy unversioned summaries are rejected instead of guessed", () => {
+  test("invalid display summaries expose the attempted tool", () => {
     const item = decodeSessionTimelineItem(
       toolItem({ tool_name: "bash", status: "succeeded", summary: { command: "pwd" } }),
     );
 
     expect(item.type).toBe("tool");
     if (item.type !== "tool") return;
-    expect(item.view.title).toBe("Invalid Tool output");
+    expect(item.view.title).toBe("Ran pwd");
     expect(item.view.status).toBe("failure");
   });
 
-  test("failed tools show the machine-readable error without another expand step", () => {
+  test("failed tools keep the attempted call title and expose the error detail", () => {
     const item = decodeSessionTimelineItem(
       toolItem({
         tool_name: "",
@@ -192,25 +235,25 @@ describe("tool timeline presentation", () => {
 
     expect(item.type).toBe("tool");
     if (item.type !== "tool") return;
-    expect(item.view.title).toBe("Tool error: TOOL_NOT_ALLOWED");
-    expect(item.view.expandable).toBe(false);
+    expect(item.view.title).toBe("Ran tool");
+    expect(item.view.expandable).toBe(true);
   });
 
-  test("failed ask_user calls do not render as interactive Ask cards", () => {
+  test("generic failure titles are replaced by the attempted bash command", () => {
     const item = decodeSessionTimelineItem(
       toolItem({
-        tool_name: "ask_user",
+        tool_name: "bash",
         status: "failed",
         summary: {
-          error: "VALIDATION_FAILED",
+          command: "git status --short",
           display: {
             version: 1,
-            title: "Asked a question",
+            title: "Tool error",
             status: "failed",
             body: {
               kind: "error",
-              code: "VALIDATION_FAILED",
-              detail: "non_blocking requires expires_in_ms",
+              code: "PROCESS_FAILED",
+              detail: "process exited before producing a result",
             },
           },
         },
@@ -219,65 +262,8 @@ describe("tool timeline presentation", () => {
 
     expect(item.type).toBe("tool");
     if (item.type !== "tool") return;
-    expect(item.view.title).toBe("Tool error: VALIDATION_FAILED");
-  });
-
-  test("ask projections keep the prompt and choices after settlement", () => {
-    const item = decodeSessionTimelineItem(
-      toolItem({
-        tool_name: "ask_user",
-        status: "succeeded",
-        summary: {
-          ask_id: "ask-1",
-          mode: "blocking",
-          prompt: "Pick a language",
-          choices: ["Rust", { label: "TypeScript", annotation: "Use this for the web client." }],
-          multiple: true,
-          answer: ["Rust"],
-          status: "answered",
-          display: {
-            version: 1,
-            title: "Asked Pick a language",
-            status: "succeeded",
-            body: { kind: "none" },
-          },
-        },
-      }),
-    );
-
-    expect(item).toMatchObject({
-      type: "ask",
-      askId: "ask-1",
-      prompt: "Pick a language",
-      choices: [
-        { label: "Rust", annotation: null },
-        { label: "TypeScript", annotation: "Use this for the web client." },
-      ],
-      multiple: true,
-      answer: ["Rust"],
-      status: "answered",
-    });
-  });
-
-  test("Ask answer timeline items do not become user bubbles", () => {
-    const answer: TimelineItemView = {
-      id: "answer-1",
-      session_id: "session-1",
-      turn_id: "turn-1",
-      kind: "user_message",
-      source_resource_id: "message-1",
-      display_order: 2,
-      projection: {
-        kind: "user_message",
-        text: "Rust",
-        source_ask_id: "ask-1",
-      },
-      status: "active",
-      version: "v1",
-      created_at: "2026-07-30T00:00:00Z",
-    };
-
-    expect(decodeSessionTimeline([answer])).toEqual([]);
+    expect(item.view.title).toBe("Ran git status --short");
+    expect(item.view.body).toMatchObject({ kind: "error" });
   });
 
   test("only read-only compound bash calls are low-noise", () => {

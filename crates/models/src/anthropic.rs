@@ -347,6 +347,7 @@ impl AnthropicAssembler {
             tool_calls,
             text: self.text.clone(),
             reasoning: self.reasoning.clone(),
+            reasoning_content: None,
             reasoning_duration_ms: self.reasoning_duration_ms,
         }
     }

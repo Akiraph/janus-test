@@ -8,7 +8,7 @@
 pub mod git;
 pub mod interface;
 
-pub use git::{system_runner, SystemGit};
+pub use git::{SystemGit, system_runner};
 pub use interface::{
     DiffView, GitCredential, GitError, GitFuture, GitLogEntry, GitRunner, GitStatus,
     SourceControlError, SourceControlInterface, UpdateConflictPath, UpdateOutcome,

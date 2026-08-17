@@ -3,7 +3,7 @@
 //! crate; this module is the server's single injection point for the system
 //! git executable.
 
-pub use janus_source_control::git::{system_runner, SystemGit};
+pub use janus_source_control::git::{SystemGit, system_runner};
 pub use janus_source_control::{
     DiffView, GitCredential, GitError, GitLogEntry, GitRunner, GitStatus, UpdateConflictPath,
     UpdateOutcome,

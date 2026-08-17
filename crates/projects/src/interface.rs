@@ -1,7 +1,7 @@
 //! Public Project capability boundary.
 //!
 //! Owns project lifecycle, credentials, runtime policy, the read-only Git
-//! projection, and the compatibility facade for Main Workspace routes.
+//! projection, and the Main Workspace facade for Project routes.
 //! Workspace content and copy state belong to `janus-workspace`; git state,
 //! conflicts, and git orchestration belong to `janus-source-control`.
 //!
@@ -10,8 +10,6 @@
 //! application layer) executes them through the Operation interface so a
 //! process restart cannot silently drop a half-done clone.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
@@ -19,20 +17,13 @@ use utoipa::ToSchema;
 
 use janus_infrastructure::{
     events::{EventStore, EventType, NewEvent},
-    id::{
-        CliConfigId, CorrelationId, EgressRuleId, GithubCredentialId, ProjectId,
-        RuntimeSecretId,
-    },
+    id::{CorrelationId, GithubCredentialId, ProjectId},
     operations::{
         CreateOperation, CreateWork, IdempotencyOutcome, IdempotencyRequest, OperationInterface,
         OperationView,
     },
     secrets::{Secret, SecretCipher, fingerprint},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
-};
-use janus_runtime::interface::{
-    CapabilityReason, CapabilityState, DelegatedCliKind, ExecutorKind, NetworkPolicy,
-    ResourceLimits,
 };
 use janus_workspace::interface::{
     DeleteFileInput, FileMetaView, FileMutation, FileMutationEventContext, FileMutationRequest,
@@ -102,122 +93,19 @@ pub struct ProjectView {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MemoryView {
+    pub key: String,
+    pub content: String,
+    pub version: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectModelPreference {
     pub owner_id: String,
     pub default_model_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProjectRuntimeConfigInput {
-    pub executor: ExecutorKind,
-    #[serde(default)]
-    pub allow_insecure_local_executor: bool,
-    #[serde(default)]
-    pub variables: BTreeMap<String, String>,
-    pub default_limits: ResourceLimits,
-    pub network_policy: NetworkPolicy,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ProjectRuntimeConfigView {
-    pub project_id: String,
-    pub executor: ExecutorKind,
-    pub allow_insecure_local_executor: bool,
-    pub variables: BTreeMap<String, String>,
-    pub default_limits: ResourceLimits,
-    pub network_policy: NetworkPolicy,
-    pub version: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct ProjectRuntimeSecretInput {
-    pub name: String,
-    #[schema(write_only)]
-    pub value: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ProjectRuntimeSecretView {
-    pub id: String,
-    pub name: String,
-    pub value_is_set: bool,
-    pub value_fingerprint: String,
-    pub version: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EgressScheme {
-    Http,
-    Https,
-}
-
-impl EgressScheme {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::Https => "https",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self, ProjectsError> {
-        match value {
-            "http" => Ok(Self::Http),
-            "https" => Ok(Self::Https),
-            _ => Err(ProjectsError::Validation("unknown egress scheme".into())),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProjectEgressRuleInput {
-    pub scheme: EgressScheme,
-    pub host: String,
-    pub port_start: u16,
-    pub port_end: u16,
-    pub purpose: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ProjectEgressRuleView {
-    pub id: String,
-    pub scheme: EgressScheme,
-    pub host: String,
-    pub port_start: u16,
-    pub port_end: u16,
-    pub purpose: String,
-    pub version: String,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ProjectCliConfigInput {
-    pub kind: DelegatedCliKind,
-    pub enabled: bool,
-    pub secret_id: Option<String>,
-    #[serde(default)]
-    pub options: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ProjectCliConfigView {
-    pub id: String,
-    pub kind: DelegatedCliKind,
-    pub enabled: bool,
-    pub secret_id: Option<String>,
-    pub options: BTreeMap<String, String>,
-    pub observed_version: Option<String>,
-    pub capability_state: CapabilityState,
-    pub capability_reason: Option<CapabilityReason>,
-    pub version: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -375,57 +263,6 @@ struct MainRevisionEvent<'a> {
     correlation_id: &'a str,
 }
 
-#[derive(FromRow)]
-struct RuntimeConfigRow {
-    project_id: String,
-    executor_kind: String,
-    allow_insecure_local_executor: i64,
-    variables_json: String,
-    default_limits_json: String,
-    network_policy: String,
-    version: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(FromRow)]
-struct RuntimeSecretRow {
-    id: String,
-    name: String,
-    value_fingerprint: String,
-    version: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(FromRow)]
-struct EgressRuleRow {
-    id: String,
-    scheme: String,
-    host: String,
-    port_start: i64,
-    port_end: i64,
-    purpose: String,
-    version: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(FromRow)]
-struct CliConfigRow {
-    id: String,
-    kind: String,
-    enabled: i64,
-    secret_id: Option<String>,
-    options_json: String,
-    observed_version: Option<String>,
-    capability_state: String,
-    capability_reason: Option<String>,
-    version: String,
-    created_at: String,
-    updated_at: String,
-}
-
 impl ProjectsInterface {
     pub fn new(
         pool: SqlitePool,
@@ -452,6 +289,124 @@ impl ProjectsInterface {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(ProjectsError::NotFound)
+    }
+
+    pub async fn list_memories(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Vec<MemoryView>, ProjectsError> {
+        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
+            "SELECT memory_key, content, version, created_at, updated_at \
+             FROM memories WHERE project_id = ? ORDER BY memory_key LIMIT 200",
+        )
+        .bind(project_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(key, content, version, created_at, updated_at)| MemoryView {
+                    key,
+                    content,
+                    version,
+                    created_at,
+                    updated_at,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn memory_context(&self, project_id: ProjectId) -> Result<String, ProjectsError> {
+        let memories = self.list_memories(project_id).await?;
+        if memories.is_empty() {
+            return Ok(String::new());
+        }
+        let mut context =
+            String::from("Persistent project memory (authoritative when relevant):\n");
+        for memory in memories {
+            context.push_str("- ");
+            context.push_str(&memory.key);
+            context.push_str(": ");
+            context.push_str(&memory.content);
+            context.push('\n');
+        }
+        Ok(context)
+    }
+
+    pub async fn set_memory(
+        &self,
+        project_id: ProjectId,
+        key: &str,
+        content: &str,
+    ) -> Result<MemoryView, ProjectsError> {
+        let key = key.trim();
+        let content = content.trim();
+        if key.is_empty() || key.len() > 200 {
+            return Err(ProjectsError::Validation(
+                "memory key must be 1-200 characters".into(),
+            ));
+        }
+        if content.is_empty() || content.len() > 100_000 {
+            return Err(ProjectsError::Validation(
+                "memory content must be 1-100000 bytes".into(),
+            ));
+        }
+        let now = now_utc_str();
+        let version = format!("v_{}", ProjectId::new());
+        sqlx::query(
+            "INSERT INTO memories (project_id, memory_key, content, version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id, memory_key) DO UPDATE SET content = excluded.content, \
+             version = excluded.version, updated_at = excluded.updated_at",
+        )
+        .bind(project_id.to_string())
+        .bind(key)
+        .bind(content)
+        .bind(&version)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(MemoryView {
+            key: key.to_owned(),
+            content: content.to_owned(),
+            version,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    pub async fn delete_memory(
+        &self,
+        project_id: ProjectId,
+        key: &str,
+    ) -> Result<bool, ProjectsError> {
+        Ok(
+            sqlx::query("DELETE FROM memories WHERE project_id = ? AND memory_key = ?")
+                .bind(project_id.to_string())
+                .bind(key.trim())
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                == 1,
+        )
+    }
+
+    /// Return the PAT for a ready project's GitHub credential to the
+    /// application execution boundary. Callers must place it in a secret
+    /// environment value and must never persist or log the returned string.
+    pub async fn git_token_for_project(
+        &self,
+        owner_id: &str,
+        project_id: ProjectId,
+    ) -> Result<Option<String>, ProjectsError> {
+        let row = self
+            .fetch_project(owner_id, &project_id.to_string())
+            .await?;
+        let Some(credential_id) = row.github_credential_id else {
+            return Ok(None);
+        };
+        self.pat_for(owner_id, &credential_id).await
     }
 
     pub async fn model_preference_in_tx(
@@ -489,326 +444,6 @@ impl ProjectsInterface {
         self.require_ready(owner_id, &project_id.to_string())
             .await?;
         Ok(tokio::fs::canonicalize(self.main_repo_dir(&project_id.to_string())).await?)
-    }
-
-    pub async fn runtime_config(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-    ) -> Result<Option<ProjectRuntimeConfigView>, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        let row = sqlx::query_as::<_, RuntimeConfigRow>(
-            "SELECT project_id, executor_kind, allow_insecure_local_executor, variables_json, \
-             default_limits_json, network_policy, version, created_at, updated_at \
-             FROM project_runtime_configs WHERE project_id = ?",
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(runtime_config_view).transpose()
-    }
-
-    pub async fn save_runtime_config(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-        expected_version: Option<&str>,
-        input: ProjectRuntimeConfigInput,
-    ) -> Result<ProjectRuntimeConfigView, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        validate_runtime_config(&input)?;
-        let current: Option<(String, String)> = sqlx::query_as(
-            "SELECT version, created_at FROM project_runtime_configs WHERE project_id = ?",
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        match (&current, expected_version) {
-            (Some((current, _)), Some(expected)) if current != expected => {
-                return Err(ProjectsError::RevisionMismatch {
-                    expected: expected.into(),
-                    current: current.clone(),
-                });
-            }
-            (Some((current, _)), None) => {
-                return Err(ProjectsError::RevisionMismatch {
-                    expected: "a current runtime configuration version".into(),
-                    current: current.clone(),
-                });
-            }
-            (None, Some(expected)) => {
-                return Err(ProjectsError::RevisionMismatch {
-                    expected: expected.into(),
-                    current: "missing".into(),
-                });
-            }
-            _ => {}
-        }
-
-        let now = now_utc_str();
-        let created_at = current.map_or_else(|| now.clone(), |(_, value)| value);
-        let version = format!("v_{}", ProjectId::new());
-        sqlx::query(
-            "INSERT INTO project_runtime_configs \
-             (project_id, executor_kind, allow_insecure_local_executor, variables_json, \
-              default_limits_json, network_policy, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(project_id) DO UPDATE SET executor_kind=excluded.executor_kind, \
-              allow_insecure_local_executor=excluded.allow_insecure_local_executor, \
-              variables_json=excluded.variables_json, default_limits_json=excluded.default_limits_json, \
-              network_policy=excluded.network_policy, version=excluded.version, updated_at=excluded.updated_at",
-        )
-        .bind(project_id)
-        .bind(executor_kind_str(input.executor))
-        .bind(input.allow_insecure_local_executor)
-        .bind(serde_json::to_string(&input.variables)?)
-        .bind(serde_json::to_string(&input.default_limits)?)
-        .bind(network_policy_str(input.network_policy))
-        .bind(&version)
-        .bind(&created_at)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-        self.runtime_config(owner_id, project_id)
-            .await?
-            .ok_or_else(|| ProjectsError::Internal(anyhow::anyhow!("saved runtime config missing")))
-    }
-
-    pub async fn list_runtime_secrets(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-    ) -> Result<Vec<ProjectRuntimeSecretView>, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        let rows = sqlx::query_as::<_, RuntimeSecretRow>(
-            "SELECT id, name, value_fingerprint, version, created_at, updated_at \
-             FROM project_runtime_secrets WHERE project_id = ? ORDER BY name",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(runtime_secret_view).collect())
-    }
-
-    pub async fn put_runtime_secret(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-        input: ProjectRuntimeSecretInput,
-    ) -> Result<ProjectRuntimeSecretView, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        validate_environment_name(&input.name)?;
-        if input.value.is_empty() || input.value.len() > 64 * 1024 {
-            return Err(ProjectsError::Validation(
-                "secret value must contain between 1 and 65536 bytes".into(),
-            ));
-        }
-        let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, created_at FROM project_runtime_secrets WHERE project_id = ? AND name = ?",
-        )
-        .bind(project_id)
-        .bind(&input.name)
-        .fetch_optional(&self.pool)
-        .await?;
-        let now = now_utc_str();
-        let (id, created_at) =
-            existing.unwrap_or_else(|| (RuntimeSecretId::new().to_string(), now.clone()));
-        let encrypted = self.cipher.encrypt(
-            &Secret::new(input.value.clone()),
-            &runtime_secret_aad(project_id, &id),
-        )?;
-        let version = format!("v_{}", RuntimeSecretId::new());
-        sqlx::query(
-            "INSERT INTO project_runtime_secrets \
-             (id, project_id, name, value_ciphertext, value_fingerprint, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(project_id, name) DO UPDATE SET value_ciphertext=excluded.value_ciphertext, \
-              value_fingerprint=excluded.value_fingerprint, version=excluded.version, updated_at=excluded.updated_at",
-        )
-        .bind(&id)
-        .bind(project_id)
-        .bind(input.name.trim())
-        .bind(encrypted)
-        .bind(fingerprint(&input.value))
-        .bind(&version)
-        .bind(&created_at)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-        self.list_runtime_secrets(owner_id, project_id)
-            .await?
-            .into_iter()
-            .find(|value| value.id == id)
-            .ok_or_else(|| ProjectsError::Internal(anyhow::anyhow!("saved runtime secret missing")))
-    }
-
-    pub async fn runtime_secret_value(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-        secret_id: &str,
-    ) -> Result<Secret, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        let row: Option<(Vec<u8>,)> = sqlx::query_as(
-            "SELECT value_ciphertext FROM project_runtime_secrets WHERE id = ? AND project_id = ?",
-        )
-        .bind(secret_id)
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let (ciphertext,) = row.ok_or(ProjectsError::NotFound)?;
-        self.cipher
-            .decrypt(&ciphertext, &runtime_secret_aad(project_id, secret_id))
-            .map_err(ProjectsError::Internal)
-    }
-
-    pub async fn replace_egress_rules(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-        rules: Vec<ProjectEgressRuleInput>,
-    ) -> Result<Vec<ProjectEgressRuleView>, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        let rules = validate_egress_rules(rules)?;
-        let now = now_utc_str();
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM project_egress_rules WHERE project_id = ?")
-            .bind(project_id)
-            .execute(&mut *tx)
-            .await?;
-        for rule in rules {
-            sqlx::query(
-                "INSERT INTO project_egress_rules \
-                 (id, project_id, scheme, host, port_start, port_end, purpose, version, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(EgressRuleId::new().to_string())
-            .bind(project_id)
-            .bind(rule.scheme.as_str())
-            .bind(rule.host)
-            .bind(i64::from(rule.port_start))
-            .bind(i64::from(rule.port_end))
-            .bind(rule.purpose)
-            .bind(format!("v_{}", EgressRuleId::new()))
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        self.egress_rules(owner_id, project_id).await
-    }
-
-    pub async fn egress_rules(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-    ) -> Result<Vec<ProjectEgressRuleView>, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        let rows = sqlx::query_as::<_, EgressRuleRow>(
-            "SELECT id, scheme, host, port_start, port_end, purpose, version, created_at, updated_at \
-             FROM project_egress_rules WHERE project_id = ? ORDER BY scheme, host, port_start",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(egress_rule_view).collect()
-    }
-
-    pub async fn save_cli_config(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-        input: ProjectCliConfigInput,
-    ) -> Result<ProjectCliConfigView, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        validate_cli_options(input.kind, &input.options)?;
-        if let Some(secret_id) = &input.secret_id {
-            let exists: i64 = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM project_runtime_secrets WHERE id = ? AND project_id = ?)",
-            )
-            .bind(secret_id)
-            .bind(project_id)
-            .fetch_one(&self.pool)
-            .await?;
-            if exists == 0 {
-                return Err(ProjectsError::Validation(
-                    "CLI secret_id does not belong to the project".into(),
-                ));
-            }
-        }
-        let kind = delegated_cli_kind_str(input.kind);
-        let existing: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, created_at FROM project_cli_configs WHERE project_id = ? AND kind = ?",
-        )
-        .bind(project_id)
-        .bind(kind)
-        .fetch_optional(&self.pool)
-        .await?;
-        let now = now_utc_str();
-        let (id, created_at) =
-            existing.unwrap_or_else(|| (CliConfigId::new().to_string(), now.clone()));
-        let version = format!("v_{}", CliConfigId::new());
-        sqlx::query(
-            "INSERT INTO project_cli_configs \
-             (id, project_id, kind, enabled, secret_id, options_json, capability_state, \
-              capability_reason, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'unconfigured', 'DEPENDENCY_MISSING', ?, ?, ?) \
-             ON CONFLICT(project_id, kind) DO UPDATE SET enabled=excluded.enabled, \
-              secret_id=excluded.secret_id, options_json=excluded.options_json, \
-              version=excluded.version, updated_at=excluded.updated_at",
-        )
-        .bind(&id)
-        .bind(project_id)
-        .bind(kind)
-        .bind(input.enabled)
-        .bind(input.secret_id)
-        .bind(serde_json::to_string(&input.options)?)
-        .bind(&version)
-        .bind(&created_at)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-        self.cli_configs(owner_id, project_id)
-            .await?
-            .into_iter()
-            .find(|value| value.id == id)
-            .ok_or_else(|| ProjectsError::Internal(anyhow::anyhow!("saved CLI config missing")))
-    }
-
-    pub async fn cli_configs(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-    ) -> Result<Vec<ProjectCliConfigView>, ProjectsError> {
-        self.ensure_project_owner(owner_id, project_id).await?;
-        let rows = sqlx::query_as::<_, CliConfigRow>(
-            "SELECT id, kind, enabled, secret_id, options_json, observed_version, capability_state, \
-             capability_reason, version, created_at, updated_at FROM project_cli_configs \
-             WHERE project_id = ? ORDER BY kind",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(cli_config_view).collect()
-    }
-
-    async fn ensure_project_owner(
-        &self,
-        owner_id: &str,
-        project_id: &str,
-    ) -> Result<(), ProjectsError> {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ? AND owner_id = ?)",
-        )
-        .bind(project_id)
-        .bind(owner_id)
-        .fetch_one(&self.pool)
-        .await?;
-        if exists == 0 {
-            return Err(ProjectsError::NotFound);
-        }
-        Ok(())
     }
 
     /// Create a Project record in `creating` state and enqueue a clone work
@@ -1250,6 +885,50 @@ impl ProjectsInterface {
         work.commit().await?;
         let row = self.fetch_credential(owner_id, &id.to_string()).await?;
         credential_view(row)
+    }
+
+    /// Reuse the automation PAT when the same deployment token is seen again;
+    /// this keeps repeated webhook deliveries from creating one credential per
+    /// email while keeping the plaintext token out of operation payloads.
+    pub async fn ensure_automation_credential(
+        &self,
+        owner_id: &str,
+        github_host: &str,
+        pat: &str,
+        correlation_id: &str,
+    ) -> Result<String, ProjectsError> {
+        let pat = pat.trim();
+        if pat.is_empty() {
+            return Err(ProjectsError::Validation("github PAT is required".into()));
+        }
+        let name = "Janus webhook automation";
+        let pat_fingerprint = fingerprint(pat);
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM github_credentials \
+             WHERE owner_id = ? AND name = ? AND github_host = ? AND pat_fingerprint = ? \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(owner_id)
+        .bind(name)
+        .bind(github_host.trim())
+        .bind(pat_fingerprint)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((id,)) = existing {
+            return Ok(id);
+        }
+        Ok(self
+            .create_credential(
+                owner_id,
+                CreateGithubCredentialInput {
+                    name: name.into(),
+                    github_host: github_host.trim().into(),
+                    pat: Some(pat.into()),
+                },
+                correlation_id,
+            )
+            .await?
+            .id)
     }
 
     pub async fn get_credential(
@@ -1877,245 +1556,6 @@ fn main_revision_event_context(
         causation_id: None,
         payload: serde_json::json!({"source": "editor"}),
     }
-}
-
-fn runtime_config_view(row: RuntimeConfigRow) -> Result<ProjectRuntimeConfigView, ProjectsError> {
-    Ok(ProjectRuntimeConfigView {
-        project_id: row.project_id,
-        executor: parse_executor_kind(&row.executor_kind)?,
-        allow_insecure_local_executor: row.allow_insecure_local_executor != 0,
-        variables: serde_json::from_str(&row.variables_json)?,
-        default_limits: serde_json::from_str(&row.default_limits_json)?,
-        network_policy: parse_network_policy(&row.network_policy)?,
-        version: row.version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    })
-}
-
-fn runtime_secret_view(row: RuntimeSecretRow) -> ProjectRuntimeSecretView {
-    ProjectRuntimeSecretView {
-        id: row.id,
-        name: row.name,
-        value_is_set: true,
-        value_fingerprint: row.value_fingerprint,
-        version: row.version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    }
-}
-
-fn egress_rule_view(row: EgressRuleRow) -> Result<ProjectEgressRuleView, ProjectsError> {
-    Ok(ProjectEgressRuleView {
-        id: row.id,
-        scheme: EgressScheme::parse(&row.scheme)?,
-        host: row.host,
-        port_start: u16::try_from(row.port_start)
-            .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("invalid stored port")))?,
-        port_end: u16::try_from(row.port_end)
-            .map_err(|_| ProjectsError::Internal(anyhow::anyhow!("invalid stored port")))?,
-        purpose: row.purpose,
-        version: row.version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    })
-}
-
-fn cli_config_view(row: CliConfigRow) -> Result<ProjectCliConfigView, ProjectsError> {
-    Ok(ProjectCliConfigView {
-        id: row.id,
-        kind: parse_delegated_cli_kind(&row.kind)?,
-        enabled: row.enabled != 0,
-        secret_id: row.secret_id,
-        options: serde_json::from_str(&row.options_json)?,
-        observed_version: row.observed_version,
-        capability_state: parse_capability_state(&row.capability_state)?,
-        capability_reason: row
-            .capability_reason
-            .as_deref()
-            .map(parse_capability_reason)
-            .transpose()?,
-        version: row.version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    })
-}
-
-fn validate_runtime_config(input: &ProjectRuntimeConfigInput) -> Result<(), ProjectsError> {
-    input
-        .default_limits
-        .validate()
-        .map_err(|error| ProjectsError::Validation(error.to_string()))?;
-    if input.variables.len() > 256 {
-        return Err(ProjectsError::Validation(
-            "runtime configuration supports at most 256 variables".into(),
-        ));
-    }
-    let mut total_bytes = 0_usize;
-    for (name, value) in &input.variables {
-        validate_environment_name(name)?;
-        if value.len() > 64 * 1024 {
-            return Err(ProjectsError::Validation(format!(
-                "runtime variable {name} exceeds 65536 bytes"
-            )));
-        }
-        total_bytes = total_bytes.saturating_add(name.len() + value.len());
-    }
-    if total_bytes > 1024 * 1024 {
-        return Err(ProjectsError::Validation(
-            "runtime variables exceed the one MiB aggregate limit".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_environment_name(name: &str) -> Result<(), ProjectsError> {
-    let mut chars = name.chars();
-    if name.len() > 128
-        || !chars
-            .next()
-            .is_some_and(|value| value == '_' || value.is_ascii_alphabetic())
-        || !chars.all(|value| value == '_' || value.is_ascii_alphanumeric())
-    {
-        return Err(ProjectsError::Validation(format!(
-            "{name:?} is not a portable environment variable name"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_egress_rules(
-    mut rules: Vec<ProjectEgressRuleInput>,
-) -> Result<Vec<ProjectEgressRuleInput>, ProjectsError> {
-    if rules.len() > 128 {
-        return Err(ProjectsError::Validation(
-            "a project supports at most 128 egress rules".into(),
-        ));
-    }
-    let mut unique = BTreeSet::new();
-    for rule in &mut rules {
-        rule.host = rule.host.trim().to_ascii_lowercase();
-        rule.purpose = rule.purpose.trim().to_owned();
-        if rule.host.is_empty()
-            || rule.host.contains('*')
-            || rule.host.contains('/')
-            || rule.host.contains(char::is_whitespace)
-            || rule.purpose.is_empty()
-            || rule.purpose.len() > 256
-            || rule.port_start == 0
-            || rule.port_end < rule.port_start
-        {
-            return Err(ProjectsError::Validation("invalid egress rule".into()));
-        }
-        let key = (
-            rule.scheme.as_str(),
-            rule.host.clone(),
-            rule.port_start,
-            rule.port_end,
-        );
-        if !unique.insert(key) {
-            return Err(ProjectsError::Validation("duplicate egress rule".into()));
-        }
-    }
-    Ok(rules)
-}
-
-fn validate_cli_options(
-    kind: DelegatedCliKind,
-    options: &BTreeMap<String, String>,
-) -> Result<(), ProjectsError> {
-    let allowed: &[&str] = match kind {
-        DelegatedCliKind::ClaudeCode => &["model", "permission_mode"],
-        DelegatedCliKind::Codex => &["approval_policy", "model", "sandbox_mode"],
-    };
-    for (key, value) in options {
-        if !allowed.contains(&key.as_str())
-            || value.is_empty()
-            || value.len() > 256
-            || value.starts_with('-')
-            || value.contains(['\r', '\n', '\0'])
-        {
-            return Err(ProjectsError::Validation(format!(
-                "unsupported or invalid delegated CLI option {key:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-const fn executor_kind_str(value: ExecutorKind) -> &'static str {
-    match value {
-        ExecutorKind::Local => "local",
-        ExecutorKind::Container => "container",
-    }
-}
-
-fn parse_executor_kind(value: &str) -> Result<ExecutorKind, ProjectsError> {
-    match value {
-        "local" => Ok(ExecutorKind::Local),
-        "container" => Ok(ExecutorKind::Container),
-        _ => Err(ProjectsError::Validation("unknown executor kind".into())),
-    }
-}
-
-const fn network_policy_str(value: NetworkPolicy) -> &'static str {
-    match value {
-        NetworkPolicy::DenyAll => "deny_all",
-        NetworkPolicy::ProjectRules => "project_rules",
-    }
-}
-
-fn parse_network_policy(value: &str) -> Result<NetworkPolicy, ProjectsError> {
-    match value {
-        "deny_all" => Ok(NetworkPolicy::DenyAll),
-        "project_rules" => Ok(NetworkPolicy::ProjectRules),
-        _ => Err(ProjectsError::Validation("unknown network policy".into())),
-    }
-}
-
-const fn delegated_cli_kind_str(value: DelegatedCliKind) -> &'static str {
-    match value {
-        DelegatedCliKind::ClaudeCode => "claude_code",
-        DelegatedCliKind::Codex => "codex",
-    }
-}
-
-fn parse_delegated_cli_kind(value: &str) -> Result<DelegatedCliKind, ProjectsError> {
-    match value {
-        "claude_code" => Ok(DelegatedCliKind::ClaudeCode),
-        "codex" => Ok(DelegatedCliKind::Codex),
-        _ => Err(ProjectsError::Validation(
-            "unknown delegated CLI kind".into(),
-        )),
-    }
-}
-
-fn parse_capability_state(value: &str) -> Result<CapabilityState, ProjectsError> {
-    match value {
-        "ready" => Ok(CapabilityState::Ready),
-        "degraded" => Ok(CapabilityState::Degraded),
-        "unconfigured" => Ok(CapabilityState::Unconfigured),
-        "unsupported" => Ok(CapabilityState::Unsupported),
-        _ => Err(ProjectsError::Validation("unknown capability state".into())),
-    }
-}
-
-fn parse_capability_reason(value: &str) -> Result<CapabilityReason, ProjectsError> {
-    match value {
-        "LOCAL_EXECUTOR" => Ok(CapabilityReason::LocalExecutor),
-        "CONFIG_MISSING" => Ok(CapabilityReason::ConfigMissing),
-        "DEPENDENCY_MISSING" => Ok(CapabilityReason::DependencyMissing),
-        "PLATFORM_UNSUPPORTED" => Ok(CapabilityReason::PlatformUnsupported),
-        "POLICY_DISABLED" => Ok(CapabilityReason::PolicyDisabled),
-        "PROBE_FAILED" => Ok(CapabilityReason::ProbeFailed),
-        _ => Err(ProjectsError::Validation(
-            "unknown capability reason".into(),
-        )),
-    }
-}
-
-fn runtime_secret_aad(project_id: &str, secret_id: &str) -> String {
-    format!("v1/{project_id}/runtime_secrets/{secret_id}/value")
 }
 
 #[derive(FromRow)]

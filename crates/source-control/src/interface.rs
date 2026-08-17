@@ -516,7 +516,9 @@ impl SourceControlInterface {
         };
         match row.pat_ciphertext {
             Some(stored) => {
-                let secret = self.cipher.decrypt(&stored, &pat_aad(owner_id, credential_id))?;
+                let secret = self
+                    .cipher
+                    .decrypt(&stored, &pat_aad(owner_id, credential_id))?;
                 Ok(Some(secret.expose().to_owned()))
             }
             None => Ok(None),
@@ -747,6 +749,7 @@ impl SourceControlInterface {
         owner_id: &str,
         project_id: &str,
         paths: &[String],
+        correlation_id: CorrelationId,
     ) -> Result<(), SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
         let _lock = self
@@ -754,7 +757,9 @@ impl SourceControlInterface {
             .acquire_project_mutation_lock(project_id)
             .await?;
         let dir = self.main_repo_dir(project_id);
-        Ok(self.git.stage(&dir, paths).await?)
+        self.git.stage(&dir, paths).await?;
+        self.refresh_git_state(owner_id, project_id, "stage", correlation_id)
+            .await
     }
 
     pub async fn git_unstage(
@@ -762,6 +767,7 @@ impl SourceControlInterface {
         owner_id: &str,
         project_id: &str,
         paths: &[String],
+        correlation_id: CorrelationId,
     ) -> Result<(), SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
         let _lock = self
@@ -769,7 +775,9 @@ impl SourceControlInterface {
             .acquire_project_mutation_lock(project_id)
             .await?;
         let dir = self.main_repo_dir(project_id);
-        Ok(self.git.unstage(&dir, paths).await?)
+        self.git.unstage(&dir, paths).await?;
+        self.refresh_git_state(owner_id, project_id, "unstage", correlation_id)
+            .await
     }
 
     pub async fn git_commit(

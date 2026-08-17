@@ -1,6 +1,40 @@
 //! Turn execution state machine: round streaming, tool execution,
 //! completion and failure settlement.
 use super::*;
+use janus_infrastructure::id::ProjectId;
+use std::path::Path;
+
+fn as_i64_tokens(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn non_system_input_tokens(value: u64, system_prompt_tokens: i64) -> i64 {
+    as_i64_tokens(value)
+        .saturating_sub(system_prompt_tokens)
+        .max(0)
+}
+
+fn estimate_chat_tokens(chat: &[ChatMessage]) -> i64 {
+    i64::try_from(
+        serde_json::to_string(chat)
+            .map(|value| value.len().saturating_add(3) / 4)
+            .unwrap_or(0),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn estimate_prompt_tokens(prompt: &str) -> i64 {
+    i64::try_from(prompt.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
+}
+
+struct ToolExecutionContext<'a> {
+    session_id: SessionId,
+    project_id: ProjectId,
+    turn_id: TurnId,
+    actor: &'a Value,
+    workspace_root: &'a Path,
+    git_token: Option<&'a str>,
+}
 
 impl ExecutionInterface {
     /// Execute a running Turn until finish tool, model stop without tools, or failure.
@@ -10,16 +44,29 @@ impl ExecutionInterface {
     ) -> Result<TurnExecutionOutcome, ExecutionError> {
         let turn = self.load_turn(turn_id).await?;
         if turn.status != TurnStatus::Running || !turn.active {
-            return Ok(TurnExecutionOutcome::default()); // idempotent
+            return Ok(TurnExecutionOutcome); // idempotent
         }
         let session_id = turn.session_id;
         let owner_id = self.projects.owner_id(turn.project_id).await?;
+        let workspace_root = self
+            .projects
+            .main_workspace_root(&owner_id, turn.project_id)
+            .await?;
+        let git_token = self
+            .projects
+            .git_token_for_project(&owner_id, turn.project_id)
+            .await
+            .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?;
 
         let Some(model_snapshot) = turn.model_snapshot.as_ref() else {
-            self.enter_waiting_for_model(session_id, turn_id, "model is not configured")
+            self.fail_turn(session_id, turn_id, "model is not configured")
                 .await?;
-            return Ok(TurnExecutionOutcome::default());
+            return Ok(TurnExecutionOutcome);
         };
+        let system_prompt = self
+            .system_prompt_for_turn(turn.project_id, turn.session_id, turn.goal_mode)
+            .await?;
+        let system_prompt_tokens = estimate_prompt_tokens(&system_prompt);
         let supports_images = model_snapshot.supports_images
             || model_snapshot
                 .failover
@@ -29,23 +76,18 @@ impl ExecutionInterface {
         let (mut chat, mut input_cursor) = self
             .load_chat_history(session_id, turn_id, supports_images)
             .await?;
-        // Ensure system prefix once.
-        if !chat
-            .first()
-            .is_some_and(|m| matches!(m.role, ChatRole::System))
-        {
-            chat.insert(
-                0,
-                ChatMessage {
-                    role: ChatRole::System,
-                    parts: vec![ContentPart::Text {
-                        text: SYSTEM_PROMPT.into(),
-                    }],
-                    tool_call_id: None,
-                    tool_calls: Vec::new(),
-                },
-            );
-        }
+        chat.insert(
+            0,
+            ChatMessage {
+                role: ChatRole::System,
+                parts: vec![ContentPart::Text {
+                    text: system_prompt.clone(),
+                }],
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+        );
 
         let has_attachments = !self
             .sessions
@@ -76,8 +118,24 @@ impl ExecutionInterface {
         let mut round_seq = last_round_sequence.saturating_add(1);
         loop {
             if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
-                return Ok(TurnExecutionOutcome::default());
+                return Ok(TurnExecutionOutcome);
             }
+
+            // Provider input usage describes the complete request context and
+            // therefore includes Janus's system prefix. Count every model
+            // attempt that belongs to this Turn, including retries/failovers,
+            // while removing that prefix from each request. The ledger is the
+            // authoritative source; rounds only retain the winning attempt.
+            let usage_rows: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT input_tokens, output_tokens FROM model_usage_ledger \
+                 WHERE turn_id = ? ORDER BY occurred_at, id",
+            )
+            .bind(turn_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+            let turn_exchange = aggregate_turn_token_exchange(&usage_rows, system_prompt_tokens);
+            let turn_input_base = turn_exchange.upload_tokens;
+            let turn_output_base = turn_exchange.download_tokens;
 
             let (turn_inputs, next_cursor) = self
                 .load_turn_inputs_after(session_id, turn_id, input_cursor, supports_images)
@@ -95,18 +153,33 @@ impl ExecutionInterface {
                 .await?
             {
                 work.rollback().await?;
-                return Ok(TurnExecutionOutcome::default());
+                return Ok(TurnExecutionOutcome);
             }
+            let context_version_id = record_context_version_in_tx(
+                work.connection(),
+                session_id,
+                Some(&turn_id.to_string()),
+                estimate_chat_tokens(&chat),
+                i64::from(model_snapshot.context_limit.max(1)),
+                "not_needed",
+                json!({
+                    "kind": "turn_round",
+                    "message_count": chat.len(),
+                }),
+            )
+            .await
+            .map_err(ExecutionError::Internal)?;
             let inserted = sqlx::query(
                 "INSERT INTO rounds \
                  (id, turn_id, sequence, context_version, status, candidate_snapshot_json, \
                   final_attempt_id, output_summary_json, input_tokens, output_tokens, \
                   stop_reason, version, created_at, updated_at) \
-                 VALUES (?, ?, ?, '1', 'running', ?, NULL, NULL, 0, 0, NULL, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, 0, 0, NULL, ?, ?, ?)",
             )
             .bind(round_id.to_string())
             .bind(turn_id.to_string())
             .bind(round_seq)
+            .bind(&context_version_id)
             .bind(serde_json::to_string(&model_snapshot.failover)?)
             .bind(&version)
             .bind(&now)
@@ -115,7 +188,7 @@ impl ExecutionInterface {
             .await?;
             if inserted.rows_affected() != 1 {
                 work.rollback().await?;
-                return Ok(TurnExecutionOutcome::default());
+                return Ok(TurnExecutionOutcome);
             }
             work.append_event(NewEvent {
                 event_type: EventType::RoundChanged,
@@ -161,6 +234,21 @@ impl ExecutionInterface {
                 }
             }));
 
+            self.state_broadcaster.push_stream_text(
+                &session_id.to_string(),
+                &turn_id.to_string(),
+                json!({
+                    "text": "",
+                    "reasoning": "",
+                    "seq": 0,
+                    "round_id": round_id,
+                    "turn_input_tokens": turn_input_base,
+                    "turn_output_tokens": turn_output_base,
+                    "turn_exchange_tokens": turn_input_base.saturating_add(turn_output_base),
+                    "direction": "upload",
+                }),
+            );
+
             let stream_events = self.events.clone();
             let stream_broadcaster = self.state_broadcaster.clone();
             let stream_actor = actor.clone();
@@ -170,6 +258,14 @@ impl ExecutionInterface {
             let stream_round_id = round_id.to_string();
             let accumulated_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let accumulated_reasoning = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            // Server-side thinking interval: from the first reasoning delta to
+            // the first answer delta. Pushed with the stream so the client can
+            // label the Thought row with its duration the moment thinking
+            // completes, instead of only when the durable round settles.
+            let reasoning_started_at =
+                std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
+            let reasoning_ended_at =
+                std::sync::Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
             let mut publish_stream_event = move |event: ModelStreamEvent| {
                 let events = stream_events.clone();
                 let broadcaster = stream_broadcaster.clone();
@@ -180,6 +276,8 @@ impl ExecutionInterface {
                 let round_id = stream_round_id.clone();
                 let acc_text = accumulated_text.clone();
                 let acc_reasoning = accumulated_reasoning.clone();
+                let timing_started = reasoning_started_at.clone();
+                let timing_ended = reasoning_ended_at.clone();
                 async move {
                     match event {
                         ModelStreamEvent::Delta {
@@ -205,6 +303,35 @@ impl ExecutionInterface {
                             {
                                 acc.push_str(&text);
                             }
+                            // Track the thinking interval across deltas.
+                            if channel == "reasoning_summary" && !text.is_empty() {
+                                if let Ok(mut started) = timing_started.lock()
+                                    && started.is_none()
+                                {
+                                    *started = Some(std::time::Instant::now());
+                                }
+                            } else if channel == "text" && !text.is_empty() {
+                                let thinking_started = timing_started
+                                    .lock()
+                                    .ok()
+                                    .is_some_and(|started| started.is_some());
+                                if thinking_started
+                                    && let Ok(mut ended) = timing_ended.lock()
+                                    && ended.is_none()
+                                {
+                                    *ended = Some(std::time::Instant::now());
+                                }
+                            }
+                            let reasoning_duration_ms = match (
+                                timing_started.lock().ok().map(|guard| *guard),
+                                timing_ended.lock().ok().map(|guard| *guard),
+                            ) {
+                                (Some(Some(started)), Some(Some(ended))) => u64::try_from(
+                                    ended.saturating_duration_since(started).as_millis(),
+                                )
+                                .ok(),
+                                _ => None,
+                            };
                             let current_text =
                                 acc_text.lock().ok().map(|a| a.clone()).unwrap_or_default();
                             let current_reasoning = acc_reasoning
@@ -212,6 +339,19 @@ impl ExecutionInterface {
                                 .ok()
                                 .map(|a| a.clone())
                                 .unwrap_or_default();
+                            let (turn_input_tokens, turn_output_tokens) = usage
+                                .as_ref()
+                                .map(|usage| {
+                                    (
+                                        turn_input_base.saturating_add(non_system_input_tokens(
+                                            usage.input_tokens,
+                                            system_prompt_tokens,
+                                        )),
+                                        turn_output_base
+                                            .saturating_add(as_i64_tokens(usage.output_tokens)),
+                                    )
+                                })
+                                .unwrap_or((turn_input_base, turn_output_base));
                             let usage_value = usage.as_ref().map(|u| {
                                 json!({
                                     "input_tokens": u.input_tokens,
@@ -223,6 +363,9 @@ impl ExecutionInterface {
                             // round_id lets the client match a live stream to the
                             // durable assistant timeline item and drop the
                             // provisional overlay once the round is persisted.
+                            // reasoning_duration_ms is present from the first
+                            // answer delta onward so the Thought row can show
+                            // its duration immediately.
                             broadcaster.push_stream_text(
                                 &session_id,
                                 &turn_id,
@@ -231,7 +374,20 @@ impl ExecutionInterface {
                                     "reasoning": current_reasoning,
                                     "seq": sequence,
                                     "round_id": round_id,
-                                    "usage": usage_value,
+                                    "usage": usage.as_ref().map(|u| json!({
+                                        "input_tokens": non_system_input_tokens(
+                                            u.input_tokens,
+                                            system_prompt_tokens,
+                                        ),
+                                        "output_tokens": u.output_tokens,
+                                        "cache_tokens": u.cache_tokens,
+                                    })),
+                                    "turn_input_tokens": turn_input_tokens,
+                                    "turn_output_tokens": turn_output_tokens,
+                                    "turn_exchange_tokens": turn_input_tokens
+                                        .saturating_add(turn_output_tokens),
+                                    "direction": "download",
+                                    "reasoning_duration_ms": reasoning_duration_ms,
                                 }),
                             );
                             // Also persist to EventStore for replay
@@ -280,6 +436,11 @@ impl ExecutionInterface {
                                     "retrying": true,
                                     "attempt": attempt,
                                     "detail": detail,
+                                    "turn_input_tokens": turn_input_base,
+                                    "turn_output_tokens": turn_output_base,
+                                    "turn_exchange_tokens": turn_input_base
+                                        .saturating_add(turn_output_base),
+                                    "direction": "upload",
                                 }),
                             );
                             let _ = events
@@ -296,7 +457,6 @@ impl ExecutionInterface {
                                         "round_id": round_id,
                                         "attempt_id": attempt_id,
                                         "attempt": attempt,
-                                        "max_attempts": MAX_ATTEMPTS_PER_CANDIDATE - 1,
                                         "detail": detail,
                                         "retry_after_ms": retry_after_ms,
                                     }),
@@ -313,7 +473,7 @@ impl ExecutionInterface {
                 .try_round_stream(candidate_requests, &mut publish_stream_event)
                 .await?;
             if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
-                return Ok(TurnExecutionOutcome::default());
+                return Ok(TurnExecutionOutcome);
             }
 
             let completed = events.iter().find_map(|e| match e {
@@ -324,6 +484,7 @@ impl ExecutionInterface {
                     tool_calls,
                     text,
                     reasoning,
+                    reasoning_content,
                     reasoning_duration_ms,
                 } => Some((
                     attempt_id.clone(),
@@ -332,6 +493,7 @@ impl ExecutionInterface {
                     tool_calls.clone(),
                     text.clone(),
                     reasoning.clone(),
+                    reasoning_content.clone(),
                     *reasoning_duration_ms,
                 )),
                 _ => None,
@@ -344,12 +506,13 @@ impl ExecutionInterface {
                 tool_calls,
                 text,
                 reasoning,
+                reasoning_content,
                 reasoning_duration_ms,
             )) = completed
             else {
                 // Failed stream — no tool execution. Retryable provider faults
-                // park the Turn in `waiting_for_model` so the user/UI can call
-                // retry-model; deterministic faults fail the Turn immediately.
+                // Retryable provider faults stay inside the round retry loop;
+                // deterministic faults fail the Turn immediately.
                 let detail = events
                     .iter()
                     .find_map(|e| match e {
@@ -361,14 +524,8 @@ impl ExecutionInterface {
                     .unwrap_or_else(|| "stream failed".into());
                 self.fail_round(session_id, turn_id, &round_id, &detail)
                     .await?;
-                let class = classify_failed(&events).expect("Failed event present");
-                if class == FaultClass::Transient {
-                    self.enter_waiting_for_model(session_id, turn_id, &detail)
-                        .await?;
-                } else {
-                    self.fail_turn(session_id, turn_id, &detail).await?;
-                }
-                return Ok(TurnExecutionOutcome::default());
+                self.fail_turn(session_id, turn_id, &detail).await?;
+                return Ok(TurnExecutionOutcome);
             };
 
             let Some(accepted_calls) = self
@@ -377,26 +534,30 @@ impl ExecutionInterface {
                     turn_id,
                     round_id: &round_id,
                     attempt_id: &attempt_id,
-                    input_tokens: usage.input_tokens as i64,
-                    output_tokens: usage.output_tokens as i64,
+                    input_tokens: non_system_input_tokens(usage.input_tokens, system_prompt_tokens),
+                    output_tokens: as_i64_tokens(usage.output_tokens),
                     stop_reason: stop_reason.as_deref(),
                     text: &text,
                     reasoning: &reasoning,
+                    reasoning_content: reasoning_content.as_deref(),
                     reasoning_duration_ms,
                     tool_calls: &tool_calls,
                     actor: &actor,
                 })
                 .await?
             else {
-                return Ok(TurnExecutionOutcome::default());
+                return Ok(TurnExecutionOutcome);
             };
 
-            if !text.is_empty() || !tool_calls.is_empty() {
+            if !text.is_empty() || !tool_calls.is_empty() || reasoning_content.is_some() {
                 chat.push(ChatMessage {
                     role: ChatRole::Assistant,
                     parts: vec![ContentPart::Text { text: text.clone() }],
                     tool_call_id: None,
                     tool_calls: tool_calls.clone(),
+                    // Keep only the provider's raw reasoning on the in-memory
+                    // history. The display summary is not safe to echo back.
+                    reasoning_content,
                 });
             }
 
@@ -407,13 +568,12 @@ impl ExecutionInterface {
                 break;
             }
 
-            // Execute tools in declaration order. After a blocking wait or finish,
-            // still settle every remaining declared call with an explicit
-            // model-visible result so protocol history stays complete.
+            // Execute tools in declaration order. Async Bash is a completed
+            // tool call from the Turn's perspective; its terminal result is
+            // delivered later as a separate system Turn.
             let mut round_tool_messages: Vec<ChatMessage> = Vec::new();
-            let mut wait: Option<TurnWait> = None;
             let mut stop_executing = false;
-            let mut skip_reason = "a prior tool blocked or finished this Round";
+            let mut skip_reason = "a prior tool finished this Round";
             for accepted_call in &accepted_calls {
                 if stop_executing {
                     let message = self
@@ -429,13 +589,23 @@ impl ExecutionInterface {
                     continue;
                 }
                 if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
-                    return Ok(TurnExecutionOutcome::default());
+                    return Ok(TurnExecutionOutcome);
                 }
                 let Some(executed) = self
-                    .run_one_tool(session_id, turn_id, accepted_call, &actor)
+                    .run_one_tool(
+                        ToolExecutionContext {
+                            session_id,
+                            project_id: turn.project_id,
+                            turn_id,
+                            actor: &actor,
+                            workspace_root: &workspace_root,
+                            git_token: git_token.as_deref(),
+                        },
+                        accepted_call,
+                    )
                     .await?
                 else {
-                    return Ok(TurnExecutionOutcome::default());
+                    return Ok(TurnExecutionOutcome);
                 };
                 let ExecutedToolCall { outcome, message } = executed;
                 if let Some(fs) = outcome.finish_summary {
@@ -444,20 +614,9 @@ impl ExecutionInterface {
                     stop_executing = true;
                     skip_reason = "a prior tool finished the Turn";
                 }
-                if let Some(next_wait) = outcome.wait {
-                    wait = Some(match wait {
-                        Some(current) => current.combine(next_wait),
-                        None => next_wait,
-                    });
-                    stop_executing = true;
-                    skip_reason = "a prior tool is waiting for Job or Ask";
-                }
                 round_tool_messages.push(message);
             }
             chat.extend(round_tool_messages);
-            if let Some(wait) = wait {
-                return Ok(TurnExecutionOutcome::coordinate(wait));
-            }
             if finished {
                 break;
             }
@@ -466,18 +625,74 @@ impl ExecutionInterface {
         }
 
         if finished {
-            let completion = self
-                .complete_turn(
-                    session_id,
-                    turn_id,
-                    finish_summary.unwrap_or_else(|| CompletionSummary::from_text("")),
-                )
-                .await?;
-            if matches!(completion, CompleteTurnOutcome::WaitingForJob) {
-                return Ok(TurnExecutionOutcome::coordinate(TurnWait::job()));
+            self.complete_turn(
+                session_id,
+                turn_id,
+                finish_summary.unwrap_or_else(|| CompletionSummary::from_text("")),
+            )
+            .await?;
+        }
+        Ok(TurnExecutionOutcome)
+    }
+
+    async fn system_prompt_for_turn(
+        &self,
+        project_id: ProjectId,
+        session_id: SessionId,
+        goal_mode: bool,
+    ) -> Result<String, ExecutionError> {
+        let memory = self.projects.memory_context(project_id).await?;
+        let active_sessions = self.sessions.active_sessions(50).await?;
+        let async_tasks = self.runtime.async_tasks(100).await?;
+        let mut prompt = SYSTEM_PROMPT.to_owned();
+        if goal_mode {
+            prompt.push_str(
+                "\n\nGoal mode:\nContinue pursuing the user's objective across as many Rounds as needed. ",
+            );
+            prompt.push_str(
+                "Do not stop merely because one subtask finished; inspect evidence, keep editing the Main workspace, and stop only when the objective is complete or a concrete blocker remains.",
+            );
+        }
+        if !memory.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&memory);
+        }
+        if !active_sessions.is_empty() {
+            prompt.push_str("\n\nActive sessions in this project:\n");
+            for session in active_sessions {
+                prompt.push_str("- ");
+                prompt.push_str(&session.id);
+                if session.id == session_id.to_string() {
+                    prompt.push_str(" (current)");
+                }
+                prompt.push_str(" [project ");
+                prompt.push_str(&session.project_id);
+                prompt.push(']');
+                if let Some(title) = session.title {
+                    prompt.push_str(": ");
+                    prompt.push_str(&title);
+                }
+                if let Some(turn_id) = session.active_turn_id {
+                    prompt.push_str(" [turn ");
+                    prompt.push_str(&turn_id);
+                    prompt.push(']');
+                }
+                prompt.push('\n');
             }
         }
-        Ok(TurnExecutionOutcome::default())
+        if !async_tasks.is_empty() {
+            prompt.push_str("\nGlobal async Bash tasks:\n");
+            for task in async_tasks {
+                prompt.push_str("- ");
+                prompt.push_str(&task.id.to_string());
+                prompt.push_str(" [");
+                prompt.push_str(task.status.as_str());
+                prompt.push_str("] ");
+                prompt.push_str(&task.command_summary);
+                prompt.push('\n');
+            }
+        }
+        Ok(prompt)
     }
 }
 
@@ -552,11 +767,10 @@ impl ExecutionInterface {
         Ok(parts)
     }
 
-    /// Run one Round's model stream with bounded retry policy applied to a
-    /// ordered candidates. Each candidate gets bounded in-place retries before
-    /// a transient exhaustion moves to the next candidate. A configuration
-    /// error never fails over because resending an invalid request cannot fix
-    /// the route.
+    /// Run one Round's model stream across ordered candidates. Transient
+    /// failures retry the current candidate indefinitely with low-frequency
+    /// backoff after the reconnect notice threshold. Configuration failures
+    /// move to the next candidate because another configured route may work.
     ///
     /// Provisional attempts that fail never contribute tool calls; their only
     /// durable footprint is the `model_attempts` rows the stream layer already
@@ -571,15 +785,16 @@ impl ExecutionInterface {
         F: FnMut(ModelStreamEvent) -> Fut,
         Fut: Future<Output = ()>,
     {
-        let mut last_events: Vec<ModelStreamEvent> = Vec::new();
-        let candidate_count = requests.len();
+        let mut last_failed_events = Vec::new();
         for (candidate_index, req) in requests.into_iter().enumerate() {
             let candidate_order = i64::try_from(candidate_index).map_err(|_| {
                 ExecutionError::Internal(anyhow::anyhow!("candidate index overflow"))
             })?;
-            // `attempt` is the *attempt* index, 0-based: 0 is the initial
-            // attempt, 1..=5 are retries surfaced to the UI.
-            for attempt in 0..MAX_ATTEMPTS_PER_CANDIDATE {
+            // The retry index is unbounded. The first five retries are
+            // presented as reconnecting; later retries continue at a slower
+            // cadence until the provider succeeds or the Turn is canceled.
+            let mut attempt = 0;
+            loop {
                 let events = self
                     .models
                     .stream_completion_with_candidate(req.clone(), candidate_order, on_event)
@@ -597,18 +812,12 @@ impl ExecutionInterface {
                 };
                 let retry_attempt = attempt + 1;
                 let decision = classify(&code, &detail, retry_attempt);
-                last_events = events.clone();
                 match decision.class {
-                    FaultClass::Config => return Ok(events),
+                    FaultClass::Config => {
+                        last_failed_events = events;
+                        break;
+                    }
                     FaultClass::Transient => {
-                        if retry_attempt >= MAX_ATTEMPTS_PER_CANDIDATE {
-                            if candidate_index + 1 == candidate_count {
-                                return Ok(events);
-                            }
-                            // The next configured candidate gets its own
-                            // bounded retry budget and durable attempt rows.
-                            break;
-                        }
                         let retrying = ModelStreamEvent::Retrying {
                             attempt_id: attempt_id.clone(),
                             attempt: retry_attempt,
@@ -617,50 +826,12 @@ impl ExecutionInterface {
                         };
                         on_event(retrying).await;
                         tokio::time::sleep(decision.retry_after).await;
+                        attempt = retry_attempt;
                     }
                 }
             }
         }
-        Ok(last_events)
-    }
-
-    /// Park a running Turn in `waiting_for_model` with a typed diagnostic so the
-    /// UI can surface retry-model. The active slot stays held (the Turn is not
-    /// terminal). The retry classifier decides whether a failed attempt parks
-    /// the Turn; this method records the durable pause and reason.
-    pub async fn enter_waiting_for_model(
-        &self,
-        session_id: SessionId,
-        turn_id: TurnId,
-        reason: &str,
-    ) -> Result<(), ExecutionError> {
-        let now = now_utc_str();
-        let mut work = self.unit_of_work.begin().await?;
-        let transition = self
-            .sessions
-            .wait_for_model_in_tx(work.connection(), session_id, turn_id, reason, &now)
-            .await?;
-        let Some(transition) = transition else {
-            work.rollback().await?;
-            return Ok(());
-        };
-        work.append_event(NewEvent {
-            event_type: EventType::TurnStatusChanged,
-            actor: json!({"kind": "execution"}),
-            resource: Some(json!({"kind": "turn", "id": turn_id.to_string()})),
-            correlation_id: CorrelationId::new().to_string(),
-            causation_id: None,
-            payload: json!({
-                "turn_id": turn_id.to_string(),
-                "from": transition.from_status.as_str(),
-                "to": transition.to_status.as_str(),
-                "reason": reason,
-                "session_version": transition.session_version,
-            }),
-        })
-        .await?;
-        work.commit().await?;
-        Ok(())
+        Ok(last_failed_events)
     }
 
     async fn accept_round_response(
@@ -677,6 +848,7 @@ impl ExecutionInterface {
             stop_reason,
             text,
             reasoning,
+            reasoning_content,
             reasoning_duration_ms,
             tool_calls,
             actor,
@@ -690,6 +862,10 @@ impl ExecutionInterface {
         {
             return Ok(None);
         }
+        let mut round_body = json!({"text": text, "reasoning": reasoning});
+        if let Some(raw) = reasoning_content {
+            round_body["reasoning_content"] = json!(raw);
+        }
         let accepted = sqlx::query(
             "UPDATE rounds SET status = 'succeeded', final_attempt_id = ?, input_tokens = ?, \
              output_tokens = ?, stop_reason = ?, output_summary_json = ?, updated_at = ? \
@@ -699,7 +875,7 @@ impl ExecutionInterface {
         .bind(input_tokens)
         .bind(output_tokens)
         .bind(stop_reason)
-        .bind(json!({"text": text, "reasoning": reasoning}).to_string())
+        .bind(round_body.to_string())
         .bind(&now)
         .bind(round_id.to_string())
         .bind(turn_id.to_string())
@@ -720,6 +896,7 @@ impl ExecutionInterface {
                     round_id: *round_id,
                     text,
                     reasoning,
+                    reasoning_content,
                     duration_ms: reasoning_duration_ms
                         .map(|duration| duration.min(i64::MAX as u64) as i64),
                     tool_calls: &declared_calls,
@@ -879,6 +1056,7 @@ impl ExecutionInterface {
             parts: vec![ContentPart::Text { text: text.clone() }],
             tool_call_id: Some(accepted.request.id.clone()),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         };
         let mut outcome = ToolOutcome {
             disposition: ToolExecutionDisposition::Failed,
@@ -891,7 +1069,6 @@ impl ExecutionInterface {
             }),
             error_code: Some("TOOL_SKIPPED_AFTER_BLOCK".into()),
             finish_summary: None,
-            wait: None,
         };
         attach_tool_display(&accepted.request.name, &input, &mut outcome);
         let summary = outcome.summary;
@@ -971,11 +1148,17 @@ impl ExecutionInterface {
 
     async fn run_one_tool(
         &self,
-        session_id: SessionId,
-        turn_id: TurnId,
+        context: ToolExecutionContext<'_>,
         accepted: &AcceptedToolCall,
-        actor: &Value,
     ) -> Result<Option<ExecutedToolCall>, ExecutionError> {
+        let ToolExecutionContext {
+            session_id,
+            project_id,
+            turn_id,
+            actor,
+            workspace_root,
+            git_token,
+        } = context;
         let now = now_utc_str();
         let input: Value =
             serde_json::from_str(&accepted.request.arguments_json).unwrap_or_else(|_| json!({}));
@@ -1022,13 +1205,18 @@ impl ExecutionInterface {
 
         let read_paths = self.read_paths_for_turn(turn_id).await?;
         let ctx = ToolContext {
+            project_id,
             session_id,
             turn_id,
             tool_call_id: accepted.id,
             workspace: &self.workspace,
+            workspace_root,
+            workspace_handle: janus_workspace::interface::WorkspaceHandle::main(project_id),
             sessions: &self.sessions,
+            projects: &self.projects,
             blobs: &self.blobs,
             runtime: &self.runtime,
+            git_token,
             read_paths: &read_paths,
             actor: actor.clone(),
         };
@@ -1050,7 +1238,6 @@ impl ExecutionInterface {
                     }),
                     error_code: Some("TOOL_EXECUTION_FAILED".into()),
                     finish_summary: None,
-                    wait: None,
                 };
                 attach_tool_display(&accepted.request.name, &input, &mut outcome);
                 outcome
@@ -1073,7 +1260,7 @@ impl ExecutionInterface {
         }
         let (message, durable_parts) = tool_result_message(&outcome, &accepted.request.id);
         let status = outcome.disposition.as_str();
-        let ended_at = (!outcome.disposition.is_waiting()).then_some(ended.as_str());
+        let ended_at = Some(ended.as_str());
         let finalized = sqlx::query(
             "UPDATE tool_calls SET status = ?, result_summary_json = ?, error_code = ?, \
               ended_at = ?, version = ? WHERE id = ? AND status = 'running'",
@@ -1134,35 +1321,22 @@ impl ExecutionInterface {
         session_id: SessionId,
         turn_id: TurnId,
         summary: CompletionSummary,
-    ) -> Result<CompleteTurnOutcome, ExecutionError> {
+    ) -> Result<(), ExecutionError> {
         let now = now_utc_str();
         let summary_value = serde_json::to_value(&summary)?;
         let mut work = self.unit_of_work.begin().await?;
         let unfinished_calls: i64 = sqlx::query_scalar(
             "SELECT COUNT(1) FROM tool_calls AS call \
              JOIN rounds AS round ON round.id = call.round_id \
-             WHERE round.turn_id = ? AND call.status IN ('requested', 'running', 'waiting')",
+             WHERE round.turn_id = ? AND call.status IN ('requested', 'running')",
         )
         .bind(turn_id.to_string())
         .fetch_one(work.connection())
         .await?;
-        let unfinished_jobs = self
-            .runtime
-            .has_unfinished_jobs_in_tx(work.connection(), turn_id)
-            .await
-            .map_err(|error| {
-                ExecutionError::Internal(anyhow::anyhow!(
-                    "inspect unfinished Jobs before Turn completion: {error}"
-                ))
-            })?;
         if unfinished_calls > 0 {
             return Err(ExecutionError::Internal(anyhow::anyhow!(
                 "Turn completion attempted with unfinished Tool Calls"
             )));
-        }
-        if unfinished_jobs {
-            work.rollback().await?;
-            return Ok(CompleteTurnOutcome::WaitingForJob);
         }
         let (input_tokens, output_tokens): (i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
@@ -1187,7 +1361,7 @@ impl ExecutionInterface {
             .await?;
         let Some(transition) = transition else {
             work.rollback().await?;
-            return Ok(CompleteTurnOutcome::Completed);
+            return Ok(());
         };
         work.append_event(NewEvent {
             event_type: EventType::TurnStatusChanged,
@@ -1207,7 +1381,7 @@ impl ExecutionInterface {
         })
         .await?;
         work.commit().await?;
-        Ok(CompleteTurnOutcome::Completed)
+        Ok(())
     }
 
     async fn fail_turn(
@@ -1267,6 +1441,28 @@ impl ExecutionInterface {
         let session_id = turn.session_id;
         self.fail_turn(session_id, turn_id, reason).await
     }
-
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{aggregate_turn_token_exchange, estimated_system_prompt_tokens};
+
+    #[test]
+    fn turn_exchange_sums_attempts_and_excludes_system_prefix() {
+        let exchange = aggregate_turn_token_exchange(&[(100, 20), (50, 5)], 10);
+        assert_eq!(exchange.upload_tokens, 130);
+        assert_eq!(exchange.download_tokens, 25);
+    }
+
+    #[test]
+    fn turn_exchange_does_not_underflow_small_input() {
+        let exchange = aggregate_turn_token_exchange(&[(5, 2)], 10);
+        assert_eq!(exchange.upload_tokens, 0);
+        assert_eq!(exchange.download_tokens, 2);
+    }
+
+    #[test]
+    fn system_prompt_estimate_is_stable_and_positive() {
+        assert!(estimated_system_prompt_tokens() > 0);
+    }
+}

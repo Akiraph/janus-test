@@ -58,7 +58,7 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
         .parts
         .iter()
         .all(|p| matches!(p, ContentPart::Text { .. }));
-    if all_text {
+    let mut v = if all_text {
         let text = msg
             .parts
             .iter()
@@ -68,47 +68,29 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
             })
             .collect::<Vec<_>>()
             .join("");
-        let mut v = json!({"role": role, "content": text});
-        if let Some(id) = &msg.tool_call_id {
-            v["tool_call_id"] = json!(id);
-        }
-        if !msg.tool_calls.is_empty() {
-            v["tool_calls"] = json!(
-                msg.tool_calls
-                    .iter()
-                    .map(|call| json!({
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": openai_tool_name(&call.name),
-                            "arguments": call.arguments_json,
-                        },
-                    }))
-                    .collect::<Vec<_>>()
-            );
-        }
-        return v;
-    }
-    let content: Vec<Value> = msg
-        .parts
-        .iter()
-        .map(|p| match p {
-            ContentPart::Text { text } => json!({"type": "text", "text": text}),
-            ContentPart::Image { mime, bytes, .. } => {
-                let b64 = B64.encode(bytes);
-                json!({
-                    "type": "image_url",
-                    "image_url": {"url": format!("data:{mime};base64,{b64}")}
-                })
-            }
-        })
-        .collect();
-    let mut value = json!({"role": role, "content": content});
+        json!({"role": role, "content": text})
+    } else {
+        let content: Vec<Value> = msg
+            .parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => json!({"type": "text", "text": text}),
+                ContentPart::Image { mime, bytes, .. } => {
+                    let b64 = B64.encode(bytes);
+                    json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{mime};base64,{b64}")}
+                    })
+                }
+            })
+            .collect();
+        json!({"role": role, "content": content})
+    };
     if let Some(id) = &msg.tool_call_id {
-        value["tool_call_id"] = json!(id);
+        v["tool_call_id"] = json!(id);
     }
     if !msg.tool_calls.is_empty() {
-        value["tool_calls"] = json!(
+        v["tool_calls"] = json!(
             msg.tool_calls
                 .iter()
                 .map(|call| json!({
@@ -122,14 +104,30 @@ fn message_to_openai(msg: &ChatMessage) -> Value {
                 .collect::<Vec<_>>()
         );
     }
-    value
+    // Thinking-mode providers require the assistant's previous reasoning to be
+    // echoed back as `reasoning_content`; without it they reject the request
+    // with "The `reasoning_content` in the thinking mode must be passed back".
+    if matches!(msg.role, ChatRole::Assistant)
+        && let Some(reasoning) = msg.reasoning_content.as_deref()
+    {
+        v["reasoning_content"] = json!(reasoning);
+    }
+    v
 }
 
 /// Mutable state while consuming OpenAI chat.completion.chunk SSE.
 #[derive(Default)]
 pub struct OpenaiChatAssembler {
     pub text: String,
+    /// Display-formatted reasoning summary (newlines inserted between
+    /// sentences). Never echoed back to the provider.
     pub reasoning: String,
+    /// Raw reasoning deltas concatenated verbatim, for echo-back on the next
+    /// request. Thinking-mode providers reject reformatted reasoning with 400.
+    pub raw_reasoning: String,
+    /// Whether the provider sent the `reasoning_content` field at least once.
+    /// An empty field is still meaningful in thinking mode and must be echoed.
+    saw_reasoning_content: bool,
     pub tool_args: Vec<(Option<String>, Option<String>, String)>, // id, name, args
     pub seq: u64,
     pub usage: Option<TokenUsage>,
@@ -205,21 +203,21 @@ impl OpenaiChatAssembler {
                 self.finish_reason = Some(fr.to_owned());
             }
             let delta = choice.get("delta").cloned().unwrap_or(json!({}));
-            if let Some(reasoning) = ["reasoning_content", "reasoning", "thinking"]
-                .into_iter()
-                .find_map(|key| delta.get(key).and_then(Value::as_str))
-                .filter(|value| !value.is_empty())
-            {
-                append_reasoning_summary(&mut self.reasoning, reasoning);
-                self.seq += 1;
-                out.push(ModelStreamEvent::Delta {
-                    attempt_id: attempt_id.to_owned(),
-                    sequence: self.seq,
-                    channel: StreamChannel::ReasoningSummary,
-                    text: reasoning.to_owned(),
-                    provisional: true,
-                    usage: None,
-                });
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
+                self.saw_reasoning_content = true;
+                if !reasoning.is_empty() {
+                    append_reasoning_summary(&mut self.reasoning, reasoning);
+                    self.raw_reasoning.push_str(reasoning);
+                    self.seq += 1;
+                    out.push(ModelStreamEvent::Delta {
+                        attempt_id: attempt_id.to_owned(),
+                        sequence: self.seq,
+                        channel: StreamChannel::ReasoningSummary,
+                        text: reasoning.to_owned(),
+                        provisional: true,
+                        usage: None,
+                    });
+                }
             }
             if let Some(content) = delta.get("content").and_then(|c| c.as_str())
                 && !content.is_empty()
@@ -319,6 +317,9 @@ impl OpenaiChatAssembler {
             tool_calls,
             text: self.text.clone(),
             reasoning: self.reasoning.clone(),
+            reasoning_content: self
+                .saw_reasoning_content
+                .then(|| self.raw_reasoning.clone()),
             reasoning_duration_ms: self.reasoning_duration_ms,
         }
     }
@@ -338,8 +339,11 @@ fn openai_tool_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::OpenaiChatAssembler;
-    use crate::stream_types::ModelStreamEvent;
+    use super::{OpenaiChatAssembler, build_chat_body};
+    use crate::stream_types::{
+        ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent, ToolSpec,
+    };
+    use serde_json::json;
 
     #[test]
     fn eof_without_done_is_failed() {
@@ -368,5 +372,164 @@ mod tests {
             assembler.finish("attempt"),
             ModelStreamEvent::Completed { .. }
         ));
+    }
+
+    fn request(messages: Vec<ChatMessage>) -> ModelRequest {
+        ModelRequest {
+            owner_id: "owner".into(),
+            provider_id: "provider".into(),
+            upstream_model_id: "deepseek-reasoner".into(),
+            parameters: json!({"reasoning_effort": "high"}),
+            messages,
+            tools: vec![ToolSpec {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type": "object"}),
+            }],
+            round_id: None,
+            project_id: None,
+            session_id: None,
+            turn_id: None,
+        }
+    }
+
+    fn assistant_message(content: &str, reasoning: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            parts: vec![ContentPart::Text {
+                text: content.into(),
+            }],
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            reasoning_content: reasoning.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn thinking_reasoning_is_echoed_back_as_reasoning_content() {
+        let body = build_chat_body(&request(vec![
+            assistant_message(
+                "I checked the config.",
+                Some("Summarizing the workspace state\nDetailing relevant files"),
+            ),
+            ChatMessage {
+                role: ChatRole::User,
+                parts: vec![ContentPart::Text {
+                    text: "proceed".into(),
+                }],
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+        ]));
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(
+            messages[0]["reasoning_content"],
+            "Summarizing the workspace state\nDetailing relevant files"
+        );
+        // Non-assistant / reasoning-less messages never carry the field.
+        assert!(messages[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_content_is_omitted_when_absent() {
+        let body = build_chat_body(&request(vec![assistant_message("plain answer", None)]));
+        let messages = body["messages"].as_array().expect("messages array");
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert_eq!(messages[0]["content"], "plain answer");
+    }
+
+    #[test]
+    fn empty_reasoning_content_is_echoed_when_explicitly_present() {
+        let body = build_chat_body(&request(vec![assistant_message("answer", Some(""))]));
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn completed_carries_verbatim_raw_reasoning_separate_from_display_summary() {
+        let mut assembler = OpenaiChatAssembler::default();
+        assembler
+            .ingest_data(
+                "attempt",
+                r#"{"choices":[{"delta":{"reasoning_content":"Summarizing the workspace state"}}]}"#,
+            )
+            .expect("valid event");
+        assembler
+            .ingest_data(
+                "attempt",
+                r#"{"choices":[{"delta":{"reasoning_content":"Detailing relevant files"}}]}"#,
+            )
+            .expect("valid event");
+        assembler
+            .ingest_data("attempt", "[DONE]")
+            .expect("valid terminal sentinel");
+        let event = assembler.finish("attempt");
+        let ModelStreamEvent::Completed {
+            reasoning,
+            reasoning_content,
+            ..
+        } = event
+        else {
+            panic!("expected Completed");
+        };
+        // Display summary inserts a sentence boundary newline...
+        assert_eq!(
+            reasoning,
+            "Summarizing the workspace state\nDetailing relevant files"
+        );
+        // ...but the raw content is concatenated verbatim for echo-back.
+        assert_eq!(
+            reasoning_content.as_deref(),
+            Some("Summarizing the workspace stateDetailing relevant files")
+        );
+    }
+
+    #[test]
+    fn completed_omits_reasoning_content_when_provider_sends_none() {
+        let mut assembler = OpenaiChatAssembler::default();
+        assembler
+            .ingest_data(
+                "attempt",
+                r#"{"choices":[{"delta":{"content":"plain answer"}}]}"#,
+            )
+            .expect("valid event");
+        assembler
+            .ingest_data("attempt", "[DONE]")
+            .expect("valid terminal sentinel");
+        let ModelStreamEvent::Completed {
+            reasoning_content, ..
+        } = assembler.finish("attempt")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(reasoning_content, None);
+    }
+
+    #[test]
+    fn empty_provider_reasoning_content_is_preserved_for_echo_back() {
+        let mut assembler = OpenaiChatAssembler::default();
+        assembler
+            .ingest_data(
+                "attempt",
+                r#"{"choices":[{"delta":{"reasoning_content":""}}]}"#,
+            )
+            .expect("valid empty reasoning delta");
+        assembler
+            .ingest_data("attempt", "[DONE]")
+            .expect("valid terminal sentinel");
+        let ModelStreamEvent::Completed {
+            reasoning_content, ..
+        } = assembler.finish("attempt")
+        else {
+            panic!("expected Completed");
+        };
+        let body = build_chat_body(&request(vec![assistant_message(
+            "tool result",
+            reasoning_content.as_deref(),
+        )]));
+        assert_eq!(reasoning_content.as_deref(), Some(""));
+        assert_eq!(body["messages"][0]["reasoning_content"], "");
     }
 }

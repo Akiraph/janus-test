@@ -93,27 +93,21 @@ fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolD
             let path = input_string("path");
             (format!("Removed {path}"), ToolDisplayBody::None)
         }
-        "delegate_cli" => {
-            let cli = input_string("cli");
-            (
-                format!("Delegated to {}", display_tool_name(&cli)),
-                ToolDisplayBody::Structured {
-                    value: outcome.summary.clone(),
-                },
-            )
-        }
         "read_output" => {
-            let job_id = input_string("job_id");
+            let async_task_id = input_string("task_id");
             (
-                format!("Read output for {job_id}"),
+                format!("Read output for {async_task_id}"),
                 ToolDisplayBody::Structured {
                     value: outcome.summary.clone(),
                 },
             )
         }
         "stop" => {
-            let job_id = input_string("job_id");
-            (format!("Stopped job {job_id}"), ToolDisplayBody::None)
+            let async_task_id = input_string("task_id");
+            (
+                format!("Stopped async_task {async_task_id}"),
+                ToolDisplayBody::None,
+            )
         }
         "todo" => (
             "Updated plan".into(),
@@ -121,10 +115,6 @@ fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolD
                 value: input.clone(),
             },
         ),
-        "ask_user" => {
-            let prompt = input_string("prompt");
-            (format!("Asked {prompt}"), ToolDisplayBody::None)
-        }
         "attachment_list" => (
             "Listed attachments".into(),
             ToolDisplayBody::Structured {
@@ -225,4 +215,3 @@ fn display_tool_name(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-

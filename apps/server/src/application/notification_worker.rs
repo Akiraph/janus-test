@@ -45,14 +45,13 @@ pub fn spawn(state: Application) {
                 }
                 for event in events {
                     cursor = event.cursor.parse().unwrap_or(cursor);
-                    if let Some((owner_id, notification)) = translate(&state, &event).await {
-                        if let Err(error) = state
+                    if let Some((owner_id, notification)) = translate(&state, &event).await
+                        && let Err(error) = state
                             .notifications()
                             .dispatch(&owner_id, &notification)
                             .await
-                        {
-                            warn!(%error, event_type = %event.event_type, cursor, "notification delivery failed");
-                        }
+                    {
+                        warn!(%error, event_type = %event.event_type, cursor, "notification delivery failed");
                     }
                 }
             }
@@ -76,28 +75,18 @@ async fn translate(
                 "Turn failed",
                 "The model turn needs attention.",
             ),
-            Some("waiting_for_model") => (
-                NotificationEventKind::ModelWaiting,
-                "Model needs attention",
-                "The model turn is waiting for a model retry or configuration change.",
-            ),
             _ => return None,
         },
-        "ask.changed" if event.payload.get("status").and_then(Value::as_str) == Some("open") => (
-            NotificationEventKind::AskOpened,
-            "Janus is waiting for your answer",
-            "The model asked a question in a session.",
-        ),
-        "job.changed" => match event.payload.get("status").and_then(Value::as_str) {
+        "async_task.changed" => match event.payload.get("status").and_then(Value::as_str) {
             Some("succeeded") => (
-                NotificationEventKind::JobCompleted,
-                "Async job completed",
-                "A background bash or CLI job completed successfully.",
+                NotificationEventKind::AsyncTaskCompleted,
+                "Async task completed",
+                "A background Bash task completed successfully.",
             ),
             Some("failed") | Some("canceled") | Some("lost") => (
-                NotificationEventKind::JobCompleted,
-                "Async job finished",
-                "A background bash or CLI job finished without success.",
+                NotificationEventKind::AsyncTaskCompleted,
+                "Async task finished",
+                "A background Bash task finished without success.",
             ),
             _ => return None,
         },
@@ -130,10 +119,10 @@ async fn event_session_id(state: &Application, event: &EventEnvelope) -> Option<
         .get("session_id")
         .and_then(Value::as_str)
         .or_else(|| event.payload.get("sessionId").and_then(Value::as_str));
-    if let Some(raw) = raw {
-        if let Ok(session_id) = raw.parse() {
-            return Some(session_id);
-        }
+    if let Some(raw) = raw
+        && let Ok(session_id) = raw.parse()
+    {
+        return Some(session_id);
     }
     let turn_id = event
         .payload

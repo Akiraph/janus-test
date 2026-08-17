@@ -378,6 +378,7 @@ impl OpenaiResponsesAssembler {
             tool_calls,
             text: self.text.clone(),
             reasoning: self.reasoning.clone(),
+            reasoning_content: None,
             reasoning_duration_ms: self.reasoning_duration_ms,
         }
     }
@@ -424,6 +425,7 @@ mod tests {
                 }],
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             }],
             tools: vec![ToolSpec {
                 name: "read_file".into(),

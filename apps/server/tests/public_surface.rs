@@ -1,4 +1,4 @@
-﻿use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -26,6 +26,9 @@ fn test_config(data_root: PathBuf) -> Config {
         webauthn_rp_id: "localhost".into(),
         public_origin: url::Url::parse("http://localhost").expect("static test URL"),
         event_heartbeat: Duration::from_millis(50),
+        automation_webhook_enabled: false,
+        automation_webhook_secret: None,
+        automation_github_token: None,
     }
 }
 
@@ -83,13 +86,62 @@ async fn probes_expose_request_and_snapshot_cursors() -> anyhow::Result<()> {
     assert!(info.status().is_success());
     let body: Value = info.json().await?;
     assert_eq!(body["data"]["database"]["journal_mode"], "wal");
-    assert!(
-        body["data"]["capabilities"]
-            .as_array()
-            .is_some_and(|values| values.len() == 7)
-    );
 
     task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()> {
+    let disabled_directory = TempDir::new()?;
+    let disabled_state =
+        AppState::initialize(test_config(disabled_directory.path().into())).await?;
+    let (disabled_base, disabled_task) = spawn(disabled_state).await?;
+    let client = Client::new();
+    let body = r#"<a href="https://github.com/acme/widget/pull/42">conflict</a>"#;
+
+    let disabled = client
+        .post(format!("{disabled_base}/api/v1/automation/webhook"))
+        .header("content-type", "text/html")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(disabled.status(), reqwest::StatusCode::NOT_FOUND);
+    disabled_task.abort();
+
+    let enabled_directory = TempDir::new()?;
+    let mut config = test_config(enabled_directory.path().into());
+    config.automation_webhook_enabled = true;
+    config.automation_webhook_secret = Some("test-secret".into());
+    let enabled_state = AppState::initialize(config).await?;
+    enabled_state.identity().authenticate(None).await?;
+    let (enabled_base, enabled_task) = spawn(enabled_state).await?;
+
+    let unauthorized = client
+        .post(format!("{enabled_base}/api/v1/automation/webhook"))
+        .header("content-type", "text/html")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let accepted = client
+        .post(format!("{enabled_base}/api/v1/automation/webhook"))
+        .header("content-type", "text/html")
+        .header("x-janus-webhook-secret", "test-secret")
+        .header("idempotency-key", "webhook-test-1")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let accepted_body: Value = accepted.json().await?;
+    assert_eq!(accepted_body["data"]["kind"], "automation.pull_request");
+    assert_eq!(
+        accepted_body["data"]["target_id"],
+        "https://github.com/acme/widget/pull/42"
+    );
+
+    enabled_task.abort();
     Ok(())
 }
 
@@ -135,8 +187,7 @@ async fn event_stream_replays_committed_rows_and_validates_cursors() -> anyhow::
         .lines()
         .find(|line| line.starts_with("data: ") && line.contains("\"kind\""))
         .context("replayed frame has no state data")?;
-    let replayed: Value =
-        serde_json::from_str(line.strip_prefix("data: ").context("data line")?)?;
+    let replayed: Value = serde_json::from_str(line.strip_prefix("data: ").context("data line")?)?;
     assert_eq!(replayed["kind"], "providers");
     assert_eq!(replayed["cursor"].as_str(), Some(appended.cursor.as_str()));
 
@@ -199,6 +250,7 @@ fn openapi_contains_every_public_route() {
         "/api/v1/bootstrap",
         "/api/v1/system/info",
         "/api/v1/events",
+        "/api/v1/automation/webhook",
         "/api/v1/auth/initialize/options",
         "/api/v1/auth/initialize/complete",
         "/api/v1/auth/logout",
@@ -246,6 +298,7 @@ fn openapi_contains_every_public_route() {
         "/api/v1/projects/{project_id}/sessions",
         "/api/v1/sessions/{id}",
         "/api/v1/sessions/{id}/context",
+        "/api/v1/sessions/{id}/context/compact",
         "/api/v1/sessions/{id}/messages",
         "/api/v1/sessions/{id}/attachments",
         "/api/v1/sessions/{id}/attachments/{attachment_id}",
@@ -254,14 +307,9 @@ fn openapi_contains_every_public_route() {
         "/api/v1/sessions/{id}/timeline",
         "/api/v1/sessions/{id}/turns/{turn_id}",
         "/api/v1/sessions/{id}/turns/{turn_id}/cancel",
-        "/api/v1/sessions/{id}/turns/{turn_id}/retry-model",
-        "/api/v1/asks/{ask_id}/answer",
-        "/api/v1/sessions/{id}/diff",
-        "/api/v1/sessions/{id}/sync",
-        "/api/v1/sessions/{id}/apply",
-        "/api/v1/sessions/{id}/jobs",
-        "/api/v1/jobs/{id}/log",
-        "/api/v1/jobs/{id}/cancel",
+        "/api/v1/async-tasks",
+        "/api/v1/async-tasks/{id}/log",
+        "/api/v1/async-tasks/{id}/cancel",
         "/api/v1/notification-channels",
         "/api/v1/notification-channels/{id}",
         "/api/v1/notification-channels/{id}/test",

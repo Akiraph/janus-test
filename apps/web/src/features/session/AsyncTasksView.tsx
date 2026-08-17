@@ -2,34 +2,34 @@ import { Briefcase, CircleAlert, Loader2, Square } from "lucide-solid";
 import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
 import { Button } from "../../components/ui/Button";
 import {
-  cancelJob,
+  type AsyncTaskProjection,
+  cancelAsyncTask,
+  getAsyncTaskLog,
   getErrorMessage,
-  getJobLog,
-  type JobProjection,
   type LogRange,
 } from "../../lib/api";
 
-interface AsyncJobsViewProps {
-  jobs: readonly JobProjection[];
+interface AsyncTasksViewProps {
+  tasks: readonly AsyncTaskProjection[];
   loading: boolean;
   error: string | null;
   onRefresh: () => void;
 }
 
-export function AsyncJobsView(props: AsyncJobsViewProps) {
+export function AsyncTasksView(props: AsyncTasksViewProps) {
   return (
     <Show
-      when={!props.loading || props.jobs.length > 0}
-      fallback={<p class="session-async__empty">Loading async jobs...</p>}
+      when={!props.loading || props.tasks.length > 0}
+      fallback={<p class="session-async__empty">Loading async tasks...</p>}
     >
       <Show when={!props.error} fallback={<p class="session-async__empty">{props.error}</p>}>
         <Show
-          when={props.jobs.length > 0}
-          fallback={<p class="session-async__empty">No async jobs.</p>}
+          when={props.tasks.length > 0}
+          fallback={<p class="session-async__empty">No async tasks.</p>}
         >
-          <div class="session-async__jobs">
-            <For each={props.jobs}>
-              {(job) => <AsyncJobCard job={job} onRefresh={props.onRefresh} />}
+          <div class="session-async__tasks">
+            <For each={props.tasks}>
+              {(task) => <AsyncTaskCard task={task} onRefresh={props.onRefresh} />}
             </For>
           </div>
         </Show>
@@ -38,14 +38,14 @@ export function AsyncJobsView(props: AsyncJobsViewProps) {
   );
 }
 
-function AsyncJobCard(props: { job: JobProjection; onRefresh: () => void }) {
+function AsyncTaskCard(props: { task: AsyncTaskProjection; onRefresh: () => void }) {
   const [log, setLog] = createSignal<LogRange>();
   const [error, setError] = createSignal<string>();
   const [canceling, setCanceling] = createSignal(false);
 
   const refreshLog = async () => {
     try {
-      setLog(await getJobLog(props.job.id, { limit: 512 * 1024 }));
+      setLog(await getAsyncTaskLog(props.task.id, { limit: 512 * 1024 }));
       setError(undefined);
     } catch (value) {
       setError(getErrorMessage(value, "Output unavailable"));
@@ -53,7 +53,7 @@ function AsyncJobCard(props: { job: JobProjection; onRefresh: () => void }) {
   };
 
   createEffect(() => {
-    const status = props.job.status;
+    const status = props.task.status;
     void refreshLog();
     if (status === "queued" || status === "running") {
       const timer = setInterval(() => void refreshLog(), 1000);
@@ -64,35 +64,30 @@ function AsyncJobCard(props: { job: JobProjection; onRefresh: () => void }) {
   async function stop() {
     setCanceling(true);
     try {
-      await cancelJob(props.job.id);
+      await cancelAsyncTask(props.task.id);
       props.onRefresh();
     } catch (value) {
-      setError(getErrorMessage(value, "Job could not be canceled"));
+      setError(getErrorMessage(value, "Async task could not be canceled"));
     } finally {
       setCanceling(false);
     }
   }
 
-  const label = () =>
-    props.job.cli_kind === "claude_code"
-      ? "Claude Code"
-      : props.job.cli_kind === "codex"
-        ? "Codex"
-        : "Bash";
+  const label = () => "Bash";
   const output = () =>
     log()
       ?.chunks.map((chunk) => `[${chunk.channel}] ${chunk.text}`)
       .join("") ?? "";
-  const active = () => props.job.status === "queued" || props.job.status === "running";
+  const active = () => props.task.status === "queued" || props.task.status === "running";
 
   return (
-    <article class="async-job-card">
-      <header class="async-job-card__head">
-        <div class="async-job-card__identity">
+    <article class="async-task-card">
+      <header class="async-task-card__head">
+        <div class="async-task-card__identity">
           <Briefcase size={15} />
           <strong>{label()}</strong>
-          <span class={`async-job-card__status async-job-card__status--${props.job.status}`}>
-            {props.job.status}
+          <span class={`async-task-card__status async-task-card__status--${props.task.status}`}>
+            {props.task.status}
           </span>
         </div>
         <Show when={active()}>
@@ -100,7 +95,7 @@ function AsyncJobCard(props: { job: JobProjection; onRefresh: () => void }) {
             variant="ghost"
             size="sm"
             iconOnly
-            aria-label="Stop job"
+            aria-label="Stop async task"
             disabled={canceling()}
             onClick={() => void stop()}
           >
@@ -110,14 +105,14 @@ function AsyncJobCard(props: { job: JobProjection; onRefresh: () => void }) {
           </Button>
         </Show>
       </header>
-      <p class="async-job-card__command">{props.job.command_summary}</p>
-      <p class="async-job-card__id">{props.job.id}</p>
+      <p class="async-task-card__command">{props.task.command_summary}</p>
+      <p class="async-task-card__id">{props.task.id}</p>
       <Show when={error()}>
-        <p class="async-job-card__error">
+        <p class="async-task-card__error">
           <CircleAlert size={14} /> {error()}
         </p>
       </Show>
-      <pre class="async-job-card__output">{output() || "Waiting for output..."}</pre>
+      <pre class="async-task-card__output">{output() || "Waiting for output..."}</pre>
     </article>
   );
 }

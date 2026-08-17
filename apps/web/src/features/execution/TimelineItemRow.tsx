@@ -1,8 +1,8 @@
+import ChevronRight from "lucide-solid/icons/chevron-right";
 import Loader2 from "lucide-solid/icons/loader-2";
 import { createSignal, For, Show } from "solid-js";
-import type { AskAnswer } from "../../lib/api";
 import { MarkdownOutput } from "../../components/MarkdownOutput";
-import { AskCard, JobCard, ModelCard, PlanCard, ServiceCard } from "../session/SessionCards";
+import { ModelCard, PlanCard } from "../session/SessionCards";
 import type { SessionTimelineItem, ToolView } from "../session/sessionTimeline";
 import { formatThoughtDuration } from "../session/sessionTimeline";
 import { ThoughtRow } from "./ThoughtRow";
@@ -11,10 +11,7 @@ import { ThoughtRow } from "./ThoughtRow";
  * Unified timeline item renderer - simpler than the old EventRow approach.
  * Mirrors bun version's ConversationItemRow architecture.
  */
-export function TimelineItemRow(props: {
-  item: SessionTimelineItem;
-  onAnswer?: (askId: string, answer: AskAnswer) => Promise<void>;
-}) {
+export function TimelineItemRow(props: { item: SessionTimelineItem }) {
   switch (props.item.type) {
     case "user":
       return <UserMessage item={props.item} />;
@@ -26,16 +23,8 @@ export function TimelineItemRow(props: {
       return <ToolMessage item={props.item} />;
     case "plan":
       return <PlanCard item={props.item} />;
-    case "ask":
-      return (
-        <AskCard item={props.item} {...(props.onAnswer ? { onAnswer: props.onAnswer } : {})} />
-      );
     case "model":
       return <ModelCard item={props.item} />;
-    case "job":
-      return <JobCard item={props.item} />;
-    case "service":
-      return <ServiceCard item={props.item} />;
     case "unknown":
       return (
         <article class="session-message session-message--tool">
@@ -71,7 +60,7 @@ function AssistantMessage(props: { item: Extract<SessionTimelineItem, { type: "a
       <Show when={props.item.reasoning}>
         {(reasoning) => (
           <ThoughtRow
-            title={`Thought ${formatThoughtDuration(props.item.durationMs ?? undefined)}`.trim()}
+            title={`Thought ${formatThoughtDuration(props.item.durationMs ?? 0)}`.trim()}
             text={reasoning()}
             status="completed"
           />
@@ -157,20 +146,11 @@ function ToolMessage(props: { item: Extract<SessionTimelineItem, { type: "tool" 
           <Loader2 size={14} class="ui-spinner" />
         </Show>
         <span class="tool-row__title">{view.title}</span>
-        <svg
+        <ChevronRight
           aria-hidden="true"
-          width="13"
-          height="13"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
+          size={13}
           class={`collapsible-row__chevron ${open() ? "collapsible-row__chevron--open" : ""}`}
-        >
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
+        />
       </button>
       <Show when={open()}>
         <div class="collapsible-row__detail">
@@ -226,9 +206,6 @@ function ToolBodyContent(props: { view: ToolView; isGroup: boolean }) {
     case "command_output":
       return (
         <div>
-          <Show when={body.command}>
-            <pre class="session-event__command">{body.command}</pre>
-          </Show>
           <Show when={body.stdout}>
             <pre class="session-event__terminal">{body.stdout}</pre>
           </Show>

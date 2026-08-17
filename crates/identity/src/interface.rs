@@ -281,14 +281,12 @@ impl IdentityInterface {
         {
             return Err(IdentityError::InvalidInitializationToken);
         }
-        sqlx::query(
-            "INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)",
-        )
-        .bind(&state.owner_id)
-        .bind(&state.display_name)
-        .bind(format_utc(now))
-        .execute(&mut *transaction)
-        .await?;
+        sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
+            .bind(&state.owner_id)
+            .bind(&state.display_name)
+            .bind(format_utc(now))
+            .execute(&mut *transaction)
+            .await?;
         insert_passkey(
             &mut transaction,
             &state.owner_id,
@@ -394,12 +392,7 @@ impl IdentityInterface {
         .await?;
         transaction.commit().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(
-                &owner.id,
-                &owner.display_name,
-                csrf_token,
-                false,
-            ),
+            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false),
             session_token,
             recovery_codes: None,
         })
@@ -466,6 +459,17 @@ impl IdentityInterface {
             csrf_token.into(),
             auth.development,
         )
+    }
+
+    /// Return the single deployment owner's id for internal automation flows.
+    ///
+    /// Janus deliberately has no membership model, so an authenticated
+    /// webhook does not need to select a tenant or user.
+    pub async fn single_owner_id(&self) -> Result<String, IdentityError> {
+        if self.development_auth {
+            self.ensure_development_owner().await?;
+        }
+        Ok(self.owner().await?.id)
     }
 
     pub async fn logout(&self, auth: &AuthContext) -> Result<(), IdentityError> {
@@ -730,12 +734,7 @@ impl IdentityInterface {
         .await?;
         transaction.commit().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(
-                &owner.id,
-                &owner.display_name,
-                csrf_token,
-                false,
-            ),
+            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false),
             session_token,
             recovery_codes: None,
         })
@@ -843,7 +842,13 @@ impl IdentityInterface {
         let now = now_utc_str();
         let owner_id = OwnerId::new().to_string();
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Development Owner', ?)").bind(owner_id).bind(now).execute(&mut *transaction).await?;
+        sqlx::query(
+            "INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Development Owner', ?)",
+        )
+        .bind(owner_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -871,12 +876,7 @@ fn normalize_name(value: &str, fallback: &str) -> Result<String, IdentityError> 
     })
 }
 
-fn owner_view(
-    id: &str,
-    display_name: &str,
-    csrf_token: String,
-    development: bool,
-) -> OwnerView {
+fn owner_view(id: &str, display_name: &str, csrf_token: String, development: bool) -> OwnerView {
     OwnerView {
         id: id.into(),
         display_name: display_name.into(),

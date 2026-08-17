@@ -27,6 +27,9 @@ pub struct Config {
     pub webauthn_rp_id: String,
     pub public_origin: url::Url,
     pub event_heartbeat: Duration,
+    pub automation_webhook_enabled: bool,
+    pub automation_webhook_secret: Option<String>,
+    pub automation_github_token: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +48,8 @@ pub enum ConfigError {
     InvalidPublicOrigin(String),
     #[error("production WebAuthn requires an https public origin")]
     InsecureProductionOrigin,
+    #[error("JANUS_AUTOMATION_WEBHOOK_SECRET is required when automation webhooks are enabled")]
+    AutomationWebhookSecretRequired,
 }
 
 impl Config {
@@ -98,6 +103,13 @@ impl Config {
                 .unwrap_or_else(|_| public_origin.host_str().unwrap_or("localhost").into()),
             public_origin,
             event_heartbeat: Duration::from_secs(15),
+            automation_webhook_enabled: parse_bool_env("JANUS_AUTOMATION_WEBHOOK_ENABLED", false),
+            automation_webhook_secret: env::var("JANUS_AUTOMATION_WEBHOOK_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            automation_github_token: env::var("JANUS_AUTOMATION_GITHUB_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         };
         config.validate()?;
         Ok(config)
@@ -126,7 +138,18 @@ impl Config {
         if self.mode == RunMode::Production && self.public_origin.scheme() != "https" {
             return Err(ConfigError::InsecureProductionOrigin);
         }
+        if self.automation_webhook_enabled && self.automation_webhook_secret.is_none() {
+            return Err(ConfigError::AutomationWebhookSecretRequired);
+        }
         Ok(())
+    }
+}
+
+fn parse_bool_env(name: &str, default: bool) -> bool {
+    match env::var(name).ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") => true,
+        Some("0") | Some("false") | Some("FALSE") => false,
+        _ => default,
     }
 }
 
@@ -146,6 +169,9 @@ mod tests {
             webauthn_rp_id: "localhost".into(),
             public_origin: url::Url::parse("https://localhost").expect("static URL"),
             event_heartbeat: Duration::from_secs(15),
+            automation_webhook_enabled: false,
+            automation_webhook_secret: None,
+            automation_github_token: None,
         };
 
         assert!(matches!(

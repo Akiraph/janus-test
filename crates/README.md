@@ -1,29 +1,27 @@
 # Crate Boundaries
 
 `crates/` contains technical foundations and capability modules that can be
-compiled and tested along the dependency graph. A split moves ownership and
-`interface.rs` first, then moves implementation. Cross-capability transactions,
-scheduling, recovery, and composition remain in `apps/server/application/`.
+compiled and tested along the dependency graph. Each capability exposes a
+narrow `interface.rs`; cross-capability transactions, scheduling, recovery,
+and composition remain in `apps/server/application/`.
 
 ## Current layout
 
 | Crate | Current ownership | Dependency direction |
 | --- | --- | --- |
 | `janus-infrastructure` | Generic IDs, clocks, SQLite, transactions, public events, operation journals, and Blob storage | Generic technical libraries only |
-| `janus-workspace` | Main/Session copies, content revisions, snapshots, manifests, diffs, and controlled file mutations | `infrastructure` |
+| `janus-workspace` | Main copy, content revisions, snapshots, manifests, diffs, and controlled file mutations | `infrastructure` |
 | `janus-source-control` | Git errors, status/log values, update outcomes, and the `GitRunner` port | Generic serialization and standard future types |
 | `janus-identity` | Single-owner passkeys, recovery grants, and authentication state | `infrastructure` plus WebAuthn implementation |
 | `janus-models` | Provider credentials, model configuration, failover attempts, usage, and stream adapters | `infrastructure` |
 | `janus-runtime` | Runtime configuration, lifecycle state, logs, tickets, and recovery projections | `infrastructure` |
 | `janus-projects` | Project metadata, repository credentials, runtime policy, and Project Git projections | `infrastructure`, `runtime`, `source-control`, `workspace` |
 | `janus-sessions` | Session, Turn, Message, timeline, checkpoint, upload, and attachment projections | `infrastructure`, `workspace` |
-| `janus-execution` | Round, Tool Call, Ask, plan, context, and stream-diagnostic projections | `infrastructure`, `models`, `projects`, `runtime`, `sessions`, `workspace` |
+| `janus-execution` | Round, Tool Call, plan, context, and stream-diagnostic projections | `infrastructure`, `models`, `projects`, `runtime`, `sessions`, `workspace` |
 
-`janus-source-control` is currently at the interface-migration stage. The Git
-process adapter remains in server, and Projects temporarily owns the Git
-projection and conflict tables. Moving those tables and transactions later
-must preserve historical table names, event names, and migration-owner
-normalization.
+`janus-source-control` owns Git protocol values, the Git port, and Git state and
+conflict tables. The system Git process adapter remains in server. Table names,
+event names, and migration-owner normalization are fixed deployment contracts.
 
 ## Boundary rules
 
@@ -36,15 +34,14 @@ normalization.
   introducing a shared layer for a few lines of code.
 - Do not suppress lint or boundary problems with blanket attributes. Fix the
   code, narrow the interface, or add a focused test.
-- Applied SQLx migrations are immutable. Historical types and public event
-  names remain compatible during extraction.
+- The deployment uses one `0001_initial.sql` migration. Do not add migration
+  history or compatibility shims for removed features.
 
 ## Documentation rules
 
 Each capability README records only maintenance-relevant context: mission,
-observable behavior, invariants, boundaries, temporary compatibility
-conditions, and design decisions. Comments explain behavior causes or external
-constraints; they do not restate the code.
+observable behavior, invariants, boundaries, and design decisions. Comments
+explain behavior causes or external constraints; they do not restate the code.
 
 ## Verification
 

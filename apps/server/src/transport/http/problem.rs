@@ -1,4 +1,4 @@
-﻿use axum::{
+use axum::{
     Json,
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
@@ -63,12 +63,9 @@ pub mod codes {
     pub const SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
     pub const ACTIVE_TURN_EXISTS: &str = "ACTIVE_TURN_EXISTS";
     pub const SESSION_DELETING: &str = "SESSION_DELETING";
-    pub const WORKSPACE_PROPAGATION_CONFLICT: &str = "WORKSPACE_PROPAGATION_CONFLICT";
     pub const TIMELINE_CURSOR_INVALID: &str = "TIMELINE_CURSOR_INVALID";
     pub const TURN_NOT_INTERACTIVE: &str = "TURN_NOT_INTERACTIVE";
     pub const TURN_TERMINAL: &str = "TURN_TERMINAL";
-    pub const ASK_NOT_FOUND: &str = "ASK_NOT_FOUND";
-    pub const ASK_NOT_OPEN: &str = "ASK_NOT_OPEN";
 
     // Models
     pub const PROVIDER_STREAM_FAILED: &str = "PROVIDER_STREAM_FAILED";
@@ -88,11 +85,8 @@ pub mod codes {
     pub const MODEL_CONFIGURATION_FAULT: &str = "MODEL_CONFIGURATION_FAULT";
     pub const MODEL_UNAVAILABLE: &str = "MODEL_UNAVAILABLE";
     pub const RATE_LIMITED: &str = "RATE_LIMITED";
-    pub const COMMAND_FORBIDDEN: &str = "COMMAND_FORBIDDEN";
-    pub const NETWORK_POLICY_DENIED: &str = "NETWORK_POLICY_DENIED";
     pub const RUNTIME_UNAVAILABLE: &str = "RUNTIME_UNAVAILABLE";
-    pub const JOB_LOST: &str = "JOB_LOST";
-    pub const SERVICE_LOST: &str = "SERVICE_LOST";
+    pub const ASYNC_TASK_LOST: &str = "ASYNC_TASK_LOST";
     pub const TERMINAL_TICKET_INVALID: &str = "TERMINAL_TICKET_INVALID";
     pub const TERMINAL_SCROLLBACK_EXPIRED: &str = "TERMINAL_SCROLLBACK_EXPIRED";
     pub const TERMINAL_NOT_WRITABLE: &str = "TERMINAL_NOT_WRITABLE";
@@ -101,20 +95,16 @@ pub mod codes {
 fn code_status_title(code: &str) -> (StatusCode, &'static str) {
     use codes::*;
     match code {
-        RESOURCE_NOT_FOUND | SESSION_NOT_FOUND | ASK_NOT_FOUND => {
-            (StatusCode::NOT_FOUND, "Resource not found")
-        }
+        RESOURCE_NOT_FOUND | SESSION_NOT_FOUND => (StatusCode::NOT_FOUND, "Resource not found"),
         RESOURCE_VERSION_MISMATCH => (StatusCode::PRECONDITION_FAILED, "Resource version mismatch"),
         PRECONDITION_REQUIRED => (StatusCode::PRECONDITION_REQUIRED, "Precondition required"),
         IDEMPOTENCY_KEY_REUSED => (StatusCode::CONFLICT, "Idempotency key reused"),
         OPERATION_IN_PROGRESS
         | ACTIVE_TURN_EXISTS
         | SESSION_DELETING
-        | WORKSPACE_PROPAGATION_CONFLICT
         | RESOURCE_BUSY
         | TURN_NOT_INTERACTIVE
-        | TURN_TERMINAL
-        | ASK_NOT_OPEN => (StatusCode::CONFLICT, "Operation conflict"),
+        | TURN_TERMINAL => (StatusCode::CONFLICT, "Operation conflict"),
         VALIDATION_FAILED
         | TIMELINE_CURSOR_INVALID
         | TOOL_PATH_INVALID
@@ -129,14 +119,11 @@ fn code_status_title(code: &str) -> (StatusCode, &'static str) {
         ),
         MODEL_CONTEXT_EXCEEDED => (StatusCode::CONFLICT, "Model context exceeded"),
         MODEL_CAPABILITY_MISMATCH => (StatusCode::CONFLICT, "Model capability mismatch"),
-        MODEL_UNAVAILABLE | RUNTIME_UNAVAILABLE | JOB_LOST | SERVICE_LOST => (
+        MODEL_UNAVAILABLE | RUNTIME_UNAVAILABLE | ASYNC_TASK_LOST => (
             StatusCode::SERVICE_UNAVAILABLE,
             "Runtime dependency unavailable",
         ),
         RATE_LIMITED => (StatusCode::TOO_MANY_REQUESTS, "Rate limited"),
-        COMMAND_FORBIDDEN | NETWORK_POLICY_DENIED => {
-            (StatusCode::FORBIDDEN, "Runtime policy denied")
-        }
         TERMINAL_TICKET_INVALID => (StatusCode::UNAUTHORIZED, "Terminal ticket invalid"),
         TERMINAL_SCROLLBACK_EXPIRED => (StatusCode::GONE, "Terminal scrollback expired"),
         TERMINAL_NOT_WRITABLE => (StatusCode::CONFLICT, "Terminal not writable"),
@@ -157,20 +144,11 @@ pub fn map_runtime_error(error: janus_runtime::interface::RuntimeError) -> Probl
         janus_runtime::interface::RuntimeErrorCode::ResourceBusy => {
             Problem::from_code(RESOURCE_BUSY, error.to_string())
         }
-        janus_runtime::interface::RuntimeErrorCode::CommandForbidden => {
-            Problem::from_code(COMMAND_FORBIDDEN, error.to_string())
-        }
-        janus_runtime::interface::RuntimeErrorCode::NetworkPolicyDenied => {
-            Problem::from_code(NETWORK_POLICY_DENIED, error.to_string())
-        }
         janus_runtime::interface::RuntimeErrorCode::RuntimeUnavailable => {
             Problem::from_code(RUNTIME_UNAVAILABLE, error.to_string())
         }
-        janus_runtime::interface::RuntimeErrorCode::JobLost => {
-            Problem::from_code(JOB_LOST, error.to_string())
-        }
-        janus_runtime::interface::RuntimeErrorCode::ServiceLost => {
-            Problem::from_code(SERVICE_LOST, error.to_string())
+        janus_runtime::interface::RuntimeErrorCode::AsyncTaskLost => {
+            Problem::from_code(ASYNC_TASK_LOST, error.to_string())
         }
         janus_runtime::interface::RuntimeErrorCode::TerminalTicketInvalid => {
             Problem::from_code(TERMINAL_TICKET_INVALID, error.to_string())

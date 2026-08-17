@@ -1,4 +1,4 @@
-import { Loader2 } from "lucide-solid";
+import { ChevronRight, Loader2 } from "lucide-solid";
 import { createSignal, type JSX, Show } from "solid-js";
 
 type ToolStatus = "running" | "success" | "failure";
@@ -56,20 +56,11 @@ export function ToolRow(props: ToolRowProps) {
         onClick={() => setOpen(!open())}
       >
         {row}
-        <svg
+        <ChevronRight
           aria-hidden="true"
-          width="13"
-          height="13"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
+          size={13}
           class={`collapsible-row__chevron${open() ? " collapsible-row__chevron--open" : ""}`}
-        >
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
+        />
       </button>
       <Show when={open()}>
         <div class="collapsible-row__detail tool-row__detail">{props.detail}</div>
@@ -107,20 +98,11 @@ export function ToolGroupRow(props: ToolGroupRowProps) {
         onClick={() => setOpen(!open())}
       >
         {row}
-        <svg
+        <ChevronRight
           aria-hidden="true"
-          width="13"
-          height="13"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
+          size={13}
           class={`collapsible-row__chevron${open() ? " collapsible-row__chevron--open" : ""}`}
-        >
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
+        />
       </button>
       <Show when={open()}>
         <div class="collapsible-row__detail tool-row__detail tool-group__detail">

@@ -10,8 +10,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use janus_infrastructure::{database::Database, events::EventStore, secrets::SecretCipher};
 use janus_models::interface::{
-    ChatMessage, ChatRole, ContentPart, ModelClient, ModelRequest, ModelStreamEvent, ModelsInterface,
-    ProviderInput, ProviderKind,
+    ChatMessage, ChatRole, ContentPart, ModelClient, ModelRequest, ModelStreamEvent,
+    ModelsInterface, ProviderInput, ProviderKind,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -130,6 +130,7 @@ fn user_msg(text: &str) -> ChatMessage {
         }],
         tool_call_id: None,
         tool_calls: Vec::new(),
+        reasoning_content: None,
     }
 }
 

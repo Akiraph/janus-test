@@ -78,44 +78,6 @@ impl WorkspaceInterface {
             .map_err(WorkspaceError::Internal)
     }
 
-    async fn record_manifest_revision(
-        &self,
-        handle: &WorkspaceHandle,
-        manifest_root_hash: &str,
-        cause: &str,
-        actor: serde_json::Value,
-    ) -> Result<RevisionRef, WorkspaceError> {
-        self.advance_revision(
-            handle,
-            None,
-            cause,
-            actor,
-            Some(manifest_root_hash),
-            Some("external_scan"),
-        )
-        .await
-    }
-
-    pub(crate) async fn record_manifest_revision_if_needed(
-        &self,
-        handle: &WorkspaceHandle,
-        manifest_root_hash: &str,
-        actor: serde_json::Value,
-    ) -> Result<RevisionRef, WorkspaceError> {
-        let current = self.current_revision(handle).await?;
-        let current_root: Option<String> = sqlx::query_scalar(
-            "SELECT manifest_root_hash FROM content_revisions WHERE revision_id = ?",
-        )
-        .bind(&current.0)
-        .fetch_one(&self.pool)
-        .await?;
-        if current_root.as_deref() == Some(manifest_root_hash) {
-            return Ok(current);
-        }
-        self.record_manifest_revision(handle, manifest_root_hash, "workspace.propagation", actor)
-            .await
-    }
-
     async fn advance_revision(
         &self,
         handle: &WorkspaceHandle,
@@ -247,4 +209,3 @@ impl WorkspaceInterface {
         Ok(revision_ref)
     }
 }
-

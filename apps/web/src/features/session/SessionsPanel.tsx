@@ -4,20 +4,14 @@ import Loader2 from "lucide-solid/icons/loader-2";
 import MessageSquare from "lucide-solid/icons/message-square";
 import Plus from "lucide-solid/icons/plus";
 import Trash2 from "lucide-solid/icons/trash-2";
-import { createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import { Alt } from "../../components/ui/Alt";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { useNotifications } from "../../components/ui/notifications";
 import { SideScrollbar } from "../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../lib/api";
-import {
-  createSession,
-  deleteSession,
-  getErrorMessage,
-  getSession,
-  waitForOperation,
-} from "../../lib/api";
-import { useSessions } from "../../lib/queries";
+import { createSession, deleteSession, getErrorMessage, getSession } from "../../lib/api";
+import { useOperation, useSessions } from "../../lib/queries";
 import "../projects/workspace/sessions-panel.css";
 
 interface SessionsPanelProps {
@@ -33,51 +27,122 @@ interface SessionsPanelProps {
   onSessionDeleted?: (sessionId: string) => void;
 }
 
+type SessionOperation =
+  | {
+      operationId: string;
+      kind: "create";
+      projectId: string;
+      sessionId: string;
+    }
+  | {
+      operationId: string;
+      kind: "delete";
+      session: SessionSummary;
+    };
+
 export function SessionsPanel(props: SessionsPanelProps) {
   const sessions = useSessions(props.projectId);
   const queryClient = useQueryClient();
   const notify = useNotifications().notify;
   const [deletingId, setDeletingId] = createSignal<string | null>(null);
+  const [sessionOperation, setSessionOperation] = createSignal<SessionOperation | null>(null);
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
+  const trackedOperation = useOperation(() => sessionOperation()?.operationId);
+  let handledOperationId: string | null = null;
 
-  async function finishCreation(
-    operationId: string,
-    projectId: string,
-    sessionId: string,
-  ): Promise<void> {
-    try {
-      const completed = await waitForOperation(operationId, 30_000);
-      const durableSessionId = completed.target_id ?? sessionId;
-      const session = await getSession(durableSessionId);
-      queryClient.setQueryData(["session", session.id], session);
-      queryClient.setQueryData(["session-timeline", session.id], {
-        items: [],
-        has_older: false,
-        has_newer: false,
-        oldest_cursor: null,
-        newest_cursor: null,
-      });
-      queryClient.setQueryData<SessionSummary[]>(["sessions", projectId], (prev) => {
-        const list = prev ?? [];
-        if (list.some((candidate) => candidate.id === session.id)) {
-          return list.map((candidate) => (candidate.id === session.id ? session : candidate));
-        }
-        return [session, ...list];
-      });
-      void queryClient.invalidateQueries({ queryKey: ["session-context", session.id] });
-    } catch (error) {
-      queryClient.removeQueries({ queryKey: ["session", sessionId] });
-      queryClient.setQueryData<SessionSummary[]>(["sessions", projectId], (prev) =>
-        (prev ?? []).filter((candidate) => candidate.id !== sessionId),
-      );
-      props.onSessionDeleted?.(sessionId);
-      notify(getErrorMessage(error, "Failed to create session"), {
-        variant: "danger",
-      });
-    } finally {
-      void sessions.refetch();
+  createEffect(() => {
+    const current = sessionOperation();
+    const operation = trackedOperation.data;
+    if (
+      !current ||
+      !operation ||
+      operation.id !== current.operationId ||
+      handledOperationId === operation.id
+    ) {
+      return;
     }
-  }
+
+    if (operation.status !== "succeeded") {
+      if (
+        operation.status === "failed" ||
+        operation.status === "canceled" ||
+        operation.status === "needs_attention"
+      ) {
+        handledOperationId = operation.id;
+        setSessionOperation(null);
+        if (current.kind === "create") {
+          queryClient.removeQueries({ queryKey: ["session", current.sessionId] });
+          queryClient.setQueryData<SessionSummary[]>(["sessions", current.projectId], (prev) =>
+            (prev ?? []).filter((candidate) => candidate.id !== current.sessionId),
+          );
+          props.onSessionDeleted?.(current.sessionId);
+          props.onCreatingChange(false);
+          notify(getErrorMessage(operation.problem, "Failed to create session"), {
+            variant: "danger",
+          });
+        } else {
+          queryClient.setQueryData<SessionSummary[]>(
+            ["sessions", current.session.project_id],
+            (prev) => {
+              const list = prev ?? [];
+              return list.some((candidate) => candidate.id === current.session.id)
+                ? list
+                : [current.session, ...list];
+            },
+          );
+          setDeletingId(null);
+          notify(getErrorMessage(operation.problem, "Failed to delete session"), {
+            variant: "danger",
+          });
+        }
+      }
+      return;
+    }
+
+    handledOperationId = operation.id;
+    if (current.kind === "create") {
+      const durableSessionId = operation.target_id ?? current.sessionId;
+      void (async () => {
+        try {
+          const cached = queryClient.getQueryData<SessionSummary>(["session", durableSessionId]);
+          const session = cached?.state === "ready" ? cached : await getSession(durableSessionId);
+          queryClient.setQueryData(["session", session.id], session);
+          queryClient.setQueryData(["session-timeline", session.id], {
+            items: [],
+            has_older: false,
+            has_newer: false,
+            oldest_cursor: null,
+            newest_cursor: null,
+          });
+          queryClient.setQueryData<SessionSummary[]>(["sessions", current.projectId], (prev) => {
+            const list = prev ?? [];
+            if (list.some((candidate) => candidate.id === session.id)) {
+              return list.map((candidate) => (candidate.id === session.id ? session : candidate));
+            }
+            return [session, ...list];
+          });
+          void queryClient.invalidateQueries({ queryKey: ["session-context", session.id] });
+        } catch (error) {
+          queryClient.removeQueries({ queryKey: ["session", current.sessionId] });
+          queryClient.setQueryData<SessionSummary[]>(["sessions", current.projectId], (prev) =>
+            (prev ?? []).filter((candidate) => candidate.id !== current.sessionId),
+          );
+          props.onSessionDeleted?.(current.sessionId);
+          notify(getErrorMessage(error, "Failed to create session"), {
+            variant: "danger",
+          });
+        } finally {
+          setSessionOperation(null);
+          props.onCreatingChange(false);
+        }
+      })();
+      return;
+    }
+
+    queryClient.removeQueries({ queryKey: ["session", current.session.id] });
+    setSessionOperation(null);
+    setDeletingId(null);
+  });
 
   async function onCreate() {
     const id = props.projectId();
@@ -88,18 +153,15 @@ export function SessionsPanel(props: SessionsPanelProps) {
       const accepted = await createSession(id, { title: "New session" }, crypto.randomUUID());
       const sessionId = accepted.target_id;
       if (!sessionId) throw new Error("Session creation was accepted without a Session id");
+      queryClient.setQueryData(["operations", accepted.id], accepted);
       const now = new Date().toISOString();
       const optimisticSession: SessionSummary = {
         id: sessionId,
-        kind: "session",
         project_id: id,
         title: "New session",
         state: "creating",
         active_turn_id: null,
         version: "",
-        source_main_revision_id: "",
-        workspace_handle: "",
-        workspace_revision: null,
         model_preference: null,
         created_at: now,
         updated_at: now,
@@ -121,14 +183,13 @@ export function SessionsPanel(props: SessionsPanelProps) {
       // continue preparing the Git worktree while the document shows its
       // creating state with the composer disabled.
       props.onOpenSession(sessionId, optimisticSession.title);
-      await finishCreation(accepted.id, id, sessionId);
+      setSessionOperation({ operationId: accepted.id, kind: "create", projectId: id, sessionId });
     } catch (error) {
       // Session create/delete are sidebar actions — failures surface as a
       // transient toast, not a red block that occupies the session list.
       notify(getErrorMessage(error, "Failed to create session"), {
         variant: "danger",
       });
-    } finally {
       props.onCreatingChange(false);
     }
   }
@@ -138,28 +199,16 @@ export function SessionsPanel(props: SessionsPanelProps) {
     setDeletingId(session.id);
     try {
       const accepted = await deleteSession(session.id, session.version, crypto.randomUUID());
+      queryClient.setQueryData(["operations", accepted.id], accepted);
       props.onSessionDeleted?.(session.id);
       queryClient.setQueryData<SessionSummary[]>(["sessions", session.project_id], (prev) =>
         (prev ?? []).filter((candidate) => candidate.id !== session.id),
       );
-      setDeletingId(null);
-      void (async () => {
-        try {
-          await waitForOperation(accepted.id, 30_000);
-          queryClient.removeQueries({ queryKey: ["session", session.id] });
-        } catch (error) {
-          notify(getErrorMessage(error, "Failed to delete session"), {
-            variant: "danger",
-          });
-        } finally {
-          void sessions.refetch();
-        }
-      })();
+      setSessionOperation({ operationId: accepted.id, kind: "delete", session });
     } catch (error) {
       notify(getErrorMessage(error, "Failed to delete session"), {
         variant: "danger",
       });
-    } finally {
       setDeletingId(null);
     }
   }
@@ -190,7 +239,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
                 <EmptyState
                   icon={MessageSquare}
                   title="No sessions"
-                  description="Create a Session to chat with the Supervisor on a copy of this project."
+                  description="Create a Session to work with the Supervisor in this project's Main workspace."
                   class="sessions-panel__empty"
                 />
               }
@@ -251,8 +300,7 @@ function SessionRow(props: {
         </Alt>
         <span class="sessions-panel__title">{props.session.title ?? "Untitled session"}</span>
       </button>
-      {/* Trailing row action — invisible until hover/focus, mirroring the legacy
-          panel's hover-reveal affordance. */}
+      {/* Keep the secondary row action quiet until the row receives attention. */}
       <button
         type="button"
         class="sessions-panel__action"
@@ -272,7 +320,7 @@ function SessionRow(props: {
   );
 }
 
-/** Map a server Session state to an icon + label, mirroring the legacy panel. */
+/** Map a server Session state to the icon and label used by the list row. */
 function createStatusInfo(state: string): {
   icon: import("solid-js").JSX.Element;
   label: string;

@@ -24,6 +24,9 @@ fn test_config(data_root: PathBuf) -> Config {
         webauthn_rp_id: "localhost".into(),
         public_origin: url::Url::parse("http://localhost").expect("static test URL"),
         event_heartbeat: Duration::from_millis(50),
+        automation_webhook_enabled: false,
+        automation_webhook_secret: None,
+        automation_github_token: None,
     }
 }
 

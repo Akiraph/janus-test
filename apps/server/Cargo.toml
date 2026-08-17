@@ -14,6 +14,7 @@ clap.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+hmac.workspace = true
 http.workspace = true
 janus-identity = { path = "../../crates/identity" }
 janus-infrastructure = { path = "../../crates/infrastructure" }
@@ -26,6 +27,7 @@ janus-sessions = { path = "../../crates/sessions" }
 janus-source-control = { path = "../../crates/source-control" }
 janus-workspace = { path = "../../crates/workspace" }
 rand.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -38,7 +40,6 @@ url.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 tempfile.workspace = true
 tower.workspace = true
 

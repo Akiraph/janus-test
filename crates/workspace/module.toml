@@ -4,9 +4,7 @@ owned_tables = [
   "workspace_copies",
   "content_revisions",
   "workspace_snapshots",
-  "propagation_links",
-  "workspace_propagation_conflicts",
   "workspace_mutation_intents",
 ]
-publishes = ["session.revision_changed", "workspace.diff_changed"]
+publishes = []
 allowed_module_dependencies = []

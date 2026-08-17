@@ -1,4 +1,6 @@
+import Flag from "lucide-solid/icons/flag";
 import Loader2 from "lucide-solid/icons/loader-2";
+import Minimize2 from "lucide-solid/icons/minimize-2";
 import Paperclip from "lucide-solid/icons/paperclip";
 import Send from "lucide-solid/icons/send";
 import Square from "lucide-solid/icons/square";
@@ -25,6 +27,7 @@ export interface SessionMessageReceipt {
 interface SessionComposerProps {
   delivery: "send" | "queue";
   disabled?: boolean;
+  settingsDisabled?: boolean;
   /** True when a Turn is actively running (queued or executing). When true
    * the primary action becomes Cancel (stop) instead of Send. */
   isRunning?: boolean;
@@ -37,11 +40,15 @@ interface SessionComposerProps {
     content: string,
     modelPreference: SessionModelPreference | null,
     attachmentIds: readonly string[],
+    goalMode: boolean,
   ) => Promise<SessionMessageReceipt>;
   onUploadAttachment: (sessionId: string, file: File) => Promise<AttachmentView>;
   onDeleteAttachment: (sessionId: string, attachmentId: string) => Promise<void>;
+  onCompact?: () => Promise<void>;
   onCancel?: (() => Promise<void>) | undefined;
 }
+
+const DEFAULT_CONTEXT_LIMIT = 1_000_000;
 
 const REASONING_OPTIONS: readonly SelectOption[] = [
   { value: "none", label: "No reasoning" },
@@ -61,6 +68,8 @@ export function SessionComposer(props: SessionComposerProps) {
   const [reasoningEffort, setReasoningEffort] = createSignal<ReasoningEffort>("none");
   const [attachments, setAttachments] = createSignal<AttachmentView[]>([]);
   const [uploading, setUploading] = createSignal(false);
+  const [compacting, setCompacting] = createSignal(false);
+  const [goalMode, setGoalMode] = createSignal(false);
   const [canceling, setCanceling] = createSignal(false);
   let textarea: HTMLTextAreaElement | undefined;
   let fileInput: HTMLInputElement | undefined;
@@ -116,7 +125,13 @@ export function SessionComposer(props: SessionComposerProps) {
 
   const hasContent = () => Boolean(draft().trim()) || attachments().length > 0;
   const canSubmit = () =>
-    !props.disabled && !submitting() && !uploading() && !canceling() && hasContent();
+    !props.disabled &&
+    !submitting() &&
+    !uploading() &&
+    !canceling() &&
+    !compacting() &&
+    !compactInProgress() &&
+    hasContent();
   const actionLabel = () => (props.delivery === "queue" ? "Queue message" : "Send message");
 
   function resize() {
@@ -136,6 +151,7 @@ export function SessionComposer(props: SessionComposerProps) {
         content,
         selectedPreference(),
         attachments().map((attachment) => attachment.id),
+        goalMode(),
       );
       setDraft("");
       setAttachments([]);
@@ -219,17 +235,46 @@ export function SessionComposer(props: SessionComposerProps) {
     };
   }
 
-  const contextLabel = () => {
-    const usage = props.contextUsage;
-    if (!usage || usage.context_limit <= 0) return "--";
-    return `${Math.min(999, Math.round((usage.estimated_input_tokens / usage.context_limit) * 100))}%`;
-  };
+  const contextLimit = () =>
+    props.contextUsage?.context_limit && props.contextUsage.context_limit > 0
+      ? props.contextUsage.context_limit
+      : DEFAULT_CONTEXT_LIMIT;
+  const contextTokens = () => Math.max(0, props.contextUsage?.estimated_input_tokens ?? 0);
+  const contextPercent = () =>
+    Math.min(100, Math.max(0, Math.round((contextTokens() / contextLimit()) * 100)));
+  const contextLabel = () => `${contextPercent()}%`;
 
   const contextTitle = () => {
-    const usage = props.contextUsage;
-    if (!usage) return "Context usage is not available yet";
-    return `${usage.estimated_input_tokens.toLocaleString()} of ${usage.context_limit.toLocaleString()} context tokens used`;
+    return `${formatContextTokens(contextTokens())}/${formatContextTokens(contextLimit())} ${contextPercent()}%`;
   };
+
+  const compactStatus = () => props.contextUsage?.compact_status;
+  const compactInProgress = () => compactStatus() === "scheduled" || compactStatus() === "running";
+  const compactDisabled = () =>
+    Boolean(
+      props.disabled ||
+        props.settingsDisabled ||
+        props.isRunning ||
+        submitting() ||
+        uploading() ||
+        canceling() ||
+        compacting() ||
+        compactInProgress(),
+    );
+
+  async function compact() {
+    if (!props.onCompact || compactDisabled()) return;
+    setCompacting(true);
+    try {
+      await props.onCompact();
+    } catch (cause) {
+      notify(getErrorMessage(cause, "Context could not be compacted"), {
+        variant: "danger",
+      });
+    } finally {
+      setCompacting(false);
+    }
+  }
 
   return (
     <form
@@ -303,7 +348,7 @@ export function SessionComposer(props: SessionComposerProps) {
               submitting() ||
               uploading() ||
               canceling() ||
-              Boolean(props.disabled) ||
+              Boolean(props.settingsDisabled) ||
               attachments().length >= (props.limits?.max_attachments ?? 20)
             }
             aria-label={uploading() ? "Uploading attachment" : "Add attachment"}
@@ -318,7 +363,7 @@ export function SessionComposer(props: SessionComposerProps) {
             aria-label="Model"
             value={modelValue()}
             options={modelOptions()}
-            disabled={submitting() || canceling() || Boolean(props.disabled)}
+            disabled={submitting() || canceling() || Boolean(props.settingsDisabled)}
             onChange={(value) => {
               setModelValue(value);
             }}
@@ -331,17 +376,59 @@ export function SessionComposer(props: SessionComposerProps) {
             disabled={
               submitting() ||
               canceling() ||
-              Boolean(props.disabled) ||
+              Boolean(props.settingsDisabled) ||
               !selectedModel() ||
               !supportsReasoning()
             }
             onChange={(value) => setReasoningEffort(value as ReasoningEffort)}
           />
-          <span class="session-composer__context" title={contextTitle()}>
-            {contextLabel()}
+          <Button
+            type="button"
+            variant={goalMode() ? "outline" : "ghost"}
+            size="sm"
+            iconOnly
+            aria-label={goalMode() ? "Disable goal mode" : "Enable goal mode"}
+            aria-pressed={goalMode()}
+            title="Goal mode"
+            disabled={submitting() || canceling() || Boolean(props.settingsDisabled)}
+            onClick={() => setGoalMode((current) => !current)}
+          >
+            <Flag size={15} />
+          </Button>
+          <span
+            class="session-composer__context"
+            role="progressbar"
+            aria-label="Context usage"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={contextPercent()}
+            title={contextTitle()}
+            style={`--context-progress: ${contextPercent()}%`}
+          >
+            <span class="session-composer__context-ring" aria-hidden="true">
+              <span>{contextLabel()}</span>
+            </span>
           </span>
+          <Show when={props.onCompact}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              iconOnly
+              disabled={compactDisabled()}
+              aria-label={
+                compacting() || compactInProgress() ? "Compacting context" : "Compact context"
+              }
+              title="Compact context"
+              onClick={() => void compact()}
+            >
+              <Show when={compacting() || compactInProgress()} fallback={<Minimize2 size={15} />}>
+                <Loader2 size={15} class="ui-spinner" />
+              </Show>
+            </Button>
+          </Show>
           <span class="session-composer__delivery">
-            {props.delivery === "queue" ? "Next turn" : "Current session"}
+            {props.delivery === "queue" ? "Next turn" : "Send now"}
           </span>
         </div>
         <Show
@@ -384,6 +471,16 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatContextTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${trimDecimal(tokens / 1_000_000)}M`;
+  if (tokens >= 1_000) return `${trimDecimal(tokens / 1_000)}k`;
+  return String(tokens);
+}
+
+function trimDecimal(value: number): string {
+  return value.toFixed(1).replace(/\.0$/, "");
 }
 
 function modelKey(providerId: string, upstreamModelId: string): string {

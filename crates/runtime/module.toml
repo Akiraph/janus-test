@@ -3,10 +3,9 @@ public_root = "interface.rs"
 owned_tables = [
   "runtimes",
   "log_streams",
-  "jobs",
-  "services",
+  "async_tasks",
   "terminals",
   "runtime_access_tickets",
 ]
-publishes = ["runtime.changed", "job.changed", "service.changed", "terminal.changed"]
+publishes = ["runtime.changed", "async_task.changed", "terminal.changed"]
 allowed_module_dependencies = []

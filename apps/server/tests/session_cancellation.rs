@@ -29,6 +29,9 @@ fn test_config(data_root: PathBuf) -> Config {
         webauthn_rp_id: "localhost".into(),
         public_origin: url::Url::parse("http://localhost").expect("static test URL"),
         event_heartbeat: Duration::from_millis(50),
+        automation_webhook_enabled: false,
+        automation_webhook_secret: None,
+        automation_github_token: None,
     }
 }
 
@@ -95,10 +98,8 @@ async fn seed_session(
     .await?;
     sqlx::query(
         "INSERT INTO sessions \
-         (id, project_id, kind, state, workspace_handle, active_turn_id, \
-          source_main_revision_id, version, created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, 'regular', 'active', 'workspace', ?, 'revision', \
-                 'v_session', ?, ?, ?)",
+         (id, project_id, state, active_turn_id, version, created_at, updated_at, last_activity_at) \
+         VALUES (?, ?, 'active', ?, 'v_session', ?, ?, ?)",
     )
     .bind(session_id.to_string())
     .bind(project_id.to_string())

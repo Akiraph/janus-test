@@ -80,8 +80,8 @@ async fn main() -> anyhow::Result<()> {
         .context("record system startup event")?;
 
     workers::spawn(state.application().clone());
-    workers::spawn_job_wake(state.application().clone());
-    workers::spawn_ask_expiry(state.application().clone());
+    workers::spawn_auto_context_compact(state.application().clone());
+    workers::spawn_async_task_delivery(state.application().clone());
     janus_server::application::notification_worker::spawn(state.application().clone());
     janus_server::application::state_worker::spawn(state.application().clone());
 

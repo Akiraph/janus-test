@@ -17,14 +17,14 @@ export function stableSessionTurnId(
   return candidates.active ?? candidates.pending ?? previous ?? candidates.latest;
 }
 
-/** A started or handed-off POST response is authoritative before session SSE
+/** A started POST response is authoritative before session SSE
  * catches up. Queued messages must leave the currently running turn visible. */
 export function renderSessionTurnId(
   previous: string | undefined,
   candidates: SessionTurnCandidates,
   accepted: AcceptedSessionTurn | null,
 ): string | undefined {
-  if (accepted && (accepted.route === "started" || accepted.route === "handed_off")) {
+  if (accepted?.route === "started") {
     return accepted.id;
   }
   if (accepted?.route === "queued" && previous) {

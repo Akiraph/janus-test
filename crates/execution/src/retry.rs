@@ -1,57 +1,41 @@
-//! Model retry classifier.
-//!
-//! Turns a `ModelStreamEvent::Failed { code, detail }` into a typed
-//! `RetryDecision` used by the Round-internal retry loop.
-//! Retry-After headers are not surfaced by the stream layer yet, so the
-//! `retry_after_ms` comes from an exponential backoff schedule keyed off the
-//! fault class. If a future stream change exposes a parsed header, the caller
-//! can pass it through `RetryDecision::override_after`.
+//! Model retry classification and backoff.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Fault class driving backoff and the round's terminal posture.
-///
-/// Per the product spec ("Reconnecting (X/5): reason"), almost every provider
-/// fault is retried in place with a short backoff so the user sees the attempt
-/// counter climb instead of a silent immediate failure. Only faults we *know*
-/// cannot succeed on a re-send are excluded.
+/// After this many reconnects the retry loop switches to low-frequency
+/// backoff. This is deliberately a threshold, never an execution limit.
+pub const RECONNECT_NOTICE_ATTEMPTS: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultClass {
-    /// Credential / quota / invalid-request faults that a re-send cannot fix.
-    /// Never retry in place; park the turn `waiting_for_model` (so the UI can
-    /// surface the reason and offer a manual retry) or fail it.
     Config,
-    /// Everything else — network blips, HTTP 5xx, timeouts, truncated streams,
-    /// transport errors, and any fault we could not positively identify as
-    /// deterministic. Retry in place up to the attempt cap before parking.
     Transient,
 }
 
-/// Decision for one failed attempt.
 #[derive(Debug, Clone)]
 pub struct RetryDecision {
     pub class: FaultClass,
-    /// Suggested delay before the next attempt of this candidate.
     pub retry_after: Duration,
 }
 
-/// Caps the in-Round retry loop: one initial attempt plus five retries. The
-/// `model_attempts.attempt_number` column is `CHECK BETWEEN 0 AND 5`, which pins
-/// this cap — changing it requires a migration. The "X/5" surfaced to the UI
-/// counts retries, so the retry index runs 1..=5.
-pub const MAX_ATTEMPTS_PER_CANDIDATE: usize = 6;
-
-/// Fixed 10-second backoff for all transient faults so the user sees the
-/// attempt counter climb at a predictable cadence. Config faults never retry
-/// (zero backoff); the class is the only meaningful signal for them.
-fn retry_backoff(_attempt: usize) -> Duration {
-    Duration::from_secs(10)
+fn retry_backoff(attempt: usize) -> Duration {
+    let base_seconds = if attempt <= RECONNECT_NOTICE_ATTEMPTS {
+        2
+    } else {
+        10_u64.saturating_add((attempt - RECONNECT_NOTICE_ATTEMPTS) as u64 * 5)
+    };
+    let jitter_limit_ms = if attempt <= RECONNECT_NOTICE_ATTEMPTS {
+        1_000
+    } else {
+        5_000
+    };
+    let jitter_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_millis() % jitter_limit_ms)
+        .unwrap_or(0);
+    Duration::from_secs(base_seconds.min(60)) + Duration::from_millis(u64::from(jitter_ms))
 }
 
-/// Classify a provider fault. `attempt` is the retry index we are about to make
-/// (1 = first retry after the initial attempt failed). Config faults never
-/// retry (zero backoff); everything else is Transient and retried with the
-/// short schedule.
 pub fn classify(code: &str, detail: &str, attempt: usize) -> RetryDecision {
     let class = classify_fault(code, detail);
     let retry_after = match class {
@@ -61,36 +45,23 @@ pub fn classify(code: &str, detail: &str, attempt: usize) -> RetryDecision {
     RetryDecision { class, retry_after }
 }
 
-/// Classification only, without a backoff. Used when a caller needs the class
-/// (to decide the terminal posture) but not the schedule.
 pub fn classify_fault(code: &str, detail: &str) -> FaultClass {
     match code {
-        // Hard credential rejection — re-sending identical headers cannot help.
         "PROVIDER_AUTH_FAILED" => FaultClass::Config,
         "PROVIDER_STREAM_FAILED" | "PROVIDER_UNREACHABLE" | "PROVIDER_TIMEOUT" => {
-            // A streaming fault may carry an HTTP status or transport word in
-            // its detail. Only a small set of HTTP statuses are known to be
-            // retries-will-never-help (auth/quota/schema); everything else —
-            // including HTTP 5xx, timeouts, truncations, and *unidentified*
-            // statuses — is retryable per the "Reconnecting (X/5)" spec.
             if looks_config_fault(detail) {
                 FaultClass::Config
             } else {
                 FaultClass::Transient
             }
         }
-        // Unknown error code: we cannot prove it is deterministic, and the
-        // spec prefers retrying over failing fast, so retry.
         _ => FaultClass::Transient,
     }
 }
 
 fn looks_config_fault(detail: &str) -> bool {
-    let l = detail.to_ascii_lowercase();
-    /// Only responses a re-send provably cannot satisfy: bad credentials or a
-    /// malformed/bad-request payload. Quota / rate-limit responses ARE retried
-    /// (they resolve once the window resets), so they are intentionally absent.
-    const CONFIG: &[&str] = &[
+    let lower = detail.to_ascii_lowercase();
+    [
         "http 400",
         "http 401",
         "http 403",
@@ -100,8 +71,9 @@ fn looks_config_fault(detail: &str) -> bool {
         "forbidden",
         "invalid_api_key",
         "invalid request",
-    ];
-    CONFIG.iter().any(|k| l.contains(k))
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 #[cfg(test)]
@@ -109,41 +81,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_failure_is_config_no_backoff() {
-        let d = classify("PROVIDER_AUTH_FAILED", "provider rejected credentials", 0);
-        assert_eq!(d.class, FaultClass::Config);
-        assert_eq!(d.retry_after, Duration::ZERO);
+    fn auth_failure_is_config_without_backoff() {
+        let decision = classify("PROVIDER_AUTH_FAILED", "provider rejected credentials", 0);
+        assert_eq!(decision.class, FaultClass::Config);
+        assert_eq!(decision.retry_after, Duration::ZERO);
     }
 
     #[test]
-    fn rate_limit_is_transient_with_fixed_10s() {
-        // HTTP 429 is quota/rate, retried at a fixed 10-second interval.
-        let d = classify("PROVIDER_STREAM_FAILED", "provider HTTP 429", 1);
-        assert_eq!(d.class, FaultClass::Transient);
-        assert_eq!(d.retry_after, Duration::from_secs(10));
-        let d2 = classify("PROVIDER_STREAM_FAILED", "provider HTTP 429", 3);
-        assert_eq!(d2.retry_after, Duration::from_secs(10));
+    fn transient_faults_remain_retryable_after_notice_threshold() {
+        let decision = classify("PROVIDER_STREAM_FAILED", "provider HTTP 429", 6);
+        assert_eq!(decision.class, FaultClass::Transient);
+        assert!(decision.retry_after >= Duration::from_secs(10));
     }
 
     #[test]
-    fn schema_400_is_config_not_transient() {
-        let d = classify("PROVIDER_STREAM_FAILED", "provider HTTP 400", 0);
-        assert_eq!(d.class, FaultClass::Config);
+    fn schema_error_is_config() {
+        let decision = classify("PROVIDER_STREAM_FAILED", "provider HTTP 400", 0);
+        assert_eq!(decision.class, FaultClass::Config);
     }
 
     #[test]
-    fn unknown_code_is_transient() {
-        // Per the "Reconnecting (X/5)" spec, an unidentified fault is retried
-        // rather than failing the Turn outright.
-        let d = classify("SOMETHING_ELSE", "x", 1);
-        assert_eq!(d.class, FaultClass::Transient);
+    fn unknown_error_is_transient() {
+        let decision = classify("SOMETHING_ELSE", "x", 1);
+        assert_eq!(decision.class, FaultClass::Transient);
     }
 
     #[test]
-    fn backoff_is_fixed_10s() {
-        // All transient faults retry at a fixed 10-second interval.
-        let d = classify("PROVIDER_STREAM_FAILED", "provider HTTP 503", 9);
-        assert_eq!(d.class, FaultClass::Transient);
-        assert_eq!(d.retry_after, Duration::from_secs(10));
+    fn backoff_has_a_low_frequency_cap() {
+        let decision = classify("PROVIDER_STREAM_FAILED", "provider HTTP 503", 100);
+        assert!(decision.retry_after < Duration::from_secs(66));
     }
 }

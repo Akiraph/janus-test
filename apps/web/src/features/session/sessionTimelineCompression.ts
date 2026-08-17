@@ -88,7 +88,7 @@ function createCompressedActivityGroup(
   const title = formatActivityTitle(thoughts, counts, isLive);
   const groupId = `group:${items[0]?.id ?? "activity"}`;
   const version = `${isLatestGroup ? "latest" : "history"}:${items
-    .map((item) => `${item.id}:${item.version ?? ""}`)
+    .map((item) => `${item.id}:${item.version ?? ""}:${turnStatusVersion(item)}`)
     .join("|")}`;
   const turnStatus = [...items].reverse().find((item) => item.turnStatus)?.turnStatus ?? null;
 
@@ -119,6 +119,18 @@ function createCompressedActivityGroup(
       activity: counts,
     },
   };
+}
+
+function turnStatusVersion(item: CompressibleActivityItem): string {
+  const status = item.turnStatus;
+  if (!status) return "";
+  return [
+    status.id,
+    status.status,
+    status.cancellation_reason ?? "",
+    status.completion_reason ?? "",
+    status.updated_at,
+  ].join(":");
 }
 
 function toActivityDetail(item: CompressibleActivityItem): ToolActivityDetail {
@@ -161,17 +173,7 @@ function compressedStatus(tools: readonly CompressibleTool[]): ToolStatus {
 function hasActiveTurn(items: readonly CompressibleActivityItem[]): boolean {
   return items.some((item) => {
     const status = item.turnStatus?.status;
-    return (
-      status !== undefined &&
-      [
-        "queued",
-        "running",
-        "waiting_for_job",
-        "waiting_for_ask",
-        "waiting_for_model",
-        "canceling",
-      ].includes(status)
-    );
+    return status !== undefined && ["queued", "running", "canceling"].includes(status);
   });
 }
 
@@ -200,7 +202,7 @@ function formatActivityTitle(
 
 function formatThoughtTitle(thoughts: readonly CompressibleThought[], live: boolean): string {
   const durationMs = thoughts.reduce((sum, thought) => sum + (thought.durationMs ?? 0), 0);
-  const duration = durationMs > 0 ? ` ${formatThoughtDuration(durationMs)}` : "";
+  const duration = ` ${formatThoughtDuration(durationMs)}`;
   return `${live ? "Thinking" : "Thought"}${duration}`;
 }
 

@@ -1,132 +1,7 @@
-//! Job/round scheduling and turn interruption: waiting sets, job
-//! settlement, interrupt and cancel transactions.
+//! Round scheduling and Turn interruption/cancel transactions.
 use super::*;
 
 impl ExecutionInterface {
-    pub async fn waiting_job_ids(&self, limit: i64) -> Result<Vec<JobId>, ExecutionError> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT job_id FROM tool_calls \
-             WHERE status = 'waiting' AND job_id IS NOT NULL \
-             ORDER BY started_at ASC LIMIT ?",
-        )
-        .bind(limit.clamp(1, 100))
-        .fetch_all(&self.pool)
-        .await?;
-        ids.into_iter()
-            .map(|id| {
-                id.parse()
-                    .map_err(|_| ExecutionError::Internal(anyhow::anyhow!("invalid Job id")))
-            })
-            .collect()
-    }
-
-    pub async fn settle_job_tool_call_in_tx(
-        &self,
-        tx: &mut sqlx::SqliteConnection,
-        job: &JobProjection,
-        now: &str,
-    ) -> Result<Option<ToolCallSettlement>, ExecutionError> {
-        if !job.status.is_terminal() {
-            return Ok(None);
-        }
-        let row: Option<(String, Option<String>, String, String)> = sqlx::query_as(
-            "SELECT call.tool_name, call.provider_call_id, round.turn_id, call.input_json \
-             FROM tool_calls AS call \
-             JOIN rounds AS round ON round.id = call.round_id \
-             WHERE call.id = ? AND call.status = 'waiting' \
-               AND (call.job_id IS NULL OR call.job_id = ?)",
-        )
-        .bind(job.initiated_by_tool_call_id.to_string())
-        .bind(job.id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((tool_name, provider_call_id, source_turn_id, input_json)) = row else {
-            return Ok(None);
-        };
-        let provider_call_id = provider_call_id.ok_or_else(|| {
-            ExecutionError::Internal(anyhow::anyhow!("waiting Tool Call has no Provider call id"))
-        })?;
-        let (status, error_code, disposition) = match job.status {
-            JobStatus::Succeeded => (
-                ToolCallStatus::Succeeded,
-                None,
-                ToolExecutionDisposition::Succeeded,
-            ),
-            JobStatus::Failed => (
-                ToolCallStatus::Failed,
-                Some("JOB_FAILED"),
-                ToolExecutionDisposition::Failed,
-            ),
-            JobStatus::Canceled => (
-                ToolCallStatus::Canceled,
-                Some("JOB_CANCELED"),
-                ToolExecutionDisposition::Failed,
-            ),
-            JobStatus::Lost => (
-                ToolCallStatus::Lost,
-                Some("JOB_LOST"),
-                ToolExecutionDisposition::Failed,
-            ),
-            JobStatus::Queued | JobStatus::Running => return Ok(None),
-        };
-        let summary = json!({
-            "job_id": job.id.to_string(),
-            "status": job.status.as_str(),
-            "exit": job.exit,
-            "usage": job.usage,
-            "log_stream_id": job.log_stream_id.to_string(),
-            "command_summary": job.command_summary,
-        });
-        let mut outcome = ToolOutcome {
-            disposition,
-            parts: vec![ToolResultPart::Text {
-                text: format!(
-                    "job {} {} (exit={:?}, log_stream={})",
-                    job.id,
-                    job.status.as_str(),
-                    job.exit.as_ref().and_then(|exit| exit.exit_code),
-                    job.log_stream_id,
-                ),
-            }],
-            summary,
-            error_code: error_code.map(str::to_owned),
-            finish_summary: None,
-            wait: None,
-        };
-        let input = serde_json::from_str::<Value>(&input_json).unwrap_or_else(|_| json!({}));
-        attach_tool_display(&tool_name, &input, &mut outcome);
-        let summary = outcome.summary.clone();
-        let (_, model_parts) = tool_result_message(&outcome, &provider_call_id);
-        let changed = sqlx::query(
-            "UPDATE tool_calls SET status = ?, result_summary_json = ?, error_code = ?, \
-                    job_id = ?, ended_at = ?, version = ? \
-             WHERE id = ? AND status = 'waiting' \
-               AND (job_id IS NULL OR job_id = ?)",
-        )
-        .bind(status.as_str())
-        .bind(summary.to_string())
-        .bind(&outcome.error_code)
-        .bind(job.id.to_string())
-        .bind(now)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .bind(job.initiated_by_tool_call_id.to_string())
-        .bind(job.id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        if changed.rows_affected() != 1 {
-            return Ok(None);
-        }
-        Ok(Some(ToolCallSettlement {
-            tool_call_id: job.initiated_by_tool_call_id.to_string(),
-            source_turn_id,
-            provider_call_id,
-            tool_name,
-            status,
-            summary,
-            model_parts,
-        }))
-    }
-
     pub async fn interrupt_execution_in_tx(
         &self,
         tx: &mut SqliteConnection,
@@ -150,14 +25,12 @@ impl ExecutionInterface {
         .await?;
         sqlx::query(
             "UPDATE tool_calls SET status = 'lost', error_code = 'CONTROL_PLANE_RESTART', \
-                    ended_at = ?, version = ? WHERE status IN ('running', 'waiting')",
+                    ended_at = ?, version = ? WHERE status = 'running'",
         )
         .bind(now)
         .bind(format!("v_{}", ToolCallId::new()))
         .execute(&mut *tx)
         .await?;
-        self.close_asks_in_tx(tx, None, AskClosure::ControlPlaneRestart, now)
-            .await?;
         Ok(())
     }
 
@@ -197,7 +70,7 @@ impl ExecutionInterface {
         sqlx::query(
             "UPDATE tool_calls SET status = 'canceled', error_code = 'USER_CANCEL', \
                     ended_at = ?, version = ? \
-             WHERE status IN ('requested', 'running', 'waiting') \
+             WHERE status IN ('requested', 'running') \
                AND round_id IN (SELECT id FROM rounds WHERE turn_id = ?)",
         )
         .bind(now)
@@ -214,8 +87,6 @@ impl ExecutionInterface {
         .bind(turn_id.to_string())
         .execute(&mut *tx)
         .await?;
-        self.close_asks_in_tx(tx, Some(turn_id), AskClosure::UserCancel, now)
-            .await?;
         Ok(round_ids)
     }
 
@@ -241,17 +112,17 @@ impl ExecutionInterface {
         }
         Ok(rounds)
     }
-
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ExecutionDependencies, ExecutionInterface, ToolCallSettlement, ToolCallStatus};
+    use super::{ExecutionDependencies, ExecutionInterface};
     use futures_util::future::BoxFuture;
     use janus_infrastructure::{
-        clock::{format_utc, now_utc, now_utc_str},
+        clock::now_utc_str,
         events::EventStore,
-        id::{AskId, JobId, LogStreamId, RoundId, RuntimeId, ServiceId, SessionId, TerminalId, ToolCallId, TurnId},
+        id::{AsyncTaskId, LogStreamId, RoundId, RuntimeId, TerminalId, ToolCallId, TurnId},
         managed_storage::BlobStore,
         operations::OperationInterface,
         secrets::SecretCipher,
@@ -260,10 +131,9 @@ mod tests {
     use janus_models::interface::ModelsInterface;
     use janus_projects::interface::ProjectsInterface;
     use janus_runtime::interface::{
-        ExecutorProcessHandle, ExecutorRuntimeHandle, ExecutionResult, ExecutionSpec, ExitSummary,
-        JobProjection, JobSpec, JobStatus, ProcessCompletion, ResourceUsage, RuntimeError,
-        RuntimeExecutor, RuntimeInterface, RuntimeSpec, ServiceSpec, TerminalSignal, TerminalSize,
-        TerminalSpec,
+        AsyncTaskSpec, ExecutionResult, ExecutionSpec, ExecutorProcessHandle,
+        ExecutorRuntimeHandle, ProcessCompletion, RuntimeError, RuntimeExecutor, RuntimeInterface,
+        RuntimeSpec, TerminalSignal, TerminalSize, TerminalSpec,
     };
     use janus_sessions::interface::SessionsInterface;
     use janus_workspace::interface::WorkspaceInterface;
@@ -296,52 +166,31 @@ mod tests {
         ) -> BoxFuture<'a, Result<ExecutionResult, RuntimeError>> {
             Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
         }
-        fn start_job<'a>(
+        fn start_async_task<'a>(
             &'a self,
-            _spec: JobSpec,
+            _spec: AsyncTaskSpec,
             _log_stream_id: LogStreamId,
         ) -> BoxFuture<'a, Result<ExecutorProcessHandle, RuntimeError>> {
             Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
         }
-        fn wait_job<'a>(
+        fn wait_async_task<'a>(
             &'a self,
-            _id: JobId,
+            _id: AsyncTaskId,
             _executor_nonce: &'a str,
         ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
             Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
         }
-        fn write_job_stdin<'a>(
+        fn write_async_task_stdin<'a>(
             &'a self,
-            _id: JobId,
+            _id: AsyncTaskId,
             _executor_nonce: &'a str,
             _input: Vec<u8>,
         ) -> BoxFuture<'a, Result<(), RuntimeError>> {
             Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
         }
-        fn cancel_job<'a>(
+        fn cancel_async_task<'a>(
             &'a self,
-            _id: JobId,
-            _executor_nonce: &'a str,
-        ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
-            Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
-        }
-        fn start_service<'a>(
-            &'a self,
-            _spec: ServiceSpec,
-            _log_stream_id: LogStreamId,
-        ) -> BoxFuture<'a, Result<ExecutorProcessHandle, RuntimeError>> {
-            Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
-        }
-        fn wait_service<'a>(
-            &'a self,
-            _id: ServiceId,
-            _executor_nonce: &'a str,
-        ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
-            Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
-        }
-        fn stop_service<'a>(
-            &'a self,
-            _id: ServiceId,
+            _id: AsyncTaskId,
             _executor_nonce: &'a str,
         ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
             Box::pin(async { Err(RuntimeError::RuntimeUnavailable) })
@@ -426,7 +275,7 @@ mod tests {
             data_root,
         );
         let models = ModelsInterface::new(pool.clone(), cipher, events.clone()).unwrap();
-        let sessions = SessionsInterface::new(pool.clone(), events.clone(), workspace.clone(), blobs.clone());
+        let sessions = SessionsInterface::new(pool.clone(), events.clone(), blobs.clone());
         let runtime = RuntimeInterface::new(
             pool.clone(),
             events.clone(),
@@ -494,62 +343,6 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_open_ask(
-        pool: &sqlx::SqlitePool,
-        id: &AskId,
-        turn_id: TurnId,
-        tool_call_id: &ToolCallId,
-        now: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO asks \
-             (id, turn_id, tool_call_id, mode, prompt_json, choices_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'blocking', '{}', '{}', 'open', 'v1', ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(turn_id.to_string())
-        .bind(tool_call_id.to_string())
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
-    fn job_projection(
-        id: JobId,
-        initiated_by_tool_call_id: ToolCallId,
-        turn_id: TurnId,
-        status: JobStatus,
-        now: &str,
-    ) -> JobProjection {
-        JobProjection {
-            id,
-            runtime_id: RuntimeId::new(),
-            session_id: SessionId::new(),
-            controlling_turn_id: turn_id,
-            cli_kind: None,
-            initiated_by_tool_call_id,
-            cli_session_id: None,
-            status,
-            command_summary: "ls".to_owned(),
-            log_stream_id: LogStreamId::new(),
-            exit: if matches!(status, JobStatus::Succeeded) {
-                Some(ExitSummary {
-                    exit_code: Some(0),
-                    signal: None,
-                })
-            } else {
-                None
-            },
-            usage: ResourceUsage::default(),
-            version: "v1".to_owned(),
-            created_at: now.to_owned(),
-            started_at: Some(now.to_owned()),
-            ended_at: Some(now.to_owned()),
-        }
-    }
-
     async fn tool_call_status_and_error(
         pool: &sqlx::SqlitePool,
         id: &ToolCallId,
@@ -570,12 +363,10 @@ mod tests {
         seed_round(&pool, &round, turn, 1, "running", &now).await;
         let requested = ToolCallId::new();
         let running = ToolCallId::new();
-        let waiting = ToolCallId::new();
+        let second_running = ToolCallId::new();
         seed_tool_call(&pool, &requested, &round, 1, "requested", &now).await;
         seed_tool_call(&pool, &running, &round, 2, "running", &now).await;
-        seed_tool_call(&pool, &waiting, &round, 3, "waiting", &now).await;
-        let ask = AskId::new();
-        seed_open_ask(&pool, &ask, turn, &waiting, &now).await;
+        seed_tool_call(&pool, &second_running, &round, 3, "running", &now).await;
 
         let mut tx = pool.begin().await.unwrap();
         execution
@@ -596,20 +387,11 @@ mod tests {
         let (status, error) = tool_call_status_and_error(&pool, &requested).await;
         assert_eq!(status, "canceled");
         assert_eq!(error.as_deref(), Some("CONTROL_PLANE_RESTART"));
-        for id in [running, waiting] {
+        for id in [running, second_running] {
             let (status, error) = tool_call_status_and_error(&pool, &id).await;
             assert_eq!(status, "lost");
             assert_eq!(error.as_deref(), Some("CONTROL_PLANE_RESTART"));
         }
-
-        let (status, reason): (String, Option<String>) =
-            sqlx::query_as("SELECT status, closure_reason FROM asks WHERE id = ?")
-                .bind(ask.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(status, "canceled");
-        assert_eq!(reason.as_deref(), Some("control_plane_restart"));
     }
 
     #[tokio::test]
@@ -624,9 +406,7 @@ mod tests {
         let tc_a = ToolCallId::new();
         let tc_b = ToolCallId::new();
         seed_tool_call(&pool, &tc_a, &round_a, 1, "running", &now).await;
-        seed_tool_call(&pool, &tc_b, &round_b, 1, "waiting", &now).await;
-        let ask = AskId::new();
-        seed_open_ask(&pool, &ask, turn, &tc_b, &now).await;
+        seed_tool_call(&pool, &tc_b, &round_b, 1, "running", &now).await;
         // Another turn stays untouched.
         let other_turn = TurnId::new();
         let other_round = RoundId::new();
@@ -655,14 +435,6 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "canceled");
         assert_eq!(stop.as_deref(), Some("user_cancel"));
-        let (status, reason): (String, Option<String>) =
-            sqlx::query_as("SELECT status, closure_reason FROM asks WHERE id = ?")
-                .bind(ask.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(status, "canceled");
-        assert_eq!(reason.as_deref(), Some("user_cancel"));
         // The unrelated turn is untouched.
         let (status, _): (String, Option<String>) =
             sqlx::query_as("SELECT status, stop_reason FROM rounds WHERE id = ?")
@@ -695,153 +467,4 @@ mod tests {
         assert!(result.contains(&unstarted));
         assert!(!result.contains(&started));
     }
-
-    #[tokio::test]
-    async fn waiting_job_ids_orders_by_started_at() {
-        let (pool, execution, _temp) = test_execution().await;
-        let now = now_utc_str();
-        let turn = TurnId::new();
-        let round = RoundId::new();
-        seed_round(&pool, &round, turn, 1, "running", &now).await;
-        let job_b = JobId::new();
-        let job_a = JobId::new();
-        let tc_a = ToolCallId::new();
-        let tc_b = ToolCallId::new();
-        // job_b started before job_a; both are waiting.
-        sqlx::query(
-            "INSERT INTO tool_calls \
-             (id, round_id, ord, tool_name, schema_version, input_json, status, actor_json, version, job_id, started_at) \
-             VALUES (?, ?, 1, 'bash', 1, '{}', 'waiting', '{\"kind\":\"model\"}', 'v1', ?, ?)",
-        )
-        .bind(tc_a.to_string())
-        .bind(round.to_string())
-        .bind(job_a.to_string())
-        .bind(format_utc(now_utc() + chrono::Duration::seconds(10)))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO tool_calls \
-             (id, round_id, ord, tool_name, schema_version, input_json, status, actor_json, version, job_id, started_at) \
-             VALUES (?, ?, 2, 'bash', 1, '{}', 'waiting', '{\"kind\":\"model\"}', 'v1', ?, ?)",
-        )
-        .bind(tc_b.to_string())
-        .bind(round.to_string())
-        .bind(job_b.to_string())
-        .bind(now_utc_str())
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let ids = execution.waiting_job_ids(10).await.unwrap();
-        assert_eq!(ids, vec![job_b, job_a]);
-    }
-
-    #[tokio::test]
-    async fn settle_marks_waiting_tool_call_from_terminal_job() {
-        let (pool, execution, _temp) = test_execution().await;
-        let now = now_utc_str();
-        let turn = TurnId::new();
-        let round = RoundId::new();
-        seed_round(&pool, &round, turn, 1, "running", &now).await;
-        let tool_call = ToolCallId::new();
-        sqlx::query(
-            "INSERT INTO tool_calls \
-             (id, round_id, ord, tool_name, schema_version, input_json, status, actor_json, version, provider_call_id, started_at) \
-             VALUES (?, ?, 1, 'bash', 1, '{\"command\":\"ls\"}', 'waiting', '{\"kind\":\"model\"}', 'v1', 'prov-1', ?)",
-        )
-        .bind(tool_call.to_string())
-        .bind(round.to_string())
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let job = job_projection(JobId::new(), tool_call, turn, JobStatus::Succeeded, &now);
-        let mut tx = pool.begin().await.unwrap();
-        let settlement: ToolCallSettlement = execution
-            .settle_job_tool_call_in_tx(&mut tx, &job, &now)
-            .await
-            .unwrap()
-            .expect("terminal job should settle the waiting call");
-        tx.commit().await.unwrap();
-
-        assert_eq!(settlement.tool_call_id, tool_call.to_string());
-        assert_eq!(settlement.source_turn_id, turn.to_string());
-        assert_eq!(settlement.provider_call_id, "prov-1");
-        assert_eq!(settlement.tool_name, "bash");
-        assert_eq!(settlement.status, ToolCallStatus::Succeeded);
-        let (status, job_id): (String, Option<String>) =
-            sqlx::query_as("SELECT status, job_id FROM tool_calls WHERE id = ?")
-                .bind(tool_call.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(status, "succeeded");
-        assert_eq!(job_id, Some(job.id.to_string()));
-    }
-
-    #[tokio::test]
-    async fn settle_ignores_nonterminal_and_job_id_mismatch() {
-        let (pool, execution, _temp) = test_execution().await;
-        let now = now_utc_str();
-        let turn = TurnId::new();
-        let round = RoundId::new();
-        seed_round(&pool, &round, turn, 1, "running", &now).await;
-        let tool_call = ToolCallId::new();
-        sqlx::query(
-            "INSERT INTO tool_calls \
-             (id, round_id, ord, tool_name, schema_version, input_json, status, actor_json, version, provider_call_id, started_at) \
-             VALUES (?, ?, 1, 'bash', 1, '{}', 'waiting', '{\"kind\":\"model\"}', 'v1', 'prov-1', ?)",
-        )
-        .bind(tool_call.to_string())
-        .bind(round.to_string())
-        .bind(&now)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // A non-terminal job is never settled.
-        let running_job = job_projection(JobId::new(), tool_call, turn, JobStatus::Running, &now);
-        let mut tx = pool.begin().await.unwrap();
-        let settled = execution
-            .settle_job_tool_call_in_tx(&mut tx, &running_job, &now)
-            .await
-            .unwrap();
-        assert!(settled.is_none());
-        tx.commit().await.unwrap();
-        let (status, _): (String, Option<String>) =
-            sqlx::query_as("SELECT status, job_id FROM tool_calls WHERE id = ?")
-                .bind(tool_call.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(status, "waiting");
-
-        // A terminal job for a different job id cannot settle the call.
-        let recorded_job = JobId::new();
-        let other_job = JobId::new();
-        sqlx::query("UPDATE tool_calls SET job_id = ? WHERE id = ?")
-            .bind(recorded_job.to_string())
-            .bind(tool_call.to_string())
-            .execute(&pool)
-            .await
-            .unwrap();
-        let mismatched_job = job_projection(other_job, tool_call, turn, JobStatus::Succeeded, &now);
-        let mut tx = pool.begin().await.unwrap();
-        let settled = execution
-            .settle_job_tool_call_in_tx(&mut tx, &mismatched_job, &now)
-            .await
-            .unwrap();
-        assert!(settled.is_none());
-        tx.commit().await.unwrap();
-        let (status, _): (String, Option<String>) =
-            sqlx::query_as("SELECT status, job_id FROM tool_calls WHERE id = ?")
-                .bind(tool_call.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(status, "waiting");
-    }
 }
-

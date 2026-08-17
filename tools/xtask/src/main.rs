@@ -29,6 +29,7 @@ const PLATFORM_TABLES: &[&str] = &[
     "operation_steps",
     "work_items",
     "idempotency_records",
+    "command_idempotency_records",
     "blob_objects",
     "blob_references",
     "blob_cleanup_intents",
@@ -458,10 +459,7 @@ fn validate_migration_ownership(
             if temporary_tables.contains(table_use.name.as_str()) {
                 continue;
             }
-            let table = table_use
-                .name
-                .strip_suffix("_legacy")
-                .unwrap_or(&table_use.name);
+            let table = &table_use.name;
             let owner = table_owners.get(table).with_context(|| {
                 format!(
                     "{} mutates unregistered table {}",
@@ -632,6 +630,20 @@ struct RustStringCollector {
 }
 
 impl<'ast> Visit<'ast> for RustStringCollector {
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if has_test_only_cfg(&item.attrs) {
+            return;
+        }
+        syn::visit::visit_item_fn(self, item);
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if has_test_only_cfg(&item.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, item);
+    }
+
     fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
         self.values.push(literal.value());
     }
@@ -642,6 +654,38 @@ fn rust_string_literals(source: &str) -> anyhow::Result<Vec<String>> {
     let mut collector = RustStringCollector::default();
     collector.visit_file(&file);
     Ok(collector.values)
+}
+
+fn has_test_only_cfg(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        if !attribute.path().is_ident("cfg") {
+            return false;
+        }
+        let Ok(list) = attribute.meta.require_list() else {
+            return false;
+        };
+        let Ok(expressions) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return false;
+        };
+        expressions.len() == 1 && cfg_expression_is_test_only(&expressions[0])
+    })
+}
+
+fn cfg_expression_is_test_only(expression: &syn::Meta) -> bool {
+    match expression {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") => {
+            let Ok(expressions) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            !expressions.is_empty() && expressions.iter().all(cfg_expression_is_test_only)
+        }
+        _ => false,
+    }
 }
 
 fn validate_module_reference(
@@ -716,7 +760,7 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
 mod tests {
     use std::{collections::BTreeSet, path::Path};
 
-    use super::{validate_dependency, validate_module_reference};
+    use super::{rust_string_literals, validate_dependency, validate_module_reference};
 
     #[test]
     fn intentional_unknown_dependency_is_rejected() {
@@ -735,6 +779,30 @@ mod tests {
                 Path::new("intentional-violation.rs"),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn production_sql_literals_exclude_test_only_items() {
+        let source = r#"
+            const PRODUCTION: &str = "SELECT id FROM projects";
+
+            #[cfg(test)]
+            mod tests {
+                const FIXTURE: &str = "INSERT INTO owners (id) VALUES (?)";
+            }
+
+            #[cfg(all(test))]
+            fn fixture_query() {
+                let _ = "DELETE FROM owners";
+            }
+        "#;
+        let literals = rust_string_literals(source).expect("test fixture parses");
+
+        assert!(literals.iter().any(|literal| literal.contains("projects")));
+        assert!(
+            !literals.iter().any(|literal| literal.contains("owners")),
+            "unexpected test-only SQL literals: {literals:?}"
         );
     }
 }

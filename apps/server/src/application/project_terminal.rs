@@ -2,9 +2,8 @@ use crate::application::Application;
 use janus_infrastructure::id::{ProjectId, RuntimeId, TerminalId};
 use janus_projects::interface::ProjectsError;
 use janus_runtime::interface::{
-    ExecutionEnvironment, ExecutorKind, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
-    RuntimeError, RuntimeScope, RuntimeSpec, RuntimeStatus, TerminalProjection, TerminalSize,
-    TerminalSpec,
+    ExecutionEnvironment, RelativeWorkingDirectory, ResourceLimits, RuntimeError, RuntimeScope,
+    RuntimeSpec, RuntimeStatus, TerminalProjection, TerminalSize, TerminalSpec,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -33,41 +32,15 @@ impl Application {
             Some(runtime) if runtime.status == RuntimeStatus::Ready => runtime,
             Some(_) => return Err(RuntimeError::RuntimeUnavailable.into()),
             None => {
-                let config = self
-                    .projects()
-                    .runtime_config(owner_id, &project_id.to_string())
-                    .await?;
-                let (executor, limits, network_policy) = config.map_or_else(
-                    || {
-                        (
-                            ExecutorKind::Local,
-                            ResourceLimits {
-                                timeout_ms: 30_000,
-                                memory_bytes: 256 * 1024 * 1024,
-                                cpu_millis: 1_000,
-                                pids: 64,
-                                temporary_disk_bytes: 128 * 1024 * 1024,
-                                open_files: 128,
-                            },
-                            NetworkPolicy::DenyAll,
-                        )
-                    },
-                    |config| {
-                        (
-                            config.executor,
-                            config.default_limits,
-                            config.network_policy,
-                        )
-                    },
-                );
-                let spec = RuntimeSpec::new(
-                    RuntimeId::new(),
-                    scope,
-                    executor,
-                    workspace_root,
-                    limits,
-                    network_policy,
-                )?;
+                let limits = ResourceLimits {
+                    timeout_ms: 30_000,
+                    memory_bytes: 256 * 1024 * 1024,
+                    cpu_millis: 1_000,
+                    pids: 64,
+                    temporary_disk_bytes: 128 * 1024 * 1024,
+                    open_files: 128,
+                };
+                let spec = RuntimeSpec::new(RuntimeId::new(), scope, workspace_root, limits)?;
                 self.runtime().ensure_runtime(&spec).await?
             }
         };

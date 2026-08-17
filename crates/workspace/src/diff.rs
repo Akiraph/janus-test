@@ -1,64 +1,9 @@
-//! Path-level Diff summary between Session and Main manifests.
-//!
-//! Reports file-level added, modified, and deleted paths, plus the line-level
-//! details used by the Session Diff view.
+//! Line-level diff helpers used when reporting file mutations.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use utoipa::ToSchema;
 
 use super::manifest::{is_text_bytes, split_lines};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PropagationDirection {
-    Sync,
-    Apply,
-}
-
-impl PropagationDirection {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sync => "sync",
-            Self::Apply => "apply",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PropagationConflictPath {
-    pub path: String,
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub main_hash: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct PropagationConflict {
-    pub direction: PropagationDirection,
-    pub paths: Vec<PropagationConflictPath>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct PropagationResult {
-    pub direction: PropagationDirection,
-    pub changed_paths: Vec<String>,
-    pub session_revision: String,
-    pub main_revision: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DiffChangeKind {
-    Added,
-    Modified,
-    Deleted,
-}
 
 /// One rendered line inside a file hunk. `old_no` / `new_no` are 1-based;
 /// either may be absent for pure additions / deletions.
@@ -88,93 +33,6 @@ pub enum DiffLineKind {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct DiffPathEntry {
-    pub path: String,
-    pub kind: DiffChangeKind,
-    pub additions: u32,
-    pub deletions: u32,
-    /// Line-level hunks when available. Empty for binary / oversized / pure path
-    /// classification without content. Frontend collapses by default.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hunks: Vec<DiffHunk>,
-    /// True when content is binary or too large for line-level display.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub binary: bool,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct DiffSummary {
-    pub added: u32,
-    pub modified: u32,
-    pub deleted: u32,
-    pub paths: Vec<DiffPathEntry>,
-    pub sync_enabled: bool,
-    pub apply_enabled: bool,
-    pub pending_conflict: Option<PropagationConflict>,
-}
-
-/// Session vs Main content-hash maps (path -> file node_hash).
-pub fn diff_file_maps(
-    session: &BTreeMap<String, String>,
-    main: &BTreeMap<String, String>,
-) -> DiffSummary {
-    let mut paths = Vec::new();
-    let all: BTreeSet<&String> = session.keys().chain(main.keys()).collect();
-    let mut added = 0u32;
-    let mut modified = 0u32;
-    let mut deleted = 0u32;
-
-    for path in all {
-        match (session.get(path), main.get(path)) {
-            (Some(s), Some(m)) if s != m => {
-                modified += 1;
-                paths.push(DiffPathEntry {
-                    path: path.clone(),
-                    kind: DiffChangeKind::Modified,
-                    additions: 0,
-                    deletions: 0,
-                    hunks: Vec::new(),
-                    binary: false,
-                });
-            }
-            (Some(_), None) => {
-                added += 1;
-                paths.push(DiffPathEntry {
-                    path: path.clone(),
-                    kind: DiffChangeKind::Added,
-                    additions: 0,
-                    deletions: 0,
-                    hunks: Vec::new(),
-                    binary: false,
-                });
-            }
-            (None, Some(_)) => {
-                deleted += 1;
-                paths.push(DiffPathEntry {
-                    path: path.clone(),
-                    kind: DiffChangeKind::Deleted,
-                    additions: 0,
-                    deletions: 0,
-                    hunks: Vec::new(),
-                    binary: false,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    DiffSummary {
-        added,
-        modified,
-        deleted,
-        paths,
-        sync_enabled: false,
-        apply_enabled: false,
-        pending_conflict: None,
-    }
 }
 
 /// Cap for line-level diff. Larger files still appear as path entries with
@@ -211,26 +69,6 @@ pub fn line_hunks(session_bytes: &[u8], main_bytes: &[u8]) -> (Vec<DiffHunk>, bo
 
 /// Count changed content lines without treating the synthetic empty line used
 /// by `split_lines` to distinguish a trailing newline as a user line.
-pub(crate) fn line_change_counts(session_bytes: &[u8], main_bytes: &[u8]) -> (u32, u32) {
-    let session_lines = content_lines(session_bytes);
-    let main_lines = content_lines(main_bytes);
-    let ops = lcs_ops(&main_lines, &session_lines);
-    let additions = ops.iter().filter(|op| **op == Op::Insert).count();
-    let deletions = ops.iter().filter(|op| **op == Op::Delete).count();
-    (
-        additions.try_into().unwrap_or(u32::MAX),
-        deletions.try_into().unwrap_or(u32::MAX),
-    )
-}
-
-fn content_lines(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut lines: Vec<&[u8]> = split_lines(bytes).collect();
-    if matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
-        lines.pop();
-    }
-    lines
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     Equal,
@@ -411,24 +249,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_added_modified_deleted() {
-        let mut session = BTreeMap::new();
-        session.insert("a.txt".into(), "h1".into());
-        session.insert("b.txt".into(), "h2".into());
-        session.insert("c.txt".into(), "h3".into());
-        let mut main = BTreeMap::new();
-        main.insert("a.txt".into(), "h1".into()); // same
-        main.insert("b.txt".into(), "hX".into()); // modified
-        main.insert("d.txt".into(), "h4".into()); // deleted from session
-
-        let summary = diff_file_maps(&session, &main);
-        assert_eq!(summary.added, 1);
-        assert_eq!(summary.modified, 1);
-        assert_eq!(summary.deleted, 1);
-        assert!(!summary.apply_enabled);
-    }
-
-    #[test]
     fn line_hunks_marks_change_and_collapses_common() {
         // 20 shared lines, one middle change - must collapse the bulk.
         let mut main = String::new();
@@ -473,13 +293,6 @@ mod tests {
         let (hunks, binary) = line_hunks(b"a\nb\n", b"a\nb\n");
         assert!(!binary);
         assert!(hunks.is_empty());
-    }
-
-    #[test]
-    fn line_change_counts_ignore_trailing_newline_sentinel() {
-        assert_eq!(line_change_counts(b"new\n", b""), (1, 0));
-        assert_eq!(line_change_counts(b"", b"old\n"), (0, 1));
-        assert_eq!(line_change_counts(b"new\n", b"old\n"), (1, 1));
     }
 
     #[test]

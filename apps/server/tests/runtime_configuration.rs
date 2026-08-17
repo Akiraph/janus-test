@@ -7,11 +7,7 @@ use janus_infrastructure::{
 use janus_models::interface::{
     EmbeddedModelInput, ModelClient, ModelsError, ModelsInterface, ProviderInput, ProviderKind,
 };
-use janus_projects::interface::{
-    EgressScheme, ProjectCliConfigInput, ProjectEgressRuleInput, ProjectRuntimeConfigInput,
-    ProjectRuntimeSecretInput, ProjectsError, ProjectsInterface,
-};
-use janus_runtime::interface::*;
+use janus_projects::interface::ProjectsInterface;
 use janus_workspace::interface::WorkspaceInterface;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -24,7 +20,7 @@ struct Fx {
     _temp: TempDir,
     _database: Database,
     pool: SqlitePool,
-    projects: ProjectsInterface,
+    _projects: ProjectsInterface,
     models: ModelsInterface,
 }
 
@@ -51,7 +47,7 @@ impl Fx {
             _temp: temp,
             _database: database,
             pool,
-            projects,
+            _projects: projects,
             models,
         })
     }
@@ -82,154 +78,6 @@ async fn seed_owner_and_project(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
     Ok(())
 }
-
-fn limits() -> ResourceLimits {
-    ResourceLimits {
-        timeout_ms: 30_000,
-        memory_bytes: 512 * 1024 * 1024,
-        cpu_millis: 1_000,
-        pids: 64,
-        temporary_disk_bytes: 256 * 1024 * 1024,
-        open_files: 256,
-    }
-}
-
-#[tokio::test]
-async fn project_runtime_configuration_is_versioned_validated_and_redacted() -> anyhow::Result<()> {
-    let fx = Fx::new().await?;
-    let input = ProjectRuntimeConfigInput {
-        executor: ExecutorKind::Local,
-        allow_insecure_local_executor: true,
-        variables: BTreeMap::from([("RUST_LOG".into(), "info".into())]),
-        default_limits: limits(),
-        network_policy: NetworkPolicy::ProjectRules,
-    };
-    let first = fx
-        .projects
-        .save_runtime_config(OWNER_ID, PROJECT_ID, None, input.clone())
-        .await?;
-    let second = fx
-        .projects
-        .save_runtime_config(OWNER_ID, PROJECT_ID, Some(&first.version), input)
-        .await?;
-    assert_ne!(first.version, second.version);
-    assert!(matches!(
-        fx.projects
-            .save_runtime_config(
-                OWNER_ID,
-                PROJECT_ID,
-                Some(&first.version),
-                ProjectRuntimeConfigInput {
-                    executor: ExecutorKind::Local,
-                    allow_insecure_local_executor: true,
-                    variables: BTreeMap::new(),
-                    default_limits: limits(),
-                    network_policy: NetworkPolicy::DenyAll,
-                },
-            )
-            .await,
-        Err(ProjectsError::RevisionMismatch { .. })
-    ));
-
-    let plaintext = "never-store-this-in-plaintext";
-    let secret = fx
-        .projects
-        .put_runtime_secret(
-            OWNER_ID,
-            PROJECT_ID,
-            ProjectRuntimeSecretInput {
-                name: "OPENAI_API_KEY".into(),
-                value: plaintext.into(),
-            },
-        )
-        .await?;
-    assert!(!serde_json::to_string(&secret)?.contains(plaintext));
-    let stored: Vec<u8> =
-        sqlx::query_scalar("SELECT value_ciphertext FROM project_runtime_secrets WHERE id = ?")
-            .bind(&secret.id)
-            .fetch_one(&fx.pool)
-            .await?;
-    assert!(
-        !stored
-            .windows(plaintext.len())
-            .any(|bytes| bytes == plaintext.as_bytes())
-    );
-    assert_eq!(
-        fx.projects
-            .runtime_secret_value(OWNER_ID, PROJECT_ID, &secret.id)
-            .await?
-            .expose(),
-        plaintext
-    );
-
-    let rules = fx
-        .projects
-        .replace_egress_rules(
-            OWNER_ID,
-            PROJECT_ID,
-            vec![ProjectEgressRuleInput {
-                scheme: EgressScheme::Https,
-                host: " API.Example.COM ".into(),
-                port_start: 443,
-                port_end: 443,
-                purpose: " model API ".into(),
-            }],
-        )
-        .await?;
-    assert_eq!(rules[0].host, "api.example.com");
-    assert_eq!(rules[0].purpose, "model API");
-    assert!(matches!(
-        fx.projects
-            .replace_egress_rules(
-                OWNER_ID,
-                PROJECT_ID,
-                vec![ProjectEgressRuleInput {
-                    scheme: EgressScheme::Https,
-                    host: "*.example.com".into(),
-                    port_start: 443,
-                    port_end: 443,
-                    purpose: "wildcard".into(),
-                }],
-            )
-            .await,
-        Err(ProjectsError::Validation(_))
-    ));
-
-    let cli = fx
-        .projects
-        .save_cli_config(
-            OWNER_ID,
-            PROJECT_ID,
-            ProjectCliConfigInput {
-                kind: DelegatedCliKind::Codex,
-                enabled: true,
-                secret_id: Some(secret.id),
-                options: BTreeMap::from([
-                    ("approval_policy".into(), "never".into()),
-                    ("sandbox_mode".into(), "workspace-write".into()),
-                ]),
-            },
-        )
-        .await?;
-    assert!(cli.enabled);
-    assert!(matches!(
-        fx.projects
-            .save_cli_config(
-                OWNER_ID,
-                PROJECT_ID,
-                ProjectCliConfigInput {
-                    kind: DelegatedCliKind::Codex,
-                    enabled: true,
-                    secret_id: None,
-                    options: BTreeMap::from([("dangerous_flag".into(), "yes".into())]),
-                },
-            )
-            .await,
-        Err(ProjectsError::Validation(_))
-    ));
-    Ok(())
-}
-
 fn provider_input(models: Vec<EmbeddedModelInput>) -> ProviderInput {
     ProviderInput {
         client: ModelClient::Supervisor,
@@ -315,46 +163,6 @@ async fn normalized_models_keep_ids_and_validate_ordered_failover() -> anyhow::R
     Ok(())
 }
 
-#[test]
-fn capability_evaluator_is_exhaustive_and_enforces_production_local_policy() {
-    let probe = DeploymentCapabilityProbe {
-        platform_supports_container: false,
-        podman_available: false,
-        podman_probe_failed: false,
-        browser_available: false,
-        claude_code_available: true,
-        codex_available: false,
-        checked_at: NOW.into(),
-    };
-    let capabilities = RuntimeCapabilityEvaluator::effective(
-        &probe,
-        EffectiveCapabilityConfig {
-            executor: ExecutorKind::Local,
-            production: true,
-            allow_insecure_local_executor: false,
-            bash_egress_configured: true,
-            live_preview_configured: false,
-            scope: CapabilityScope::Session,
-        },
-    );
-    assert_eq!(capabilities.len(), RuntimeCapabilityId::ALL.len());
-    assert!(capabilities.iter().all(|value| {
-        value.scope == CapabilityScope::Session && value.checked_at.as_deref() == Some(NOW)
-    }));
-    let process = capabilities
-        .iter()
-        .find(|value| value.id == RuntimeCapabilityId::ProcessExecution)
-        .expect("process capability");
-    assert_eq!(process.state, CapabilityState::Unconfigured);
-    assert_eq!(process.reason_code, Some(CapabilityReason::PolicyDisabled));
-    let claude = capabilities
-        .iter()
-        .find(|value| value.id == RuntimeCapabilityId::DelegatedCliClaudeCode)
-        .expect("Claude capability");
-    assert_eq!(claude.state, CapabilityState::Ready);
-    assert_eq!(claude.reason_code, None);
-}
-
 #[tokio::test]
 async fn runtime_scope_uniqueness_rejects_duplicate_scope() -> anyhow::Result<()> {
     let fx = Fx::new().await?;
@@ -365,9 +173,9 @@ async fn runtime_scope_uniqueness_rejects_duplicate_scope() -> anyhow::Result<()
         scope_id: &str,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO runtimes (id, scope_kind, scope_id, executor_kind, executor_nonce, \
-             limits_json, capability_snapshot_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'local', 'nonce', '{}', '{}', 'ready', 'v1', ?, ?)",
+            "INSERT INTO runtimes (id, scope_kind, scope_id, executor_nonce, limits_json, \
+             status, version, created_at, updated_at) \
+             VALUES (?, ?, ?, 'nonce', '{}', 'ready', 'v1', ?, ?)",
         )
         .bind(id)
         .bind(scope_kind)
@@ -378,11 +186,19 @@ async fn runtime_scope_uniqueness_rejects_duplicate_scope() -> anyhow::Result<()
         .await?;
         Ok(())
     }
-    insert_runtime(&fx.pool, "runtime-session", "session", "session-shared").await?;
-    let duplicate = insert_runtime(&fx.pool, "runtime-session-dup", "session", "session-shared").await;
-    assert!(duplicate.is_err(), "duplicate session-scoped Runtime was accepted");
-    // A different scope_kind is a different unique-index key and must be allowed.
-    insert_runtime(&fx.pool, "runtime-project", "project", "session-shared").await?;
+    insert_runtime(&fx.pool, "runtime-project", "project", "project-shared").await?;
+    let duplicate =
+        insert_runtime(&fx.pool, "runtime-project-dup", "project", "project-shared").await;
+    assert!(
+        duplicate.is_err(),
+        "duplicate project-scoped Runtime was accepted"
+    );
+    insert_runtime(
+        &fx.pool,
+        "runtime-project-other",
+        "project",
+        "project-other",
+    )
+    .await?;
     Ok(())
 }
-

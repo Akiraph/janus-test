@@ -5,10 +5,10 @@
 //! - dir node:  domain `janus-dir-v1` + sorted (name_len, name, node_type, node_hash)* -> node_hash
 //!
 //! `content_hash` is computed over **line-normalized** text: CRLF/CR are
-//! treated equivalently to LF so a Session worktree checkout (LF) and a Main
+//! treated equivalently to LF so a checked-out working tree (LF) and a Main
 //! clone checked out with `core.autocrlf=true` (CRLF on disk) hash identically.
 //! Binary files (any NUL byte) hash their raw bytes unchanged. This is what
-//! stops a clean Session copy from showing up as "every file modified" purely
+//! stops a clean working tree from showing up as "every file modified" purely
 //! because one side normalized line endings and the other did not.
 //! `blob_sha` still stores the **raw** bytes in CAS (unmodified) - only the
 //! content identity used for diffing is normalized.

@@ -1,6 +1,8 @@
 //! Turn content persistence: read queries and transactional writes for turn inputs, messages, tool results, and checkpoints.
 
 use super::*;
+use crate::interface::ContextCompactedTimelineInput;
+use serde_json::Value;
 
 struct MessageAttachment {
     id: AttachmentId,
@@ -22,7 +24,7 @@ impl SessionsInterface {
     pub async fn execution_turn(&self, turn_id: TurnId) -> Result<ExecutionTurn, SessionsError> {
         let row = sqlx::query(
             "SELECT turn.id, turn.session_id, session.project_id, \
-                    turn.status, turn.sequence, turn.model_snapshot_json, session.active_turn_id \
+                    turn.status, turn.sequence, turn.goal_mode, turn.model_snapshot_json, session.active_turn_id \
              FROM turns AS turn \
              JOIN sessions AS session ON session.id = turn.session_id \
              WHERE turn.id = ?",
@@ -54,6 +56,7 @@ impl SessionsInterface {
                 .parse()
                 .map_err(|error: String| SessionsError::Internal(anyhow::anyhow!(error)))?,
             sequence: row.try_get("sequence")?,
+            goal_mode: row.try_get::<i64, _>("goal_mode")? != 0,
             model_snapshot: TurnModelSnapshot::parse(&model_snapshot_json)?,
         })
     }
@@ -62,6 +65,25 @@ impl SessionsInterface {
         &self,
         session_id: SessionId,
         turn_id: TurnId,
+    ) -> Result<Vec<ContextMessage>, SessionsError> {
+        self.context_messages_since(session_id, turn_id, None).await
+    }
+
+    pub async fn context_messages_after_timeline(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        after_timeline_id: &str,
+    ) -> Result<Vec<ContextMessage>, SessionsError> {
+        self.context_messages_since(session_id, turn_id, Some(after_timeline_id))
+            .await
+    }
+
+    async fn context_messages_since(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        after_timeline_id: Option<&str>,
     ) -> Result<Vec<ContextMessage>, SessionsError> {
         let rows = sqlx::query(
             "SELECT message.turn_id, message.kind, message.body_json, \
@@ -73,10 +95,16 @@ impl SessionsInterface {
                AND message.status = 'active' \
                AND (message.turn_id IS NULL OR message.turn_id = current_turn.id OR \
                     (source_turn.sequence < current_turn.sequence AND \
-                     source_turn.status IN ('completed', 'failed', 'canceled', 'interrupted', 'handed_off'))) \
+                     source_turn.status IN ('completed', 'failed', 'canceled', 'interrupted'))) \
+               AND (? IS NULL OR COALESCE(message.timeline_sequence, 0) > \
+                    COALESCE((SELECT display_order FROM timeline_items \
+                              WHERE id = ? AND session_id = ?), 0)) \
              ORDER BY COALESCE(message.timeline_sequence, 0), message.created_at, message.id",
         )
         .bind(turn_id.to_string())
+        .bind(session_id.to_string())
+        .bind(after_timeline_id)
+        .bind(after_timeline_id)
         .bind(session_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -91,6 +119,63 @@ impl SessionsInterface {
                 })
             })
             .collect()
+    }
+
+    pub async fn append_context_compacted_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        input: ContextCompactedTimelineInput<'_>,
+    ) -> Result<(String, bool), SessionsError> {
+        let ContextCompactedTimelineInput {
+            session_id,
+            compact_summary_id,
+            source_first_timeline_id: source_first,
+            source_last_timeline_id: source_last,
+            summary,
+            now,
+        } = input;
+        if let Some(existing) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM timeline_items \
+             WHERE session_id = ? AND kind = 'context_compacted' \
+               AND source_resource_id = ? LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .bind(compact_summary_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            return Ok((existing, false));
+        }
+
+        let timeline_item_id = TimelineItemId::new().to_string();
+        let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
+        let item_count = summary.get("item_count").cloned();
+        let projection = json!({
+            "kind": "context_compacted",
+            "title": "Context Compacted",
+            "compact_summary_id": compact_summary_id,
+            "source_first_timeline_id": source_first,
+            "source_last_timeline_id": source_last,
+            "item_count": item_count,
+            "summary": summary,
+        });
+        sqlx::query(
+            "INSERT INTO timeline_items \
+             (id, session_id, turn_id, kind, source_resource_id, display_order, \
+              projection_json, status, version, created_at, updated_at) \
+             VALUES (?, ?, NULL, 'context_compacted', ?, ?, ?, 'active', ?, ?, ?)",
+        )
+        .bind(&timeline_item_id)
+        .bind(session_id.to_string())
+        .bind(compact_summary_id)
+        .bind(display_order)
+        .bind(projection.to_string())
+        .bind(format!("v_{}", TimelineItemId::new()))
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        Ok((timeline_item_id, true))
     }
 
     pub async fn turn_inputs_after(
@@ -122,18 +207,6 @@ impl SessionsInterface {
             .collect()
     }
 
-    pub async fn current_workspace_revision(
-        &self,
-        session_id: SessionId,
-    ) -> Result<String, SessionsError> {
-        let session = self.get_session(session_id).await?;
-        Ok(self
-            .workspace
-            .current_revision(&WorkspaceHandle(session.workspace_handle))
-            .await?
-            .0)
-    }
-
     pub async fn turn_status_in_tx(
         &self,
         tx: &mut SqliteConnection,
@@ -161,13 +234,21 @@ impl SessionsInterface {
             session_id,
             content,
             actor,
+            message_kind,
+            timeline_kind,
+            metadata,
+            goal_mode,
             predecessor_turn_id,
-            source_ask_id,
             attachment_ids,
             model_snapshot,
             checkpoint_revision,
             now,
         } = input;
+        if !matches!(message_kind, "user" | "system") || timeline_kind.trim().is_empty() {
+            return Err(SessionsError::Validation(
+                "invalid message or timeline kind".into(),
+            ));
+        }
         if content.trim().is_empty() && attachment_ids.is_empty() {
             return Err(SessionsError::Validation(
                 "message content or an attachment is required".into(),
@@ -232,17 +313,17 @@ impl SessionsInterface {
         sqlx::query(
             "INSERT INTO turns \
              (id, session_id, sequence, status, input_message_id, model_snapshot_json, \
-              predecessor_turn_id, handoff_from_turn_id, handoff_to_turn_id, \
+              goal_mode, predecessor_turn_id, \
               completion_summary_json, completion_reason, cancellation_reason, \
               input_tokens, output_tokens, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, ?, ?, ?)",
+             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, ?)",
         )
         .bind(turn_id.to_string())
         .bind(session_id.to_string())
         .bind(next_sequence)
         .bind(message_id.to_string())
         .bind(model_snapshot_json)
-        .bind(predecessor_turn_id)
+        .bind(i64::from(goal_mode))
         .bind(predecessor_turn_id)
         .bind(format!("v_{}", TurnId::new()))
         .bind(now)
@@ -264,19 +345,22 @@ impl SessionsInterface {
             })
         }));
         let mut body = json!({"parts": parts});
-        if let Some(source_ask_id) = source_ask_id {
-            body["turn_input"] = json!({"kind": "ask_answer", "source_ask_id": source_ask_id});
+        if let Some(metadata) = metadata.and_then(Value::as_object)
+            && let Some(body_object) = body.as_object_mut()
+        {
+            body_object.extend(metadata.clone());
         }
         sqlx::query(
             "INSERT INTO messages \
              (id, session_id, turn_id, actor_json, kind, body_json, status, \
               timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'user', ?, 'active', ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
         )
         .bind(message_id.to_string())
         .bind(session_id.to_string())
         .bind(turn_id.to_string())
         .bind(actor.to_string())
+        .bind(message_kind)
         .bind(body.to_string())
         .bind(display_order)
         .bind(format!("v_{}", MessageId::new()))
@@ -305,7 +389,7 @@ impl SessionsInterface {
         }
 
         let mut projection = json!({
-            "kind": "user_message",
+            "kind": timeline_kind,
             "message_id": message_id.to_string(),
             "turn_id": turn_id.to_string(),
             "text": content,
@@ -316,19 +400,21 @@ impl SessionsInterface {
                 "byte_size": attachment.byte_size,
             })).collect::<Vec<_>>(),
         });
-        if let Some(source_ask_id) = source_ask_id {
-            projection["source_ask_id"] = json!(source_ask_id);
-            projection["ask_answer"] = json!(false);
+        if let Some(metadata) = metadata.and_then(Value::as_object)
+            && let Some(projection_object) = projection.as_object_mut()
+        {
+            projection_object.extend(metadata.clone());
         }
         sqlx::query(
             "INSERT INTO timeline_items \
              (id, session_id, turn_id, kind, source_resource_id, display_order, \
               projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'user_message', ?, ?, ?, 'active', ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
         )
         .bind(timeline_item_id.to_string())
         .bind(session_id.to_string())
         .bind(turn_id.to_string())
+        .bind(timeline_kind)
         .bind(message_id.to_string())
         .bind(display_order)
         .bind(projection.to_string())
@@ -378,7 +464,6 @@ impl SessionsInterface {
             content,
             expected_version,
             actor,
-            source_ask_id,
             now,
         } = input;
         let row = sqlx::query(
@@ -421,10 +506,7 @@ impl SessionsInterface {
         let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
         let message_id = MessageId::new();
         let timeline_item_id = TimelineItemId::new();
-        let mut body = json!({"parts": [{"type": "text", "text": content}], "steer": true});
-        if let Some(source_ask_id) = source_ask_id {
-            body["turn_input"] = json!({"kind": "ask_answer", "source_ask_id": source_ask_id});
-        }
+        let body = json!({"parts": [{"type": "text", "text": content}], "steer": true});
         sqlx::query(
             "INSERT INTO messages \
              (id, session_id, turn_id, actor_json, kind, body_json, status, \
@@ -442,15 +524,12 @@ impl SessionsInterface {
         .execute(&mut *tx)
         .await?;
 
-        let mut projection = json!({
+        let projection = json!({
             "kind": "steer",
             "message_id": message_id.to_string(),
             "turn_id": active_turn_id.to_string(),
             "text": content,
         });
-        if let Some(source_ask_id) = source_ask_id {
-            projection["source_ask_id"] = json!(source_ask_id);
-        }
         sqlx::query(
             "INSERT INTO timeline_items \
              (id, session_id, turn_id, kind, source_resource_id, display_order, \
@@ -507,6 +586,7 @@ impl SessionsInterface {
             round_id,
             text,
             reasoning,
+            reasoning_content,
             duration_ms,
             tool_calls,
             actor,
@@ -514,11 +594,14 @@ impl SessionsInterface {
         } = input;
         let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
         let message_id = MessageId::new();
-        let body = json!({
+        let mut body = json!({
             "parts": [{"type": "text", "text": text}],
             "reasoning": reasoning,
             "tool_calls": tool_calls,
         });
+        if let Some(raw) = reasoning_content {
+            body["reasoning_content"] = json!(raw);
+        }
         sqlx::query(
             "INSERT INTO messages \
              (id, session_id, turn_id, actor_json, kind, body_json, status, \
@@ -807,5 +890,4 @@ impl SessionsInterface {
         .await?;
         Ok(checkpoint_id)
     }
-
 }

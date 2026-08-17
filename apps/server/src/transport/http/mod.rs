@@ -1,9 +1,9 @@
+mod async_tasks;
 mod auth;
 mod conditions;
 pub mod dto;
 mod git;
 mod handlers;
-mod jobs;
 mod models;
 mod notifications;
 mod operations;
@@ -13,6 +13,7 @@ mod request_id;
 mod sessions;
 mod sse;
 mod terminal;
+mod webhooks;
 
 use axum::{
     Router, middleware,
@@ -32,6 +33,7 @@ pub use problem::Problem;
         handlers::bootstrap,
         handlers::system_info,
         sse::events
+        , webhooks::webhook
         , auth::initialize_options, auth::initialize_complete, auth::login_options,
         auth::login_complete, auth::me, auth::logout, auth::passkeys, auth::passkey_options,
         auth::passkey_complete, auth::rename_passkey, auth::revoke_passkey,
@@ -51,13 +53,12 @@ pub use problem::Problem;
         operations::get_operation,
         sessions::list_sessions, sessions::create_session, sessions::get_session,
         sessions::delete_session, sessions::post_message, sessions::upload_attachment,
-        sessions::delete_attachment, sessions::session_context, sessions::timeline,
-        sessions::queued_turns, sessions::get_turn, sessions::session_diff, sessions::sync, sessions::apply, sessions::steer, sessions::cancel_turn,
-        sessions::answer_ask, sessions::retry_model,
+        sessions::delete_attachment, sessions::session_context, sessions::compact_context, sessions::timeline,
+        sessions::queued_turns, sessions::get_turn, sessions::steer, sessions::cancel_turn,
         terminal::create_terminal, terminal::list_terminals, terminal::issue_terminal_ticket,
         terminal::resize_terminal, terminal::signal_terminal, terminal::close_terminal,
         terminal::terminal_scrollback, terminal::connect_terminal,
-        jobs::list_jobs, jobs::job_log, jobs::cancel_job
+        async_tasks::list_async_tasks, async_tasks::async_task_log, async_tasks::cancel_async_task
         , notifications::list_channels, notifications::create_channel,
         notifications::update_channel, notifications::delete_channel, notifications::test_channel
     ),
@@ -72,11 +73,6 @@ pub use problem::Problem;
         dto::SystemInfo,
         dto::DatabaseInfo,
         dto::EventInfo,
-        dto::RuntimeCapability,
-        dto::RuntimeCapabilityId,
-        dto::CapabilityScope,
-        dto::CapabilityState,
-        dto::CapabilityReason,
         dto::InitializeOptionsRequest,
         dto::CeremonyCompleteRequest,
         dto::PasskeyOptionsRequest,
@@ -118,11 +114,6 @@ pub use problem::Problem;
         janus_infrastructure::operations::OperationView,
         janus_infrastructure::operations::OperationStatus,
         janus_workspace::interface::RevisionRef,
-        janus_workspace::interface::DiffSummary,
-        janus_workspace::interface::PropagationConflict,
-        janus_workspace::interface::PropagationConflictPath,
-        janus_workspace::interface::PropagationDirection,
-        janus_workspace::interface::PropagationResult,
         projects::UpdateProjectRequest,
         git::GitStatusView,
         git::GitLogEntryView,
@@ -151,16 +142,13 @@ pub use problem::Problem;
         sessions::PostMessageRequest,
         sessions::SteerRequest,
         sessions::CancelTurnRequest,
-        sessions::AnswerAskRequest,
-        sessions::AnswerAskResult,
         janus_runtime::interface::TerminalProjection,
         janus_runtime::interface::TerminalStatus,
         janus_runtime::interface::TerminalSize,
         janus_runtime::interface::TerminalSignal,
         janus_runtime::interface::TerminalTicket,
         janus_runtime::interface::LogRange,
-        janus_runtime::interface::JobProjection,
-        janus_runtime::interface::DelegatedCliKind,
+        janus_runtime::interface::AsyncTaskProjection,
         janus_notifications::interface::NotificationChannelKind,
         janus_notifications::interface::NotificationEventKind,
         janus_notifications::interface::NotificationTarget,
@@ -183,9 +171,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/bootstrap", get(handlers::bootstrap))
         .route("/api/v1/system/info", get(handlers::system_info))
         .route("/api/v1/events", get(sse::events))
-        .route("/api/v1/sessions/{id}/jobs", get(jobs::list_jobs))
-        .route("/api/v1/jobs/{id}/log", get(jobs::job_log))
-        .route("/api/v1/jobs/{id}/cancel", post(jobs::cancel_job))
+        .route("/api/v1/automation/webhook", post(webhooks::webhook))
+        .route("/api/v1/async-tasks", get(async_tasks::list_async_tasks))
+        .route(
+            "/api/v1/async-tasks/{id}/log",
+            get(async_tasks::async_task_log),
+        )
+        .route(
+            "/api/v1/async-tasks/{id}/cancel",
+            post(async_tasks::cancel_async_task),
+        )
         .route(
             "/api/v1/notification-channels",
             get(notifications::list_channels).post(notifications::create_channel),
@@ -352,6 +347,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/context",
             get(sessions::session_context),
         )
+        .route(
+            "/api/v1/sessions/{id}/context/compact",
+            post(sessions::compact_context),
+        )
         .route("/api/v1/sessions/{id}/timeline", get(sessions::timeline))
         .route(
             "/api/v1/sessions/{id}/queued-turns",
@@ -365,14 +364,6 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/sessions/{id}/turns/{turn_id}/cancel",
             post(sessions::cancel_turn),
         )
-        .route(
-            "/api/v1/sessions/{id}/turns/{turn_id}/retry-model",
-            post(sessions::retry_model),
-        )
-        .route("/api/v1/asks/{ask_id}/answer", post(sessions::answer_ask))
-        .route("/api/v1/sessions/{id}/diff", get(sessions::session_diff))
-        .route("/api/v1/sessions/{id}/sync", post(sessions::sync))
-        .route("/api/v1/sessions/{id}/apply", post(sessions::apply))
         .route(
             "/api/v1/terminals",
             get(terminal::list_terminals).post(terminal::create_terminal),

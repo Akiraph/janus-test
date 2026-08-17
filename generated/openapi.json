@@ -10,15 +10,45 @@
     "version": "0.1.0"
   },
   "paths": {
-    "/api/v1/asks/{ask_id}/answer": {
+    "/api/v1/async-tasks": {
+      "get": {
+        "tags": [
+          "async_tasks"
+        ],
+        "operationId": "list_async_tasks",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_AsyncTaskProjection"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/async-tasks/{id}/cancel": {
       "post": {
         "tags": [
-          "sessions"
+          "async_tasks"
         ],
-        "operationId": "answer_ask",
+        "operationId": "cancel_async_task",
         "parameters": [
           {
-            "name": "ask_id",
+            "name": "id",
             "in": "path",
             "required": true,
             "schema": {
@@ -26,28 +56,75 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AnswerAskRequest"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
           "200": {
             "description": "",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_AnswerAskResult"
+                  "$ref": "#/components/schemas/DataResponse_AsyncTaskProjection"
                 }
               }
             }
           },
-          "404": {
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/async-tasks/{id}/log": {
+      "get": {
+        "tags": [
+          "async_tasks"
+        ],
+        "operationId": "async_task_log",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_LogRange"
+                }
+              }
+            }
+          },
+          "401": {
             "description": "",
             "content": {
               "application/json": {
@@ -341,6 +418,76 @@
             }
           },
           "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/automation/webhook": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "operationId": "webhook",
+        "requestBody": {
+          "content": {
+            "text/html": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "",
             "content": {
               "application/json": {
@@ -709,103 +856,6 @@
             }
           },
           "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/jobs/{id}/cancel": {
-      "post": {
-        "tags": [
-          "jobs"
-        ],
-        "operationId": "cancel_job",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DataResponse_JobProjection"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/jobs/{id}/log": {
-      "get": {
-        "tags": [
-          "jobs"
-        ],
-        "operationId": "job_log",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "after",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DataResponse_LogRange"
-                }
-              }
-            }
-          },
-          "401": {
             "description": "",
             "content": {
               "application/json": {
@@ -3453,56 +3503,6 @@
         }
       }
     },
-    "/api/v1/sessions/{id}/apply": {
-      "post": {
-        "tags": [
-          "sessions"
-        ],
-        "operationId": "apply",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DataResponse_PropagationResult"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/sessions/{id}/attachments": {
       "post": {
         "tags": [
@@ -3662,12 +3662,12 @@
         }
       }
     },
-    "/api/v1/sessions/{id}/diff": {
-      "get": {
+    "/api/v1/sessions/{id}/context/compact": {
+      "post": {
         "tags": [
           "sessions"
         ],
-        "operationId": "session_diff",
+        "operationId": "compact_context",
         "parameters": [
           {
             "name": "id",
@@ -3679,12 +3679,12 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "description": "",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DataResponse_DiffSummary"
+                  "$ref": "#/components/schemas/DataResponse_OperationView"
                 }
               }
             }
@@ -3698,38 +3698,8 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/api/v1/sessions/{id}/jobs": {
-      "get": {
-        "tags": [
-          "jobs"
-        ],
-        "operationId": "list_jobs",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DataResponse_Vec_JobProjection"
-                }
-              }
-            }
           },
-          "401": {
+          "409": {
             "description": "",
             "content": {
               "application/json": {
@@ -3865,56 +3835,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DataResponse_SteerResult"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/sessions/{id}/sync": {
-      "post": {
-        "tags": [
-          "sessions"
-        ],
-        "operationId": "sync",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DataResponse_PropagationResult"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
                 }
               }
             }
@@ -4091,54 +4011,6 @@
             }
           },
           "409": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Problem"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/sessions/{id}/turns/{turn_id}/retry-model": {
-      "post": {
-        "tags": [
-          "sessions"
-        ],
-        "operationId": "retry_model",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "turn_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/DataResponse_Value"
-                }
-              }
-            }
-          },
-          "404": {
             "description": "",
             "content": {
               "application/json": {
@@ -4589,37 +4461,93 @@
   },
   "components": {
     "schemas": {
-      "AnswerAskRequest": {
-        "type": "object",
-        "required": [
-          "answer"
-        ],
-        "properties": {
-          "answer": {}
-        }
+      "AsyncTaskId": {
+        "type": "string",
+        "format": "uuid"
       },
-      "AnswerAskResult": {
+      "AsyncTaskProjection": {
         "type": "object",
         "required": [
-          "ask_id",
-          "turn_id",
-          "route_or_status",
-          "session_version"
+          "id",
+          "runtime_id",
+          "session_id",
+          "controlling_turn_id",
+          "initiated_by_tool_call_id",
+          "status",
+          "command_summary",
+          "log_stream_id",
+          "usage",
+          "version",
+          "created_at"
         ],
         "properties": {
-          "ask_id": {
+          "command_summary": {
             "type": "string"
           },
-          "route_or_status": {
+          "controlling_turn_id": {
+            "$ref": "#/components/schemas/TurnId"
+          },
+          "created_at": {
             "type": "string"
           },
-          "session_version": {
-            "type": "string"
+          "ended_at": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
-          "turn_id": {
+          "exit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExitSummary"
+              }
+            ]
+          },
+          "id": {
+            "$ref": "#/components/schemas/AsyncTaskId"
+          },
+          "initiated_by_tool_call_id": {
+            "$ref": "#/components/schemas/ToolCallId"
+          },
+          "log_stream_id": {
+            "$ref": "#/components/schemas/LogStreamId"
+          },
+          "runtime_id": {
+            "$ref": "#/components/schemas/RuntimeId"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AsyncTaskStatus"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/ResourceUsage"
+          },
+          "version": {
             "type": "string"
           }
         }
+      },
+      "AsyncTaskStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "canceled",
+          "lost"
+        ]
       },
       "AttachmentId": {
         "type": "string",
@@ -4759,34 +4687,6 @@
           }
         }
       },
-      "CapabilityReason": {
-        "type": "string",
-        "enum": [
-          "LOCAL_EXECUTOR",
-          "CONFIG_MISSING",
-          "DEPENDENCY_MISSING",
-          "PLATFORM_UNSUPPORTED",
-          "POLICY_DISABLED",
-          "PROBE_FAILED"
-        ]
-      },
-      "CapabilityScope": {
-        "type": "string",
-        "enum": [
-          "deployment",
-          "project",
-          "session"
-        ]
-      },
-      "CapabilityState": {
-        "type": "string",
-        "enum": [
-          "ready",
-          "degraded",
-          "unconfigured",
-          "unsupported"
-        ]
-      },
       "CeremonyCompleteRequest": {
         "type": "object",
         "required": [
@@ -4812,10 +4712,6 @@
           },
           "public_key": {}
         }
-      },
-      "CliSessionId": {
-        "type": "string",
-        "format": "uuid"
       },
       "ContextUsageView": {
         "type": "object",
@@ -4940,7 +4836,7 @@
           }
         }
       },
-      "DataResponse_AnswerAskResult": {
+      "DataResponse_AsyncTaskProjection": {
         "type": "object",
         "required": [
           "data"
@@ -4949,22 +4845,72 @@
           "data": {
             "type": "object",
             "required": [
-              "ask_id",
-              "turn_id",
-              "route_or_status",
-              "session_version"
+              "id",
+              "runtime_id",
+              "session_id",
+              "controlling_turn_id",
+              "initiated_by_tool_call_id",
+              "status",
+              "command_summary",
+              "log_stream_id",
+              "usage",
+              "version",
+              "created_at"
             ],
             "properties": {
-              "ask_id": {
+              "command_summary": {
                 "type": "string"
               },
-              "route_or_status": {
+              "controlling_turn_id": {
+                "$ref": "#/components/schemas/TurnId"
+              },
+              "created_at": {
                 "type": "string"
               },
-              "session_version": {
-                "type": "string"
+              "ended_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
-              "turn_id": {
+              "exit": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExitSummary"
+                  }
+                ]
+              },
+              "id": {
+                "$ref": "#/components/schemas/AsyncTaskId"
+              },
+              "initiated_by_tool_call_id": {
+                "$ref": "#/components/schemas/ToolCallId"
+              },
+              "log_stream_id": {
+                "$ref": "#/components/schemas/LogStreamId"
+              },
+              "runtime_id": {
+                "$ref": "#/components/schemas/RuntimeId"
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/SessionId"
+              },
+              "started_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "$ref": "#/components/schemas/AsyncTaskStatus"
+              },
+              "usage": {
+                "$ref": "#/components/schemas/ResourceUsage"
+              },
+              "version": {
                 "type": "string"
               }
             }
@@ -5099,64 +5045,6 @@
               },
               "status": {
                 "type": "string"
-              }
-            }
-          }
-        }
-      },
-      "DataResponse_DiffSummary": {
-        "type": "object",
-        "required": [
-          "data"
-        ],
-        "properties": {
-          "data": {
-            "type": "object",
-            "required": [
-              "added",
-              "modified",
-              "deleted",
-              "paths",
-              "sync_enabled",
-              "apply_enabled"
-            ],
-            "properties": {
-              "added": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "apply_enabled": {
-                "type": "boolean"
-              },
-              "deleted": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "modified": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "paths": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/DiffPathEntry"
-                }
-              },
-              "pending_conflict": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/PropagationConflict"
-                  }
-                ]
-              },
-              "sync_enabled": {
-                "type": "boolean"
               }
             }
           }
@@ -5396,107 +5284,6 @@
           }
         }
       },
-      "DataResponse_JobProjection": {
-        "type": "object",
-        "required": [
-          "data"
-        ],
-        "properties": {
-          "data": {
-            "type": "object",
-            "required": [
-              "id",
-              "runtime_id",
-              "session_id",
-              "controlling_turn_id",
-              "initiated_by_tool_call_id",
-              "status",
-              "command_summary",
-              "log_stream_id",
-              "usage",
-              "version",
-              "created_at"
-            ],
-            "properties": {
-              "cli_kind": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/DelegatedCliKind"
-                  }
-                ]
-              },
-              "cli_session_id": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/CliSessionId"
-                  }
-                ]
-              },
-              "command_summary": {
-                "type": "string"
-              },
-              "controlling_turn_id": {
-                "$ref": "#/components/schemas/TurnId"
-              },
-              "created_at": {
-                "type": "string"
-              },
-              "ended_at": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "exit": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/ExitSummary"
-                  }
-                ]
-              },
-              "id": {
-                "$ref": "#/components/schemas/JobId"
-              },
-              "initiated_by_tool_call_id": {
-                "$ref": "#/components/schemas/ToolCallId"
-              },
-              "log_stream_id": {
-                "$ref": "#/components/schemas/LogStreamId"
-              },
-              "runtime_id": {
-                "$ref": "#/components/schemas/RuntimeId"
-              },
-              "session_id": {
-                "$ref": "#/components/schemas/SessionId"
-              },
-              "started_at": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "status": {
-                "$ref": "#/components/schemas/JobStatus"
-              },
-              "usage": {
-                "$ref": "#/components/schemas/ResourceUsage"
-              },
-              "version": {
-                "type": "string"
-              }
-            }
-          }
-        }
-      },
       "DataResponse_LogRange": {
         "type": "object",
         "required": [
@@ -5542,12 +5329,6 @@
               "session_version"
             ],
             "properties": {
-              "handoff_from_turn_id": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
               "message_id": {
                 "type": "string"
               },
@@ -5900,40 +5681,6 @@
           }
         }
       },
-      "DataResponse_PropagationResult": {
-        "type": "object",
-        "required": [
-          "data"
-        ],
-        "properties": {
-          "data": {
-            "type": "object",
-            "required": [
-              "direction",
-              "changed_paths",
-              "session_revision",
-              "main_revision"
-            ],
-            "properties": {
-              "changed_paths": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "direction": {
-                "$ref": "#/components/schemas/PropagationDirection"
-              },
-              "main_revision": {
-                "type": "string"
-              },
-              "session_revision": {
-                "type": "string"
-              }
-            }
-          }
-        }
-      },
       "DataResponse_ProviderView": {
         "type": "object",
         "required": [
@@ -6027,10 +5774,7 @@
             "required": [
               "id",
               "project_id",
-              "kind",
               "state",
-              "workspace_handle",
-              "source_main_revision_id",
               "version",
               "created_at",
               "updated_at",
@@ -6049,9 +5793,6 @@
               "id": {
                 "type": "string"
               },
-              "kind": {
-                "type": "string"
-              },
               "last_activity_at": {
                 "type": "string"
               },
@@ -6068,9 +5809,6 @@
               "project_id": {
                 "type": "string"
               },
-              "source_main_revision_id": {
-                "type": "string"
-              },
               "state": {
                 "type": "string"
               },
@@ -6085,15 +5823,6 @@
               },
               "version": {
                 "type": "string"
-              },
-              "workspace_handle": {
-                "type": "string"
-              },
-              "workspace_revision": {
-                "type": [
-                  "string",
-                  "null"
-                ]
               }
             }
           }
@@ -6301,6 +6030,7 @@
               "session_id",
               "sequence",
               "status",
+              "goal_mode",
               "version",
               "created_at",
               "updated_at"
@@ -6321,17 +6051,8 @@
               "created_at": {
                 "type": "string"
               },
-              "handoff_from_turn_id": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "handoff_to_turn_id": {
-                "type": [
-                  "string",
-                  "null"
-                ]
+              "goal_mode": {
+                "type": "boolean"
               },
               "id": {
                 "type": "string"
@@ -6378,6 +6099,17 @@
               "status": {
                 "type": "string"
               },
+              "token_exchange": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/TurnTokenExchange",
+                    "description": "The durable whole-Turn model exchange. Live direction remains a\nstream concern and is intentionally not stored here."
+                  }
+                ]
+              },
               "updated_at": {
                 "type": "string"
               },
@@ -6388,13 +6120,88 @@
           }
         }
       },
-      "DataResponse_Value": {
+      "DataResponse_Vec_AsyncTaskProjection": {
         "type": "object",
         "required": [
           "data"
         ],
         "properties": {
-          "data": {}
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "runtime_id",
+                "session_id",
+                "controlling_turn_id",
+                "initiated_by_tool_call_id",
+                "status",
+                "command_summary",
+                "log_stream_id",
+                "usage",
+                "version",
+                "created_at"
+              ],
+              "properties": {
+                "command_summary": {
+                  "type": "string"
+                },
+                "controlling_turn_id": {
+                  "$ref": "#/components/schemas/TurnId"
+                },
+                "created_at": {
+                  "type": "string"
+                },
+                "ended_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "exit": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ExitSummary"
+                    }
+                  ]
+                },
+                "id": {
+                  "$ref": "#/components/schemas/AsyncTaskId"
+                },
+                "initiated_by_tool_call_id": {
+                  "$ref": "#/components/schemas/ToolCallId"
+                },
+                "log_stream_id": {
+                  "$ref": "#/components/schemas/LogStreamId"
+                },
+                "runtime_id": {
+                  "$ref": "#/components/schemas/RuntimeId"
+                },
+                "session_id": {
+                  "$ref": "#/components/schemas/SessionId"
+                },
+                "started_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "status": {
+                  "$ref": "#/components/schemas/AsyncTaskStatus"
+                },
+                "usage": {
+                  "$ref": "#/components/schemas/ResourceUsage"
+                },
+                "version": {
+                  "type": "string"
+                }
+              }
+            }
+          }
         }
       },
       "DataResponse_Vec_FileTreeView": {
@@ -6537,110 +6344,6 @@
                 },
                 "updated_at": {
                   "type": "string"
-                },
-                "version": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      },
-      "DataResponse_Vec_JobProjection": {
-        "type": "object",
-        "required": [
-          "data"
-        ],
-        "properties": {
-          "data": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "required": [
-                "id",
-                "runtime_id",
-                "session_id",
-                "controlling_turn_id",
-                "initiated_by_tool_call_id",
-                "status",
-                "command_summary",
-                "log_stream_id",
-                "usage",
-                "version",
-                "created_at"
-              ],
-              "properties": {
-                "cli_kind": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/DelegatedCliKind"
-                    }
-                  ]
-                },
-                "cli_session_id": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/CliSessionId"
-                    }
-                  ]
-                },
-                "command_summary": {
-                  "type": "string"
-                },
-                "controlling_turn_id": {
-                  "$ref": "#/components/schemas/TurnId"
-                },
-                "created_at": {
-                  "type": "string"
-                },
-                "ended_at": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "exit": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/ExitSummary"
-                    }
-                  ]
-                },
-                "id": {
-                  "$ref": "#/components/schemas/JobId"
-                },
-                "initiated_by_tool_call_id": {
-                  "$ref": "#/components/schemas/ToolCallId"
-                },
-                "log_stream_id": {
-                  "$ref": "#/components/schemas/LogStreamId"
-                },
-                "runtime_id": {
-                  "$ref": "#/components/schemas/RuntimeId"
-                },
-                "session_id": {
-                  "$ref": "#/components/schemas/SessionId"
-                },
-                "started_at": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "status": {
-                  "$ref": "#/components/schemas/JobStatus"
-                },
-                "usage": {
-                  "$ref": "#/components/schemas/ResourceUsage"
                 },
                 "version": {
                   "type": "string"
@@ -6947,10 +6650,7 @@
               "required": [
                 "id",
                 "project_id",
-                "kind",
                 "state",
-                "workspace_handle",
-                "source_main_revision_id",
                 "version",
                 "created_at",
                 "updated_at",
@@ -6969,9 +6669,6 @@
                 "id": {
                   "type": "string"
                 },
-                "kind": {
-                  "type": "string"
-                },
                 "last_activity_at": {
                   "type": "string"
                 },
@@ -6988,9 +6685,6 @@
                 "project_id": {
                   "type": "string"
                 },
-                "source_main_revision_id": {
-                  "type": "string"
-                },
                 "state": {
                   "type": "string"
                 },
@@ -7005,15 +6699,6 @@
                 },
                 "version": {
                   "type": "string"
-                },
-                "workspace_handle": {
-                  "type": "string"
-                },
-                "workspace_revision": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
                 }
               }
             }
@@ -7135,13 +6820,6 @@
           }
         }
       },
-      "DelegatedCliKind": {
-        "type": "string",
-        "enum": [
-          "claude_code",
-          "codex"
-        ]
-      },
       "DeleteFileInput": {
         "type": "object",
         "required": [
@@ -7158,158 +6836,6 @@
             "type": "string"
           },
           "recursive": {
-            "type": "boolean"
-          }
-        }
-      },
-      "DiffChangeKind": {
-        "type": "string",
-        "enum": [
-          "added",
-          "modified",
-          "deleted"
-        ]
-      },
-      "DiffHunk": {
-        "type": "object",
-        "description": "One contiguous change region. Unchanged spans longer than the context window\nbecome a single `Skip` line instead of being listed out.",
-        "required": [
-          "lines"
-        ],
-        "properties": {
-          "lines": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiffLine"
-            }
-          }
-        }
-      },
-      "DiffLine": {
-        "type": "object",
-        "description": "One rendered line inside a file hunk. `old_no` / `new_no` are 1-based;\neither may be absent for pure additions / deletions.",
-        "required": [
-          "kind",
-          "text"
-        ],
-        "properties": {
-          "kind": {
-            "$ref": "#/components/schemas/DiffLineKind"
-          },
-          "new_no": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "old_no": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "text": {
-            "type": "string"
-          }
-        }
-      },
-      "DiffLineKind": {
-        "type": "string",
-        "enum": [
-          "context",
-          "add",
-          "delete",
-          "skip"
-        ]
-      },
-      "DiffPathEntry": {
-        "type": "object",
-        "required": [
-          "path",
-          "kind",
-          "additions",
-          "deletions"
-        ],
-        "properties": {
-          "additions": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "binary": {
-            "type": "boolean",
-            "description": "True when content is binary or too large for line-level display."
-          },
-          "deletions": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "hunks": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiffHunk"
-            },
-            "description": "Line-level hunks when available. Empty for binary / oversized / pure path\nclassification without content. Frontend collapses by default."
-          },
-          "kind": {
-            "$ref": "#/components/schemas/DiffChangeKind"
-          },
-          "path": {
-            "type": "string"
-          }
-        }
-      },
-      "DiffSummary": {
-        "type": "object",
-        "required": [
-          "added",
-          "modified",
-          "deleted",
-          "paths",
-          "sync_enabled",
-          "apply_enabled"
-        ],
-        "properties": {
-          "added": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "apply_enabled": {
-            "type": "boolean"
-          },
-          "deleted": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "modified": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "paths": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiffPathEntry"
-            }
-          },
-          "pending_conflict": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/PropagationConflict"
-              }
-            ]
-          },
-          "sync_enabled": {
             "type": "boolean"
           }
         }
@@ -7846,114 +7372,6 @@
           }
         }
       },
-      "JobId": {
-        "type": "string",
-        "format": "uuid"
-      },
-      "JobProjection": {
-        "type": "object",
-        "required": [
-          "id",
-          "runtime_id",
-          "session_id",
-          "controlling_turn_id",
-          "initiated_by_tool_call_id",
-          "status",
-          "command_summary",
-          "log_stream_id",
-          "usage",
-          "version",
-          "created_at"
-        ],
-        "properties": {
-          "cli_kind": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/DelegatedCliKind"
-              }
-            ]
-          },
-          "cli_session_id": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/CliSessionId"
-              }
-            ]
-          },
-          "command_summary": {
-            "type": "string"
-          },
-          "controlling_turn_id": {
-            "$ref": "#/components/schemas/TurnId"
-          },
-          "created_at": {
-            "type": "string"
-          },
-          "ended_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "exit": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ExitSummary"
-              }
-            ]
-          },
-          "id": {
-            "$ref": "#/components/schemas/JobId"
-          },
-          "initiated_by_tool_call_id": {
-            "$ref": "#/components/schemas/ToolCallId"
-          },
-          "log_stream_id": {
-            "$ref": "#/components/schemas/LogStreamId"
-          },
-          "runtime_id": {
-            "$ref": "#/components/schemas/RuntimeId"
-          },
-          "session_id": {
-            "$ref": "#/components/schemas/SessionId"
-          },
-          "started_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "status": {
-            "$ref": "#/components/schemas/JobStatus"
-          },
-          "usage": {
-            "$ref": "#/components/schemas/ResourceUsage"
-          },
-          "version": {
-            "type": "string"
-          }
-        }
-      },
-      "JobStatus": {
-        "type": "string",
-        "enum": [
-          "queued",
-          "running",
-          "succeeded",
-          "failed",
-          "canceled",
-          "lost"
-        ]
-      },
       "LiveResponse": {
         "type": "object",
         "required": [
@@ -8078,12 +7496,6 @@
           "session_version"
         ],
         "properties": {
-          "handoff_from_turn_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "message_id": {
             "type": "string"
           },
@@ -8111,11 +7523,9 @@
       },
       "ModelClient": {
         "type": "string",
-        "description": "The client surface a provider is intended to serve.\n\n`claude-code` and `codex` are the public client identities used by the\nClaude Code/Codex integrations. Existing providers remain Supervisor\nproviders through the migration default.",
+        "description": "The client surface a provider is intended to serve.",
         "enum": [
-          "supervisor",
-          "claude-code",
-          "codex"
+          "supervisor"
         ]
       },
       "MoveFileInput": {
@@ -8239,9 +7649,7 @@
         "enum": [
           "turn_completed",
           "turn_failed",
-          "ask_opened",
-          "model_waiting",
-          "job_completed",
+          "async_task_completed",
           "test"
         ]
       },
@@ -8406,6 +7814,9 @@
           "expected_session_version": {
             "type": "string"
           },
+          "goal_mode": {
+            "type": "boolean"
+          },
           "model_preference": {
             "oneOf": [
               {
@@ -8563,90 +7974,6 @@
             "type": "string"
           },
           "version": {
-            "type": "string"
-          }
-        }
-      },
-      "PropagationConflict": {
-        "type": "object",
-        "required": [
-          "direction",
-          "paths"
-        ],
-        "properties": {
-          "direction": {
-            "$ref": "#/components/schemas/PropagationDirection"
-          },
-          "paths": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PropagationConflictPath"
-            }
-          }
-        }
-      },
-      "PropagationConflictPath": {
-        "type": "object",
-        "required": [
-          "path",
-          "kind"
-        ],
-        "properties": {
-          "base_hash": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "kind": {
-            "type": "string"
-          },
-          "main_hash": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "path": {
-            "type": "string"
-          },
-          "session_hash": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        }
-      },
-      "PropagationDirection": {
-        "type": "string",
-        "enum": [
-          "sync",
-          "apply"
-        ]
-      },
-      "PropagationResult": {
-        "type": "object",
-        "required": [
-          "direction",
-          "changed_paths",
-          "session_revision",
-          "main_revision"
-        ],
-        "properties": {
-          "changed_paths": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "direction": {
-            "$ref": "#/components/schemas/PropagationDirection"
-          },
-          "main_revision": {
-            "type": "string"
-          },
-          "session_revision": {
             "type": "string"
           }
         }
@@ -9054,64 +8381,6 @@
         "type": "string",
         "description": "Content Revision identity exposed as opaque `rev_<uuid>` string."
       },
-      "RuntimeCapability": {
-        "type": "object",
-        "required": [
-          "id",
-          "scope",
-          "state"
-        ],
-        "properties": {
-          "checked_at": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "effective_limits": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          "id": {
-            "$ref": "#/components/schemas/RuntimeCapabilityId"
-          },
-          "reason_code": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/CapabilityReason"
-              }
-            ]
-          },
-          "scope": {
-            "$ref": "#/components/schemas/CapabilityScope"
-          },
-          "state": {
-            "$ref": "#/components/schemas/CapabilityState"
-          }
-        }
-      },
-      "RuntimeCapabilityId": {
-        "type": "string",
-        "enum": [
-          "process_execution",
-          "container_isolation",
-          "bash_egress",
-          "browser",
-          "live_preview",
-          "delegated_cli.claude_code",
-          "delegated_cli.codex"
-        ]
-      },
       "RuntimeId": {
         "type": "string",
         "format": "uuid"
@@ -9164,10 +8433,7 @@
         "required": [
           "id",
           "project_id",
-          "kind",
           "state",
-          "workspace_handle",
-          "source_main_revision_id",
           "version",
           "created_at",
           "updated_at",
@@ -9186,9 +8452,6 @@
           "id": {
             "type": "string"
           },
-          "kind": {
-            "type": "string"
-          },
           "last_activity_at": {
             "type": "string"
           },
@@ -9205,9 +8468,6 @@
           "project_id": {
             "type": "string"
           },
-          "source_main_revision_id": {
-            "type": "string"
-          },
           "state": {
             "type": "string"
           },
@@ -9222,15 +8482,6 @@
           },
           "version": {
             "type": "string"
-          },
-          "workspace_handle": {
-            "type": "string"
-          },
-          "workspace_revision": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },
@@ -9288,16 +8539,9 @@
           "mode",
           "database",
           "events",
-          "capabilities",
           "update_available"
         ],
         "properties": {
-          "capabilities": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RuntimeCapability"
-            }
-          },
           "database": {
             "$ref": "#/components/schemas/DatabaseInfo"
           },
@@ -9622,7 +8866,7 @@
       },
       "TurnModelAttempt": {
         "type": "object",
-        "description": "The most recent model attempt for this Turn's active Round, projected onto\n`TurnSummary` so the UI can render the live retry counter\n(\"Reconnecting (X/5): reason\") even when the SSE event that announced it has\nalready been consumed. Absent when the Turn has had no attempts yet.",
+        "description": "The most recent model attempt for this Turn's active Round, projected onto\n`TurnSummary` so the UI can render the live retry counter\n(\"Reconnecting (X): reason\") even when the SSE event that announced it has\nalready been consumed. Absent when the Turn has had no attempts yet.",
         "required": [
           "attempt",
           "status"
@@ -9736,6 +8980,7 @@
           "session_id",
           "sequence",
           "status",
+          "goal_mode",
           "version",
           "created_at",
           "updated_at"
@@ -9756,17 +9001,8 @@
           "created_at": {
             "type": "string"
           },
-          "handoff_from_turn_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "handoff_to_turn_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "goal_mode": {
+            "type": "boolean"
           },
           "id": {
             "type": "string"
@@ -9813,11 +9049,41 @@
           "status": {
             "type": "string"
           },
+          "token_exchange": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TurnTokenExchange",
+                "description": "The durable whole-Turn model exchange. Live direction remains a\nstream concern and is intentionally not stored here."
+              }
+            ]
+          },
           "updated_at": {
             "type": "string"
           },
           "version": {
             "type": "string"
+          }
+        }
+      },
+      "TurnTokenExchange": {
+        "type": "object",
+        "required": [
+          "upload_tokens",
+          "download_tokens"
+        ],
+        "properties": {
+          "download_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Model output tokens for this Turn."
+          },
+          "upload_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Non-cached model input tokens for this Turn, excluding the system and\ndeveloper prompt prefix."
           }
         }
       },

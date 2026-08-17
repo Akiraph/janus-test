@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
                 id,
                 content,
                 expected_session_version,
+                idempotency_key,
             } => {
                 sessions_post_message(
                     &client,
@@ -187,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
                     &id,
                     &content,
                     &expected_session_version,
+                    idempotency_key,
                 )
                 .await
             }
@@ -199,7 +201,6 @@ async fn main() -> anyhow::Result<()> {
             SessionsCommand::GetTurn { id, turn_id } => {
                 sessions_get_turn(&client, &cli.base_url, &id, &turn_id).await
             }
-            SessionsCommand::Diff { id } => sessions_diff(&client, &cli.base_url, &id).await,
             SessionsCommand::Steer {
                 id,
                 content,
@@ -229,12 +230,6 @@ async fn main() -> anyhow::Result<()> {
                     reason,
                 )
                 .await
-            }
-            SessionsCommand::AnswerAsk { ask_id, answer } => {
-                sessions_answer_ask(&client, &cli.base_url, &ask_id, &answer).await
-            }
-            SessionsCommand::RetryModel { id, turn_id } => {
-                sessions_retry_model(&client, &cli.base_url, &id, &turn_id).await
             }
         },
         Command::Operations { command } => match command {
@@ -388,6 +383,9 @@ enum SessionsCommand {
         id: String,
         content: String,
         expected_session_version: String,
+        /// Random idempotency key if omitted.
+        #[arg(long)]
+        idempotency_key: Option<String>,
     },
     /// Read the session timeline (optionally bounded by opaque cursors).
     Timeline {
@@ -401,8 +399,6 @@ enum SessionsCommand {
     },
     /// Fetch the routed Turn for a session.
     GetTurn { id: String, turn_id: String },
-    /// Read the session diff projection.
-    Diff { id: String },
     /// Steer an interactive active Turn.
     Steer {
         id: String,
@@ -417,14 +413,6 @@ enum SessionsCommand {
         #[arg(long)]
         reason: Option<String>,
     },
-    /// Answer an open Ask by id.
-    AnswerAsk {
-        ask_id: String,
-        /// JSON value or plain text string.
-        answer: String,
-    },
-    /// Retry a Turn parked on waiting_for_model.
-    RetryModel { id: String, turn_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -772,6 +760,7 @@ async fn sessions_post_message(
     id: &str,
     content: &str,
     expected_session_version: &str,
+    idempotency_key: Option<String>,
 ) -> anyhow::Result<()> {
     let body = serde_json::json!({
         "content": content,
@@ -779,6 +768,7 @@ async fn sessions_post_message(
     });
     let response = client
         .post(url(base_url, &format!("/api/v1/sessions/{id}/messages")))
+        .header("Idempotency-Key", random_key(idempotency_key))
         .json(&body)
         .send()
         .await?;
@@ -816,14 +806,6 @@ async fn sessions_get_turn(
             base_url,
             &format!("/api/v1/sessions/{id}/turns/{turn_id}"),
         ))
-        .send()
-        .await?;
-    print_response(response).await
-}
-
-async fn sessions_diff(client: &Client, base_url: &str, id: &str) -> anyhow::Result<()> {
-    let response = client
-        .get(url(base_url, &format!("/api/v1/sessions/{id}/diff")))
         .send()
         .await?;
     print_response(response).await
@@ -868,39 +850,6 @@ async fn sessions_cancel(
             &format!("/api/v1/sessions/{id}/turns/{turn_id}/cancel"),
         ))
         .json(&body)
-        .send()
-        .await?;
-    print_response(response).await
-}
-
-async fn sessions_answer_ask(
-    client: &Client,
-    base_url: &str,
-    ask_id: &str,
-    answer: &str,
-) -> anyhow::Result<()> {
-    let answer_value = serde_json::from_str::<serde_json::Value>(answer)
-        .unwrap_or_else(|_| serde_json::Value::String(answer.to_owned()));
-    let body = serde_json::json!({ "answer": answer_value });
-    let response = client
-        .post(url(base_url, &format!("/api/v1/asks/{ask_id}/answer")))
-        .json(&body)
-        .send()
-        .await?;
-    print_response(response).await
-}
-
-async fn sessions_retry_model(
-    client: &Client,
-    base_url: &str,
-    id: &str,
-    turn_id: &str,
-) -> anyhow::Result<()> {
-    let response = client
-        .post(url(
-            base_url,
-            &format!("/api/v1/sessions/{id}/turns/{turn_id}/retry-model"),
-        ))
         .send()
         .await?;
     print_response(response).await

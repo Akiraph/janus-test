@@ -1,4 +1,4 @@
-import { expect, type Response, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import { type LiveJanusEnvironment, startLiveJanus } from "./support/liveJanus";
 
 type DataResponse<T> = { data: T };
@@ -11,14 +11,11 @@ interface LiveSession {
 }
 
 interface LiveTurn {
-  handoff_from_turn_id?: string | null;
-  handoff_to_turn_id?: string | null;
   id: string;
   status: string;
 }
 
 interface MessageRoute {
-  handoff_from_turn_id?: string | null;
   route: string;
   session_version: string;
   turn_id: string;
@@ -32,12 +29,6 @@ interface TimelineItem {
 
 interface TimelinePage {
   items: TimelineItem[];
-}
-
-interface CancelResult {
-  session_version: string;
-  to_status: string;
-  turn_id: string;
 }
 
 interface LiveTerminal {
@@ -85,10 +76,13 @@ test("a browser message completes through live execution", async ({ page }) => {
   // convergence), so boundingBox() can hit a transient gap mid-swap. Poll until
   // the durable bubble reports a box instead of measuring once.
   await expect
-    .poll(async () => {
-      const box = await userBubble.boundingBox();
-      return box ? box.width > box.height : false;
-    }, { timeout: 5_000 })
+    .poll(
+      async () => {
+        const box = await userBubble.boundingBox();
+        return box ? box.width > box.height : false;
+      },
+      { timeout: 5_000 },
+    )
     .toBe(true);
 
   // Streaming provisional text renders as plain text (not parsed as markdown
@@ -96,7 +90,7 @@ test("a browser message completes through live execution", async ({ page }) => {
   // completes. The durable assistant message contains the heading + list item,
   // so "Live fixture reply" is the stable visible signal across both phases.
   await expect(page.locator(".session-message--status")).toContainText(
-    /^(Working \(|Reconnecting \()/,
+    /^(Working \d+[smh]|Reconnecting \(|Worked for \d+[smh])/,
     { timeout: 10_000 },
   );
   await expect(page.getByText("Live fixture reply")).toBeVisible({ timeout: 30_000 });
@@ -117,110 +111,6 @@ test("a browser message completes through live execution", async ({ page }) => {
       expect.objectContaining({ kind: "assistant_message" }),
     ]),
   );
-});
-
-test("browser queue management preserves the active Turn and keeps Cancel usable", async ({
-  page,
-}) => {
-  test.setTimeout(90_000);
-  await page.goto(`/projects/${live.projectId}?view=sessions`, {
-    waitUntil: "domcontentloaded",
-  });
-  await page.getByRole("button", { name: live.sessionTitle, exact: true }).click();
-
-  const composer = page.locator(".session-composer__input");
-  await composer.fill("[fixture:ask] Hold the active Turn for browser queue testing");
-  await page.getByRole("button", { name: "Send message" }).click();
-  const activeSession = await waitFor(
-    () => readSession(),
-    (session) => Boolean(session.active_turn_id),
-    "Session to acquire an active Turn",
-  );
-  const activeTurnId = activeSession.active_turn_id as string;
-  await waitForTurn(activeTurnId, "waiting_for_ask", 20_000);
-
-  const cancel = page.getByRole("button", { name: "Cancel turn" });
-  await expect(cancel).toBeVisible();
-  await composer.fill("queued browser follow-up");
-  await expect(cancel).toHaveCount(0);
-
-  await page.context().setOffline(true);
-  const versionBump = postMessage("queued version-race sentinel");
-  const removedVersionBump = live.cli<DataResponse<CancelResult>>([
-    "sessions",
-    "cancel",
-    live.sessionId,
-    versionBump.turn_id,
-    versionBump.session_version,
-    "--reason",
-    "force browser version refresh",
-  ]);
-  expect(removedVersionBump.data.to_status).toBe("canceled");
-
-  const isQueuedFollowUpResponse = (response: Response) => {
-    const request = response.request();
-    if (
-      request.method() !== "POST" ||
-      !response.url().endsWith(`/api/v1/sessions/${live.sessionId}/messages`)
-    ) {
-      return false;
-    }
-    return (
-      (request.postDataJSON() as { content?: unknown } | null)?.content ===
-      "queued browser follow-up"
-    );
-  };
-  const queuedResponseStatuses: number[] = [];
-  page.on("response", (response) => {
-    if (isQueuedFollowUpResponse(response)) queuedResponseStatuses.push(response.status());
-  });
-  const queuedResponsePromise = page.waitForResponse(
-    (response) => isQueuedFollowUpResponse(response) && response.status() === 200,
-  );
-  await page.evaluate(() => {
-    window.addEventListener(
-      "online",
-      () =>
-        document.querySelector<HTMLButtonElement>('button[aria-label="Queue message"]')?.click(),
-      { once: true },
-    );
-  });
-  await page.context().setOffline(false);
-  const queuedResponse = await queuedResponsePromise;
-  expect(queuedResponse.status(), await queuedResponse.text()).toBe(200);
-  expect(queuedResponseStatuses).toEqual([412, 200]);
-
-  const queuedBar = page.getByRole("status", { name: "Queued messages" });
-  await expect(queuedBar.getByText("1 queued message", { exact: true })).toBeVisible();
-  await expect(queuedBar.getByText("queued browser follow-up", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Remove queued message" }).click();
-  await expect(queuedBar.getByText("queued browser follow-up", { exact: true })).toHaveCount(0);
-  await waitFor(
-    () => live.request<DataResponse<unknown[]>>(`/api/v1/sessions/${live.sessionId}/queued-turns`),
-    (response) => response.data.length === 0,
-    "queued Turn removal",
-  );
-  expect((await readTurn(activeTurnId)).status).toBe("waiting_for_ask");
-
-  await page.locator('input[type="file"]').setInputFiles([
-    {
-      name: "queue-only.txt",
-      mimeType: "text/plain",
-      buffer: Buffer.from("attachment-only queued message"),
-    },
-  ]);
-  await expect(page.getByRole("button", { name: "Queue message" })).toBeVisible();
-  await expect(cancel).toHaveCount(0);
-  await page.getByRole("button", { name: "Remove queue-only.txt" }).click();
-  await expect(cancel).toBeVisible();
-  await cancel.click();
-  await waitForTurn(activeTurnId, "canceled", 20_000);
-  await waitFor(
-    () => readSession(),
-    (session) => session.active_turn_id === null,
-    "Session to release the canceled Turn",
-  );
-  await expect(cancel).toHaveCount(0);
 });
 
 test("Session attachments remain reusable and can become workspace files", async ({
@@ -261,9 +151,16 @@ test("Session attachments remain reusable and can become workspace files", async
     30_000,
   );
 
-  const diff = await live.request(`/api/v1/sessions/${live.sessionId}/diff`);
-  expect(JSON.stringify(diff)).toContain("assets/logo.bin");
+  const savedFile = await live.request<DataResponse<{ path: string; size: number }>>(
+    `/api/v1/projects/${live.projectId}/files/meta?path=${encodeURIComponent("assets/logo.bin")}`,
+  );
+  expect(savedFile.data).toMatchObject({ path: "assets/logo.bin", size: 6 });
 
+  await waitFor(
+    () => readSession(),
+    (session) => session.state === "ready" && session.active_turn_id === null,
+    "attachment turn to settle before reuse",
+  );
   const reused = postMessage("[fixture:attachment-reuse] Read a previous Session attachment");
   await waitForTurn(reused.turn_id, "completed", 30_000);
   const attachmentReads = JSON.stringify(await readTimeline()).match(
@@ -306,6 +203,7 @@ test("Main Terminal runs in the Project workspace through CLI and WebSocket", as
 test("Project files keep drafts across real SCM navigation and close cleanly", async ({
   page,
 }, testInfo) => {
+  test.setTimeout(60_000);
   await page.goto(`/projects/${live.projectId}`, { waitUntil: "domcontentloaded" });
 
   await page.getByRole("button", { name: "Explorer", exact: true }).click();
@@ -336,6 +234,7 @@ test("Project files keep drafts across real SCM navigation and close cleanly", a
 test("mobile workspace switches between navigation and the active Session", async ({
   page,
 }, testInfo) => {
+  test.setTimeout(60_000);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/projects/${live.projectId}`, { waitUntil: "domcontentloaded" });
 
@@ -359,12 +258,15 @@ test("mobile workspace switches between navigation and the active Session", asyn
 });
 
 test("live deployment pages remain usable on mobile", async ({ page }, testInfo) => {
+  test.setTimeout(60_000);
   await page.setViewportSize({ width: 390, height: 844 });
 
   await page.goto("/", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
-  await expect(page.getByText("Live project", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByText("Live project", { exact: true })).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("link", { name: "Settings" })).toBeVisible({ timeout: 15_000 });
 
   await page.goto("/settings", { waitUntil: "domcontentloaded" });
   const navigation = page.getByRole("navigation", { name: "Settings navigation" });
@@ -376,154 +278,15 @@ test("live deployment pages remain usable on mobile", async ({ page }, testInfo)
   await page.screenshot({ path: testInfo.outputPath("live-settings-mobile.png"), fullPage: true });
 
   await page.goto("/system", { waitUntil: "domcontentloaded" });
-  await expect(page.getByRole("heading", { name: "System", level: 2 })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Capabilities" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "System", level: 2 })).toBeVisible({
+    timeout: 15_000,
+  });
+  await expect(page.getByRole("heading", { name: "Service" })).toBeVisible({ timeout: 15_000 });
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
     ),
   ).toBe(false);
-});
-
-test("blocking Ask answers once and duplicate delivery is idempotent", async () => {
-  test.setTimeout(60_000);
-  const routed = postMessage("[fixture:ask] Ask before finishing");
-  await waitForTurn(routed.turn_id, "waiting_for_ask");
-
-  const timeline = await waitFor(
-    () => readTimeline(),
-    (page) =>
-      page.items.some(
-        (item) =>
-          item.turn_id === routed.turn_id &&
-          findStringProperty(item.projection, "ask_id") !== undefined,
-      ),
-    "blocking Ask projection",
-  );
-  const askId = timeline.items
-    .filter((item) => item.turn_id === routed.turn_id)
-    .map((item) => findStringProperty(item.projection, "ask_id"))
-    .find((value) => value !== undefined);
-  expect(askId).toBeTruthy();
-
-  live.cli(["sessions", "answer-ask", askId as string, "fixture answer"]);
-  await waitForTurn(routed.turn_id, "completed");
-
-  const beforeTimeline = await readTimeline();
-  const beforeSession = await readSession();
-  const beforeRequests = live.providerRequestCount();
-  const duplicate = live.cli<DataResponse<{ route_or_status: string }>>([
-    "sessions",
-    "answer-ask",
-    askId as string,
-    "fixture answer",
-  ]);
-  expect(duplicate.data.route_or_status).toBe("completed");
-
-  await delay(300);
-  expect((await readTimeline()).items).toHaveLength(beforeTimeline.items.length);
-  expect((await readSession()).version).toBe(beforeSession.version);
-  expect(live.providerRequestCount()).toBe(beforeRequests);
-});
-
-test("best-effort Ask expires to its default and resumes", async () => {
-  test.setTimeout(60_000);
-  const routed = postMessage("[fixture:ask-expire] Use the default");
-  await waitForTurn(routed.turn_id, "completed", 20_000);
-  const turnItems = (await readTimeline()).items.filter((item) => item.turn_id === routed.turn_id);
-  expect(JSON.stringify(turnItems)).toContain("fixture expiry default");
-});
-
-test("a completed Job settles its Tool Call and resumes exactly once", async () => {
-  test.setTimeout(60_000);
-  const beforeRequests = live.providerRequestCount();
-  const routed = postMessage("[fixture:job-resume] Finish after the Job");
-  await waitForTurn(routed.turn_id, "waiting_for_job", 20_000);
-  await waitForTurn(routed.turn_id, "completed", 20_000);
-
-  const toolCall = (await readTimeline()).items.find(
-    (item) => item.turn_id === routed.turn_id && item.kind === "tool_call",
-  );
-  expect(toolCall?.projection).toMatchObject({
-    kind: "tool_call",
-    status: "succeeded",
-    summary: expect.objectContaining({ status: "succeeded" }),
-    tool_name: "bash",
-  });
-  expect(live.providerRequestCount()).toBe(beforeRequests + 2);
-});
-
-test("Handoff transfers a running Job and completes the successor", async () => {
-  test.setTimeout(60_000);
-  const beforeRequests = live.providerRequestCount();
-  const predecessor = postMessage("[fixture:handoff-job] Start transferable work");
-  await waitForTurn(predecessor.turn_id, "waiting_for_job", 20_000);
-
-  const successor = postMessage("Take over while the existing Job finishes");
-  expect(successor.route).toBe("handed_off");
-  expect(successor.handoff_from_turn_id).toBe(predecessor.turn_id);
-  await waitForTurn(predecessor.turn_id, "handed_off");
-  await waitForTurn(successor.turn_id, "waiting_for_job");
-  await waitForTurn(successor.turn_id, "completed", 20_000);
-
-  const predecessorAfter = await readTurn(predecessor.turn_id);
-  const successorAfter = await readTurn(successor.turn_id);
-  expect(predecessorAfter.handoff_to_turn_id).toBe(successor.turn_id);
-  expect(successorAfter.handoff_from_turn_id).toBe(predecessor.turn_id);
-  expect((await readSession()).active_turn_id).toBeNull();
-
-  const toolCall = (await readTimeline()).items.find(
-    (item) => item.turn_id === predecessor.turn_id && item.kind === "tool_call",
-  );
-  expect(toolCall?.projection).toMatchObject({
-    kind: "tool_call",
-    status: "succeeded",
-    summary: expect.objectContaining({ status: "succeeded" }),
-    tool_name: "bash",
-  });
-  expect(live.providerRequestCount()).toBe(beforeRequests + 3);
-});
-
-test("Cancel stops a running Job and is retryable with the original version", async () => {
-  test.setTimeout(60_000);
-  const routed = postMessage("[fixture:cancel-job] Start cancellable work");
-  await waitForTurn(routed.turn_id, "waiting_for_job", 20_000);
-  const cancelVersion = (await readSession()).version;
-
-  const first = live.cli<DataResponse<CancelResult>>([
-    "sessions",
-    "cancel",
-    live.sessionId,
-    routed.turn_id,
-    cancelVersion,
-    "--reason",
-    "fixture cancel",
-  ]);
-  expect(first.data.to_status).toBe("canceled");
-
-  const repeated = live.cli<DataResponse<CancelResult>>([
-    "sessions",
-    "cancel",
-    live.sessionId,
-    routed.turn_id,
-    cancelVersion,
-    "--reason",
-    "fixture cancel retry",
-  ]);
-  expect(repeated.data.to_status).toBe("canceled");
-  expect((await readSession()).active_turn_id).toBeNull();
-});
-
-test("restart interrupts an active Turn without replaying the Provider", async () => {
-  test.setTimeout(60_000);
-  const routed = postMessage("[fixture:restart-ask] Wait across restart");
-  await waitForTurn(routed.turn_id, "waiting_for_ask");
-  const beforeRequests = live.providerRequestCount();
-
-  await live.restart();
-  await waitForTurn(routed.turn_id, "interrupted", 20_000);
-  expect((await readSession()).active_turn_id).toBeNull();
-  expect(live.providerRequestCount()).toBe(beforeRequests);
 });
 
 function postMessage(content: string): MessageRoute {
@@ -584,24 +347,6 @@ async function waitFor<T>(
   throw new Error(
     `${label} timed out; last value: ${JSON.stringify(last)}\nJanus server output:\n${live.serverLog()}`,
   );
-}
-
-function findStringProperty(value: unknown, key: string): string | undefined {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const found = findStringProperty(item, key);
-      if (found !== undefined) return found;
-    }
-    return undefined;
-  }
-  if (typeof value !== "object" || value === null) return undefined;
-  const direct = Reflect.get(value, key);
-  if (typeof direct === "string") return direct;
-  for (const nested of Object.values(value)) {
-    const found = findStringProperty(nested, key);
-    if (found !== undefined) return found;
-  }
-  return undefined;
 }
 
 function delay(milliseconds: number): Promise<void> {

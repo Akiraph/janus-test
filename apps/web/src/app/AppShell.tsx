@@ -1,11 +1,11 @@
 import { A, useLocation } from "@solidjs/router";
 import ArrowLeft from "lucide-solid/icons/arrow-left";
+import Bell from "lucide-solid/icons/bell";
 import Database from "lucide-solid/icons/database";
 import Loader2 from "lucide-solid/icons/loader-2";
 import Server from "lucide-solid/icons/server";
 import Settings from "lucide-solid/icons/settings";
 import ShieldCheck from "lucide-solid/icons/shield-check";
-import Bell from "lucide-solid/icons/bell";
 import type { JSX } from "solid-js";
 import { Show, Suspense } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";

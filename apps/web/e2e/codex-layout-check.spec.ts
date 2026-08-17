@@ -4,7 +4,7 @@ import { expect, test } from "@playwright/test";
 test("thinking content and nested tools share the thinking alignment", async ({ page }) => {
   await page.goto("/", { waitUntil: "domcontentloaded" });
   const sessionCss = await readFile(
-    new URL("../src/features/projects/workspace/session.css", import.meta.url),
+    new URL("../src/features/session/session.css", import.meta.url),
     "utf8",
   );
   await page.addStyleTag({

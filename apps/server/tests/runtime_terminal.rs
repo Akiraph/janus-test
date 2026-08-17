@@ -25,6 +25,9 @@ fn test_config(data_root: PathBuf) -> Config {
         webauthn_rp_id: "localhost".into(),
         public_origin: url::Url::parse("http://localhost").expect("static URL"),
         event_heartbeat: Duration::from_millis(50),
+        automation_webhook_enabled: false,
+        automation_webhook_secret: None,
+        automation_github_token: None,
     }
 }
 
@@ -51,10 +54,8 @@ async fn boot_state() -> anyhow::Result<(TempDir, AppState, RuntimeId, ProjectId
     let runtime = RuntimeSpec::new(
         runtime_id,
         RuntimeScope::project(project_id),
-        ExecutorKind::Local,
         workspace,
         limits(),
-        NetworkPolicy::DenyAll,
     )?;
     let ready = state
         .runtime()

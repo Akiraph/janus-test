@@ -4,11 +4,9 @@
     http::{HeaderMap, HeaderValue, StatusCode, header::HeaderName},
 };
 use janus_identity::InitializationState;
-use janus_runtime::interface::{DeploymentCapabilityProbe, RuntimeCapabilityEvaluator};
 
 use crate::{
     AppState,
-    config::RunMode,
     transport::http::{
         dto::{
             BootstrapData, BootstrapResponse, BootstrapState, DatabaseInfo, EventInfo,
@@ -139,10 +137,6 @@ pub async fn system_info(
                     min_cursor: bounds.min.to_string(),
                     max_cursor: bounds.max.to_string(),
                 },
-                capabilities: RuntimeCapabilityEvaluator::deployment(
-                    &DeploymentCapabilityProbe::detect(),
-                    state.config().mode == RunMode::Production,
-                ),
                 update_available: false,
             },
         }),

@@ -1,7 +1,7 @@
 //! Cross-module Session/Project deletion and bounded Runtime shutdown.
 //!
 //! Sessions and Projects declare no Runtime dependency in their architecture
-//! manifests. Deletion that stops live Jobs, Services, or Terminals therefore
+//! manifests. Deletion that stops live async tasks or Terminals therefore
 //! lives here: isolate the resource, stop Runtime-owned processes, then hand
 //! durable row and workspace removal back to the owning capability.
 
@@ -24,9 +24,7 @@ use janus_infrastructure::{
 };
 use janus_models::interface::ModelsError;
 use janus_projects::interface::ProjectsError;
-use janus_runtime::interface::{
-    JobStatus, RuntimeError, RuntimeScope, ServiceStatus, TerminalStatus,
-};
+use janus_runtime::interface::{AsyncTaskStatus, RuntimeError, RuntimeScope, TerminalStatus};
 use janus_sessions::interface::{SessionsError, TurnStatus};
 use janus_workspace::interface::WorkspaceError;
 
@@ -475,39 +473,6 @@ async fn execute_session_creation(
         }
     }
 
-    let workspace_step = state
-        .operations()
-        .begin_step_claimed(
-            claim,
-            &input.operation_id,
-            "create_workspace",
-            json!({"session_id": session_id, "project_id": project_id}),
-        )
-        .await?;
-    if matches!(workspace_step, StepState::NeedsReconciliation) {
-        return Err(SessionLifecycleError::StepNeedsReconciliation(
-            "create_workspace".into(),
-        ));
-    }
-    if matches!(workspace_step, StepState::Running) {
-        state.operations().assert_claimed(claim).await?;
-    }
-    let copy = state
-        .workspace()
-        .ensure_session_copy(project_id, session_id, None, input.actor.clone())
-        .await?;
-    if matches!(workspace_step, StepState::Running) {
-        state
-            .operations()
-            .complete_step_claimed(
-                claim,
-                &input.operation_id,
-                "create_workspace",
-                Some(&copy.revision.0),
-            )
-            .await?;
-    }
-
     let record_step = state
         .operations()
         .begin_step_claimed(
@@ -534,8 +499,6 @@ async fn execute_session_creation(
                     session_id,
                     project_id,
                     input.title.clone(),
-                    &copy.handle,
-                    &copy.source_main_revision.0,
                 )
                 .await?;
             if record.created {
@@ -550,7 +513,6 @@ async fn execute_session_creation(
                         "project_id": project_id,
                         "state": "ready",
                         "version": record.version,
-                        "workspace_revision": copy.revision.0,
                     }),
                 })
                 .await?;
@@ -620,9 +582,9 @@ async fn execute_session_deletion_steps(
         state.operations(),
         claim,
         operation_id,
-        &step_key("stop_runtime"),
+        &step_key("stop_processes"),
         step_input(),
-        drain_session_runtime(state, session_id),
+        drain_session_processes(state, session_id),
     )
     .await?;
     run_operation_step(
@@ -633,18 +595,6 @@ async fn execute_session_deletion_steps(
         step_input(),
         async {
             state.runtime().delete_session_log_files(session_id).await?;
-            Ok(())
-        },
-    )
-    .await?;
-    run_operation_step(
-        state.operations(),
-        claim,
-        operation_id,
-        &step_key("delete_workspace"),
-        step_input(),
-        async {
-            state.workspace().delete_session_copy(session_id).await?;
             Ok(())
         },
     )
@@ -868,38 +818,25 @@ pub(crate) async fn delete_project_with_runtime(
     Ok(())
 }
 
-async fn drain_session_runtime(
+async fn drain_session_processes(
     state: &Application,
     session_id: SessionId,
 ) -> Result<(), SessionLifecycleError> {
     let runtime = state.runtime();
-    for job in runtime.jobs(session_id).await? {
-        if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
-            runtime.cancel_job(job.id).await?;
-        }
-    }
-    for service in runtime.services(session_id).await? {
-        if matches!(
-            service.status,
-            ServiceStatus::Starting | ServiceStatus::Running | ServiceStatus::Unhealthy
-        ) {
-            runtime.stop_service(service.id).await?;
-        }
-    }
-    if let Some(current) = runtime
-        .current_runtime(RuntimeScope::session(session_id))
+    for async_task in runtime
+        .async_tasks(1000)
         .await?
+        .into_iter()
+        .filter(|async_task| async_task.session_id == session_id)
     {
-        runtime.stop_runtime(current.id).await?;
+        if matches!(
+            async_task.status,
+            AsyncTaskStatus::Queued | AsyncTaskStatus::Running
+        ) {
+            runtime.cancel_async_task(async_task.id).await?;
+        }
     }
     Ok(())
-}
-
-/// Best-effort Runtime drain used only during bounded process shutdown.
-async fn cleanup_session_runtime(state: &Application, session_id: SessionId) {
-    if let Err(error) = drain_session_runtime(state, session_id).await {
-        warn!(%error, %session_id, "drain Runtime during graceful shutdown");
-    }
 }
 
 async fn cleanup_project_terminals(
@@ -933,15 +870,9 @@ pub async fn graceful_shutdown(state: &Application, deadline: Duration) {
         match state.runtime().live_runtimes().await {
             Ok(runtimes) => {
                 for runtime in runtimes {
-                    match runtime.scope {
-                        RuntimeScope::Session { session_id } => {
-                            cleanup_session_runtime(state, session_id).await;
-                        }
-                        RuntimeScope::Project { project_id } => {
-                            if let Err(error) = cleanup_project_terminals(state, project_id).await {
-                                warn!(%error, %project_id, "drain Project Runtime during graceful shutdown");
-                            }
-                        }
+                    let RuntimeScope::Project { project_id } = runtime.scope;
+                    if let Err(error) = cleanup_project_terminals(state, project_id).await {
+                        warn!(%error, %project_id, "drain Project Runtime during graceful shutdown");
                     }
                 }
             }

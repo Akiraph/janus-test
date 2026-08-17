@@ -21,7 +21,7 @@ pub struct LogRetention {
 }
 
 impl LogRetention {
-    pub const JOB_SERVICE: Self = Self {
+    pub const ASYNC_TASK: Self = Self {
         raw_limit_bytes: 512 * 1024 * 1024,
         head_bytes: 1024 * 1024,
     };
@@ -555,7 +555,7 @@ mod tests {
 
     use super::{LogRetention, LogStore};
     use crate::interface::{LogChannel, LogCursor, LogOwnerKind};
-    use janus_infrastructure::id::JobId;
+    use janus_infrastructure::id::AsyncTaskId;
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn test_store() -> anyhow::Result<(TempDir, LogStore)> {
@@ -604,7 +604,7 @@ mod tests {
     async fn redacts_closes_and_retains_head_marker_and_tail() -> anyhow::Result<()> {
         let (_temp, store) = test_store().await?;
         let stream = store
-            .create(LogOwnerKind::Job, &JobId::new().to_string())
+            .create(LogOwnerKind::AsyncTask, &AsyncTaskId::new().to_string())
             .await?;
         let retention = LogRetention {
             raw_limit_bytes: 96,
@@ -670,7 +670,7 @@ mod tests {
             head_bytes: 5,
         };
         let retained = store
-            .create(LogOwnerKind::Job, &JobId::new().to_string())
+            .create(LogOwnerKind::AsyncTask, &AsyncTaskId::new().to_string())
             .await?;
         store
             .append(
@@ -690,7 +690,7 @@ mod tests {
         );
 
         let ranged = store
-            .create(LogOwnerKind::Job, &JobId::new().to_string())
+            .create(LogOwnerKind::AsyncTask, &AsyncTaskId::new().to_string())
             .await?;
         store
             .append(
@@ -698,7 +698,7 @@ mod tests {
                 LogChannel::Stdout,
                 "甲🙂乙".as_bytes(),
                 &[],
-                LogRetention::JOB_SERVICE,
+                LogRetention::ASYNC_TASK,
             )
             .await?;
         let first = store.read(ranged.id, LogCursor::ZERO, 3).await?;

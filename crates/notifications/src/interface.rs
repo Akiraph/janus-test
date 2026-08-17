@@ -29,46 +29,31 @@ pub enum NotificationChannelKind {
 pub enum NotificationEventKind {
     TurnCompleted,
     TurnFailed,
-    AskOpened,
-    ModelWaiting,
-    JobCompleted,
+    AsyncTaskCompleted,
     Test,
 }
 
 impl NotificationEventKind {
-    pub const CONFIGURABLE: [Self; 5] = [
+    pub const CONFIGURABLE: [Self; 3] = [
         Self::TurnCompleted,
         Self::TurnFailed,
-        Self::AskOpened,
-        Self::ModelWaiting,
-        Self::JobCompleted,
+        Self::AsyncTaskCompleted,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TurnCompleted => "turn_completed",
             Self::TurnFailed => "turn_failed",
-            Self::AskOpened => "ask_opened",
-            Self::ModelWaiting => "model_waiting",
-            Self::JobCompleted => "job_completed",
+            Self::AsyncTaskCompleted => "async_task_completed",
             Self::Test => "test",
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct NotificationTarget {
     pub user_id: Option<String>,
     pub group_id: Option<String>,
-}
-
-impl Default for NotificationTarget {
-    fn default() -> Self {
-        Self {
-            user_id: None,
-            group_id: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -434,12 +419,7 @@ fn validate_input(
         ));
     }
     normalize_url(&input.endpoint_url)?;
-    if input.events.is_empty()
-        || input
-            .events
-            .iter()
-            .any(|event| *event == NotificationEventKind::Test)
-    {
+    if input.events.is_empty() || input.events.contains(&NotificationEventKind::Test) {
         return Err(NotificationsError::Validation(
             "events must contain at least one configurable event".into(),
         ));

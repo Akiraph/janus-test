@@ -5,6 +5,8 @@ export interface StreamUsage {
   outputTokens: number;
 }
 
+export type StreamDirection = "upload" | "download";
+
 export interface ModelStreamOutput {
   roundId: string;
   attemptId: string;
@@ -14,12 +16,21 @@ export interface ModelStreamOutput {
   usage: StreamUsage | null;
   reasoningFirstSeenAt: number | null;
   textFirstSeenAt: number | null;
+  /** Server-measured thinking duration (ms), present from the first answer delta. */
+  reasoningDurationMs: number | null;
+  /** Total non-cached exchange tokens for the whole Turn so far. */
+  turnExchangeTokens?: number | null;
+  /** Input/upload portion of the authoritative whole-Turn exchange. */
+  turnInputTokens?: number | null;
+  /** Output/download portion of the authoritative whole-Turn exchange. */
+  turnOutputTokens?: number | null;
+  /** Direction of the current model exchange. */
+  direction?: StreamDirection | null;
 }
 
 export interface RetryState {
   attemptId: string;
   attempt: number;
-  maxAttempts: number;
   detail: string;
   retryAt: number;
 }
@@ -27,7 +38,15 @@ export interface RetryState {
 const MAX_RETAINED_OUTPUTS = 32;
 const [outputs, setOutputs] = createSignal<ReadonlyMap<string, ModelStreamOutput>>(new Map());
 const [retryStates, setRetryStates] = createSignal<ReadonlyMap<string, RetryState>>(new Map());
-const usageByTurn = new Map<string, Map<string, StreamUsage>>();
+interface RetainedUsage {
+  attemptKey: string;
+  usage: StreamUsage;
+}
+
+// Provider usage frames are cumulative for one model attempt. Retain only the
+// current round/attempt and normalize input to non-cached exchange tokens so a
+// retry or a new round cannot make the status line jump by summing old frames.
+const usageByTurn = new Map<string, RetainedUsage>();
 
 const SUMMARY_START =
   /^(?:summarizing|detailing|outlining|inspecting|reviewing|checking|planning|searching|reading|analyzing|comparing|verifying|tracing|exploring|preparing|updating|implementing|testing|running)\b/i;
@@ -56,10 +75,14 @@ interface StreamTextPayload {
   seq?: number;
   round_id?: string;
   usage?: { input_tokens?: number; output_tokens?: number; cache_tokens?: number } | null;
+  turn_input_tokens?: number;
+  turn_output_tokens?: number;
+  turn_exchange_tokens?: number;
+  direction?: StreamDirection;
+  reasoning_duration_ms?: number | null;
   retrying?: boolean;
   attempt?: number;
   detail?: string;
-  max_attempts?: number;
   retry_after_ms?: number;
   attempt_id?: string;
 }
@@ -69,7 +92,9 @@ export function initStreamTextListener(eventTarget?: EventTarget) {
   const target = eventTarget ?? (typeof window !== "undefined" ? window : null);
   if (!target) return;
   const handler = (event: Event) => {
-    const detail = (event as CustomEvent).detail as { id: string; data: StreamTextPayload } | undefined;
+    const detail = (event as CustomEvent).detail as
+      | { id: string; data: StreamTextPayload }
+      | undefined;
     if (!detail) return;
     const { id: key, data } = detail;
     if (!key || !data) return;
@@ -81,11 +106,10 @@ export function initStreamTextListener(eventTarget?: EventTarget) {
       setRetryStates((current) => {
         const next = new Map(current);
         const k = retryKey(sessionId, turnId);
-        if (data.attempt && data.max_attempts && data.retry_after_ms != null && data.attempt_id) {
+        if (data.attempt && data.retry_after_ms != null && data.attempt_id) {
           next.set(k, {
             attemptId: data.attempt_id,
             attempt: data.attempt,
-            maxAttempts: data.max_attempts,
             detail: data.detail ?? "",
             retryAt: Date.now() + data.retry_after_ms,
           });
@@ -104,9 +128,17 @@ export function initStreamTextListener(eventTarget?: EventTarget) {
         const prev = current.get(key);
         if (!prev) return current;
         const next = new Map(current);
-        next.set(key, { ...prev, text: "", reasoning: "" });
+        next.set(key, {
+          ...prev,
+          text: "",
+          reasoning: "",
+          reasoningDurationMs: null,
+          direction: data.direction ?? "upload",
+          ...turnTokenFields(data, prev),
+        });
         return next;
       });
+      usageByTurn.delete(key);
       return;
     }
 
@@ -115,6 +147,10 @@ export function initStreamTextListener(eventTarget?: EventTarget) {
     const fullText = data.text ?? "";
     const fullReasoning = data.reasoning ?? "";
     const usage = parseUsage(data.usage ?? null);
+    const reasoningDurationMs = numberValue(data.reasoning_duration_ms ?? null);
+    const roundId = data.round_id ?? "stream";
+    const attemptId = data.attempt_id ?? "stream";
+    const direction = data.direction ?? (fullText || fullReasoning ? "download" : undefined);
 
     setOutputs((current) => {
       const previous = current.get(key);
@@ -124,10 +160,9 @@ export function initStreamTextListener(eventTarget?: EventTarget) {
       // Server pushes accumulated text, so we use it directly. The round_id is
       // the same value the durable assistant timeline item carries, so once
       // that item appears isModelStreamOutputDurable can retire this overlay.
-      const roundId = data.round_id ?? "stream";
       const previousReasoningAt = previous?.reasoningFirstSeenAt ?? null;
       const previousTextAt = previous?.textFirstSeenAt ?? null;
-      const totalUsage = usage ? recordUsage(key, "stream", "stream", usage) : usageTotal(key);
+      const totalUsage = usage ? recordUsage(key, roundId, attemptId, usage) : usageTotal(key);
 
       next.set(key, {
         roundId,
@@ -136,8 +171,12 @@ export function initStreamTextListener(eventTarget?: EventTarget) {
         text: fullText,
         reasoning: fullReasoning,
         usage: totalUsage,
-        reasoningFirstSeenAt: fullReasoning && previousReasoningAt === null ? Date.now() : previousReasoningAt,
+        reasoningFirstSeenAt:
+          fullReasoning && previousReasoningAt === null ? Date.now() : previousReasoningAt,
         textFirstSeenAt: fullText && previousTextAt === null ? Date.now() : previousTextAt,
+        reasoningDurationMs: reasoningDurationMs ?? previous?.reasoningDurationMs ?? null,
+        ...turnTokenFields(data, previous),
+        direction: direction ?? previous?.direction ?? null,
       });
       while (next.size > MAX_RETAINED_OUTPUTS) {
         const oldest = next.keys().next().value as string | undefined;
@@ -159,41 +198,74 @@ function parseUsage(value: unknown): StreamUsage | null {
   const outputTokens = numberValue(value.output_tokens);
   if (inputTokens === null && outputTokens === null) return null;
   return {
+    // The Rust provider contract already makes input_tokens non-cached. Keep
+    // cache_tokens as accounting metadata only; subtracting it here would
+    // count cached input twice and make the live indicator jump backwards.
     inputTokens: inputTokens ?? 0,
     outputTokens: outputTokens ?? 0,
   };
 }
 
-function recordUsage(key: string, roundId: string, attemptId: string, usage: StreamUsage): StreamUsage {
-  const attempts = usageByTurn.get(key) ?? new Map<string, StreamUsage>();
+function recordUsage(
+  key: string,
+  roundId: string,
+  attemptId: string,
+  usage: StreamUsage,
+): StreamUsage {
   const attemptKey = JSON.stringify([roundId, attemptId]);
-  const previous = attempts.get(attemptKey);
-  attempts.set(attemptKey, {
-    inputTokens: Math.max(previous?.inputTokens ?? 0, usage.inputTokens),
-    outputTokens: Math.max(previous?.outputTokens ?? 0, usage.outputTokens),
-  });
-  usageByTurn.set(key, attempts);
-  return usageTotal(key) ?? { inputTokens: 0, outputTokens: 0 };
+  const previous = usageByTurn.get(key);
+  const retained =
+    previous?.attemptKey === attemptKey
+      ? {
+          inputTokens: Math.max(previous.usage.inputTokens, usage.inputTokens),
+          outputTokens: Math.max(previous.usage.outputTokens, usage.outputTokens),
+        }
+      : usage;
+  usageByTurn.set(key, { attemptKey, usage: retained });
+  return retained;
 }
 
 function usageTotal(key: string): StreamUsage | null {
-  const attempts = usageByTurn.get(key);
-  if (!attempts || attempts.size === 0) return null;
-  let inputTokens = 0;
-  let outputTokens = 0;
-  for (const usage of attempts.values()) {
-    inputTokens += usage.inputTokens;
-    outputTokens += usage.outputTokens;
-  }
-  return { inputTokens, outputTokens };
+  return usageByTurn.get(key)?.usage ?? null;
 }
 
-export function modelStreamOutput(sessionId: string, turnId: string | undefined): ModelStreamOutput | null {
+function turnTokenFields(
+  data: StreamTextPayload,
+  previous: ModelStreamOutput | undefined,
+): Pick<ModelStreamOutput, "turnExchangeTokens" | "turnInputTokens" | "turnOutputTokens"> {
+  const input = numberValue(data.turn_input_tokens);
+  const output = numberValue(data.turn_output_tokens);
+  const exchange = numberValue(data.turn_exchange_tokens);
+  const previousInput = previous?.turnInputTokens ?? null;
+  const previousOutput = previous?.turnOutputTokens ?? null;
+  const previousExchange = previous?.turnExchangeTokens ?? null;
+  const nextInput = input === null ? previousInput : Math.max(previousInput ?? 0, input);
+  const nextOutput = output === null ? previousOutput : Math.max(previousOutput ?? 0, output);
+  const nextExchange =
+    exchange === null
+      ? nextInput !== null || nextOutput !== null
+        ? (nextInput ?? 0) + (nextOutput ?? 0)
+        : previousExchange
+      : Math.max(previousExchange ?? 0, exchange);
+  return {
+    turnInputTokens: nextInput,
+    turnOutputTokens: nextOutput,
+    turnExchangeTokens: nextExchange,
+  };
+}
+
+export function modelStreamOutput(
+  sessionId: string,
+  turnId: string | undefined,
+): ModelStreamOutput | null {
   if (!turnId) return null;
   return outputs().get(outputKey(sessionId, turnId)) ?? null;
 }
 
-export function isModelStreamOutputDurable(output: ModelStreamOutput | null, durableRoundIds: ReadonlySet<string>): boolean {
+export function isModelStreamOutputDurable(
+  output: ModelStreamOutput | null,
+  durableRoundIds: ReadonlySet<string>,
+): boolean {
   return output !== null && durableRoundIds.has(output.roundId);
 }
 

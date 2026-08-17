@@ -2,19 +2,19 @@ import { createQuery } from "@tanstack/solid-query";
 import {
   getBootstrap,
   getMe,
+  getNotificationChannels,
+  getOperation,
   getProject,
   getProviders,
-  getNotificationChannels,
-  listSessionJobs,
   getQueuedTurns,
   getSession,
   getSessionContext,
-  getSessionDiff,
   getSessionTimeline,
   getSystemInfo,
   getTurn,
   gitLog,
   gitStatus,
+  listAsyncTasks,
   listFileTree,
   listGithubCredentials,
   listProjects,
@@ -26,8 +26,8 @@ import {
 // reconnect replays missed projections (Last-Event-ID) then a full snapshot.
 // No polling safety nets — they only masked a lossy push path that no longer
 // exists, and they caused the stale-until-refetch flicker users had to refresh
-// past. Terminal and operation state are still read on demand (they are not
-// projected on the SSE channel).
+// past. Streaming text and log ranges remain on-demand data because they are
+// not durable state projections.
 
 export function useBootstrap() {
   return createQuery(() => ({
@@ -63,6 +63,17 @@ export function useProjects() {
     queryKey: ["projects"],
     queryFn: () => listProjects(),
   }));
+}
+
+export function useOperation(operationId: () => string | undefined) {
+  return createQuery(() => {
+    const id = operationId();
+    return {
+      queryKey: ["operations", id],
+      queryFn: () => getOperation(id as string),
+      enabled: Boolean(id),
+    };
+  });
 }
 
 export function useProject(id: () => string | undefined) {
@@ -173,21 +184,6 @@ export function useSessionTimeline(
   });
 }
 
-export function useSessionDiff(
-  sessionId: () => string | undefined,
-  shouldLoad: () => boolean = () => true,
-) {
-  return createQuery(() => {
-    const id = sessionId();
-    return {
-      queryKey: ["session-diff", id],
-      queryFn: () => getSessionDiff(id as string),
-      enabled: Boolean(id) && shouldLoad(),
-      placeholderData: (previous) => previous,
-    };
-  });
-}
-
 export function useTurn(sessionId: () => string | undefined, turnId: () => string | undefined) {
   return createQuery(() => {
     const sid = sessionId();
@@ -216,16 +212,12 @@ export function useQueuedTurns(
   });
 }
 
-export function useSessionJobs(
-  sessionId: () => string | undefined,
-  shouldLoad: () => boolean = () => true,
-) {
+export function useAsyncTasks(shouldLoad: () => boolean = () => true) {
   return createQuery(() => {
-    const id = sessionId();
     return {
-      queryKey: ["jobs", id],
-      queryFn: () => listSessionJobs(id as string),
-      enabled: Boolean(id) && shouldLoad(),
+      queryKey: ["async-tasks"],
+      queryFn: listAsyncTasks,
+      enabled: shouldLoad(),
       placeholderData: (previous) => previous,
     };
   });

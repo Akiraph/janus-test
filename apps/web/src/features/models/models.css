@@ -205,7 +205,6 @@
   white-space: nowrap;
 }
 
-
 .provider-form-models {
   display: grid;
   gap: var(--space-2);
@@ -230,6 +229,19 @@
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto auto;
   align-items: center;
   gap: var(--space-2);
+}
+
+.provider-form-model-slot {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-2);
+  height: var(--control);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+  background: var(--canvas-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
 }
 
 .model-chip-check {

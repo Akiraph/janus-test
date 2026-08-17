@@ -37,77 +37,6 @@ impl SessionsInterface {
         Ok(runnable == 1)
     }
 
-    pub async fn reconcile_turn_blockers_in_tx(
-        &self,
-        tx: &mut SqliteConnection,
-        turn_id: TurnId,
-        blockers: TurnBlockers,
-        now: &str,
-    ) -> Result<TurnBlockerOutcome, SessionsError> {
-        let row = sqlx::query(
-            "SELECT turn.session_id, turn.status, session.active_turn_id, session.version \
-             FROM turns AS turn \
-             JOIN sessions AS session ON session.id = turn.session_id \
-             WHERE turn.id = ?",
-        )
-        .bind(turn_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        let session_id = row
-            .try_get::<String, _>("session_id")?
-            .parse::<SessionId>()
-            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-        let current_status = row
-            .try_get::<String, _>("status")?
-            .parse::<TurnStatus>()
-            .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-        let active_turn_id: Option<String> = row.try_get("active_turn_id")?;
-        let active = active_turn_id.as_deref() == Some(turn_id.to_string().as_str());
-        let current_session_version: String = row.try_get("version")?;
-        let can_reconcile = active
-            && matches!(
-                current_status,
-                TurnStatus::Running | TurnStatus::WaitingForAsk | TurnStatus::WaitingForJob
-            );
-        let target_status = blockers.status();
-        if !can_reconcile || current_status == target_status {
-            return Ok(TurnBlockerOutcome {
-                session_id,
-                status: current_status,
-                active,
-                session_version: current_session_version,
-                transition: None,
-            });
-        }
-        let transition = self
-            .transition_active_turn_in_tx(
-                tx,
-                ActiveTurnTransition {
-                    session_id,
-                    turn_id,
-                    from_status: current_status,
-                    to_status: target_status,
-                    reason: None,
-                    now,
-                },
-            )
-            .await?;
-        let session_version = transition
-            .as_ref()
-            .map(|transition| transition.session_version.clone())
-            .unwrap_or(current_session_version);
-        Ok(TurnBlockerOutcome {
-            session_id,
-            status: transition
-                .as_ref()
-                .map_or(current_status, |transition| transition.to_status),
-            active,
-            session_version,
-            transition,
-        })
-    }
-
     pub async fn running_turn_ids_in_tx(
         &self,
         tx: &mut SqliteConnection,
@@ -131,8 +60,7 @@ impl SessionsInterface {
     ) -> Result<Vec<RecoveredTurn>, SessionsError> {
         let rows = sqlx::query(
             "SELECT id, session_id, status, version FROM turns \
-             WHERE status IN ('running', 'waiting_for_job', 'waiting_for_ask', \
-                              'waiting_for_model', 'canceling') \
+             WHERE status IN ('running', 'canceling') \
              ORDER BY session_id, sequence",
         )
         .fetch_all(&mut *tx)
@@ -212,7 +140,7 @@ impl SessionsInterface {
         now: &str,
     ) -> Result<SessionCommandState, SessionsError> {
         let row = sqlx::query(
-            "SELECT project_id, state, workspace_handle, next_model_ref, active_turn_id, version \
+            "SELECT project_id, state, next_model_ref, active_turn_id, version \
              FROM sessions WHERE id = ?",
         )
         .bind(session_id.to_string())
@@ -278,7 +206,6 @@ impl SessionsInterface {
         Ok(SessionCommandState {
             project_id: row.try_get("project_id")?,
             state,
-            workspace_handle: row.try_get("workspace_handle")?,
             next_model_ref,
             active_turn_id: row.try_get("active_turn_id")?,
             session_version,
@@ -388,5 +315,4 @@ impl SessionsInterface {
         .await?;
         Ok(Some(session_version))
     }
-
 }

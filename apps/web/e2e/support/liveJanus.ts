@@ -1,5 +1,4 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { appendFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -92,8 +91,6 @@ export interface LiveJanusEnvironment {
   sessionTitle: string;
   cli: <T>(args: string[]) => T;
   request: <T>(path: string, init?: RequestInit) => Promise<T>;
-  providerRequestCount: () => number;
-  restart: () => Promise<void>;
   serverLog: () => string;
   stop: () => Promise<void>;
 }
@@ -144,12 +141,6 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
       });
       const collectLog = (chunk: Buffer) => {
         serverLog = `${serverLog}${chunk.toString("utf8")}`.slice(-16_000);
-        // DIAGNOSTIC: also persist full server log to disk.
-        try {
-          appendFileSync(`${tmpdir()}/janus-live-server.log`, chunk.toString("utf8"));
-        } catch {
-          // ignore
-        }
       };
       child.stdout?.on("data", collectLog);
       child.stderr?.on("data", collectLog);
@@ -238,13 +229,6 @@ export async function startLiveJanus(): Promise<LiveJanusEnvironment> {
         }
       },
       request: requestJson,
-      providerRequestCount: provider.requestCount,
-      restart: async () => {
-        await stopProcess(server);
-        serverLog = "";
-        server = launchServer();
-        await waitForReady(server, () => serverLog);
-      },
       serverLog: () => serverLog,
       stop: async () => {
         try {
@@ -284,12 +268,10 @@ async function startProvider(): Promise<{
     request.on("end", () => {
       requestCount += 1;
       let latestUser = "";
-      let hasToolResult = false;
       let payload: unknown;
       try {
         payload = JSON.parse(requestBody);
         latestUser = latestUserContent(payload);
-        hasToolResult = hasToolResultAfterLatestUser(payload);
       } catch {
         response.writeHead(400).end();
         return;
@@ -319,40 +301,6 @@ async function startProvider(): Promise<{
         } else if (!calledTools.includes("attachment_read") && attachmentId) {
           stream = toolStream(callId, "attachment_read", { attachment_id: attachmentId });
         }
-      } else if (latestUser.includes("[fixture:ask-expire]") && !calledTools.includes("ask_user")) {
-        stream = toolStream(callId, "ask_user", {
-          prompt: "Use the fixture default",
-          mode: "best_effort",
-          default: "fixture expiry default",
-          expires_in_ms: 100,
-        });
-      } else if (
-        (latestUser.includes("[fixture:ask]") || latestUser.includes("[fixture:restart-ask]")) &&
-        !calledTools.includes("ask_user")
-      ) {
-        stream = toolStream(callId, "ask_user", {
-          prompt: "Choose the fixture answer",
-          mode: "blocking",
-          choices: ["fixture answer"],
-        });
-      } else if (latestUser.includes("[fixture:cancel-job]") && !calledTools.includes("bash")) {
-        stream = toolStream(callId, "bash", {
-          command: fixtureSleepCommand(30),
-          mode: "async",
-          timeout_ms: 60_000,
-        });
-      } else if (latestUser.includes("[fixture:job-resume]") && !hasToolResult) {
-        stream = toolStream(callId, "bash", {
-          command: fixtureSleepCommand(1),
-          mode: "async",
-          timeout_ms: 30_000,
-        });
-      } else if (latestUser.includes("[fixture:handoff-job]") && !calledTools.includes("bash")) {
-        stream = toolStream(callId, "bash", {
-          command: fixtureSleepCommand(3),
-          mode: "async",
-          timeout_ms: 30_000,
-        });
       }
 
       response.writeHead(200, { "content-type": "text/event-stream" });
@@ -395,30 +343,6 @@ function latestUserContent(payload: unknown): string {
     return typeof content === "string" ? content : JSON.stringify(content);
   }
   return "";
-}
-
-function hasToolResultAfterLatestUser(payload: unknown): boolean {
-  if (typeof payload !== "object" || payload === null) return false;
-  const messages = Reflect.get(payload, "messages");
-  if (!Array.isArray(messages)) return false;
-  let latestUserIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (
-      typeof message === "object" &&
-      message !== null &&
-      Reflect.get(message, "role") === "user"
-    ) {
-      latestUserIndex = index;
-      break;
-    }
-  }
-  return messages
-    .slice(latestUserIndex + 1)
-    .some(
-      (message) =>
-        typeof message === "object" && message !== null && Reflect.get(message, "role") === "tool",
-    );
 }
 
 function toolNamesAfterLatestUser(payload: unknown): string[] {
@@ -471,12 +395,6 @@ function uuids(value: string): string[] {
   return [...value.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)]
     .map((match) => match[0])
     .filter((id, index, values) => values.indexOf(id) === index);
-}
-
-function fixtureSleepCommand(seconds: number): string {
-  return process.platform === "win32"
-    ? `powershell -NoProfile -NonInteractive -Command "Start-Sleep -Seconds ${seconds}"`
-    : `sleep ${seconds}`;
 }
 
 async function waitForReady(server: ChildProcess, getLog: () => string): Promise<void> {

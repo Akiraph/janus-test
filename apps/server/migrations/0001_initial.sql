@@ -12,46 +12,23 @@
 -- Janus initial schema.
 --
 -- This file is the single squash of the pre-release migration history
--- (formerly 0001..0024, including several table rebuilds and ALTER chains that
--- only existed to evolve an organic prototype schema). Janus has not shipped to
--- a public platform and no deployed database exists, so a fresh install creates
+-- (formerly dozens of files, including table rebuilds and ALTER chains that
+-- only existed to evolve an organic prototype schema). Janus has not shipped to a
+-- public platform and no deployed database exists, so a fresh install creates
 -- this schema directly; there is no version 0 database to upgrade.
 --
--- Applied SQL files are immutable. To evolve the schema, add a new migration
--- with the next version and declare every module that owns a table it touches;
--- tools/xtask validates that a migration only mutates tables owned by the
--- modules it declares (canonical names: supervisor -> execution,
--- workspace-sync -> workspace).
+-- Convention: this is the one and only migration. This project does not
+-- preserve compatibility shims or migration history for features that are no
+-- longer supported; schema changes are folded into 0001 directly. See CLAUDE.md.
+-- Each table still declares its owning module in the leading comment block
+-- (canonical names: supervisor -> execution, workspace -> workspace);
+-- tools/xtask validates that this file only mutates tables owned by the modules
+-- it declares.
 --
 -- Dead tables removed by the squash (never read or written by Rust code):
 --   runtime_ports, model_recovery_cooldowns, stream_diagnostics.
 -- Tables are ordered so that referenced tables precede their referencers.
 --
-
-CREATE TABLE asks (
-    id TEXT PRIMARY KEY,
-    turn_id TEXT NOT NULL,
-    tool_call_id TEXT NOT NULL,
-    mode TEXT NOT NULL CHECK (mode IN ('blocking', 'best_effort')),
-    prompt_json TEXT NOT NULL,
-    choices_json TEXT NOT NULL,
-    default_json TEXT,
-    answer_json TEXT,
-    status TEXT NOT NULL CHECK (
-        status IN ('open', 'answered', 'expired', 'closed_by_handoff', 'canceled')
-    ),
-    closure_reason TEXT,
-    expires_at TEXT,
-    answered_at TEXT,
-    version TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    CHECK (
-        (status IN ('open', 'answered', 'expired') AND closure_reason IS NULL)
-        OR (status = 'closed_by_handoff' AND closure_reason = 'handoff')
-        OR (status = 'canceled' AND closure_reason IS NOT NULL)
-    )
-);
 
 CREATE TABLE attachments (
     id TEXT PRIMARY KEY,
@@ -153,7 +130,7 @@ CREATE TABLE context_versions (
     sequence INTEGER NOT NULL,
     compact_summary_id TEXT REFERENCES compact_summaries(id) ON DELETE SET NULL,
     estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
-    context_limit INTEGER NOT NULL DEFAULT 200000,
+    context_limit INTEGER NOT NULL DEFAULT 1000000,
     compact_status TEXT NOT NULL DEFAULT 'not_needed'
         CHECK (compact_status IN ('not_needed', 'scheduled', 'running', 'succeeded', 'failed')),
     selection_json TEXT NOT NULL,
@@ -214,6 +191,17 @@ CREATE TABLE idempotency_records (
     expires_at TEXT NOT NULL
 );
 
+CREATE TABLE command_idempotency_records (
+    key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+    method TEXT NOT NULL,
+    normalized_route TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE initialization_tokens (
     id TEXT PRIMARY KEY,
     token_hash TEXT NOT NULL UNIQUE,
@@ -222,14 +210,12 @@ CREATE TABLE initialization_tokens (
     created_at TEXT NOT NULL
 );
 
-CREATE TABLE jobs (
+CREATE TABLE async_tasks (
     id TEXT PRIMARY KEY,
     runtime_id TEXT NOT NULL REFERENCES runtimes(id) ON DELETE CASCADE,
     session_id TEXT NOT NULL,
     initiated_by_tool_call_id TEXT NOT NULL,
     controlling_turn_id TEXT NOT NULL,
-    cli_kind TEXT CHECK (cli_kind IN ('claude_code', 'codex')),
-    cli_session_id TEXT,
     command_summary TEXT NOT NULL,
     executor_process_identity TEXT,
     executor_nonce TEXT NOT NULL,
@@ -241,12 +227,14 @@ CREATE TABLE jobs (
     created_at TEXT NOT NULL,
     started_at TEXT,
     ended_at TEXT,
-    cancellation_requested_at TEXT
+    cancellation_requested_at TEXT,
+    delivery_claimed_at TEXT,
+    delivery_completed_at TEXT
 );
 
 CREATE TABLE log_streams (
     id TEXT PRIMARY KEY,
-    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('job', 'service', 'terminal', 'sync')),
+    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('async_task', 'terminal', 'sync')),
     owner_id TEXT NOT NULL,
     relative_path TEXT NOT NULL,
     first_cursor INTEGER NOT NULL DEFAULT 0,
@@ -294,7 +282,7 @@ CREATE TABLE model_attempts (
     id TEXT PRIMARY KEY,
     round_id TEXT NOT NULL,
     candidate_order INTEGER NOT NULL DEFAULT 0,
-    attempt_number INTEGER NOT NULL DEFAULT 0 CHECK (attempt_number BETWEEN 0 AND 5),
+    attempt_number INTEGER NOT NULL DEFAULT 0 CHECK (attempt_number >= 0),
     provider_id TEXT NOT NULL,
     model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
     upstream_model_id TEXT NOT NULL,
@@ -444,37 +432,6 @@ CREATE TABLE plan_versions (
     UNIQUE (turn_id, sequence)
 );
 
-CREATE TABLE project_cli_configs (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK (kind IN ('claude_code', 'codex')),
-    enabled INTEGER NOT NULL DEFAULT 0,
-    secret_id TEXT REFERENCES project_runtime_secrets(id) ON DELETE SET NULL,
-    options_json TEXT NOT NULL DEFAULT '{}',
-    observed_version TEXT,
-    capability_state TEXT NOT NULL DEFAULT 'unconfigured'
-        CHECK (capability_state IN ('ready', 'degraded', 'unconfigured', 'unsupported')),
-    capability_reason TEXT,
-    version TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (project_id, kind)
-);
-
-CREATE TABLE project_egress_rules (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    scheme TEXT NOT NULL CHECK (scheme IN ('http', 'https')),
-    host TEXT NOT NULL,
-    port_start INTEGER NOT NULL CHECK (port_start BETWEEN 1 AND 65535),
-    port_end INTEGER NOT NULL CHECK (port_end BETWEEN port_start AND 65535),
-    purpose TEXT NOT NULL,
-    version TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (project_id, scheme, host, port_start, port_end)
-);
-
 CREATE TABLE project_git_state (
     project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     git_state_version TEXT NOT NULL,
@@ -485,30 +442,6 @@ CREATE TABLE project_git_state (
     last_scan_at TEXT NOT NULL,
     version TEXT NOT NULL,
     updated_at TEXT NOT NULL
-);
-
-CREATE TABLE project_runtime_configs (
-    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-    executor_kind TEXT NOT NULL DEFAULT 'container' CHECK (executor_kind IN ('local', 'container')),
-    allow_insecure_local_executor INTEGER NOT NULL DEFAULT 0,
-    variables_json TEXT NOT NULL DEFAULT '{}',
-    default_limits_json TEXT NOT NULL,
-    network_policy TEXT NOT NULL DEFAULT 'deny_all' CHECK (network_policy IN ('deny_all', 'project_rules')),
-    version TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE project_runtime_secrets (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    value_ciphertext BLOB NOT NULL,
-    value_fingerprint TEXT NOT NULL,
-    version TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (project_id, name)
 );
 
 CREATE TABLE projection_cursor (
@@ -534,20 +467,14 @@ CREATE TABLE projects (
     last_activity_at TEXT NOT NULL
 );
 
-CREATE TABLE propagation_links (
+CREATE TABLE memories (
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL PRIMARY KEY,
-    source_branch TEXT NOT NULL,
-    initial_main_revision_id TEXT NOT NULL,
-    main_to_session_cursor_revision_id TEXT NOT NULL,
-    session_to_main_cursor_revision_id TEXT NOT NULL,
+    memory_key TEXT NOT NULL,
+    content TEXT NOT NULL,
     version TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    baseline_manifest_json TEXT,
-    recovery_state TEXT NOT NULL DEFAULT 'idle' CHECK (recovery_state IN ('idle', 'transferring')),
-    recovery_intent_json TEXT,
-    recovery_error TEXT
+    PRIMARY KEY (project_id, memory_key)
 );
 
 CREATE TABLE public_events (
@@ -618,52 +545,25 @@ CREATE TABLE runtime_access_tickets (
 CREATE TABLE runtimes (
     id TEXT PRIMARY KEY,
     scope_id TEXT NOT NULL,
-    executor_kind TEXT NOT NULL CHECK (executor_kind IN ('local', 'container')),
     executor_identity TEXT,
     executor_nonce TEXT NOT NULL,
     limits_json TEXT NOT NULL,
-    capability_snapshot_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('starting', 'ready', 'stopping', 'stopped', 'failed', 'lost')),
     stop_reason TEXT,
     version TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     stopped_at TEXT,
-    scope_kind TEXT NOT NULL DEFAULT 'session' CHECK (scope_kind IN ('project', 'session'))
-);
-
-CREATE TABLE services (
-    id TEXT PRIMARY KEY,
-    runtime_id TEXT NOT NULL REFERENCES runtimes(id) ON DELETE CASCADE,
-    session_id TEXT NOT NULL,
-    initiated_by_tool_call_id TEXT NOT NULL,
-    impact TEXT NOT NULL CHECK (impact IN ('read_only', 'ignored_output', 'source_writing')),
-    command_summary TEXT NOT NULL,
-    health_json TEXT,
-    executor_process_identity TEXT,
-    executor_nonce TEXT NOT NULL,
-    log_stream_id TEXT NOT NULL REFERENCES log_streams(id),
-    status TEXT NOT NULL CHECK (status IN ('starting', 'running', 'unhealthy', 'stopping', 'stopped', 'stopped_after_restart', 'failed')),
-    exit_json TEXT,
-    version TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    started_at TEXT,
-    ended_at TEXT
+    scope_kind TEXT NOT NULL DEFAULT 'project' CHECK (scope_kind = 'project')
 );
 
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    kind TEXT NOT NULL DEFAULT 'regular' CHECK (kind IN ('regular', 'resolver')),
-    parent_session_id TEXT,
-    forked_from_checkpoint_id TEXT,
-    resolver_conflict_id TEXT,
     title TEXT,
     state TEXT NOT NULL CHECK (state IN ('ready', 'active', 'deleting')),
-    workspace_handle TEXT NOT NULL,
     next_model_ref TEXT,
     active_turn_id TEXT,
-    source_main_revision_id TEXT NOT NULL,
     version TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -711,12 +611,11 @@ CREATE TABLE tool_calls (
     input_json TEXT NOT NULL,
     result_summary_json TEXT,
     result_metadata_json TEXT,
-    status TEXT NOT NULL CHECK (status IN ('requested', 'running', 'waiting', 'succeeded', 'failed', 'canceled', 'lost')),
+    status TEXT NOT NULL CHECK (status IN ('requested', 'running', 'succeeded', 'failed', 'canceled', 'lost')),
     actor_json TEXT NOT NULL,
     error_code TEXT,
     runtime_id TEXT,
-    job_id TEXT,
-    service_id TEXT,
+    async_task_id TEXT,
     terminal_id TEXT,
     log_stream_id TEXT,
     correlation_id TEXT,
@@ -732,14 +631,12 @@ CREATE TABLE turns (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     sequence INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN (
-        'queued', 'running', 'waiting_for_job', 'waiting_for_ask', 'waiting_for_model',
-        'canceling', 'completed', 'failed', 'canceled', 'interrupted', 'handed_off'
+        'queued', 'running', 'canceling', 'completed', 'failed', 'canceled', 'interrupted'
     )),
     input_message_id TEXT,
+    goal_mode INTEGER NOT NULL DEFAULT 0 CHECK (goal_mode IN (0, 1)),
     model_snapshot_json TEXT NOT NULL,
     predecessor_turn_id TEXT,
-    handoff_from_turn_id TEXT,
-    handoff_to_turn_id TEXT,
     completion_summary_json TEXT,
     completion_reason TEXT,
     cancellation_reason TEXT,
@@ -778,8 +675,7 @@ CREATE TABLE work_items (
 CREATE TABLE workspace_copies (
     handle TEXT PRIMARY KEY,
     project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-    session_id TEXT,
-    kind TEXT NOT NULL CHECK (kind IN ('main', 'session')),
+    kind TEXT NOT NULL CHECK (kind = 'main'),
     managed_dir TEXT NOT NULL,
     current_revision_id TEXT,
     observation_generation INTEGER NOT NULL DEFAULT 0,
@@ -807,16 +703,6 @@ CREATE TABLE workspace_mutation_intents (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE workspace_propagation_conflicts (
-    session_id TEXT PRIMARY KEY,
-    direction TEXT NOT NULL CHECK (direction IN ('sync', 'apply')),
-    session_revision_id TEXT NOT NULL,
-    main_revision_id TEXT NOT NULL,
-    paths_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
 CREATE TABLE workspace_snapshots (
     snapshot_id TEXT PRIMARY KEY,
     revision_id TEXT NOT NULL UNIQUE REFERENCES content_revisions(revision_id) ON DELETE CASCADE,
@@ -827,8 +713,6 @@ CREATE TABLE workspace_snapshots (
     integrity_state TEXT NOT NULL CHECK (integrity_state IN ('complete', 'incomplete')),
     created_at TEXT NOT NULL
 );
-
-CREATE INDEX asks_turn_idx ON asks (turn_id, status);
 
 CREATE INDEX attachments_session_idx ON attachments (session_id);
 
@@ -853,9 +737,9 @@ CREATE UNIQUE INDEX github_credential_name_idx ON github_credentials (owner_id, 
 
 CREATE INDEX idempotency_records_owner_idx ON idempotency_records (owner_id, expires_at);
 
-CREATE INDEX jobs_session_idx ON jobs (session_id, created_at);
+CREATE INDEX async_tasks_session_idx ON async_tasks (session_id, created_at);
 
-CREATE INDEX jobs_turn_idx ON jobs (controlling_turn_id, status);
+CREATE INDEX async_tasks_turn_idx ON async_tasks (controlling_turn_id, status);
 
 CREATE UNIQUE INDEX log_streams_owner_idx ON log_streams (owner_kind, owner_id);
 
@@ -889,8 +773,6 @@ CREATE INDEX projects_owner_idx ON projects (owner_id, last_activity_at);
 
 CREATE INDEX projects_state_idx ON projects (state);
 
-CREATE INDEX propagation_links_project_idx ON propagation_links (project_id);
-
 CREATE INDEX public_events_type_cursor_idx
     ON public_events (event_type, cursor);
 
@@ -900,8 +782,6 @@ CREATE INDEX runtime_access_tickets_terminal_idx ON runtime_access_tickets (term
 
 CREATE UNIQUE INDEX runtimes_one_current_per_scope ON runtimes (scope_kind, scope_id)
 WHERE status IN ('starting', 'ready', 'stopping');
-
-CREATE INDEX services_session_idx ON services (session_id, status);
 
 CREATE INDEX sessions_project_idx ON sessions (project_id, last_activity_at);
 
@@ -921,7 +801,7 @@ WHERE provider_call_id IS NOT NULL;
 CREATE INDEX tool_calls_round_idx ON tool_calls (round_id, ord);
 
 CREATE UNIQUE INDEX turns_one_active_per_session ON turns (session_id)
-WHERE status IN ('running', 'waiting_for_job', 'waiting_for_ask', 'waiting_for_model', 'canceling');
+WHERE status IN ('running', 'canceling');
 
 CREATE INDEX turns_queued_idx ON turns (session_id, sequence) WHERE status = 'queued';
 
@@ -933,16 +813,10 @@ CREATE INDEX work_items_claimable_idx ON work_items (dead, not_before) WHERE lea
 
 CREATE INDEX workspace_copies_project_idx ON workspace_copies (project_id);
 
-CREATE INDEX workspace_copies_session_idx ON workspace_copies (session_id);
-
 CREATE INDEX workspace_mutation_intents_handle_idx
     ON workspace_mutation_intents (workspace_handle, state);
 
 CREATE INDEX workspace_mutation_intents_recovery_idx
     ON workspace_mutation_intents (state, updated_at);
 
-CREATE INDEX workspace_propagation_conflicts_updated_idx
-    ON workspace_propagation_conflicts (updated_at);
-
 CREATE INDEX workspace_snapshots_revision_idx ON workspace_snapshots (revision_id);
-

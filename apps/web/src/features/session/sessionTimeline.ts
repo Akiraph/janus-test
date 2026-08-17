@@ -1,4 +1,4 @@
-import type { AskAnswer, TimelineItemView, TimelineTurnStatus } from "../../lib/api";
+import type { TimelineItemView, TimelineTurnStatus } from "../../lib/api";
 import { normalizeReasoningSummary } from "../../lib/modelStream";
 
 type Projection = Record<string, unknown>;
@@ -23,11 +23,6 @@ export interface TimelineAttachment {
   name: string;
   mime: string;
   byteSize: number;
-}
-
-export interface AskChoice {
-  label: string;
-  annotation: string | null;
 }
 
 export type ToolStatus = "success" | "failure" | "running";
@@ -105,18 +100,6 @@ export type SessionTimelineItem =
       toolStatus: string;
     })
   | (TimelineItemBase & {
-      type: "ask";
-      askId: string | null;
-      prompt: string;
-      mode: string;
-      status: string;
-      choices: AskChoice[];
-      multiple: boolean;
-      answer: AskAnswer | null;
-      expiresAt: string | null;
-      toolStatus: string;
-    })
-  | (TimelineItemBase & {
       type: "model";
       model: string;
       status: string;
@@ -125,19 +108,18 @@ export type SessionTimelineItem =
       warning: boolean;
     })
   | (TimelineItemBase & {
-      type: "job";
-      jobId: string | null;
-      command: string;
-      status: string;
-      toolStatus: string;
+      type: "context";
+      title: string;
+      sourceFirst: string | null;
+      sourceLast: string | null;
+      itemCount: number | null;
     })
   | (TimelineItemBase & {
-      type: "service";
-      serviceId: string | null;
-      command: string;
+      type: "async_task";
+      taskId: string | null;
       status: string;
-      impact: string;
-      toolStatus: string;
+      command: string;
+      output: string;
     })
   | (TimelineItemBase & { type: "unknown"; raw: unknown });
 
@@ -146,13 +128,38 @@ export function decodeSessionTimeline(
   previous: readonly SessionTimelineItem[] = [],
 ): SessionTimelineItem[] {
   const previousById = new Map(previous.map((item) => [item.id, item]));
-  return items
-    .filter((item) => !isAskAnswerTimelineItem(item))
-    .map((item) => {
-      const cached = previousById.get(item.id);
-      if (cached?.version !== undefined && cached.version === item.version) return cached;
-      return decodeSessionTimelineItem(item);
-    });
+  return items.map((item) => {
+    const cached = previousById.get(item.id);
+    // A Turn status is joined onto timeline rows and has its own version
+    // clock (`turn.updated_at`). The timeline item version does not change
+    // when the Turn moves from running to completed/interrupted, so it must
+    // be part of the cache identity or the durable status row freezes until
+    // a full page reload.
+    if (
+      cached?.version !== undefined &&
+      cached.version === item.version &&
+      sameTurnStatus(cached.turnStatus, item.turn_status ?? null)
+    ) {
+      return cached;
+    }
+    return decodeSessionTimelineItem(item);
+  });
+}
+
+function sameTurnStatus(
+  previous: TimelineTurnStatus | null,
+  next: TimelineTurnStatus | null,
+): boolean {
+  if (previous === next) return true;
+  if (!previous || !next) return false;
+  return (
+    previous.id === next.id &&
+    previous.status === next.status &&
+    previous.cancellation_reason === next.cancellation_reason &&
+    previous.completion_reason === next.completion_reason &&
+    previous.created_at === next.created_at &&
+    previous.updated_at === next.updated_at
+  );
 }
 
 export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimelineItem {
@@ -188,6 +195,29 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
       };
     case "steer":
       return { ...base, type: "steer", text: text(projection.text) };
+    case "async_task_result":
+      return {
+        ...base,
+        type: "async_task",
+        taskId: optionalText(projection.task_id),
+        status: text(projection.status, "unknown"),
+        command: text(projection.command, "bash"),
+        output: text(projection.output ?? projection.text),
+      };
+    case "context_compacted":
+      return {
+        ...base,
+        type: "context",
+        title: text(projection.title, "Context Compacted"),
+        sourceFirst: optionalText(projection.source_first_timeline_id),
+        sourceLast: optionalText(projection.source_last_timeline_id),
+        itemCount:
+          typeof projection.item_count === "number"
+            ? projection.item_count
+            : typeof summary.item_count === "number"
+              ? summary.item_count
+              : null,
+      };
   }
 
   if (isPlan(item.kind, toolName)) {
@@ -198,31 +228,6 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
       title: text(plan.title ?? projection.title, "Plan update"),
       sequence: displayValue(summary.sequence ?? projection.sequence),
       steps: decodePlanSteps(plan.steps ?? plan.items ?? summary.steps ?? projection.steps),
-      toolStatus: toolStatus(projection, item.status),
-    };
-  }
-
-  // A failed ask_user invocation is an ordinary failed Tool result. It must
-  // not become a second interactive Ask card beside the successful retry.
-  if (
-    isAsk(item.kind, toolName) &&
-    normalizeToolStatus(toolStatus(projection, item.status)) !== "failure"
-  ) {
-    const domain = item.kind === "tool_call" ? summary : projection;
-    return {
-      ...base,
-      type: "ask",
-      askId: optionalText(domain.ask_id ?? summary.ask_id ?? projection.ask_id),
-      prompt: text(
-        domain.prompt ?? projection.prompt ?? projection.text,
-        "Waiting for your answer...",
-      ),
-      mode: text(domain.mode ?? projection.mode, "blocking"),
-      status: text(domain.status, "open"),
-      choices: decodeAskChoices(domain.choices ?? projection.choices),
-      multiple: domain.multiple === true,
-      answer: decodeAskAnswer(domain.answer ?? projection.answer),
-      expiresAt: optionalText(domain.expires_at ?? projection.expires_at),
       toolStatus: toolStatus(projection, item.status),
     };
   }
@@ -250,37 +255,8 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
     };
   }
 
-  if (isJob(item.kind, toolName, projection, summary)) {
-    return {
-      ...base,
-      type: "job",
-      jobId: optionalText(summary.job_id ?? projection.job_id ?? projection.id),
-      command: text(
-        summary.command_summary ?? projection.command_summary ?? projection.command,
-        "Job",
-      ),
-      status: text(summary.status ?? projection.status, "unknown"),
-      toolStatus: toolStatus(projection, item.status),
-    };
-  }
-
-  if (isService(item.kind, toolName, projection, summary)) {
-    return {
-      ...base,
-      type: "service",
-      serviceId: optionalText(summary.service_id ?? projection.service_id ?? projection.id),
-      command: text(
-        summary.command_summary ?? projection.command_summary ?? projection.command,
-        "Service",
-      ),
-      status: text(summary.status ?? projection.status, "unknown"),
-      impact: text(summary.impact ?? projection.impact, "unknown"),
-      toolStatus: toolStatus(projection, item.status),
-    };
-  }
-
   if (item.kind === "tool_call") {
-    const view = parseToolView(summary, toolName);
+    const view = parseToolView(summary, toolName, item.status);
     return {
       ...base,
       type: "tool",
@@ -301,42 +277,65 @@ function normalizeToolStatus(raw: string): ToolStatus {
   return "success";
 }
 
-function parseToolView(summary: Projection, toolName: string): ToolView {
+function parseToolView(summary: Projection, toolName: string, itemStatus: string): ToolView {
   const display = asRecord(summary.display);
-  const title = text(display.title).trim();
+  const rawTitle = text(display.title).trim();
   const version = display.version;
-  if (version !== 1 || !title) {
+  if (version !== 1 || !rawTitle) {
     return {
-      title: "Invalid Tool output",
+      title: fallbackToolTitle(toolName, summary, display.body),
       status: "failure",
       body: {
         kind: "error",
-        code: "INVALID_TOOL_DISPLAY",
-        detail: "The Tool result does not contain a supported display projection.",
+        code: "TOOL_DISPLAY_UNAVAILABLE",
+        detail: text(summary.detail ?? summary.error, "The Tool returned no display projection."),
       },
       expandable: true,
       lowNoise: false,
     };
   }
+  const title = normalizeToolTitle(rawTitle, toolName, summary, display.body);
   const body = decodeToolDisplayBody(display.body);
-  if (body.kind === "error") {
-    return {
-      title: `Tool error: ${body.code}`,
-      status: "failure",
-      body,
-      expandable: false,
-      lowNoise: false,
-    };
-  }
   const activity = analyzeToolActivity(toolName, body);
   return {
     title,
-    status: normalizeToolStatus(text(display.status)),
+    status:
+      body.kind === "error" ? "failure" : normalizeToolStatus(text(display.status, itemStatus)),
     body,
     expandable: body.kind !== "none",
     lowNoise: activity !== null,
     ...(activity === null ? {} : { activity }),
   };
+}
+
+function normalizeToolTitle(
+  title: string,
+  toolName: string,
+  summary: Projection,
+  displayBody: unknown,
+): string {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  if (!/^(?:used|ran tool|tool error|tool failed|tool execution failed)$/i.test(normalized)) {
+    return normalized;
+  }
+  return fallbackToolTitle(toolName, summary, displayBody);
+}
+
+function fallbackToolTitle(toolName: string, summary: Projection, displayBody?: unknown): string {
+  const body = asRecord(displayBody);
+  const command = text(summary.command ?? summary.command_summary ?? body.command)
+    .replace(/\s+/g, " ")
+    .trim();
+  if (command) return `Ran ${command}`;
+  if (toolName === "bash") {
+    return "Ran bash";
+  }
+  if (!toolName) return "Ran tool";
+  return `Used ${toolName
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ")}`;
 }
 
 /** Low-noise tools whose consecutive calls can compress into a summary. */
@@ -572,38 +571,12 @@ function decodeToolDisplayBody(value: unknown): ToolDisplayBody {
 function isPlan(kind: string, toolName: string): boolean {
   return kind === "plan" || kind === "plan_version" || toolName === "todo";
 }
-function isAsk(kind: string, toolName: string): boolean {
-  return kind === "ask" || toolName === "ask_user" || toolName === "ask";
-}
-
 function isModel(kind: string, toolName: string): boolean {
   return (
     kind === "model_attempt" ||
     kind === "model_warning" ||
     kind === "model" ||
     toolName.startsWith("model.")
-  );
-}
-
-function isJob(
-  kind: string,
-  toolName: string,
-  projection: Projection,
-  summary: Projection,
-): boolean {
-  return kind === "job" || toolName === "job" || Boolean(summary.job_id ?? projection.job_id);
-}
-
-function isService(
-  kind: string,
-  toolName: string,
-  projection: Projection,
-  summary: Projection,
-): boolean {
-  return (
-    kind === "service" ||
-    toolName === "service" ||
-    Boolean(summary.service_id ?? projection.service_id)
   );
 }
 
@@ -634,46 +607,6 @@ function decodeAttachments(value: unknown): TimelineAttachment[] {
       },
     ];
   });
-}
-
-function decodeAskChoices(value: unknown): AskChoice[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((value) => {
-    if (typeof value === "string") {
-      const label = value.trim();
-      return label ? [{ label, annotation: null }] : [];
-    }
-    const choice = asRecord(value);
-    const label = text(choice.label ?? choice.text).trim();
-    if (!label) return [];
-    return [
-      {
-        label,
-        annotation: optionalText(choice.annotation ?? choice.description),
-      },
-    ];
-  });
-}
-
-function decodeAskAnswer(value: unknown): AskAnswer | null {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value)) {
-    const values = value
-      .filter((entry): entry is string => typeof entry === "string")
-      .map((entry) => entry.trim())
-      .filter(Boolean);
-    return values.length > 0 ? values : null;
-  }
-  return null;
-}
-
-function isAskAnswerTimelineItem(item: TimelineItemView): boolean {
-  if (item.kind !== "user_message") return false;
-  const projection = asRecord(item.projection);
-  return (
-    projection.ask_answer === true ||
-    (optionalText(projection.source_ask_id) !== null && projection.ask_answer !== false)
-  );
 }
 
 function toolStatus(projection: Projection, fallback: string): string {
@@ -712,10 +645,13 @@ function displayValue(value: unknown): string | null {
  * Human-readable reasoning time for an assistant message, e.g. "for 4s",
  * "for 1m 12s". Rendered in the Thought row title as "Thought for {duration}".
  * - <3000ms → "for a while" (too short to be meaningful as a stopwatch).
- * - null/missing → "" (caller shows just "Thought" with no trailing duration).
+ * - null/missing → "for a while" so a completed thought never flashes a bare
+ *   "Thought" while its durable duration catches up.
  */
 export function formatThoughtDuration(durationMs: number | null | undefined): string {
-  if (durationMs == null || !Number.isFinite(durationMs) || durationMs < 0) return "";
+  if (durationMs == null || !Number.isFinite(durationMs) || durationMs < 0) {
+    return "for a while";
+  }
   if (durationMs < 3000) return "for a while";
   const totalSeconds = Math.round(durationMs / 1000);
   if (totalSeconds < 60) return `for ${totalSeconds}s`;

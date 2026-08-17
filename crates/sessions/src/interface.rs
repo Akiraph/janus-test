@@ -10,31 +10,28 @@ use janus_infrastructure::clock::now_utc_str;
 use serde_json::{Value, json};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+pub use super::types::{
+    ActiveTurnOutcome, AppendAssistantMessage, AppendSteerInput, AppendToolResultInput,
+    AttachmentResource, AttachmentView, CancelResult, ContextMessage, CreateTurnInput,
+    CreatedTurnInput, ExecutionTurn, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS, MAX_MESSAGE_BYTES,
+    MessageRoute, MessageRouteResult, ModelAttemptStatus, QueuedTurnCandidate, QueuedTurnItem,
+    ReasoningEffort, RecordedTurnInput, RecoveredTurn, ReplaceToolResultInput, SessionCommandState,
+    SessionModelPreference, SessionSummary, SessionsError, SteerResult, TerminalSettlement,
+    TimelineItemView, TimelinePage, TimelineTurnStatus, TurnModelAttempt,
+    TurnModelCandidateSnapshot, TurnModelSnapshot, TurnStatus, TurnSummary, TurnTokenExchange,
+    TurnTransition, UploadAttachmentInput,
+};
 use janus_infrastructure::{
     events::{EventStore, EventType, NewEvent},
     id::{AttachmentId, CorrelationId, ProjectId, SessionId, TurnId},
     managed_storage::{BlobReference, BlobStore},
     unit_of_work::UnitOfWork,
 };
-use janus_workspace::interface::{WorkspaceHandle, WorkspaceInterface};
-
-pub use super::types::{
-    ActiveTurnOutcome, AppendAssistantMessage, AppendSteerInput, AppendToolResultInput,
-    AskAnswerResult, AskSummary, AttachmentResource, AttachmentView, CancelResult, ContextMessage,
-    CreateTurnInput, CreatedTurnInput, ExecutionTurn, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS,
-    MAX_MESSAGE_BYTES, MessageRoute, MessageRouteResult, ModelAttemptStatus, QueuedTurnCandidate,
-    QueuedTurnItem, ReasoningEffort, RecordedTurnInput, RecoveredTurn, ReplaceToolResultInput,
-    SessionCommandState, SessionModelPreference, SessionSummary, SessionsError, SteerResult,
-    TerminalSettlement, TimelineItemView, TimelinePage, TimelineTurnStatus, TurnBlockerOutcome,
-    TurnBlockers, TurnModelAttempt, TurnModelCandidateSnapshot, TurnModelSnapshot, TurnStatus,
-    TurnSummary, TurnTransition, UploadAttachmentInput,
-};
 
 #[derive(Clone)]
 pub struct SessionsInterface {
     pub(super) pool: SqlitePool,
     pub(super) unit_of_work: UnitOfWork,
-    pub(super) workspace: WorkspaceInterface,
     pub(super) blobs: BlobStore,
 }
 
@@ -58,6 +55,16 @@ pub struct SessionDeletionPlan {
     pub turn_ids: Vec<TurnId>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ContextCompactedTimelineInput<'a> {
+    pub session_id: SessionId,
+    pub compact_summary_id: &'a str,
+    pub source_first_timeline_id: Option<&'a str>,
+    pub source_last_timeline_id: &'a str,
+    pub summary: &'a Value,
+    pub now: &'a str,
+}
+
 struct PersistUploadAttachment<'a> {
     owner_id: &'a str,
     session_id: SessionId,
@@ -70,17 +77,11 @@ struct PersistUploadAttachment<'a> {
 }
 
 impl SessionsInterface {
-    pub fn new(
-        pool: SqlitePool,
-        events: EventStore,
-        workspace: WorkspaceInterface,
-        blobs: BlobStore,
-    ) -> Self {
+    pub fn new(pool: SqlitePool, events: EventStore, blobs: BlobStore) -> Self {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Self {
             pool,
             unit_of_work,
-            workspace,
             blobs,
         }
     }
@@ -91,8 +92,6 @@ impl SessionsInterface {
         session_id: SessionId,
         project_id: ProjectId,
         title: Option<String>,
-        workspace_handle: &WorkspaceHandle,
-        source_main_revision: &str,
     ) -> Result<CreatedSessionRecord, SessionsError> {
         let existing: Option<(String, String)> =
             sqlx::query_as("SELECT project_id, version FROM sessions WHERE id = ?")
@@ -116,17 +115,14 @@ impl SessionsInterface {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (id, project_id, kind, parent_session_id, forked_from_checkpoint_id, \
-              resolver_conflict_id, title, state, workspace_handle, next_model_ref, \
-              active_turn_id, source_main_revision_id, version, created_at, updated_at, \
+             (id, project_id, title, state, next_model_ref, active_turn_id, \
+              version, created_at, updated_at, \
               last_activity_at) \
-             VALUES (?, ?, 'regular', NULL, NULL, NULL, ?, 'ready', ?, NULL, NULL, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, 'ready', NULL, NULL, ?, ?, ?, ?)",
         )
         .bind(session_id.to_string())
         .bind(project_id.to_string())
         .bind(&title)
-        .bind(workspace_handle.as_str())
-        .bind(source_main_revision)
         .bind(&version)
         .bind(&now)
         .bind(&now)
@@ -146,8 +142,8 @@ impl SessionsInterface {
     ) -> Result<Vec<SessionSummary>, SessionsError> {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query(
-            "SELECT id, project_id, kind, title, state, workspace_handle, \
-                    active_turn_id, next_model_ref, source_main_revision_id, version, \
+            "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
+                    version, \
                     created_at, updated_at, last_activity_at \
              FROM sessions \
              WHERE project_id = ? AND state != 'deleting' \
@@ -158,23 +154,26 @@ impl SessionsInterface {
         .fetch_all(&self.pool)
         .await?;
 
-        let handles = rows
-            .iter()
-            .map(|row| {
-                row.try_get::<String, _>("workspace_handle")
-                    .map(WorkspaceHandle)
-            })
-            .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        let workspace_revisions = self.workspace.current_revisions(&handles).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let handle: String = row.try_get("workspace_handle")?;
-            let revision = workspace_revisions
-                .get(&handle)
-                .map(|revision| revision.0.clone());
-            out.push(Self::summary_from_row(row, revision)?);
+            out.push(Self::summary_from_row(row)?);
         }
         Ok(out)
+    }
+
+    pub async fn active_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>, SessionsError> {
+        let limit = limit.clamp(1, 100);
+        let rows = sqlx::query(
+            "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
+                    version, created_at, updated_at, last_activity_at \
+             FROM sessions WHERE state != 'deleting' \
+               AND active_turn_id IS NOT NULL \
+             ORDER BY last_activity_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::summary_from_row).collect()
     }
 
     pub async fn project_session_ids(
@@ -195,13 +194,32 @@ impl SessionsInterface {
         .collect()
     }
 
+    pub async fn ready_session_ids(&self) -> Result<Vec<SessionId>, SessionsError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM sessions \
+             WHERE state = 'ready' AND active_turn_id IS NULL \
+               AND NOT EXISTS(SELECT 1 FROM turns \
+                              WHERE turns.session_id = sessions.id \
+                                AND turns.status = 'queued') \
+             ORDER BY last_activity_at",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|id| {
+            id.parse::<SessionId>()
+                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
+        })
+        .collect()
+    }
+
     pub async fn get_session(
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionsError> {
         let row = sqlx::query(
-            "SELECT id, project_id, kind, title, state, workspace_handle, \
-                    active_turn_id, next_model_ref, source_main_revision_id, version, \
+            "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
+                    version, \
                     created_at, updated_at, last_activity_at \
              FROM sessions WHERE id = ?",
         )
@@ -576,30 +594,14 @@ impl SessionsInterface {
     // Session Control State Machine primitives
     // ----------------------------------------------------------------------
 
-    /// Steer: bind a user message to the active interactive Turn so it becomes
-    /// visible at the next safe Round boundary. Accepted while the Turn is
-    /// `running`, waiting on Job/Ask, or parked on `waiting_for_model` (durable
-    /// input only; no mid-stream provider injection).
+    /// Steer: bind a user message to the active Turn so it becomes visible at
+    /// the next safe Round boundary.
     pub async fn steer(
         &self,
         session_id: SessionId,
         content: &str,
         expected_version: &str,
         actor: Value,
-    ) -> Result<SteerResult, SessionsError> {
-        self.steer_with_source(session_id, content, expected_version, actor, None)
-            .await
-    }
-
-    /// Steer with optional Ask attribution for late Ask answers that still bind
-    /// to an active original Turn.
-    pub async fn steer_with_source(
-        &self,
-        session_id: SessionId,
-        content: &str,
-        expected_version: &str,
-        actor: Value,
-        source_ask_id: Option<&str>,
     ) -> Result<SteerResult, SessionsError> {
         let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
@@ -612,7 +614,6 @@ impl SessionsInterface {
                     content,
                     expected_version,
                     actor: &actor,
-                    source_ask_id,
                     now: &now,
                 },
             )
@@ -628,7 +629,6 @@ impl SessionsInterface {
                 "timeline_item_id": timeline_item_id,
                 "kind": "steer",
                 "turn_id": result.turn_id,
-                "source_ask_id": source_ask_id,
             }),
         })
         .await?;
@@ -641,7 +641,7 @@ impl SessionsInterface {
             payload: json!({
                 "session_id": session_id.to_string(),
                 "version": result.session_version,
-                "steer": { "turn_id": result.turn_id, "source_ask_id": source_ask_id },
+                "steer": { "turn_id": result.turn_id },
             }),
         })
         .await?;
@@ -835,14 +835,40 @@ impl SessionsInterface {
         })
     }
 
+    pub async fn timeline_bounds(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(Option<String>, Option<String>, i64), SessionsError> {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE id = ?")
+            .bind(session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(SessionsError::NotFound);
+        }
+        sqlx::query_as(
+            "SELECT \
+                (SELECT id FROM timeline_items WHERE session_id = ? ORDER BY display_order ASC LIMIT 1), \
+                (SELECT id FROM timeline_items WHERE session_id = ? ORDER BY display_order DESC LIMIT 1), \
+                COUNT(1) \
+             FROM timeline_items WHERE session_id = ?",
+        )
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn get_turn(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Result<TurnSummary, SessionsError> {
         let row = sqlx::query(
-            "SELECT id, session_id, sequence, status, input_message_id, model_snapshot_json, \
-                    predecessor_turn_id, handoff_from_turn_id, handoff_to_turn_id, \
+            "SELECT id, session_id, sequence, status, input_message_id, goal_mode, model_snapshot_json, \
+                    predecessor_turn_id, \
                     cancellation_reason, completion_reason, version, created_at, updated_at \
              FROM turns WHERE id = ? AND session_id = ?",
         )
@@ -858,13 +884,13 @@ impl SessionsInterface {
             sequence: row.try_get("sequence")?,
             status: row.try_get("status")?,
             input_message_id: row.try_get("input_message_id")?,
+            goal_mode: row.try_get::<i64, _>("goal_mode")? != 0,
             model_snapshot: TurnModelSnapshot::parse(&model_snapshot_json)?,
             predecessor_turn_id: row.try_get("predecessor_turn_id")?,
-            handoff_from_turn_id: row.try_get("handoff_from_turn_id")?,
-            handoff_to_turn_id: row.try_get("handoff_to_turn_id")?,
             cancellation_reason: row.try_get("cancellation_reason")?,
             completion_reason: row.try_get("completion_reason")?,
             model_attempt: None,
+            token_exchange: None,
             version: row.try_get("version")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -957,32 +983,15 @@ impl SessionsInterface {
         &self,
         row: sqlx::sqlite::SqliteRow,
     ) -> Result<SessionSummary, SessionsError> {
-        let workspace_handle: String = row.try_get("workspace_handle")?;
-        let workspace_revision = {
-            let handle = WorkspaceHandle(workspace_handle.clone());
-            self.workspace
-                .current_revision(&handle)
-                .await
-                .ok()
-                .map(|r| r.0)
-        };
-        Self::summary_from_row(row, workspace_revision)
+        Self::summary_from_row(row)
     }
 
-    fn summary_from_row(
-        row: sqlx::sqlite::SqliteRow,
-        workspace_revision: Option<String>,
-    ) -> Result<SessionSummary, SessionsError> {
-        let workspace_handle: String = row.try_get("workspace_handle")?;
+    fn summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionSummary, SessionsError> {
         Ok(SessionSummary {
             id: row.try_get("id")?,
             project_id: row.try_get("project_id")?,
-            kind: row.try_get("kind")?,
             title: row.try_get("title")?,
             state: row.try_get("state")?,
-            workspace_handle,
-            workspace_revision,
-            source_main_revision_id: row.try_get("source_main_revision_id")?,
             active_turn_id: row.try_get("active_turn_id")?,
             model_preference: row
                 .try_get::<Option<String>, _>("next_model_ref")?

@@ -15,7 +15,8 @@ use tracing::{error, info, warn};
 
 use crate::application::Application;
 use crate::application::operation_kinds::{
-    KIND_CLONE, KIND_CREATE_SESSION, KIND_DELETE_PROJECT, KIND_DELETE_SESSION, KIND_TURN_WAKE,
+    KIND_CLONE, KIND_CONTEXT_COMPACT, KIND_CREATE_SESSION, KIND_DELETE_PROJECT,
+    KIND_DELETE_SESSION, KIND_PULL_REQUEST_AUTOMATION, KIND_TURN_WAKE,
 };
 use janus_infrastructure::id::TurnId;
 use janus_infrastructure::operations::{
@@ -26,12 +27,12 @@ use janus_infrastructure::operations::{
 /// is reclaimed quickly, long enough for a clone to finish.
 const LEASE_TTL_SECONDS: i64 = 120;
 const MAX_CONCURRENT_WORK: usize = 4;
+const MAX_CONCURRENT_AUTOMATION: usize = 2;
 const LEASE_RENEW_INTERVAL_SECONDS: u64 = 30;
 
-/// Session creation and deletion both update Git worktree administration and
-/// the same workspace-owned tables. Keep those filesystem operations single
-/// flight so a burst of sidebar actions cannot interleave half-created trees
-/// with cleanup or another worktree registration.
+/// Session creation and deletion both touch workspace-owned tables. Keep
+/// those filesystem-adjacent operations single flight so a burst of sidebar
+/// actions cannot interleave lifecycle cleanup with another registration.
 const SESSION_LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The kinds the worker claims. Short git commands run inline in the request
@@ -42,6 +43,8 @@ const HANDLED_KINDS: &[&str] = &[
     KIND_CREATE_SESSION,
     KIND_DELETE_SESSION,
     KIND_TURN_WAKE,
+    KIND_CONTEXT_COMPACT,
+    KIND_PULL_REQUEST_AUTOMATION,
 ];
 
 #[derive(Debug)]
@@ -76,10 +79,18 @@ impl From<anyhow::Error> for WorkFailure {
 pub fn spawn(state: Application) {
     let session_lifecycle = Arc::new(Semaphore::new(1));
     let work_concurrency = Arc::new(Semaphore::new(MAX_CONCURRENT_WORK));
+    let automation_concurrency = Arc::new(Semaphore::new(MAX_CONCURRENT_AUTOMATION));
     tokio::spawn(async move {
         info!("janus worker started");
         loop {
-            if let Err(error) = run_once(&state, &session_lifecycle, &work_concurrency).await {
+            if let Err(error) = run_once(
+                &state,
+                &session_lifecycle,
+                &work_concurrency,
+                &automation_concurrency,
+            )
+            .await
+            {
                 error!(%error, "worker iteration failed");
             }
             // Idle pause between sweeps; claim_work returns None when the queue
@@ -89,64 +100,52 @@ pub fn spawn(state: Application) {
     });
 }
 
-/// Spawn the Job-settled wake-up loop. Subscribes to Runtime's broadcast of
-/// terminal Job ids and resumes any `waiting_for_job` Turn that no longer has
-/// unfinished finite Jobs. Single-flight: each resume schedules one next
-/// Execution Round via the application coordinator.
-pub fn spawn_job_wake(state: Application) {
-    let mut rx = state.runtime().subscribe_job_settled();
+/// Compact idle Sessions before the next Turn would exhaust their context.
+/// The sweep only considers `ready` Sessions, so automatic compaction never
+/// runs concurrently with a live Turn.
+pub fn spawn_auto_context_compact(state: Application) {
     tokio::spawn(async move {
-        info!("janus job-wake worker started");
-        let mut reconciliation = tokio::time::interval(Duration::from_millis(500));
+        info!("janus automatic context compact worker started");
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
-            tokio::select! {
-                notification = rx.recv() => match notification {
-                    Ok(job_id) => match state.execution_coordinator().settle_job(job_id).await {
-                        Ok(Some(turn_id)) => state.execution_coordinator().schedule(turn_id),
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!(%error, %job_id, "settle Job notification failed");
-                        }
-                    },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "job-wake receiver lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
-                _ = reconciliation.tick() => {
-                    if let Err(error) = state.execution_coordinator().reconcile_waiting_jobs().await {
-                        warn!(%error, "waiting Job reconciliation failed");
-                    }
-                }
+            tick.tick().await;
+            if let Err(error) = state.auto_compact_idle_sessions().await {
+                warn!(%error, "automatic context compact sweep failed");
             }
         }
     });
 }
 
-/// Periodically expire due best-effort Asks through the application command so
-/// defaults become durable Turn input and only runnable Turns are scheduled.
-pub fn spawn_ask_expiry(state: Application) {
-    tokio::spawn(async move {
-        info!("janus ask-expiry worker started");
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            tick.tick().await;
-            if let Err(error) = state.expire_asks("system").await {
-                warn!(%error, "Ask expiry sweep failed");
-            }
-        }
-    });
+pub fn spawn_async_task_delivery(state: Application) {
+    crate::application::async_tasks::spawn(state);
 }
 
 async fn run_once(
     state: &Application,
     session_lifecycle: &Arc<Semaphore>,
     work_concurrency: &Arc<Semaphore>,
+    automation_concurrency: &Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
-        let work_permit = match work_concurrency.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => continue,
+        let is_automation = *kind == KIND_PULL_REQUEST_AUTOMATION;
+        let work_permit = if is_automation {
+            None
+        } else {
+            match work_concurrency.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => continue,
+            }
+        };
+        let automation_permit = if is_automation {
+            match automation_concurrency.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    drop(work_permit);
+                    continue;
+                }
+            }
+        } else {
+            None
         };
         let session_permit = if matches!(*kind, KIND_CREATE_SESSION | KIND_DELETE_SESSION) {
             // Do not claim work while the single session lifecycle slot is
@@ -156,6 +155,7 @@ async fn run_once(
                 Ok(permit) => Some(permit),
                 Err(_) => {
                     drop(work_permit);
+                    drop(automation_permit);
                     continue;
                 }
             }
@@ -168,6 +168,8 @@ async fn run_once(
             .await?
         else {
             drop(session_permit);
+            drop(work_permit);
+            drop(automation_permit);
             continue;
         };
         let worker_state = state.clone();
@@ -176,6 +178,7 @@ async fn run_once(
         let work_nonce = claimed.nonce.clone();
         tokio::spawn(async move {
             let _work_permit = work_permit;
+            let _automation_permit = automation_permit;
             let _session_permit = session_permit;
             let lease_heartbeat = spawn_lease_heartbeat(
                 worker_state.operations().clone(),
@@ -318,6 +321,22 @@ async fn dispatch(
             }
             Ok(())
         }
+        KIND_CONTEXT_COMPACT => {
+            crate::application::context::run_context_compact_operation(
+                state, payload, work_id, work_nonce,
+            )
+            .await
+            .map_err(WorkFailure::retry)?;
+            Ok(())
+        }
+        KIND_PULL_REQUEST_AUTOMATION => {
+            crate::application::automation::run_pull_request_automation(
+                state, payload, work_id, work_nonce,
+            )
+            .await
+            .map_err(WorkFailure::retry)?;
+            Ok(())
+        }
         other => Err(WorkFailure::dead_letter(anyhow::anyhow!(
             "no handler for kind {other}"
         ))),
@@ -353,7 +372,7 @@ async fn resolve_operation_id(
 }
 
 /// Mark the Operation backing this work item as succeeded so clients polling
-/// `GET /operations/{id}` leave the waiting state.
+/// `GET /operations/{id}` see its final state.
 async fn record_operation_success(
     state: &Application,
     kind: &str,
@@ -393,11 +412,12 @@ async fn record_operation_success(
 /// Project `error` (retryable/deletable); other failures leave it `creating`
 /// for the worker to retry.
 async fn run_project_clone(state: &Application, project_id: &str) -> Result<(), anyhow::Error> {
-    let owner_id = state
-        .projects()
-        .owner_id(project_id.parse()?)
-        .await?;
-    match state.source_control().clone_project(&owner_id, project_id).await {
+    let owner_id = state.projects().owner_id(project_id.parse()?).await?;
+    match state
+        .source_control()
+        .clone_project(&owner_id, project_id)
+        .await
+    {
         Ok(()) => {}
         Err(error @ janus_source_control::interface::SourceControlError::Git(_)) => {
             state

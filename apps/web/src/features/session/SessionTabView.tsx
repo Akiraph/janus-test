@@ -1,21 +1,17 @@
 import { useQueryClient } from "@tanstack/solid-query";
-import { ArrowDownToLine, ArrowUpFromLine, Loader2, TriangleAlert } from "lucide-solid";
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
-import { Alt } from "../../components/ui/Alt";
-import { Button } from "../../components/ui/Button";
+import { createEffect, createMemo, createSignal, For } from "solid-js";
 import {
   ApiError,
-  type AskAnswer,
-  answerAsk,
-  applySession,
+  type ContextUsageView,
   cancelTurn,
+  compactSession,
   deleteSessionAttachment,
   getErrorMessage,
   postSessionMessage,
   type QueuedTurnItem,
   type SessionModelPreference,
   type SessionSummary,
-  syncSession,
+  steerSession,
   type TimelinePage,
   uploadSessionAttachment,
 } from "../../lib/api";
@@ -27,27 +23,25 @@ import {
   modelStreamOutput,
 } from "../../lib/modelStream";
 import {
+  useAsyncTasks,
   useBootstrap,
   useProviders,
   useQueuedTurns,
   useSession,
   useSessionContext,
-  useSessionDiff,
-  useSessionJobs,
   useSessionTimeline,
   useTurn,
 } from "../../lib/queries";
 import { visibleTurnData } from "../../lib/queryPolicy";
-import { AsyncJobsView } from "./AsyncJobsView";
+import { renderSessionTurnId } from "../execution/sessionTurnState";
+import { isTurnRunning } from "../execution/turnPresentation";
+import { AsyncTasksView } from "./AsyncTasksView";
 import { SessionConversation } from "./SessionConversation";
-import { SessionDiffView } from "./SessionDiffView";
-import { decodeSessionDiff } from "./sessionDiff";
 import { decodeSessionTimeline, type SessionTimelineItem } from "./sessionTimeline";
 import { compressTimeline } from "./sessionTimelineCompression";
-import { renderSessionTurnId } from "../execution/sessionTurnState";
 import "./session.css";
 
-export type SessionSubView = "main" | "diff" | "async";
+export type SessionSubView = "main" | "async";
 
 interface SessionTabViewProps {
   sessionId: () => string;
@@ -68,24 +62,8 @@ export function SessionTabView(props: SessionTabViewProps) {
   const bootstrap = useBootstrap();
   const timeline = useSessionTimeline(props.sessionId, queriesEnabled);
   const context = useSessionContext(props.sessionId, queriesEnabled);
-  const jobs = useSessionJobs(props.sessionId, queriesEnabled);
+  const tasks = useAsyncTasks(queriesEnabled);
   const providers = useProviders();
-  const [diffRequested, setDiffRequested] = createSignal(false);
-  let diffLoadTimer: ReturnType<typeof setTimeout> | undefined;
-  createEffect(() => {
-    props.sessionId();
-    setDiffRequested(false);
-    if (diffLoadTimer !== undefined) clearTimeout(diffLoadTimer);
-    diffLoadTimer = setTimeout(() => setDiffRequested(true), 250);
-    onCleanup(() => {
-      if (diffLoadTimer !== undefined) clearTimeout(diffLoadTimer);
-      diffLoadTimer = undefined;
-    });
-  });
-  createEffect(() => {
-    if (props.subView() === "diff") setDiffRequested(true);
-  });
-  const diff = useSessionDiff(props.sessionId, () => queriesEnabled() && diffRequested());
   const [acceptedVersion, setAcceptedVersion] = createSignal("");
   const [pendingTurnId, setPendingTurnId] = createSignal<string | undefined>(undefined);
   const [pendingUserMessage, setPendingUserMessage] = createSignal<{
@@ -98,8 +76,6 @@ export function SessionTabView(props: SessionTabViewProps) {
   } | null>(null);
   const [submittingMessage, setSubmittingMessage] = createSignal<string | null>(null);
   const [visibleTurnId, setVisibleTurnId] = createSignal<string | undefined>(undefined);
-  const [propagationAction, setPropagationAction] = createSignal<"sync" | "apply" | null>(null);
-  const [propagationError, setPropagationError] = createSignal<string | null>(null);
   let commandSerial = 0;
   let localSessionId = "";
 
@@ -178,11 +154,8 @@ export function SessionTabView(props: SessionTabViewProps) {
     previousConversationItems = next;
     return next;
   });
-  const diffModel = createMemo(() => decodeSessionDiff(diff.data));
-  const diffFiles = createMemo(() => diffModel().files);
-  const diffFileCount = createMemo(() => diffFiles().length);
-  const asyncJobCount = createMemo(
-    () => Math.max(jobs.data?.length ?? 0, items().filter((item) => item.type === "job").length),
+  const asyncTaskCount = createMemo(() =>
+    Math.max(tasks.data?.length ?? 0, items().filter((item) => item.type === "async_task").length),
   );
   const latestTurnId = createMemo(() => {
     const timelineItems = items();
@@ -218,19 +191,26 @@ export function SessionTabView(props: SessionTabViewProps) {
     const output = modelStreamOutput(props.sessionId(), currentTurnId());
     return isModelStreamOutputDurable(output, durableAssistantRounds()) ? null : output;
   });
+  // Thinking duration for the provisional Thought row. Prefer the server's
+  // measured reasoning_duration_ms (pushed with the first answer delta) so the
+  // label reads "Thought for Xs" the moment thinking completes and matches the
+  // durable row; fall back to wall-clock while a server value is unavailable.
+  const provisionalThinkingMs = createMemo(() => {
+    const output = provisionalOutput();
+    if (output?.reasoningDurationMs != null) return output.reasoningDurationMs;
+    if (!output?.reasoningFirstSeenAt || !output.textFirstSeenAt) return null;
+    return Math.max(0, output.textFirstSeenAt - output.reasoningFirstSeenAt);
+  });
   const actionTurnId = createMemo(() => {
     const accepted = acceptedTurn();
-    if (accepted && (accepted.route === "started" || accepted.route === "handed_off")) {
+    if (accepted?.route === "started") {
       return accepted.id;
     }
     return activeTurnId() ?? pendingTurnId();
   });
-  const active = createMemo(() => Boolean(actionTurnId()));
+  const active = createMemo(() => Boolean(actionTurnId()) || isTurnRunning(renderedTurn()));
   const status = () => session.data?.state ?? (session.isLoading ? "loading" : "unavailable");
   const queuedTurns = useQueuedTurns(props.sessionId, () => actionTurnId() ?? null, queriesEnabled);
-  const canPropagate = createMemo(
-    () => status() === "ready" && !active() && propagationAction() === null,
-  );
 
   async function withFreshSessionVersion<T>(
     command: (version: string) => Promise<T>,
@@ -258,23 +238,23 @@ export function SessionTabView(props: SessionTabViewProps) {
     const sid = props.sessionId();
     if (!turnId) return;
     const commandId = ++commandSerial;
+    const idempotencyKey = crypto.randomUUID();
     const result = await withFreshSessionVersion(
-      (version) => cancelTurn(sid, turnId, version),
+      (version) => cancelTurn(sid, turnId, version, "user_cancel", idempotencyKey),
       (snapshot) => snapshot.active_turn_id === turnId,
     );
     if (commandId === commandSerial) {
       setAcceptedVersion(result.session_version);
       releaseLocalTurn(turnId);
     }
-    void session.refetch();
-    void timeline.refetch();
-    void queuedTurns.refetch();
   }
 
   async function handleQueuedTurnCancel(turn: QueuedTurnItem) {
     const commandId = ++commandSerial;
+    const idempotencyKey = crypto.randomUUID();
     const result = await withFreshSessionVersion(
-      (version) => cancelTurn(props.sessionId(), turn.turn_id, version),
+      (version) =>
+        cancelTurn(props.sessionId(), turn.turn_id, version, "user_cancel", idempotencyKey),
       async (snapshot) => {
         if (snapshot.active_turn_id === turn.turn_id) return false;
         const refreshed = await queuedTurns.refetch();
@@ -285,24 +265,39 @@ export function SessionTabView(props: SessionTabViewProps) {
       setAcceptedVersion(result.session_version);
       releaseLocalTurn(turn.turn_id);
     }
-    void session.refetch();
-    void timeline.refetch();
-    void queuedTurns.refetch();
+  }
+
+  async function handleQueuedTurnSteer(turn: QueuedTurnItem) {
+    const activeTurn = actionTurnId();
+    if (!activeTurn) throw new Error("There is no active turn to steer");
+    const commandId = ++commandSerial;
+    const steerKey = crypto.randomUUID();
+    const steer = await withFreshSessionVersion(
+      (version) => steerSession(props.sessionId(), turn.message_text, version, steerKey),
+      (snapshot) => snapshot.active_turn_id === activeTurn,
+    );
+    if (commandId !== commandSerial) return;
+    setAcceptedVersion(steer.session_version);
+
+    // The queued message has now been consumed as a durable steer. Remove the
+    // queued Turn with a second idempotent command so it cannot execute again.
+    const cancelKey = crypto.randomUUID();
+    const canceled = await withFreshSessionVersion(
+      (version) => cancelTurn(props.sessionId(), turn.turn_id, version, "steered", cancelKey),
+      async (snapshot) => {
+        if (snapshot.active_turn_id === turn.turn_id) return false;
+        const refreshed = await queuedTurns.refetch();
+        return refreshed.data?.some((candidate) => candidate.turn_id === turn.turn_id) ?? false;
+      },
+    );
+    if (commandId === commandSerial) setAcceptedVersion(canceled.session_version);
   }
   const canMessage = createMemo(() =>
     session.data ? ["ready", "active"].includes(session.data.state) : false,
   );
   const subViews = createMemo<SessionSubView[]>(() => {
     const views: SessionSubView[] = ["main"];
-    if (
-      diffFileCount() > 0 ||
-      diffModel().syncEnabled ||
-      diffModel().applyEnabled ||
-      diffModel().pendingConflict
-    ) {
-      views.push("diff");
-    }
-    if (asyncJobCount() > 0) views.push("async");
+    if (asyncTaskCount() > 0) views.push("async");
     return views;
   });
   // If the active sub view is no longer offered (its data vanished), fall back.
@@ -330,9 +325,7 @@ export function SessionTabView(props: SessionTabViewProps) {
     const status = renderedTurn()?.status;
     const output = modelStreamOutput(props.sessionId(), turnId);
     const hasDurableOutput = isModelStreamOutputDurable(output, durableAssistantRounds());
-    const terminal = ["completed", "failed", "canceled", "interrupted", "handed_off"].includes(
-      status ?? "",
-    );
+    const terminal = ["completed", "failed", "canceled", "interrupted"].includes(status ?? "");
     if (hasDurableOutput || (terminal && output === null)) {
       clearModelStreamText(props.sessionId(), turnId);
       if (terminal) clearModelStreamUsage(props.sessionId(), turnId);
@@ -353,7 +346,7 @@ export function SessionTabView(props: SessionTabViewProps) {
       pending &&
       turn?.id === pending &&
       hasDurableTimelineItem &&
-      ["completed", "failed", "canceled", "interrupted", "handed_off"].includes(status ?? "") &&
+      ["completed", "failed", "canceled", "interrupted"].includes(status ?? "") &&
       (output === null || outputIsDurable)
     ) {
       setPendingTurnId(undefined);
@@ -379,58 +372,50 @@ export function SessionTabView(props: SessionTabViewProps) {
     content: string,
     modelPreference: SessionModelPreference | null,
     attachmentIds: readonly string[],
+    goalMode: boolean,
   ) {
     const commandId = ++commandSerial;
+    const idempotencyKey = crypto.randomUUID();
     setSubmittingMessage(content);
     try {
       const result = await withFreshSessionVersion((version) =>
-        postSessionMessage(props.sessionId(), {
-          content,
-          expected_session_version: version,
-          model_preference: modelPreference,
-          attachment_ids: [...attachmentIds],
-        }),
+        postSessionMessage(
+          props.sessionId(),
+          {
+            content,
+            expected_session_version: version,
+            model_preference: modelPreference,
+            attachment_ids: [...attachmentIds],
+            goal_mode: goalMode,
+          },
+          idempotencyKey,
+        ),
       );
       if (commandId === commandSerial) {
         setAcceptedVersion(result.session_version);
         setAcceptedTurn({ id: result.turn_id, route: result.route });
         setPendingTurnId(result.turn_id);
         setPendingUserMessage({ turnId: result.turn_id, text: content });
-        if (result.route === "started" || result.route === "handed_off") {
+        if (result.route === "started") {
           setVisibleTurnId(result.turn_id);
         }
       }
-      // SSE normally invalidates these queries, but the POST response is the
-      // first authoritative signal when the stream is reconnecting or its
-      // cursor is being repaired. Refresh immediately so the active Turn
-      // starts polling even when no event reaches this tab.
-      void Promise.allSettled([session.refetch(), timeline.refetch(), queuedTurns.refetch()]);
       return { route: result.route, turnId: result.turn_id };
     } finally {
       setSubmittingMessage(null);
     }
   }
 
-  async function answerAskFromConversation(askId: string, answer: AskAnswer) {
-    const commandId = ++commandSerial;
-    const result = await answerAsk(askId, answer);
-    if (commandId === commandSerial) {
-      setAcceptedVersion(result.session_version);
-      const route = result.route_or_status;
-      if (route === "queued") {
-        setAcceptedTurn({ id: result.turn_id, route });
-        setPendingTurnId(result.turn_id);
-      } else if (!["answered", "canceled", "expired", "closed_by_handoff"].includes(route)) {
-        // Accepted answers resume the existing Turn (`running`) or create a
-        // late-answer successor (`started`/`handed_off`). Treat all of those
-        // as an active command until the authoritative Turn query settles.
-        setAcceptedTurn({ id: result.turn_id, route: "started" });
-        setVisibleTurnId(result.turn_id);
-      }
+  async function compactContext() {
+    const sessionId = props.sessionId();
+    const operation = await compactSession(sessionId, crypto.randomUUID());
+    queryClient.setQueryData(["operations", operation.id], operation);
+    if (operation.status === "queued") {
+      queryClient.setQueryData<ContextUsageView | null>(
+        ["session-context", sessionId],
+        (current) => (current ? { ...current, compact_status: "scheduled" } : current),
+      );
     }
-    void session.refetch();
-    void timeline.refetch();
-    void queuedTurns.refetch();
   }
 
   function releaseLocalTurn(turnId: string) {
@@ -444,50 +429,6 @@ export function SessionTabView(props: SessionTabViewProps) {
     // durable input. This avoids a visible disappearance during cancellation.
   }
 
-  async function runPropagation(direction: "sync" | "apply") {
-    if (!canPropagate()) return;
-    setPropagationAction(direction);
-    setPropagationError(null);
-    try {
-      if (direction === "sync") {
-        await syncSession(props.sessionId());
-      } else {
-        await applySession(props.sessionId());
-      }
-      await diff.refetch();
-      void session.refetch();
-    } catch (error) {
-      setPropagationError(getErrorMessage(error, `${direction} failed`));
-      await diff.refetch();
-    } finally {
-      setPropagationAction(null);
-    }
-  }
-
-  async function handleResolve() {
-    const conflict = diffModel().pendingConflict;
-    if (!conflict || !canPropagate() || !canMessage()) return;
-    const paths = conflict.paths
-      .map(
-        (path) =>
-          `- ${path.path} (${path.kind}; main ${path.mainHash ?? "missing"}, session ${path.sessionHash ?? "missing"})`,
-      )
-      .join("\n");
-    const prompt = [
-      "The workspace has a propagation conflict.",
-      `The conflict was detected during ${conflict.direction}.`,
-      "Please inspect and edit the session workspace so these files contain the intended merged result:",
-      paths,
-      "Do not commit the changes. Tell me when the workspace is resolved; I will apply it after this turn.",
-    ].join("\n\n");
-    try {
-      await sendMessage(prompt, session.data?.model_preference ?? null, []);
-      setPropagationError(null);
-    } catch (error) {
-      setPropagationError(getErrorMessage(error, "Resolve turn failed"));
-    }
-  }
-
   const conversationError = () => {
     if (session.data?.state === "creating") return null;
     if (!session.isLoading && !session.data)
@@ -497,8 +438,6 @@ export function SessionTabView(props: SessionTabViewProps) {
     }
     return null;
   };
-
-  const diffError = () => (diff.isError ? errorMessage(diff.error, "Diff failed to load") : null);
 
   return (
     <div class="session-doc">
@@ -512,88 +451,28 @@ export function SessionTabView(props: SessionTabViewProps) {
                 aria-pressed={props.subView() === view}
                 onClick={() => props.onSubViewChange(view)}
               >
-                <span class="session-subtabs__label">
-                  {view === "main" ? "Main" : view === "diff" ? "Diff" : "Async"}
-                </span>
+                <span class="session-subtabs__label">{view === "main" ? "Main" : "Async"}</span>
               </button>
             )}
           </For>
         </nav>
-        <div class="session-doc__toolbar-actions">
-          <Show when={subViews().includes("diff")}>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!diffModel().syncEnabled || !canPropagate()}
-              onClick={() => void runPropagation("sync")}
-            >
-              <Show when={propagationAction() === "sync"} fallback={<ArrowDownToLine size={14} />}>
-                <Loader2 size={14} class="ui-spinner" />
-              </Show>
-              Sync
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!diffModel().applyEnabled || !canPropagate()}
-              onClick={() => void runPropagation("apply")}
-            >
-              <Show when={propagationAction() === "apply"} fallback={<ArrowUpFromLine size={14} />}>
-                <Loader2 size={14} class="ui-spinner" />
-              </Show>
-              Apply
-            </Button>
-            <Show when={diffModel().pendingConflict}>
-              {(conflict) => (
-                <Alt
-                  interactive
-                  class="alt-bubble--propagation"
-                  content={
-                    <div class="session-propagation-conflict-popover">
-                      <strong>Conflict</strong>
-                      <p>
-                        Resolve {conflict().paths.length} file
-                        {conflict().paths.length === 1 ? "" : "s"} in a new turn before applying.
-                      </p>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={!canPropagate()}
-                        onClick={() => void handleResolve()}
-                      >
-                        Resolve
-                      </Button>
-                    </div>
-                  }
-                >
-                  <button
-                    type="button"
-                    class="session-propagation-conflict"
-                    aria-label="Workspace conflict"
-                  >
-                    <TriangleAlert size={15} />
-                  </button>
-                </Alt>
-              )}
-            </Show>
-          </Show>
-        </div>
       </header>
 
       <div class="session-doc__view" hidden={props.subView() !== "main"}>
         <SessionConversation
           items={conversationItems()}
           loading={
-            status() === "creating" ||
             status() === "loading" ||
-            (timeline.isLoading && items().length === 0)
+            (!props.creating() && timeline.isLoading && items().length === 0)
           }
           error={conversationError()}
           delivery={active() ? "queue" : "send"}
           composerDisabled={!canMessage()}
+          composerSettingsDisabled={!props.creating() && !session.data}
           onCancel={active() ? handleCancel : undefined}
           queuedTurns={queuedTurns.data ?? []}
           onQueuedTurnCancel={handleQueuedTurnCancel}
+          onQueuedTurnSteer={active() ? handleQueuedTurnSteer : undefined}
           contextUsage={context.data ?? null}
           limits={bootstrap.data?.data.limits}
           modelPreference={session.data?.model_preference ?? null}
@@ -603,6 +482,7 @@ export function SessionTabView(props: SessionTabViewProps) {
           provisionalUserText={pendingUserMessage()?.text ?? submittingMessage() ?? ""}
           provisionalText={provisionalOutput()?.text ?? ""}
           provisionalReasoning={provisionalOutput()?.reasoning ?? ""}
+          provisionalThinkingMs={provisionalThinkingMs()}
           provisionalRoundId={provisionalOutput()?.roundId ?? null}
           sessionId={props.sessionId()}
           onRetry={() => {
@@ -610,30 +490,22 @@ export function SessionTabView(props: SessionTabViewProps) {
             void timeline.refetch();
           }}
           onSubmit={sendMessage}
-          onAnswer={answerAskFromConversation}
           onUploadAttachment={uploadSessionAttachment}
           onDeleteAttachment={deleteSessionAttachment}
-        />
-      </div>
-
-      <div class="session-doc__view" hidden={props.subView() !== "diff"}>
-        <SessionDiffView
-          files={diffFiles()}
-          loading={diff.isLoading}
-          error={diffError()}
-          actionError={propagationError()}
-          onRetry={() => void diff.refetch()}
+          onCompact={compactContext}
         />
       </div>
 
       <div class="session-doc__view" hidden={props.subView() !== "async"}>
         <div class="session-async">
-          <p class="session-async__title">Async jobs</p>
-          <AsyncJobsView
-            jobs={jobs.data ?? []}
-            loading={jobs.isLoading}
-            error={jobs.isError ? getErrorMessage(jobs.error, "Jobs failed to load") : null}
-            onRefresh={() => void jobs.refetch()}
+          <p class="session-async__title">Async tasks</p>
+          <AsyncTasksView
+            tasks={tasks.data ?? []}
+            loading={tasks.isLoading}
+            error={
+              tasks.isError ? getErrorMessage(tasks.error, "Async tasks failed to load") : null
+            }
+            onRefresh={() => void tasks.refetch()}
           />
         </div>
       </div>

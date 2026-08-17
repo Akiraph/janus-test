@@ -1,12 +1,12 @@
-//! HTTP projection and log transport for Runtime-owned asynchronous Jobs.
+//! Global asynchronous bash task transport.
 
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::HeaderMap,
 };
-use janus_infrastructure::id::{JobId, SessionId};
-use janus_runtime::interface::{JobProjection, LogCursor, LogRange};
+use janus_infrastructure::id::AsyncTaskId;
+use janus_runtime::interface::{AsyncTaskProjection, LogCursor, LogRange};
 use serde::Deserialize;
 use utoipa::ToSchema;
 
@@ -20,7 +20,7 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct JobLogQuery {
+pub struct AsyncTaskLogQuery {
     #[serde(default)]
     pub after: Option<String>,
     #[serde(default)]
@@ -29,27 +29,17 @@ pub struct JobLogQuery {
 
 #[utoipa::path(
     get,
-    path = "/api/v1/sessions/{id}/jobs",
-    params(("id" = String, Path)),
-    responses((status = 200, body = DataResponse<Vec<JobProjection>>), (status = 401, body = Problem))
+    path = "/api/v1/async-tasks",
+    responses((status = 200, body = DataResponse<Vec<AsyncTaskProjection>>), (status = 401, body = Problem))
 )]
-pub async fn list_jobs(
+pub async fn list_async_tasks(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<DataResponse<Vec<JobProjection>>>, Problem> {
+) -> Result<Json<DataResponse<Vec<AsyncTaskProjection>>>, Problem> {
     let _auth = authenticate(&state, &headers).await?;
-    let session_id: SessionId = id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid session id"))?;
-    state
-        .sessions()
-        .get_session(session_id)
-        .await
-        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "session not found"))?;
     let data = state
         .runtime()
-        .jobs(session_id)
+        .async_tasks(200)
         .await
         .map_err(map_runtime_error)?;
     Ok(Json(DataResponse { data }))
@@ -57,30 +47,33 @@ pub async fn list_jobs(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/jobs/{id}/log",
+    path = "/api/v1/async-tasks/{id}/log",
     params(("id" = String, Path), ("after" = Option<String>, Query), ("limit" = Option<usize>, Query)),
     responses((status = 200, body = DataResponse<LogRange>), (status = 401, body = Problem))
 )]
-pub async fn job_log(
+pub async fn async_task_log(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Query(query): Query<JobLogQuery>,
+    Query(query): Query<AsyncTaskLogQuery>,
 ) -> Result<Json<DataResponse<LogRange>>, Problem> {
     let _auth = authenticate(&state, &headers).await?;
-    let job_id: JobId = id
+    let task_id: AsyncTaskId = id
         .parse()
-        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid job id"))?;
-    let job = state
+        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid async task id"))?;
+    let task = state
         .runtime()
-        .job(job_id)
+        .async_task(task_id)
         .await
         .map_err(map_runtime_error)?;
-    ensure_session_exists(&state, job.session_id).await?;
     let after = parse_cursor(query.after)?;
     let data = state
         .runtime()
-        .log_range(job.log_stream_id, after, query.limit.unwrap_or(1024 * 1024))
+        .log_range(
+            task.log_stream_id,
+            after,
+            query.limit.unwrap_or(1024 * 1024),
+        )
         .await
         .map_err(map_runtime_error)?;
     Ok(Json(DataResponse { data }))
@@ -88,40 +81,25 @@ pub async fn job_log(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/jobs/{id}/cancel",
+    path = "/api/v1/async-tasks/{id}/cancel",
     params(("id" = String, Path)),
-    responses((status = 200, body = DataResponse<JobProjection>), (status = 401, body = Problem))
+    responses((status = 200, body = DataResponse<AsyncTaskProjection>), (status = 401, body = Problem))
 )]
-pub async fn cancel_job(
+pub async fn cancel_async_task(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<DataResponse<JobProjection>>, Problem> {
+) -> Result<Json<DataResponse<AsyncTaskProjection>>, Problem> {
     let _auth = authorized(&state, &headers).await?;
-    let job_id: JobId = id
+    let task_id: AsyncTaskId = id
         .parse()
-        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid job id"))?;
-    let job = state
-        .runtime()
-        .job(job_id)
-        .await
-        .map_err(map_runtime_error)?;
-    ensure_session_exists(&state, job.session_id).await?;
+        .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid async task id"))?;
     let data = state
         .runtime()
-        .cancel_job(job_id)
+        .cancel_async_task(task_id)
         .await
         .map_err(map_runtime_error)?;
     Ok(Json(DataResponse { data }))
-}
-
-async fn ensure_session_exists(state: &AppState, session_id: SessionId) -> Result<(), Problem> {
-    state
-        .sessions()
-        .get_session(session_id)
-        .await
-        .map(|_| ())
-        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "session not found"))
 }
 
 fn parse_cursor(value: Option<String>) -> Result<LogCursor, Problem> {

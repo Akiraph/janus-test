@@ -2,346 +2,23 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use futures_util::future::BoxFuture;
-use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use utoipa::ToSchema;
 
 use janus_infrastructure::{
     id::{
-        CliSessionId, JobId, LogStreamId, ProjectId, RuntimeId, RuntimePortId, ServiceId,
-        SessionId, TerminalId, ToolCallId, TurnId,
+        AsyncTaskId, LogStreamId, ProjectId, RuntimeId, SessionId, TerminalId, ToolCallId, TurnId,
     },
     secrets::Secret,
 };
 
 pub use super::log_store::{LogRetention, LogStore};
 pub use super::service::RuntimeInterface;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutorKind {
-    Local,
-    Container,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub enum RuntimeCapabilityId {
-    #[serde(rename = "process_execution")]
-    ProcessExecution,
-    #[serde(rename = "container_isolation")]
-    ContainerIsolation,
-    #[serde(rename = "bash_egress")]
-    BashEgress,
-    #[serde(rename = "browser")]
-    Browser,
-    #[serde(rename = "live_preview")]
-    LivePreview,
-    #[serde(rename = "delegated_cli.claude_code")]
-    DelegatedCliClaudeCode,
-    #[serde(rename = "delegated_cli.codex")]
-    DelegatedCliCodex,
-}
-
-impl RuntimeCapabilityId {
-    pub const ALL: [Self; 7] = [
-        Self::ProcessExecution,
-        Self::ContainerIsolation,
-        Self::BashEgress,
-        Self::Browser,
-        Self::LivePreview,
-        Self::DelegatedCliClaudeCode,
-        Self::DelegatedCliCodex,
-    ];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityScope {
-    Deployment,
-    Project,
-    Session,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityState {
-    Ready,
-    Degraded,
-    Unconfigured,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CapabilityReason {
-    LocalExecutor,
-    ConfigMissing,
-    DependencyMissing,
-    PlatformUnsupported,
-    PolicyDisabled,
-    ProbeFailed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RuntimeCapability {
-    pub id: RuntimeCapabilityId,
-    pub scope: CapabilityScope,
-    pub state: CapabilityState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason_code: Option<CapabilityReason>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub effective_limits: BTreeMap<String, u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checked_at: Option<String>,
-}
-
-impl RuntimeCapability {
-    pub fn new(
-        id: RuntimeCapabilityId,
-        scope: CapabilityScope,
-        state: CapabilityState,
-        reason_code: Option<CapabilityReason>,
-    ) -> Result<Self, RuntimeError> {
-        if matches!(state, CapabilityState::Ready) == reason_code.is_some() {
-            return Err(RuntimeError::InvalidSpec(
-                "ready capabilities omit reason_code and all other states require it".into(),
-            ));
-        }
-        Ok(Self {
-            id,
-            scope,
-            state,
-            reason_code,
-            effective_limits: BTreeMap::new(),
-            checked_at: None,
-        })
-    }
-
-    pub fn with_effective_limits(mut self, effective_limits: BTreeMap<String, u64>) -> Self {
-        self.effective_limits = effective_limits;
-        self
-    }
-
-    pub fn with_checked_at(mut self, checked_at: impl Into<String>) -> Self {
-        self.checked_at = Some(checked_at.into());
-        self
-    }
-}
-
-/// Detect the current host and evaluate its development deployment capabilities.
-pub fn local_deployment_capabilities() -> Vec<RuntimeCapability> {
-    RuntimeCapabilityEvaluator::deployment(&DeploymentCapabilityProbe::detect(), false)
-}
-
-#[derive(Debug, Clone)]
-pub struct DeploymentCapabilityProbe {
-    pub platform_supports_container: bool,
-    pub podman_available: bool,
-    pub podman_probe_failed: bool,
-    pub browser_available: bool,
-    pub claude_code_available: bool,
-    pub codex_available: bool,
-    pub checked_at: String,
-}
-
-impl DeploymentCapabilityProbe {
-    pub fn detect() -> Self {
-        Self {
-            platform_supports_container: cfg!(target_os = "linux"),
-            podman_available: command_available("podman"),
-            podman_probe_failed: false,
-            browser_available: false,
-            claude_code_available: command_available("claude"),
-            codex_available: command_available("codex"),
-            checked_at: now_utc_str(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EffectiveCapabilityConfig {
-    pub executor: ExecutorKind,
-    pub production: bool,
-    pub allow_insecure_local_executor: bool,
-    pub bash_egress_configured: bool,
-    pub live_preview_configured: bool,
-    pub scope: CapabilityScope,
-}
-
-pub struct RuntimeCapabilityEvaluator;
-
-impl RuntimeCapabilityEvaluator {
-    pub fn deployment(
-        probe: &DeploymentCapabilityProbe,
-        production: bool,
-    ) -> Vec<RuntimeCapability> {
-        let executor = if probe.platform_supports_container && probe.podman_available {
-            ExecutorKind::Container
-        } else {
-            ExecutorKind::Local
-        };
-        Self::effective(
-            probe,
-            EffectiveCapabilityConfig {
-                executor,
-                production,
-                allow_insecure_local_executor: !production,
-                bash_egress_configured: false,
-                live_preview_configured: false,
-                scope: CapabilityScope::Deployment,
-            },
-        )
-    }
-
-    pub fn effective(
-        probe: &DeploymentCapabilityProbe,
-        config: EffectiveCapabilityConfig,
-    ) -> Vec<RuntimeCapability> {
-        RuntimeCapabilityId::ALL
-            .into_iter()
-            .map(|id| {
-                let (state, reason) = evaluate_capability(id, probe, config);
-                RuntimeCapability::new(id, config.scope, state, reason)
-                    .expect("the exhaustive runtime capability matrix is valid")
-                    .with_checked_at(probe.checked_at.clone())
-            })
-            .collect()
-    }
-}
-
-fn evaluate_capability(
-    id: RuntimeCapabilityId,
-    probe: &DeploymentCapabilityProbe,
-    config: EffectiveCapabilityConfig,
-) -> (CapabilityState, Option<CapabilityReason>) {
-    let local_allowed = !config.production || config.allow_insecure_local_executor;
-    match id {
-        RuntimeCapabilityId::ProcessExecution => match config.executor {
-            ExecutorKind::Local if local_allowed => (
-                CapabilityState::Degraded,
-                Some(CapabilityReason::LocalExecutor),
-            ),
-            ExecutorKind::Local => (
-                CapabilityState::Unconfigured,
-                Some(CapabilityReason::PolicyDisabled),
-            ),
-            ExecutorKind::Container if !probe.platform_supports_container => (
-                CapabilityState::Unsupported,
-                Some(CapabilityReason::PlatformUnsupported),
-            ),
-            ExecutorKind::Container if probe.podman_probe_failed => (
-                CapabilityState::Unconfigured,
-                Some(CapabilityReason::ProbeFailed),
-            ),
-            ExecutorKind::Container if !probe.podman_available => (
-                CapabilityState::Unconfigured,
-                Some(CapabilityReason::DependencyMissing),
-            ),
-            ExecutorKind::Container => (CapabilityState::Ready, None),
-        },
-        RuntimeCapabilityId::ContainerIsolation => {
-            if !probe.platform_supports_container {
-                (
-                    CapabilityState::Unsupported,
-                    Some(CapabilityReason::PlatformUnsupported),
-                )
-            } else if config.executor == ExecutorKind::Local {
-                (
-                    CapabilityState::Unsupported,
-                    Some(CapabilityReason::LocalExecutor),
-                )
-            } else if probe.podman_probe_failed {
-                (
-                    CapabilityState::Unconfigured,
-                    Some(CapabilityReason::ProbeFailed),
-                )
-            } else if !probe.podman_available {
-                (
-                    CapabilityState::Unconfigured,
-                    Some(CapabilityReason::DependencyMissing),
-                )
-            } else {
-                (CapabilityState::Ready, None)
-            }
-        }
-        RuntimeCapabilityId::BashEgress => {
-            if !config.bash_egress_configured {
-                (
-                    CapabilityState::Unconfigured,
-                    Some(CapabilityReason::ConfigMissing),
-                )
-            } else if config.executor == ExecutorKind::Local {
-                (
-                    CapabilityState::Degraded,
-                    Some(CapabilityReason::LocalExecutor),
-                )
-            } else {
-                (CapabilityState::Ready, None)
-            }
-        }
-        RuntimeCapabilityId::Browser => dependency_capability(probe.browser_available),
-        RuntimeCapabilityId::LivePreview => {
-            if config.live_preview_configured {
-                (CapabilityState::Ready, None)
-            } else {
-                (
-                    CapabilityState::Unconfigured,
-                    Some(CapabilityReason::ConfigMissing),
-                )
-            }
-        }
-        RuntimeCapabilityId::DelegatedCliClaudeCode => {
-            dependency_capability(probe.claude_code_available)
-        }
-        RuntimeCapabilityId::DelegatedCliCodex => dependency_capability(probe.codex_available),
-    }
-}
-
-const fn dependency_capability(available: bool) -> (CapabilityState, Option<CapabilityReason>) {
-    if available {
-        (CapabilityState::Ready, None)
-    } else {
-        (
-            CapabilityState::Unconfigured,
-            Some(CapabilityReason::DependencyMissing),
-        )
-    }
-}
-
-fn command_available(command: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var_os("PATHEXT")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(';')
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_ascii_lowercase)
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![".exe".into(), ".cmd".into(), ".bat".into()])
-    } else {
-        vec![String::new()]
-    };
-    std::env::split_paths(&path).any(|directory| {
-        extensions.iter().any(|extension| {
-            let candidate = if extension.is_empty() {
-                directory.join(command)
-            } else {
-                directory.join(format!("{command}{extension}"))
-            };
-            Path::new(&candidate).is_file()
-        })
-    })
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -358,7 +35,6 @@ pub enum RuntimeStatus {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeScope {
     Project { project_id: ProjectId },
-    Session { session_id: SessionId },
 }
 
 impl RuntimeScope {
@@ -366,35 +42,19 @@ impl RuntimeScope {
         Self::Project { project_id }
     }
 
-    pub const fn session(session_id: SessionId) -> Self {
-        Self::Session { session_id }
-    }
-
     pub(crate) const fn kind(self) -> &'static str {
-        match self {
-            Self::Project { .. } => "project",
-            Self::Session { .. } => "session",
-        }
+        "project"
     }
 
     pub(crate) fn id(self) -> String {
-        match self {
-            Self::Project { project_id } => project_id.to_string(),
-            Self::Session { session_id } => session_id.to_string(),
-        }
-    }
-
-    pub(crate) const fn capability_scope(self) -> CapabilityScope {
-        match self {
-            Self::Project { .. } => CapabilityScope::Project,
-            Self::Session { .. } => CapabilityScope::Session,
-        }
+        let Self::Project { project_id } = self;
+        project_id.to_string()
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum JobStatus {
+pub enum AsyncTaskStatus {
     Queued,
     Running,
     Succeeded,
@@ -403,7 +63,7 @@ pub enum JobStatus {
     Lost,
 }
 
-impl JobStatus {
+impl AsyncTaskStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -425,18 +85,6 @@ impl JobStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ServiceStatus {
-    Starting,
-    Running,
-    Unhealthy,
-    Stopping,
-    Stopped,
-    StoppedAfterRestart,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum TerminalStatus {
     Starting,
     Running,
@@ -448,18 +96,9 @@ pub enum TerminalStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ServiceImpact {
-    ReadOnly,
-    IgnoredOutput,
-    SourceWriting,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     Sync,
-    Job,
-    Service,
+    AsyncTask,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -489,143 +128,29 @@ impl ResourceLimits {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkPolicy {
-    DenyAll,
-    ProjectRules,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DelegatedCliKind {
-    ClaudeCode,
-    #[serde(rename = "codex")]
-    Codex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegatedCliAccess {
-    ReadOnly,
-    FullAccess,
-}
-
-impl Default for DelegatedCliAccess {
-    fn default() -> Self {
-        Self::FullAccess
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegatedCliEffort {
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
-    Ultracode,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct DelegatedCliLaunchOptions {
-    pub model: Option<String>,
-    pub effort: Option<DelegatedCliEffort>,
-    pub access: DelegatedCliAccess,
-}
-
-impl DelegatedCliLaunchOptions {
-    pub fn from_raw(
-        model: Option<&str>,
-        effort: Option<&str>,
-        access: Option<&str>,
-    ) -> Result<Self, RuntimeError> {
-        let model = model
-            .map(str::trim)
-            .map(str::to_owned)
-            .filter(|value| !value.is_empty());
-        if let Some(value) = model.as_deref() {
-            if value.len() > 100
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._:/+-".contains(&byte))
-            {
-                return Err(RuntimeError::InvalidSpec(
-                    "model must contain 1-100 ASCII letters, digits, or ._:/+- characters".into(),
-                ));
-            }
-        }
-        let effort = match effort.map(str::trim).filter(|value| !value.is_empty()) {
-            None => None,
-            Some("low") => Some(DelegatedCliEffort::Low),
-            Some("medium") => Some(DelegatedCliEffort::Medium),
-            Some("high") => Some(DelegatedCliEffort::High),
-            Some("xhigh") => Some(DelegatedCliEffort::XHigh),
-            Some("max") => Some(DelegatedCliEffort::Max),
-            Some("ultracode") => Some(DelegatedCliEffort::Ultracode),
-            Some(value) => {
-                return Err(RuntimeError::InvalidSpec(format!(
-                    "effort must be low|medium|high|xhigh|max|ultracode, got {value:?}"
-                )));
-            }
-        };
-        let access = match access.map(str::trim).filter(|value| !value.is_empty()) {
-            None | Some("full-access") => DelegatedCliAccess::FullAccess,
-            Some("read-only") => DelegatedCliAccess::ReadOnly,
-            Some(value) => {
-                return Err(RuntimeError::InvalidSpec(format!(
-                    "access must be read-only|full-access, got {value:?}"
-                )));
-            }
-        };
-        Ok(Self {
-            model,
-            effort,
-            access,
-        })
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(transparent)]
 pub struct RelativeWorkingDirectory(String);
 
 impl RelativeWorkingDirectory {
     pub fn new(value: impl Into<String>) -> Result<Self, RuntimeError> {
-        let value = value.into();
-        let normalized = value.trim();
+        let normalized = value.into();
+        let normalized = normalized.trim();
         let normalized = match normalized.strip_prefix("/workspace") {
             Some("") => ".",
             Some(rest) if rest.starts_with('/') => rest.strip_prefix('/').unwrap_or("."),
             _ => normalized,
         };
-        if normalized.is_empty() || normalized == "." {
-            return Ok(Self(".".into()));
-        }
-        if normalized.starts_with('/')
-            || normalized.starts_with('\\')
-            || normalized.contains('\\')
-            || normalized.contains('\0')
-        {
+        if normalized.contains('\0') {
             return Err(RuntimeError::InvalidSpec(
-                "working_directory must use a workspace-relative slash path or /workspace alias"
-                    .into(),
+                "working_directory contains a null byte".into(),
             ));
         }
-        let mut segments = normalized.split('/');
-        let first = segments
-            .next()
-            .expect("a non-empty relative path has a first segment");
-        if first.ends_with(':')
-            || first.is_empty()
-            || first == "."
-            || first == ".."
-            || segments.any(|segment| segment.is_empty() || segment == "." || segment == "..")
-        {
-            return Err(RuntimeError::InvalidSpec(
-                "working_directory contains an invalid path segment".into(),
-            ));
-        }
-        Ok(Self(normalized.into()))
+        Ok(Self(if normalized.is_empty() {
+            ".".into()
+        } else {
+            normalized.into()
+        }))
     }
 
     pub fn as_str(&self) -> &str {
@@ -644,88 +169,23 @@ impl<'de> Deserialize<'de> for RelativeWorkingDirectory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommandKind {
-    Shell,
-    DelegatedCli {
-        cli: DelegatedCliKind,
-        session_id: Option<CliSessionId>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCommand {
-    kind: CommandKind,
     input: String,
-    delegated_cli_options: Option<DelegatedCliLaunchOptions>,
 }
 
 impl ValidatedCommand {
     pub fn shell(script: impl Into<String>) -> Result<Self, RuntimeError> {
-        Self::new(CommandKind::Shell, script.into())
-    }
-
-    pub fn delegated_cli(
-        cli: DelegatedCliKind,
-        instruction: impl Into<String>,
-        session_id: Option<CliSessionId>,
-    ) -> Result<Self, RuntimeError> {
-        Self::delegated_cli_with_options(cli, instruction, session_id, None)
-    }
-
-    pub fn delegated_cli_with_options(
-        cli: DelegatedCliKind,
-        instruction: impl Into<String>,
-        session_id: Option<CliSessionId>,
-        options: Option<DelegatedCliLaunchOptions>,
-    ) -> Result<Self, RuntimeError> {
-        Self::new_with_options(
-            CommandKind::DelegatedCli { cli, session_id },
-            instruction.into(),
-            options,
-        )
-    }
-
-    fn new(kind: CommandKind, input: String) -> Result<Self, RuntimeError> {
-        Self::new_with_options(kind, input, None)
-    }
-
-    fn new_with_options(
-        kind: CommandKind,
-        input: String,
-        delegated_cli_options: Option<DelegatedCliLaunchOptions>,
-    ) -> Result<Self, RuntimeError> {
+        let input = script.into();
         if input.trim().is_empty() {
             return Err(RuntimeError::InvalidSpec(
                 "command input cannot be empty".into(),
             ));
         }
-        if input.len() > 1024 * 1024 {
-            return Err(RuntimeError::InvalidSpec(
-                "command input exceeds the one MiB contract limit".into(),
-            ));
-        }
-        if !matches!(kind, CommandKind::DelegatedCli { .. }) && delegated_cli_options.is_some() {
-            return Err(RuntimeError::InvalidSpec(
-                "CLI launch options require a delegated CLI command".into(),
-            ));
-        }
-        Ok(Self {
-            kind,
-            input,
-            delegated_cli_options,
-        })
-    }
-
-    pub fn kind(&self) -> &CommandKind {
-        &self.kind
+        Ok(Self { input })
     }
 
     pub fn input(&self) -> &str {
         &self.input
-    }
-
-    pub fn delegated_cli_options(&self) -> Option<&DelegatedCliLaunchOptions> {
-        self.delegated_cli_options.as_ref()
     }
 }
 
@@ -813,20 +273,16 @@ fn validate_environment_name(name: &str) -> Result<(), RuntimeError> {
 pub struct RuntimeSpec {
     id: RuntimeId,
     scope: RuntimeScope,
-    executor: ExecutorKind,
     workspace_root: PathBuf,
     limits: ResourceLimits,
-    network_policy: NetworkPolicy,
 }
 
 impl RuntimeSpec {
     pub fn new(
         id: RuntimeId,
         scope: RuntimeScope,
-        executor: ExecutorKind,
         workspace_root: PathBuf,
         limits: ResourceLimits,
-        network_policy: NetworkPolicy,
     ) -> Result<Self, RuntimeError> {
         if !workspace_root.is_absolute() {
             return Err(RuntimeError::InvalidSpec(
@@ -837,10 +293,8 @@ impl RuntimeSpec {
         Ok(Self {
             id,
             scope,
-            executor,
             workspace_root,
             limits,
-            network_policy,
         })
     }
 
@@ -852,20 +306,12 @@ impl RuntimeSpec {
         self.scope
     }
 
-    pub fn executor(&self) -> ExecutorKind {
-        self.executor
-    }
-
     pub fn workspace_root(&self) -> &PathBuf {
         &self.workspace_root
     }
 
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
-    }
-
-    pub fn network_policy(&self) -> NetworkPolicy {
-        self.network_policy
     }
 }
 
@@ -876,7 +322,6 @@ pub struct ExecutionSpec {
     command: ValidatedCommand,
     environment: ExecutionEnvironment,
     limits: ResourceLimits,
-    network_policy: NetworkPolicy,
 }
 
 impl ExecutionSpec {
@@ -886,7 +331,6 @@ impl ExecutionSpec {
         command: ValidatedCommand,
         environment: ExecutionEnvironment,
         limits: ResourceLimits,
-        network_policy: NetworkPolicy,
     ) -> Result<Self, RuntimeError> {
         limits.validate()?;
         Ok(Self {
@@ -895,7 +339,6 @@ impl ExecutionSpec {
             command,
             environment,
             limits,
-            network_policy,
         })
     }
 
@@ -918,73 +361,30 @@ impl ExecutionSpec {
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
     }
-
-    pub fn network_policy(&self) -> NetworkPolicy {
-        self.network_policy
-    }
 }
 
 #[derive(Debug)]
-pub struct JobSpec {
-    pub id: JobId,
+pub struct AsyncTaskSpec {
+    pub id: AsyncTaskId,
     pub session_id: SessionId,
     pub controlling_turn_id: TurnId,
     pub initiated_by_tool_call_id: ToolCallId,
     pub execution: ExecutionSpec,
 }
 
-impl JobSpec {
+impl AsyncTaskSpec {
     pub fn new(
-        id: JobId,
+        id: AsyncTaskId,
         session_id: SessionId,
         controlling_turn_id: TurnId,
         initiated_by_tool_call_id: ToolCallId,
         execution: ExecutionSpec,
     ) -> Result<Self, RuntimeError> {
-        if matches!(execution.command().kind(), CommandKind::DelegatedCli { .. })
-            || matches!(execution.command().kind(), CommandKind::Shell)
-        {
-            return Ok(Self {
-                id,
-                session_id,
-                controlling_turn_id,
-                initiated_by_tool_call_id,
-                execution,
-            });
-        }
-        Err(RuntimeError::InvalidSpec(
-            "unsupported finite Job command kind".into(),
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub struct ServiceSpec {
-    pub id: ServiceId,
-    pub session_id: SessionId,
-    pub initiated_by_tool_call_id: ToolCallId,
-    pub impact: ServiceImpact,
-    pub execution: ExecutionSpec,
-}
-
-impl ServiceSpec {
-    pub fn new(
-        id: ServiceId,
-        session_id: SessionId,
-        initiated_by_tool_call_id: ToolCallId,
-        impact: ServiceImpact,
-        execution: ExecutionSpec,
-    ) -> Result<Self, RuntimeError> {
-        if !matches!(execution.command().kind(), CommandKind::Shell) {
-            return Err(RuntimeError::InvalidSpec(
-                "a Service must use a shell command".into(),
-            ));
-        }
         Ok(Self {
             id,
             session_id,
+            controlling_turn_id,
             initiated_by_tool_call_id,
-            impact,
             execution,
         })
     }
@@ -1109,14 +509,6 @@ impl<'de> Deserialize<'de> for LogCursor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceHealth {
-    Unknown,
-    Healthy,
-    Unhealthy,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ExitSummary {
     pub exit_code: Option<i32>,
@@ -1181,46 +573,28 @@ pub trait RuntimeExecutor: Send + Sync {
         log_stream_id: LogStreamId,
     ) -> BoxFuture<'a, Result<ExecutionResult, RuntimeError>>;
 
-    fn start_job<'a>(
+    fn start_async_task<'a>(
         &'a self,
-        spec: JobSpec,
+        spec: AsyncTaskSpec,
         log_stream_id: LogStreamId,
     ) -> BoxFuture<'a, Result<ExecutorProcessHandle, RuntimeError>>;
 
-    fn wait_job<'a>(
+    fn wait_async_task<'a>(
         &'a self,
-        id: JobId,
+        id: AsyncTaskId,
         executor_nonce: &'a str,
     ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>>;
 
-    fn write_job_stdin<'a>(
+    fn write_async_task_stdin<'a>(
         &'a self,
-        id: JobId,
+        id: AsyncTaskId,
         executor_nonce: &'a str,
         input: Vec<u8>,
     ) -> BoxFuture<'a, Result<(), RuntimeError>>;
 
-    fn cancel_job<'a>(
+    fn cancel_async_task<'a>(
         &'a self,
-        id: JobId,
-        executor_nonce: &'a str,
-    ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>>;
-
-    fn start_service<'a>(
-        &'a self,
-        spec: ServiceSpec,
-        log_stream_id: LogStreamId,
-    ) -> BoxFuture<'a, Result<ExecutorProcessHandle, RuntimeError>>;
-
-    fn wait_service<'a>(
-        &'a self,
-        id: ServiceId,
-        executor_nonce: &'a str,
-    ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>>;
-
-    fn stop_service<'a>(
-        &'a self,
-        id: ServiceId,
+        id: AsyncTaskId,
         executor_nonce: &'a str,
     ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>>;
 
@@ -1281,9 +655,7 @@ pub trait RuntimeExecutor: Send + Sync {
 pub struct RuntimeProjection {
     pub id: RuntimeId,
     pub scope: RuntimeScope,
-    pub executor: ExecutorKind,
     pub status: RuntimeStatus,
-    pub capabilities: Vec<RuntimeCapability>,
     pub limits: ResourceLimits,
     pub version: String,
     pub created_at: String,
@@ -1292,15 +664,13 @@ pub struct RuntimeProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct JobProjection {
-    pub id: JobId,
+pub struct AsyncTaskProjection {
+    pub id: AsyncTaskId,
     pub runtime_id: RuntimeId,
     pub session_id: SessionId,
     pub controlling_turn_id: TurnId,
-    pub cli_kind: Option<DelegatedCliKind>,
     pub initiated_by_tool_call_id: ToolCallId,
-    pub cli_session_id: Option<CliSessionId>,
-    pub status: JobStatus,
+    pub status: AsyncTaskStatus,
     pub command_summary: String,
     pub log_stream_id: LogStreamId,
     pub exit: Option<ExitSummary>,
@@ -1309,43 +679,6 @@ pub struct JobProjection {
     pub created_at: String,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ServiceProjection {
-    pub id: ServiceId,
-    pub runtime_id: RuntimeId,
-    pub session_id: SessionId,
-    pub initiated_by_tool_call_id: ToolCallId,
-    pub status: ServiceStatus,
-    pub impact: ServiceImpact,
-    pub command_summary: String,
-    pub health: ServiceHealth,
-    pub log_stream_id: LogStreamId,
-    pub ports: Vec<RuntimePortProjection>,
-    pub exit: Option<ExitSummary>,
-    pub version: String,
-    pub created_at: String,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PortProtocol {
-    Http,
-    Https,
-    Tcp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RuntimePortProjection {
-    pub id: RuntimePortId,
-    pub service_id: ServiceId,
-    pub name: String,
-    pub protocol: PortProtocol,
-    pub internal_port: u16,
-    pub health_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1388,8 +721,7 @@ pub enum LogChannel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogOwnerKind {
     Sync,
-    Job,
-    Service,
+    AsyncTask,
     Terminal,
 }
 
@@ -1397,8 +729,7 @@ impl LogOwnerKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sync => "sync",
-            Self::Job => "job",
-            Self::Service => "service",
+            Self::AsyncTask => "async_task",
             Self::Terminal => "terminal",
         }
     }
@@ -1424,25 +755,19 @@ pub struct LogRange {
 pub enum RuntimeErrorCode {
     ValidationFailed,
     ResourceBusy,
-    CommandForbidden,
-    NetworkPolicyDenied,
     RuntimeUnavailable,
-    JobLost,
-    ServiceLost,
+    AsyncTaskLost,
     TerminalTicketInvalid,
     TerminalScrollbackExpired,
     TerminalNotWritable,
 }
 
 impl RuntimeErrorCode {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 7] = [
         Self::ValidationFailed,
         Self::ResourceBusy,
-        Self::CommandForbidden,
-        Self::NetworkPolicyDenied,
         Self::RuntimeUnavailable,
-        Self::JobLost,
-        Self::ServiceLost,
+        Self::AsyncTaskLost,
         Self::TerminalTicketInvalid,
         Self::TerminalScrollbackExpired,
         Self::TerminalNotWritable,
@@ -1452,11 +777,8 @@ impl RuntimeErrorCode {
         match self {
             Self::ValidationFailed => "VALIDATION_FAILED",
             Self::ResourceBusy => "RESOURCE_BUSY",
-            Self::CommandForbidden => "COMMAND_FORBIDDEN",
-            Self::NetworkPolicyDenied => "NETWORK_POLICY_DENIED",
             Self::RuntimeUnavailable => "RUNTIME_UNAVAILABLE",
-            Self::JobLost => "JOB_LOST",
-            Self::ServiceLost => "SERVICE_LOST",
+            Self::AsyncTaskLost => "ASYNC_TASK_LOST",
             Self::TerminalTicketInvalid => "TERMINAL_TICKET_INVALID",
             Self::TerminalScrollbackExpired => "TERMINAL_SCROLLBACK_EXPIRED",
             Self::TerminalNotWritable => "TERMINAL_NOT_WRITABLE",
@@ -1470,18 +792,12 @@ pub enum RuntimeError {
     InvalidSpec(String),
     #[error("the runtime resource is busy")]
     ResourceBusy,
-    #[error("the command is forbidden by runtime policy")]
-    CommandForbidden,
-    #[error("the destination is denied by network policy")]
-    NetworkPolicyDenied,
     #[error("the runtime is unavailable")]
     RuntimeUnavailable,
     #[error("the runtime is unavailable: {0}")]
     RuntimeUnavailableDetail(String),
-    #[error("job {0} can no longer be controlled")]
-    JobLost(JobId),
-    #[error("service {0} can no longer be controlled")]
-    ServiceLost(ServiceId),
+    #[error("async_task {0} can no longer be controlled")]
+    AsyncTaskLost(AsyncTaskId),
     #[error("the terminal access ticket is invalid")]
     TerminalTicketInvalid,
     #[error("terminal scrollback before cursor {first_cursor} is no longer retained")]
@@ -1495,13 +811,10 @@ impl RuntimeError {
         match self {
             Self::InvalidSpec(_) => RuntimeErrorCode::ValidationFailed,
             Self::ResourceBusy => RuntimeErrorCode::ResourceBusy,
-            Self::CommandForbidden => RuntimeErrorCode::CommandForbidden,
-            Self::NetworkPolicyDenied => RuntimeErrorCode::NetworkPolicyDenied,
             Self::RuntimeUnavailable | Self::RuntimeUnavailableDetail(_) => {
                 RuntimeErrorCode::RuntimeUnavailable
             }
-            Self::JobLost(_) => RuntimeErrorCode::JobLost,
-            Self::ServiceLost(_) => RuntimeErrorCode::ServiceLost,
+            Self::AsyncTaskLost(_) => RuntimeErrorCode::AsyncTaskLost,
             Self::TerminalTicketInvalid => RuntimeErrorCode::TerminalTicketInvalid,
             Self::TerminalScrollbackExpired { .. } => RuntimeErrorCode::TerminalScrollbackExpired,
             Self::TerminalNotWritable(_) => RuntimeErrorCode::TerminalNotWritable,
@@ -1522,46 +835,7 @@ impl RuntimeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DelegatedCliAccess, DelegatedCliEffort, DelegatedCliKind, DelegatedCliLaunchOptions,
-        RelativeWorkingDirectory, ValidatedCommand,
-    };
-
-    #[test]
-    fn validates_delegated_cli_launch_options() {
-        let options = DelegatedCliLaunchOptions::from_raw(
-            Some("gpt-5.1-codex"),
-            Some("ultracode"),
-            Some("read-only"),
-        )
-        .expect("reference CLI options should be accepted");
-        assert_eq!(options.model.as_deref(), Some("gpt-5.1-codex"));
-        assert_eq!(options.effort, Some(DelegatedCliEffort::Ultracode));
-        assert_eq!(options.access, DelegatedCliAccess::ReadOnly);
-        assert!(DelegatedCliLaunchOptions::from_raw(Some("中文"), None, None).is_err());
-        assert!(DelegatedCliLaunchOptions::from_raw(None, Some("unknown"), None).is_err());
-        assert!(DelegatedCliLaunchOptions::from_raw(None, None, Some("sandbox")).is_err());
-    }
-
-    #[test]
-    fn keeps_launch_options_on_delegated_commands_only() {
-        let options = DelegatedCliLaunchOptions::from_raw(Some("sonnet"), None, None)
-            .expect("valid model option");
-        let command = ValidatedCommand::delegated_cli_with_options(
-            DelegatedCliKind::ClaudeCode,
-            "inspect the workspace",
-            None,
-            Some(options.clone()),
-        )
-        .expect("delegated command should be valid");
-        assert_eq!(command.delegated_cli_options(), Some(&options));
-        assert!(
-            ValidatedCommand::shell("echo ok")
-                .expect("shell command should be valid")
-                .delegated_cli_options()
-                .is_none()
-        );
-    }
+    use super::RelativeWorkingDirectory;
 
     #[test]
     fn accepts_the_logical_workspace_absolute_prefix() {
@@ -1577,7 +851,17 @@ mod tests {
                 .as_str(),
             "src"
         );
-        assert!(RelativeWorkingDirectory::new("/workspace/../outside").is_err());
-        assert!(RelativeWorkingDirectory::new("/etc").is_err());
+        assert_eq!(
+            RelativeWorkingDirectory::new("/workspace/../outside")
+                .expect("arbitrary working directories are allowed")
+                .as_str(),
+            "../outside"
+        );
+        assert_eq!(
+            RelativeWorkingDirectory::new("/etc")
+                .expect("absolute working directories are allowed")
+                .as_str(),
+            "/etc"
+        );
     }
 }

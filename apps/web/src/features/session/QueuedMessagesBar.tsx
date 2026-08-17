@@ -1,3 +1,4 @@
+import ArrowUp from "lucide-solid/icons/arrow-up";
 import X from "lucide-solid/icons/x";
 import { createSignal, For, Show } from "solid-js";
 import { useNotifications } from "../../components/ui/notifications";
@@ -7,6 +8,7 @@ import { getErrorMessage } from "../../lib/api";
 interface QueuedMessagesBarProps {
   turns: readonly QueuedTurnItem[];
   onDelete: (turn: QueuedTurnItem) => Promise<void>;
+  onSteer?: (turn: QueuedTurnItem) => Promise<void>;
 }
 
 /**
@@ -17,6 +19,7 @@ interface QueuedMessagesBarProps {
 export function QueuedMessagesBar(props: QueuedMessagesBarProps) {
   const { notify } = useNotifications();
   const [deletingId, setDeletingId] = createSignal<string | null>(null);
+  const [steeringId, setSteeringId] = createSignal<string | null>(null);
 
   async function handleDelete(turn: QueuedTurnItem) {
     if (deletingId()) return;
@@ -29,6 +32,20 @@ export function QueuedMessagesBar(props: QueuedMessagesBarProps) {
       });
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  async function handleSteer(turn: QueuedTurnItem) {
+    if (!props.onSteer || deletingId() || steeringId()) return;
+    setSteeringId(turn.turn_id);
+    try {
+      await props.onSteer(turn);
+    } catch (cause) {
+      notify(getErrorMessage(cause, "Queued message could not steer the active turn"), {
+        variant: "danger",
+      });
+    } finally {
+      setSteeringId(null);
     }
   }
 
@@ -45,12 +62,26 @@ export function QueuedMessagesBar(props: QueuedMessagesBarProps) {
               <span class="queued-bar__text" title={turn.message_text}>
                 {turn.message_text || "(empty)"}
               </span>
+              <Show when={props.onSteer}>
+                <button
+                  type="button"
+                  class="queued-bar__steer"
+                  title="Steer active turn with this message"
+                  aria-label="Steer active turn with this message"
+                  disabled={Boolean(deletingId() || steeringId())}
+                  onClick={() => void handleSteer(turn)}
+                >
+                  <Show when={steeringId() === turn.turn_id} fallback={<ArrowUp size={12} />}>
+                    <ArrowUp size={12} class="ui-spinner" />
+                  </Show>
+                </button>
+              </Show>
               <button
                 type="button"
                 class="queued-bar__delete"
                 title="Remove queued message"
                 aria-label="Remove queued message"
-                disabled={deletingId() === turn.turn_id}
+                disabled={Boolean(deletingId() || steeringId())}
                 onClick={() => void handleDelete(turn)}
               >
                 <X size={12} aria-hidden="true" />

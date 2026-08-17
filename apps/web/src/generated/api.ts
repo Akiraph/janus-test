@@ -4,7 +4,23 @@
  */
 
 export interface paths {
-  "/api/v1/asks/{ask_id}/answer": {
+  "/api/v1/async-tasks": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_async_tasks"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/async-tasks/{id}/cancel": {
     parameters: {
       query?: never;
       header?: never;
@@ -13,7 +29,23 @@ export interface paths {
     };
     get?: never;
     put?: never;
-    post: operations["answer_ask"];
+    post: operations["cancel_async_task"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/async-tasks/{id}/log": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["async_task_log"];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -148,6 +180,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/automation/webhook": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["webhook"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/bootstrap": {
     parameters: {
       query?: never;
@@ -222,38 +270,6 @@ export interface paths {
     get?: never;
     put?: never;
     post: operations["probe_credential"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v1/jobs/{id}/cancel": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post: operations["cancel_job"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v1/jobs/{id}/log": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get: operations["job_log"];
-    put?: never;
-    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -868,22 +884,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v1/sessions/{id}/apply": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post: operations["apply"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v1/sessions/{id}/attachments": {
     parameters: {
       query?: never;
@@ -932,32 +932,16 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v1/sessions/{id}/diff": {
+  "/api/v1/sessions/{id}/context/compact": {
     parameters: {
       query?: never;
       header?: never;
       path?: never;
       cookie?: never;
     };
-    get: operations["session_diff"];
+    get?: never;
     put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v1/sessions/{id}/jobs": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get: operations["list_jobs"];
-    put?: never;
-    post?: never;
+    post: operations["compact_context"];
     delete?: never;
     options?: never;
     head?: never;
@@ -1012,22 +996,6 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/api/v1/sessions/{id}/sync": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post: operations["sync"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
   "/api/v1/sessions/{id}/timeline": {
     parameters: {
       query?: never;
@@ -1070,22 +1038,6 @@ export interface paths {
     get?: never;
     put?: never;
     post: operations["cancel_turn"];
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/api/v1/sessions/{id}/turns/{turn_id}/retry-model": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
-    put?: never;
-    post: operations["retry_model"];
     delete?: never;
     options?: never;
     head?: never;
@@ -1262,15 +1214,26 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
-    AnswerAskRequest: {
-      answer: unknown;
+    /** Format: uuid */
+    AsyncTaskId: string;
+    AsyncTaskProjection: {
+      command_summary: string;
+      controlling_turn_id: components["schemas"]["TurnId"];
+      created_at: string;
+      ended_at?: string | null;
+      exit?: null | components["schemas"]["ExitSummary"];
+      id: components["schemas"]["AsyncTaskId"];
+      initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
+      log_stream_id: components["schemas"]["LogStreamId"];
+      runtime_id: components["schemas"]["RuntimeId"];
+      session_id: components["schemas"]["SessionId"];
+      started_at?: string | null;
+      status: components["schemas"]["AsyncTaskStatus"];
+      usage: components["schemas"]["ResourceUsage"];
+      version: string;
     };
-    AnswerAskResult: {
-      ask_id: string;
-      route_or_status: string;
-      session_version: string;
-      turn_id: string;
-    };
+    /** @enum {string} */
+    AsyncTaskStatus: "queued" | "running" | "succeeded" | "failed" | "canceled" | "lost";
     /** Format: uuid */
     AttachmentId: string;
     AttachmentView: {
@@ -1312,18 +1275,6 @@ export interface components {
       expected_session_version: string;
       reason?: string | null;
     };
-    /** @enum {string} */
-    CapabilityReason:
-      | "LOCAL_EXECUTOR"
-      | "CONFIG_MISSING"
-      | "DEPENDENCY_MISSING"
-      | "PLATFORM_UNSUPPORTED"
-      | "POLICY_DISABLED"
-      | "PROBE_FAILED";
-    /** @enum {string} */
-    CapabilityScope: "deployment" | "project" | "session";
-    /** @enum {string} */
-    CapabilityState: "ready" | "degraded" | "unconfigured" | "unsupported";
     CeremonyCompleteRequest: {
       ceremony_id: string;
       credential: unknown;
@@ -1332,8 +1283,6 @@ export interface components {
       ceremony_id: string;
       public_key: unknown;
     };
-    /** Format: uuid */
-    CliSessionId: string;
     ContextUsageView: {
       compact_status: string;
       /** Format: int64 */
@@ -1366,12 +1315,22 @@ export interface components {
       http_status?: number | null;
       status: string;
     };
-    DataResponse_AnswerAskResult: {
+    DataResponse_AsyncTaskProjection: {
       data: {
-        ask_id: string;
-        route_or_status: string;
-        session_version: string;
-        turn_id: string;
+        command_summary: string;
+        controlling_turn_id: components["schemas"]["TurnId"];
+        created_at: string;
+        ended_at?: string | null;
+        exit?: null | components["schemas"]["ExitSummary"];
+        id: components["schemas"]["AsyncTaskId"];
+        initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
+        log_stream_id: components["schemas"]["LogStreamId"];
+        runtime_id: components["schemas"]["RuntimeId"];
+        session_id: components["schemas"]["SessionId"];
+        started_at?: string | null;
+        status: components["schemas"]["AsyncTaskStatus"];
+        usage: components["schemas"]["ResourceUsage"];
+        version: string;
       };
     };
     DataResponse_AttachmentView: {
@@ -1411,20 +1370,6 @@ export interface components {
         /** Format: int32 */
         http_status?: number | null;
         status: string;
-      };
-    };
-    DataResponse_DiffSummary: {
-      data: {
-        /** Format: int32 */
-        added: number;
-        apply_enabled: boolean;
-        /** Format: int32 */
-        deleted: number;
-        /** Format: int32 */
-        modified: number;
-        paths: components["schemas"]["DiffPathEntry"][];
-        pending_conflict?: null | components["schemas"]["PropagationConflict"];
-        sync_enabled: boolean;
       };
     };
     DataResponse_FileMetaView: {
@@ -1482,26 +1427,6 @@ export interface components {
         version: string;
       };
     };
-    DataResponse_JobProjection: {
-      data: {
-        cli_kind?: null | components["schemas"]["DelegatedCliKind"];
-        cli_session_id?: null | components["schemas"]["CliSessionId"];
-        command_summary: string;
-        controlling_turn_id: components["schemas"]["TurnId"];
-        created_at: string;
-        ended_at?: string | null;
-        exit?: null | components["schemas"]["ExitSummary"];
-        id: components["schemas"]["JobId"];
-        initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
-        log_stream_id: components["schemas"]["LogStreamId"];
-        runtime_id: components["schemas"]["RuntimeId"];
-        session_id: components["schemas"]["SessionId"];
-        started_at?: string | null;
-        status: components["schemas"]["JobStatus"];
-        usage: components["schemas"]["ResourceUsage"];
-        version: string;
-      };
-    };
     DataResponse_LogRange: {
       data: {
         after: components["schemas"]["LogCursor"];
@@ -1511,7 +1436,6 @@ export interface components {
     };
     DataResponse_MessageRouteResult: {
       data: {
-        handoff_from_turn_id?: string | null;
         message_id: string;
         /** @description Current routing result for the accepted message. */
         route: string;
@@ -1602,14 +1526,6 @@ export interface components {
         version: string;
       };
     };
-    DataResponse_PropagationResult: {
-      data: {
-        changed_paths: string[];
-        direction: components["schemas"]["PropagationDirection"];
-        main_revision: string;
-        session_revision: string;
-      };
-    };
     DataResponse_ProviderView: {
       data: {
         api_key_fingerprint?: string | null;
@@ -1635,17 +1551,13 @@ export interface components {
         active_turn_id?: string | null;
         created_at: string;
         id: string;
-        kind: string;
         last_activity_at: string;
         model_preference?: null | components["schemas"]["SessionModelPreference"];
         project_id: string;
-        source_main_revision_id: string;
         state: string;
         title?: string | null;
         updated_at: string;
         version: string;
-        workspace_handle: string;
-        workspace_revision?: string | null;
       };
     };
     DataResponse_SteerResult: {
@@ -1709,8 +1621,7 @@ export interface components {
         cancellation_reason?: string | null;
         completion_reason?: string | null;
         created_at: string;
-        handoff_from_turn_id?: string | null;
-        handoff_to_turn_id?: string | null;
+        goal_mode: boolean;
         id: string;
         input_message_id?: string | null;
         model_attempt?: null | components["schemas"]["TurnModelAttempt"];
@@ -1720,12 +1631,28 @@ export interface components {
         sequence: number;
         session_id: string;
         status: string;
+        token_exchange?: null | components["schemas"]["TurnTokenExchange"];
         updated_at: string;
         version: string;
       };
     };
-    DataResponse_Value: {
-      data: unknown;
+    DataResponse_Vec_AsyncTaskProjection: {
+      data: {
+        command_summary: string;
+        controlling_turn_id: components["schemas"]["TurnId"];
+        created_at: string;
+        ended_at?: string | null;
+        exit?: null | components["schemas"]["ExitSummary"];
+        id: components["schemas"]["AsyncTaskId"];
+        initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
+        log_stream_id: components["schemas"]["LogStreamId"];
+        runtime_id: components["schemas"]["RuntimeId"];
+        session_id: components["schemas"]["SessionId"];
+        started_at?: string | null;
+        status: components["schemas"]["AsyncTaskStatus"];
+        usage: components["schemas"]["ResourceUsage"];
+        version: string;
+      }[];
     };
     DataResponse_Vec_FileTreeView: {
       data: {
@@ -1759,26 +1686,6 @@ export interface components {
         pat_fingerprint?: string | null;
         pat_is_set: boolean;
         updated_at: string;
-        version: string;
-      }[];
-    };
-    DataResponse_Vec_JobProjection: {
-      data: {
-        cli_kind?: null | components["schemas"]["DelegatedCliKind"];
-        cli_session_id?: null | components["schemas"]["CliSessionId"];
-        command_summary: string;
-        controlling_turn_id: components["schemas"]["TurnId"];
-        created_at: string;
-        ended_at?: string | null;
-        exit?: null | components["schemas"]["ExitSummary"];
-        id: components["schemas"]["JobId"];
-        initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
-        log_stream_id: components["schemas"]["LogStreamId"];
-        runtime_id: components["schemas"]["RuntimeId"];
-        session_id: components["schemas"]["SessionId"];
-        started_at?: string | null;
-        status: components["schemas"]["JobStatus"];
-        usage: components["schemas"]["ResourceUsage"];
         version: string;
       }[];
     };
@@ -1854,17 +1761,13 @@ export interface components {
         active_turn_id?: string | null;
         created_at: string;
         id: string;
-        kind: string;
         last_activity_at: string;
         model_preference?: null | components["schemas"]["SessionModelPreference"];
         project_id: string;
-        source_main_revision_id: string;
         state: string;
         title?: string | null;
         updated_at: string;
         version: string;
-        workspace_handle: string;
-        workspace_revision?: string | null;
       }[];
     };
     DataResponse_Vec_String: {
@@ -1893,62 +1796,10 @@ export interface components {
       journal_mode: string;
       ready: boolean;
     };
-    /** @enum {string} */
-    DelegatedCliKind: "claude_code" | "codex";
     DeleteFileInput: {
       expected_main_revision?: string | null;
       path: string;
       recursive?: boolean;
-    };
-    /** @enum {string} */
-    DiffChangeKind: "added" | "modified" | "deleted";
-    /**
-     * @description One contiguous change region. Unchanged spans longer than the context window
-     *     become a single `Skip` line instead of being listed out.
-     */
-    DiffHunk: {
-      lines: components["schemas"]["DiffLine"][];
-    };
-    /**
-     * @description One rendered line inside a file hunk. `old_no` / `new_no` are 1-based;
-     *     either may be absent for pure additions / deletions.
-     */
-    DiffLine: {
-      kind: components["schemas"]["DiffLineKind"];
-      /** Format: int32 */
-      new_no?: number | null;
-      /** Format: int32 */
-      old_no?: number | null;
-      text: string;
-    };
-    /** @enum {string} */
-    DiffLineKind: "context" | "add" | "delete" | "skip";
-    DiffPathEntry: {
-      /** Format: int32 */
-      additions: number;
-      /** @description True when content is binary or too large for line-level display. */
-      binary?: boolean;
-      /** Format: int32 */
-      deletions: number;
-      /**
-       * @description Line-level hunks when available. Empty for binary / oversized / pure path
-       *     classification without content. Frontend collapses by default.
-       */
-      hunks?: components["schemas"]["DiffHunk"][];
-      kind: components["schemas"]["DiffChangeKind"];
-      path: string;
-    };
-    DiffSummary: {
-      /** Format: int32 */
-      added: number;
-      apply_enabled: boolean;
-      /** Format: int32 */
-      deleted: number;
-      /** Format: int32 */
-      modified: number;
-      paths: components["schemas"]["DiffPathEntry"][];
-      pending_conflict?: null | components["schemas"]["PropagationConflict"];
-      sync_enabled: boolean;
     };
     /** @enum {string} */
     DiffViewParam: "working_vs_index" | "index_vs_head" | "working_vs_head";
@@ -2090,28 +1941,6 @@ export interface components {
       display_name: string;
       initialization_token: string;
     };
-    /** Format: uuid */
-    JobId: string;
-    JobProjection: {
-      cli_kind?: null | components["schemas"]["DelegatedCliKind"];
-      cli_session_id?: null | components["schemas"]["CliSessionId"];
-      command_summary: string;
-      controlling_turn_id: components["schemas"]["TurnId"];
-      created_at: string;
-      ended_at?: string | null;
-      exit?: null | components["schemas"]["ExitSummary"];
-      id: components["schemas"]["JobId"];
-      initiated_by_tool_call_id: components["schemas"]["ToolCallId"];
-      log_stream_id: components["schemas"]["LogStreamId"];
-      runtime_id: components["schemas"]["RuntimeId"];
-      session_id: components["schemas"]["SessionId"];
-      started_at?: string | null;
-      status: components["schemas"]["JobStatus"];
-      usage: components["schemas"]["ResourceUsage"];
-      version: string;
-    };
-    /** @enum {string} */
-    JobStatus: "queued" | "running" | "succeeded" | "failed" | "canceled" | "lost";
     LiveResponse: {
       status: string;
       version: string;
@@ -2145,7 +1974,6 @@ export interface components {
       truncated: boolean;
     };
     MessageRouteResult: {
-      handoff_from_turn_id?: string | null;
       message_id: string;
       /** @description Current routing result for the accepted message. */
       route: string;
@@ -2156,13 +1984,9 @@ export interface components {
     ModelAttemptStatus: "running" | "succeeded" | "failed" | "canceled" | "interrupted";
     /**
      * @description The client surface a provider is intended to serve.
-     *
-     *     `claude-code` and `codex` are the public client identities used by the
-     *     Claude Code/Codex integrations. Existing providers remain Supervisor
-     *     providers through the migration default.
      * @enum {string}
      */
-    ModelClient: "supervisor" | "claude-code" | "codex";
+    ModelClient: "supervisor";
     MoveFileInput: {
       expected_main_revision?: string | null;
       from: string;
@@ -2192,13 +2016,7 @@ export interface components {
       updated_at: string;
     };
     /** @enum {string} */
-    NotificationEventKind:
-      | "turn_completed"
-      | "turn_failed"
-      | "ask_opened"
-      | "model_waiting"
-      | "job_completed"
-      | "test";
+    NotificationEventKind: "turn_completed" | "turn_failed" | "async_task_completed" | "test";
     NotificationTarget: {
       group_id?: string | null;
       user_id?: string | null;
@@ -2243,6 +2061,7 @@ export interface components {
       attachment_ids?: components["schemas"]["AttachmentId"][];
       content: string;
       expected_session_version: string;
+      goal_mode?: boolean;
       model_preference?: null | components["schemas"]["SessionModelPreference"];
     };
     ProbeResult: {
@@ -2280,25 +2099,6 @@ export interface components {
       state: string;
       updated_at: string;
       version: string;
-    };
-    PropagationConflict: {
-      direction: components["schemas"]["PropagationDirection"];
-      paths: components["schemas"]["PropagationConflictPath"][];
-    };
-    PropagationConflictPath: {
-      base_hash?: string | null;
-      kind: string;
-      main_hash?: string | null;
-      path: string;
-      session_hash?: string | null;
-    };
-    /** @enum {string} */
-    PropagationDirection: "sync" | "apply";
-    PropagationResult: {
-      changed_paths: string[];
-      direction: components["schemas"]["PropagationDirection"];
-      main_revision: string;
-      session_revision: string;
     };
     ProviderInput: {
       api_key?: string | null;
@@ -2418,25 +2218,6 @@ export interface components {
     };
     /** @description Content Revision identity exposed as opaque `rev_<uuid>` string. */
     RevisionRef: string;
-    RuntimeCapability: {
-      checked_at?: string | null;
-      effective_limits?: {
-        [key: string]: number;
-      };
-      id: components["schemas"]["RuntimeCapabilityId"];
-      reason_code?: null | components["schemas"]["CapabilityReason"];
-      scope: components["schemas"]["CapabilityScope"];
-      state: components["schemas"]["CapabilityState"];
-    };
-    /** @enum {string} */
-    RuntimeCapabilityId:
-      | "process_execution"
-      | "container_isolation"
-      | "bash_egress"
-      | "browser"
-      | "live_preview"
-      | "delegated_cli.claude_code"
-      | "delegated_cli.codex";
     /** Format: uuid */
     RuntimeId: string;
     SaveTextInput: {
@@ -2455,17 +2236,13 @@ export interface components {
       active_turn_id?: string | null;
       created_at: string;
       id: string;
-      kind: string;
       last_activity_at: string;
       model_preference?: null | components["schemas"]["SessionModelPreference"];
       project_id: string;
-      source_main_revision_id: string;
       state: string;
       title?: string | null;
       updated_at: string;
       version: string;
-      workspace_handle: string;
-      workspace_revision?: string | null;
     };
     SignalTerminalRequest: {
       signal: components["schemas"]["TerminalSignal"];
@@ -2481,7 +2258,6 @@ export interface components {
       turn_id: string;
     };
     SystemInfo: {
-      capabilities: components["schemas"]["RuntimeCapability"][];
       database: components["schemas"]["DatabaseInfo"];
       events: components["schemas"]["EventInfo"];
       mode: string;
@@ -2589,7 +2365,7 @@ export interface components {
     /**
      * @description The most recent model attempt for this Turn's active Round, projected onto
      *     `TurnSummary` so the UI can render the live retry counter
-     *     ("Reconnecting (X/5): reason") even when the SSE event that announced it has
+     *     ("Reconnecting (X): reason") even when the SSE event that announced it has
      *     already been consumed. Absent when the Turn has had no attempts yet.
      */
     TurnModelAttempt: {
@@ -2630,8 +2406,7 @@ export interface components {
       cancellation_reason?: string | null;
       completion_reason?: string | null;
       created_at: string;
-      handoff_from_turn_id?: string | null;
-      handoff_to_turn_id?: string | null;
+      goal_mode: boolean;
       id: string;
       input_message_id?: string | null;
       model_attempt?: null | components["schemas"]["TurnModelAttempt"];
@@ -2641,8 +2416,22 @@ export interface components {
       sequence: number;
       session_id: string;
       status: string;
+      token_exchange?: null | components["schemas"]["TurnTokenExchange"];
       updated_at: string;
       version: string;
+    };
+    TurnTokenExchange: {
+      /**
+       * Format: int64
+       * @description Model output tokens for this Turn.
+       */
+      download_tokens: number;
+      /**
+       * Format: int64
+       * @description Non-cached model input tokens for this Turn, excluding the system and
+       *     developer prompt prefix.
+       */
+      upload_tokens: number;
     };
     UpdateGithubCredentialInput: {
       github_host?: string | null;
@@ -2664,30 +2453,85 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
-  answer_ask: {
+  list_async_tasks: {
     parameters: {
       query?: never;
       header?: never;
-      path: {
-        ask_id: string;
-      };
+      path?: never;
       cookie?: never;
     };
-    requestBody: {
-      content: {
-        "application/json": components["schemas"]["AnswerAskRequest"];
-      };
-    };
+    requestBody?: never;
     responses: {
       200: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_AnswerAskResult"];
+          "application/json": components["schemas"]["DataResponse_Vec_AsyncTaskProjection"];
         };
       };
-      404: {
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  cancel_async_task: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_AsyncTaskProjection"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  async_task_log: {
+    parameters: {
+      query?: {
+        after?: string;
+        limit?: number;
+      };
+      header?: never;
+      path: {
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_LogRange"];
+        };
+      };
+      401: {
         headers: {
           [name: string]: unknown;
         };
@@ -2926,6 +2770,61 @@ export interface operations {
         };
       };
       400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  webhook: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "text/html": string;
+      };
+    };
+    responses: {
+      202: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OperationView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      503: {
         headers: {
           [name: string]: unknown;
         };
@@ -3221,67 +3120,6 @@ export interface operations {
         };
       };
       404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  cancel_job: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_JobProjection"];
-        };
-      };
-      401: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  job_log: {
-    parameters: {
-      query?: {
-        after?: string;
-        limit?: number;
-      };
-      header?: never;
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_LogRange"];
-        };
-      };
-      401: {
         headers: {
           [name: string]: unknown;
         };
@@ -5246,43 +5084,6 @@ export interface operations {
       };
     };
   };
-  apply: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_PropagationResult"];
-        };
-      };
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   upload_attachment: {
     parameters: {
       query: {
@@ -5395,7 +5196,7 @@ export interface operations {
       };
     };
   };
-  session_diff: {
+  compact_context: {
     parameters: {
       query?: never;
       header?: never;
@@ -5406,12 +5207,12 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      200: {
+      202: {
         headers: {
           [name: string]: unknown;
         };
         content: {
-          "application/json": components["schemas"]["DataResponse_DiffSummary"];
+          "application/json": components["schemas"]["DataResponse_OperationView"];
         };
       };
       404: {
@@ -5422,28 +5223,7 @@ export interface operations {
           "application/json": components["schemas"]["Problem"];
         };
       };
-    };
-  };
-  list_jobs: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_Vec_JobProjection"];
-        };
-      };
-      401: {
+      409: {
         headers: {
           [name: string]: unknown;
         };
@@ -5548,43 +5328,6 @@ export interface operations {
       };
     };
   };
-  sync: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_PropagationResult"];
-        };
-      };
-      404: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-      409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
   timeline: {
     parameters: {
       query?: {
@@ -5673,36 +5416,6 @@ export interface operations {
         };
       };
       409: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["Problem"];
-        };
-      };
-    };
-  };
-  retry_model: {
-    parameters: {
-      query?: never;
-      header?: never;
-      path: {
-        id: string;
-        turn_id: string;
-      };
-      cookie?: never;
-    };
-    requestBody?: never;
-    responses: {
-      200: {
-        headers: {
-          [name: string]: unknown;
-        };
-        content: {
-          "application/json": components["schemas"]["DataResponse_Value"];
-        };
-      };
-      404: {
         headers: {
           [name: string]: unknown;
         };

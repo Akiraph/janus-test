@@ -35,9 +35,7 @@ const KIND_OPTIONS: readonly SelectOption[] = [
 const EVENT_OPTIONS: readonly { value: NotificationEventKind; label: string }[] = [
   { value: "turn_completed", label: "Turn completed" },
   { value: "turn_failed", label: "Turn failed" },
-  { value: "ask_opened", label: "Model asks a question" },
-  { value: "model_waiting", label: "Model needs attention" },
-  { value: "job_completed", label: "Async job finished" },
+  { value: "async_task_completed", label: "Async task finished" },
 ];
 
 const DEFAULT_EVENTS: NotificationEventKind[] = EVENT_OPTIONS.map((event) => event.value);
@@ -88,7 +86,7 @@ export function NotificationsSettings() {
             <span class="settings-group-title">
               <Bell size={15} /> Notifications
             </span>
-            <small>Deliver turn, question, and async-job updates to external channels.</small>
+            <small>Deliver turn and async task updates to external channels.</small>
           </div>
         </button>
         <Show when={open()}>
@@ -220,7 +218,11 @@ function ChannelForm(props: ChannelFormProps) {
 
   function toggleEvent(event: NotificationEventKind, checked: boolean) {
     setEvents((current) =>
-      checked ? (current.includes(event) ? current : [...current, event]) : current.filter((item) => item !== event),
+      checked
+        ? current.includes(event)
+          ? current
+          : [...current, event]
+        : current.filter((item) => item !== event),
     );
   }
 
@@ -282,7 +284,12 @@ function ChannelForm(props: ChannelFormProps) {
         <div class="dialog-form-grid">
           <div>
             <span class="field-label">Name</span>
-            <input class="ui-input" value={name()} onInput={(event) => setName(event.currentTarget.value)} required />
+            <input
+              class="ui-input"
+              value={name()}
+              onInput={(event) => setName(event.currentTarget.value)}
+              required
+            />
           </div>
           <div>
             <span class="field-label">Channel</span>
@@ -300,7 +307,9 @@ function ChannelForm(props: ChannelFormProps) {
               type="url"
               value={endpoint()}
               onInput={(event) => setEndpoint(event.currentTarget.value)}
-              placeholder={kind() === "qqbot" ? "http://127.0.0.1:3000/send_msg" : "https://example.test/janus"}
+              placeholder={
+                kind() === "qqbot" ? "http://127.0.0.1:3000/send_msg" : "https://example.test/janus"
+              }
               required
             />
           </div>
@@ -311,7 +320,9 @@ function ChannelForm(props: ChannelFormProps) {
               type="password"
               value={secret()}
               onInput={(event) => setSecret(event.currentTarget.value)}
-              placeholder={editing() ? "Leave blank to keep the stored secret" : "Optional for Webhook"}
+              placeholder={
+                editing() ? "Leave blank to keep the stored secret" : "Optional for Webhook"
+              }
               autocomplete="off"
             />
           </div>
@@ -336,7 +347,11 @@ function ChannelForm(props: ChannelFormProps) {
             </div>
           </Show>
           <label class="full-field notification-toggle">
-            <input type="checkbox" checked={enabled()} onChange={(event) => setEnabled(event.currentTarget.checked)} />
+            <input
+              type="checkbox"
+              checked={enabled()}
+              onChange={(event) => setEnabled(event.currentTarget.checked)}
+            />
             Enabled
           </label>
         </div>
@@ -349,7 +364,9 @@ function ChannelForm(props: ChannelFormProps) {
                   <input
                     type="checkbox"
                     checked={events().includes(event.value)}
-                    onChange={(inputEvent) => toggleEvent(event.value, inputEvent.currentTarget.checked)}
+                    onChange={(inputEvent) =>
+                      toggleEvent(event.value, inputEvent.currentTarget.checked)
+                    }
                   />
                   {event.label}
                 </label>
@@ -359,7 +376,9 @@ function ChannelForm(props: ChannelFormProps) {
         </div>
         <NotificationEvent message={error()} variant="danger" />
         <div class="dialog-footer">
-          <Button variant="outline" type="button" onClick={props.close}>Cancel</Button>
+          <Button variant="outline" type="button" onClick={props.close}>
+            Cancel
+          </Button>
           <Button variant="primary" type="submit" disabled={submitting()}>
             {editing() ? "Save changes" : "Add channel"}
           </Button>

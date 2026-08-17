@@ -39,6 +39,23 @@ cargo run -p janus-test -- events follow --count 1
 Public API schema is generated to `generated/openapi.json`, then converted to
 frontend types in `apps/web/src/generated/api.ts`.
 
+## Optional PR automation
+
+The email/webhook PR repair flow is disabled by default. Enable it with
+`JANUS_AUTOMATION_WEBHOOK_ENABLED=true` and set
+`JANUS_AUTOMATION_WEBHOOK_SECRET`. POST the final email HTML, or a JSON
+envelope containing it, to `/api/v1/automation/webhook` with either
+`X-Janus-Webhook-Secret` or `Authorization: Bearer ...`. Janus extracts the
+first GitHub pull-request link, clones that repository, creates a Supervisor
+session, and lets the Supervisor resolve, test, commit, and push the repair.
+
+For private repositories and `gh`-based pushes, set
+`JANUS_AUTOMATION_GITHUB_TOKEN` to a GitHub classic PAT. The token is stored
+only as an encrypted project credential and is exposed to the managed turn as
+`GH_TOKEN`/`GITHUB_TOKEN`; the injected task runs `gh auth setup-git` before
+pushing. Leave this variable unset for public repositories or supply an
+existing project credential id in a JSON envelope.
+
 ## Crates
 
 Rust code is split along the dependency graph. `janus-infrastructure` contains

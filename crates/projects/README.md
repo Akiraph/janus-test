@@ -24,12 +24,11 @@ server composes it with the Git adapter and durable operation worker.
 ## Boundaries
 
 `janus-projects` writes only `projects`, `github_credentials`,
-`project_git_state`, `git_update_conflicts`, `git_update_conflict_paths`,
-`project_runtime_configs`, `project_runtime_secrets`, `project_egress_rules`,
-and `project_cli_configs`. The server still owns the ordered SQLx migrations;
+`project_git_state`, `git_update_conflicts`, and `git_update_conflict_paths`.
+The server still owns the ordered SQLx migrations;
 the historical table names and event names must remain unchanged.
 
-`janus-workspace` owns file bytes, copy lifecycle, revisions, manifests, diffs,
+`janus-workspace` owns Main file bytes, revisions, and manifests,
 and path safety. `janus-source-control` owns the Git port; the concrete process
 adapter is injected by the server. Cross-module cleanup, scheduling, and
 recovery belong to `application/`.
@@ -40,7 +39,7 @@ Project responsible for readiness, metadata, and its own event projection.
 
 ## Design decision
 
-The existing Project HTTP routes remain stable while their Workspace reads are
-delegated. This keeps the public API and error mapping compatible while
-removing duplicate file metadata, tree traversal, and content-read logic from
-the Projects capability.
+Project HTTP routes translate the public protocol while Workspace owns Main
+file bytes, revisions, tree traversal, and content reads. The Projects
+capability remains responsible for readiness, metadata, and its own event
+projection.

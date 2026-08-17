@@ -35,13 +35,12 @@ export type AttachmentView = components["schemas"]["AttachmentView"];
 export type PublicLimits = components["schemas"]["PublicLimits"];
 export type MessageRouteResult = components["schemas"]["MessageRouteResult"];
 export type CancelResult = components["schemas"]["CancelResult"];
+export type SteerResult = components["schemas"]["SteerResult"];
 export type QueuedTurnItem = components["schemas"]["QueuedTurnItem"];
 export type TimelinePage = components["schemas"]["TimelinePage"];
 export type TimelineItemView = components["schemas"]["TimelineItemView"];
 export type TimelineTurnStatus = components["schemas"]["TimelineTurnStatus"];
 export type TurnSummary = components["schemas"]["TurnSummary"];
-export type SessionDiffSummary = components["schemas"]["DiffSummary"];
-export type PropagationResult = components["schemas"]["PropagationResult"];
 export type CreateSessionRequest = components["schemas"]["CreateSessionRequest"];
 export type PostMessageRequest = components["schemas"]["PostMessageRequest"];
 export type TerminalProjection = components["schemas"]["TerminalProjection"];
@@ -50,15 +49,12 @@ export type TerminalSizeInput = components["schemas"]["TerminalSizeInput"];
 export type TerminalSignal = components["schemas"]["TerminalSignal"];
 export type CreateTerminalRequest = components["schemas"]["CreateTerminalRequest"];
 export type LogRange = components["schemas"]["LogRange"];
-export type JobProjection = components["schemas"]["JobProjection"];
+export type AsyncTaskProjection = components["schemas"]["AsyncTaskProjection"];
 export type NotificationChannelInput = components["schemas"]["NotificationChannelInput"];
 export type NotificationChannelView = components["schemas"]["NotificationChannelView"];
 export type NotificationChannelKind = components["schemas"]["NotificationChannelKind"];
 export type NotificationEventKind = components["schemas"]["NotificationEventKind"];
-export type RuntimeCapability = components["schemas"]["RuntimeCapability"];
 
-export type AskAnswerResult = components["schemas"]["AnswerAskResult"];
-export type AskAnswer = string | readonly string[];
 let csrfToken: string | undefined;
 
 export class ApiError extends Error {
@@ -340,21 +336,16 @@ export async function deleteSession(
 export async function postSessionMessage(
   id: string,
   input: PostMessageRequest,
+  idempotencyKey = crypto.randomUUID(),
 ): Promise<MessageRouteResult> {
   return (
     await requestJson<{ data: MessageRouteResult }>(
       `/api/v1/sessions/${id}/messages`,
-      { method: "POST", body: JSON.stringify(input) },
-      isDataResponse,
-    )
-  ).data;
-}
-
-export async function answerAsk(askId: string, answer: AskAnswer): Promise<AskAnswerResult> {
-  return (
-    await requestJson<{ data: AskAnswerResult }>(
-      `/api/v1/asks/${encodeURIComponent(askId)}/answer`,
-      { method: "POST", body: JSON.stringify({ answer }) },
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
       isDataResponse,
     )
   ).data;
@@ -365,6 +356,7 @@ export async function cancelTurn(
   turnId: string,
   expectedSessionVersion: string,
   reason = "user_cancel",
+  idempotencyKey = crypto.randomUUID(),
 ): Promise<CancelResult> {
   return (
     await requestJson<{ data: CancelResult }>(
@@ -372,6 +364,29 @@ export async function cancelTurn(
       {
         method: "POST",
         body: JSON.stringify({ expected_session_version: expectedSessionVersion, reason }),
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function steerSession(
+  sessionId: string,
+  content: string,
+  expectedSessionVersion: string,
+  idempotencyKey = crypto.randomUUID(),
+): Promise<SteerResult> {
+  return (
+    await requestJson<{ data: SteerResult }>(
+      `/api/v1/sessions/${sessionId}/steer`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          content,
+          expected_session_version: expectedSessionVersion,
+        }),
+        headers: { "Idempotency-Key": idempotencyKey },
       },
       isDataResponse,
     )
@@ -420,6 +435,20 @@ export async function getSessionContext(id: string): Promise<ContextUsageView | 
   ).data;
 }
 
+export async function compactSession(id: string, idempotencyKey: string): Promise<OperationView> {
+  return (
+    await requestJson<{ data: OperationView }>(
+      `/api/v1/sessions/${id}/context/compact`,
+      {
+        method: "POST",
+        body: "{}",
+        headers: { "Idempotency-Key": idempotencyKey },
+      },
+      isDataResponse,
+    )
+  ).data;
+}
+
 export async function getSessionTimeline(
   id: string,
   opts: { before?: string; after?: string; limit?: number } = {},
@@ -438,36 +467,6 @@ export async function getSessionTimeline(
   ).data;
 }
 
-export async function getSessionDiff(id: string): Promise<SessionDiffSummary> {
-  return (
-    await requestJson<{ data: SessionDiffSummary }>(
-      `/api/v1/sessions/${id}/diff`,
-      { method: "GET" },
-      isDataResponse,
-    )
-  ).data;
-}
-
-export async function syncSession(id: string): Promise<PropagationResult> {
-  return (
-    await requestJson<{ data: PropagationResult }>(
-      `/api/v1/sessions/${id}/sync`,
-      { method: "POST" },
-      isDataResponse,
-    )
-  ).data;
-}
-
-export async function applySession(id: string): Promise<PropagationResult> {
-  return (
-    await requestJson<{ data: PropagationResult }>(
-      `/api/v1/sessions/${id}/apply`,
-      { method: "POST" },
-      isDataResponse,
-    )
-  ).data;
-}
-
 export async function getTurn(sessionId: string, turnId: string): Promise<TurnSummary> {
   return (
     await requestJson<{ data: TurnSummary }>(
@@ -478,17 +477,17 @@ export async function getTurn(sessionId: string, turnId: string): Promise<TurnSu
   ).data;
 }
 
-export async function listSessionJobs(sessionId: string): Promise<JobProjection[]> {
+export async function listAsyncTasks(): Promise<AsyncTaskProjection[]> {
   return (
-    await requestJson<{ data: JobProjection[] }>(
-      `/api/v1/sessions/${sessionId}/jobs`,
+    await requestJson<{ data: AsyncTaskProjection[] }>(
+      "/api/v1/async-tasks",
       { method: "GET" },
       isDataResponse,
     )
   ).data;
 }
 
-export async function getJobLog(
+export async function getAsyncTaskLog(
   id: string,
   opts: { after?: string; limit?: number } = {},
 ): Promise<LogRange> {
@@ -498,17 +497,17 @@ export async function getJobLog(
   const suffix = query.toString() ? `?${query}` : "";
   return (
     await requestJson<{ data: LogRange }>(
-      `/api/v1/jobs/${id}/log${suffix}`,
+      `/api/v1/async-tasks/${id}/log${suffix}`,
       { method: "GET" },
       isDataResponse,
     )
   ).data;
 }
 
-export async function cancelJob(id: string): Promise<JobProjection> {
+export async function cancelAsyncTask(id: string): Promise<AsyncTaskProjection> {
   return (
-    await requestJson<{ data: JobProjection }>(
-      `/api/v1/jobs/${id}/cancel`,
+    await requestJson<{ data: AsyncTaskProjection }>(
+      `/api/v1/async-tasks/${id}/cancel`,
       { method: "POST" },
       isDataResponse,
     )
@@ -931,29 +930,6 @@ export async function getOperation(id: string): Promise<OperationView> {
   ).data;
 }
 
-export async function waitForOperation(
-  id: string,
-  timeoutMs = 120_000,
-  pollIntervalMs = 250,
-): Promise<OperationView> {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const operation = await getOperation(id);
-    if (operation.status === "succeeded") return operation;
-    if (
-      operation.status === "failed" ||
-      operation.status === "canceled" ||
-      operation.status === "needs_attention"
-    ) {
-      throw new ApiError(409, operationFailureMessage(operation.problem));
-    }
-    if (Date.now() >= deadline) {
-      throw new ApiError(504, `Operation ${id} did not finish in time`);
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, pollIntervalMs));
-  }
-}
-
 async function getJson<T>(path: string, decode: (value: unknown) => value is T): Promise<T> {
   return requestJson(path, { method: "GET" }, decode);
 }
@@ -1018,10 +994,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function operationFailureMessage(problem: unknown): string {
-  return getErrorMessage(problem, "Operation failed");
-}
-
 function isBootstrapResponse(value: unknown): value is BootstrapResponse {
   if (!isRecord(value) || !isRecord(value.data)) return false;
   const { data } = value;
@@ -1042,7 +1014,6 @@ function isSystemInfoResponse(value: unknown): value is SystemInfoResponse {
     typeof data.schema_version === "number" &&
     typeof data.mode === "string" &&
     isRecord(data.database) &&
-    isRecord(data.events) &&
-    Array.isArray(data.capabilities)
+    isRecord(data.events)
   );
 }

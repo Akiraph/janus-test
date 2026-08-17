@@ -17,11 +17,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use janus_source_control::{DiffView, GitLogEntry, GitStatus};
 use janus_source_control::interface::{
     GitUpdateConflictView, GitUpdateInput, ResolveGitUpdateConflictInput,
     ResolveGitUpdateConflictPath, SourceControlError,
 };
+use janus_source_control::{DiffView, GitLogEntry, GitStatus};
 
 use crate::{
     AppState,
@@ -391,16 +391,9 @@ pub async fn git_stage(
     let auth = authorized(&state, &headers).await?;
     state
         .source_control()
-        .git_stage(&auth.owner_id, &id, &input.paths)
+        .git_stage(&auth.owner_id, &id, &input.paths, CorrelationId::new())
         .await
         .map_err(problem)?;
-    // Push git status after stage
-    if let Ok(status) = state.source_control().git_status(&auth.owner_id, &id).await {
-        let view: GitStatusView = status.into();
-        state
-            .state_broadcaster()
-            .push_git_status(&id, serde_json::to_value(&view).unwrap_or_default());
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -426,16 +419,9 @@ pub async fn git_unstage(
     let auth = authorized(&state, &headers).await?;
     state
         .source_control()
-        .git_unstage(&auth.owner_id, &id, &input.paths)
+        .git_unstage(&auth.owner_id, &id, &input.paths, CorrelationId::new())
         .await
         .map_err(problem)?;
-    // Push git status after unstage
-    if let Ok(status) = state.source_control().git_status(&auth.owner_id, &id).await {
-        let view: GitStatusView = status.into();
-        state
-            .state_broadcaster()
-            .push_git_status(&id, serde_json::to_value(&view).unwrap_or_default());
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 

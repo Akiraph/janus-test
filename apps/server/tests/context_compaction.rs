@@ -74,11 +74,18 @@ async fn schedule_compact_records_immutable_summary() -> anyhow::Result<()> {
     let id = schedule_compact(&pool, sid, Some("tl-first"), "tl-last", summary.clone()).await?;
     assert!(!id.is_empty());
 
-    let latest = latest_compact_summary(&pool, sid)
-        .await?
-        .expect("summary recorded");
-    assert_eq!(latest.0, summary);
-    assert_eq!(latest.1, "tl-last");
+    let stored: (String, String) = sqlx::query_as(
+        "SELECT summary_json, source_last_timeline_id FROM compact_summaries WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored.0)?,
+        summary
+    );
+    assert_eq!(stored.1, "tl-last");
+    assert!(latest_compact_summary(&pool, sid).await?.is_none());
 
     // The summary row is immutable: scheduling again records a new row, never
     // overwriting the prior one. Range lookup always returns the newest.
@@ -97,9 +104,17 @@ async fn schedule_compact_records_immutable_summary() -> anyhow::Result<()> {
             .fetch_one(&pool)
             .await?;
     assert_eq!(all, 2);
+    sqlx::query(
+        "UPDATE context_versions SET compact_status = 'succeeded' \
+         WHERE session_id = ? AND compact_summary_id = ?",
+    )
+    .bind(sid.to_string())
+    .bind(&id2)
+    .execute(&pool)
+    .await?;
     let latest = latest_compact_summary(&pool, sid)
         .await?
-        .expect("summary recorded");
+        .expect("succeeded summary recorded");
     assert_eq!(latest.1, "tl-last-2");
     Ok(())
 }

@@ -3,10 +3,7 @@ public_root = "interface.rs"
 owned_tables = [
   "projects",
   "github_credentials",
-  "project_runtime_configs",
-  "project_runtime_secrets",
-  "project_egress_rules",
-  "project_cli_configs",
+  "memories",
 ]
 publishes = [
   "project.changed",

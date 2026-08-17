@@ -60,8 +60,6 @@ struct SnapshotFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     session_timeline: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    session_diff: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     session_context: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn: Option<serde_json::Value>,
@@ -126,7 +124,6 @@ async fn build_snapshot(state: &AppState, owner_id: &str) -> SnapshotFrame {
                         "min_cursor": bounds.min.to_string(),
                         "max_cursor": bounds.max.to_string(),
                     },
-                    "capabilities": [],
                 }
             }))
         }
@@ -148,7 +145,6 @@ async fn build_snapshot(state: &AppState, owner_id: &str) -> SnapshotFrame {
     SnapshotFrame {
         session: None,
         session_timeline: None,
-        session_diff: None,
         session_context: None,
         turn: None,
         queued_turns: None,
@@ -328,7 +324,7 @@ pub async fn events(
                                 event
                             };
                             if let Ok(event) = event.json_data(&frame) {
-                                let _ = yield Ok(event);
+                                yield Ok(event);
                             } else {
                                 return;
                             }
@@ -341,7 +337,7 @@ pub async fn events(
                     }
                 }
                 () = tokio::time::sleep(heartbeat) => {
-                    let _ = yield Ok(Event::default().event("ping").data(""));
+                    yield Ok(Event::default().event("ping").data(""));
                 }
             }
         }

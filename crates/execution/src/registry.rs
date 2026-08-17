@@ -1,9 +1,9 @@
-﻿//! Execution tool registry.
+//! Execution tool registry.
 //!
 //! Tools are grouped into capability sets so the model only sees tools it can
 //! actually use for the current turn:
 //! - core: always available (read/write/edit/delete/bash + control tools).
-//! - runtime: job/service/delegate_cli tools backed by Runtime.
+//! - runtime: global async task process-control tools backed by Runtime.
 //! - attachment: only when the session has at least one attached file.
 //!
 //! `fs.list` and `git.inspect` were removed: the model uses `bash` for both
@@ -23,7 +23,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 pub enum ToolSet {
     /// Available on every Turn regardless of context.
     Core,
-    /// Requires a bound Runtime interface (bash/job/service/delegate_cli).
+    /// Requires a bound Runtime interface (global async-task control).
     Runtime,
     /// Requires at least one attached file in the session.
     Attachment,
@@ -36,7 +36,7 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "read",
-                description: "Read a Session file as text or supported image (PNG/JPEG/WebP/non-animated GIF). Supports line offset and limit.",
+                description: "Read a file in the Main workspace as text or a supported image. Supports line offset and limit.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -52,7 +52,7 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "write",
-                description: "Write UTF-8 text to a Session-relative path. Creates the file if it does not exist (overwrites if it does) and creates parent directories.",
+                description: "Write UTF-8 text to a Main workspace path. Creates the file if it does not exist and creates parent directories.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -67,7 +67,7 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "edit",
-                description: "Apply one or more exact text replacements to an existing Session file. Each oldText must be unique in the file and edits must not overlap. Use write for new files.",
+                description: "Apply one or more exact text replacements to an existing Main workspace file. Each oldText must be unique in the file and edits must not overlap. Use write for new files.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -92,7 +92,7 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "delete",
-                description: "Delete a Session file or empty directory.",
+                description: "Delete a Main workspace file or empty directory.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -106,13 +106,13 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "bash",
-                description: "Run a shell command in the Session workspace. Use for ls, grep, find, read-only git, builds, and tests. mode=sync (default) waits for the result; mode=async runs it in the background (the Turn can keep working and wait on it later, like waiting on a delegated CLI).",
+                description: "Run a shell command in the Main workspace. Use for inspection, git, builds, tests, and other repository work. mode=sync (default) returns the result; mode=async starts a global background task and its completion is delivered to this session as a new system Turn.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "command": {"type": "string"},
-                        "mode": {"type": "string", "enum": ["sync", "async"], "description": "sync (default) blocks until exit; async runs in the background and the Turn may wait on it"},
-                        "working_directory": {"type": "string", "description": "Workspace-relative path; default \".\""},
+                        "mode": {"type": "string", "enum": ["sync", "async"], "description": "sync (default) returns when the command exits; async starts a global task and returns immediately"},
+                        "working_directory": {"type": "string", "description": "Path passed directly to Git Bash; default is the Main workspace"},
                         "timeout_ms": {"type": "integer", "minimum": 1}
                     },
                     "required": ["command"]
@@ -122,34 +122,14 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         ),
         (
             ToolSpecEntry {
-                name: "delegate_cli",
-                description: "Launch or follow up a constrained Claude Code / Codex Job.",
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "cli": {"type": "string", "enum": ["claude_code", "codex"]},
-                        "instruction": {"type": "string"},
-                        "working_directory": {"type": "string"},
-                        "cli_session_id": {"type": "string", "description": "Reuse an existing CLI session for follow-up"},
-                        "model": {"type": "string", "description": "Optional CLI model id or alias"},
-                        "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "ultracode"]},
-                        "access": {"type": "string", "enum": ["read-only", "full-access"], "default": "full-access"}
-                    },
-                    "required": ["cli", "instruction"]
-                }),
-            },
-            ToolSet::Runtime,
-        ),
-        (
-            ToolSpecEntry {
                 name: "read_output",
-                description: "Read the current accumulated output (stdout/stderr) of a background job started by bash (mode=async) or delegate_cli. The job keeps running; this only reads what it has produced so far. Pass the job_id returned when the job was started.",
+                description: "Read the current accumulated output of a global async bash task. Pass the task_id returned when it was started.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "job_id": {"type": "string"}
+                        "task_id": {"type": "string"}
                     },
-                    "required": ["job_id"]
+                    "required": ["task_id"]
                 }),
             },
             ToolSet::Runtime,
@@ -157,16 +137,59 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "stop",
-                description: "Terminate a background job started by bash (mode=async) or delegate_cli by its job_id.",
+                description: "Terminate a global async bash task by its task_id.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "job_id": {"type": "string"}
+                        "task_id": {"type": "string"}
                     },
-                    "required": ["job_id"]
+                    "required": ["task_id"]
                 }),
             },
             ToolSet::Runtime,
+        ),
+        (
+            ToolSpecEntry {
+                name: "active_sessions",
+                description: "List every active session in this project so parallel sessions can coordinate their work.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+            ToolSet::Core,
+        ),
+        (
+            ToolSpecEntry {
+                name: "read_session",
+                description: "Read the recent timeline of another session in this project.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+                    },
+                    "required": ["session_id"]
+                }),
+            },
+            ToolSet::Core,
+        ),
+        (
+            ToolSpecEntry {
+                name: "memory",
+                description: "List, set, update, or delete persistent project memory. Memory is injected into every new Turn and remains after context compaction.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "set", "delete"]},
+                        "key": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["action"]
+                }),
+            },
+            ToolSet::Core,
         ),
         // ── control tools (always available) ──────────────────────────────
         (
@@ -180,41 +203,6 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
                         "evidence": {"type": "array", "items": {"type": "string"}}
                     },
                     "required": ["todos"]
-                }),
-            },
-            ToolSet::Core,
-        ),
-        (
-            ToolSpecEntry {
-                name: "ask_user",
-                description: "Ask the user one concise-sentence question. Provide concise choices; each choice may be a string or an object with a short one-sentence annotation. Set multiple true when more than one choice may be selected. The UI also offers a manual answer and decline option. Use blocking when the turn must wait, or non_blocking when it may continue after the answer window closes. Non-blocking asks require expires_in_ms and do not use a preselected answer.",
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "prompt": {"type": "string"},
-                        "choices": {
-                            "type": "array",
-                            "items": {
-                                "oneOf": [
-                                    {"type": "string"},
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {"type": "string"},
-                                            "annotation": {"type": "string"}
-                                        },
-                                        "required": ["label"],
-                                        "additionalProperties": false
-                                    }
-                                ]
-                            },
-                            "minItems": 2
-                        },
-                        "multiple": {"type": "boolean", "default": false},
-                        "mode": {"type": "string", "enum": ["blocking", "non_blocking"]},
-                        "expires_in_ms": {"type": "integer", "minimum": 1, "description": "Required for non-blocking asks."}
-                    },
-                    "required": ["prompt", "mode"]
                 }),
             },
             ToolSet::Core,
@@ -249,7 +237,7 @@ fn full_registry() -> Vec<(ToolSpecEntry, ToolSet)> {
         (
             ToolSpecEntry {
                 name: "attachment_save",
-                description: "Save a Session attachment by ID to a Session-relative workspace path so it can be used by the project.",
+                description: "Save a Session attachment by ID to a Main workspace path so it can be used by the project.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -280,20 +268,4 @@ pub fn available_tools(has_attachments: bool) -> Vec<ToolSpecEntry> {
 
 pub fn is_registered(name: &str) -> bool {
     full_registry().iter().any(|(t, _)| t.name == name)
-}
-
-/// Hard deny list — architecture assertion for tests. The old shell/main
-/// aliases are still blocked even though they are no longer registered.
-pub fn is_forbidden_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "git.write"
-            | "git.commit"
-            | "git.push"
-            | "git.stage"
-            | "shell"
-            | "apply"
-            | "sync"
-            | "main.write"
-    )
 }

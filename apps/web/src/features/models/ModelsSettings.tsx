@@ -37,16 +37,6 @@ const PROVIDER_SECTIONS: readonly ProviderSection[] = [
     title: "Supervisor",
     description: "Models used directly by the Supervisor.",
   },
-  {
-    client: "claude-code",
-    title: "Claude Code",
-    description: "Claude Code providers used by delegated jobs.",
-  },
-  {
-    client: "codex",
-    title: "Codex",
-    description: "Codex providers used by delegated jobs.",
-  },
 ];
 
 const KIND_OPTIONS: readonly SelectOption[] = [
@@ -73,9 +63,11 @@ function emptyModel(): ModelRow {
   };
 }
 
-function clientLabel(client: ProviderClient): string {
-  if (client === "claude-code") return "Claude Code";
-  if (client === "codex") return "Codex";
+function defaultKind(): ProviderKind {
+  return "anthropic";
+}
+
+function clientLabel(_client: ProviderClient): string {
   return "Supervisor";
 }
 
@@ -85,8 +77,6 @@ export function ModelsSettings() {
   const notify = useNotifications().notify;
   const [openSections, setOpenSections] = createStore<Record<ProviderClient, boolean>>({
     supervisor: true,
-    "claude-code": true,
-    codex: true,
   });
   const [editing, setEditing] = createSignal<ProviderView | null>(null);
   const [formClient, setFormClient] = createSignal<ProviderClient>("supervisor");
@@ -296,7 +286,6 @@ function ProviderForm(props: ProviderFormProps) {
   const notify = useNotifications().notify;
   const isEditing = () => props.provider !== null;
   const hasKey = () => props.provider?.api_key_is_set ?? false;
-
   const [name, setName] = createSignal("");
   const [client, setClient] = createSignal<ProviderClient>(props.provider?.client ?? props.client);
   const [kind, setKind] = createSignal<ProviderKind>("anthropic");
@@ -330,7 +319,7 @@ function ProviderForm(props: ProviderFormProps) {
     } else {
       setName("");
       setClient(props.client);
-      setKind("anthropic");
+      setKind(defaultKind());
       setUrl("");
       setEditingKey(false);
       setKey("");
@@ -514,16 +503,6 @@ function ProviderForm(props: ProviderFormProps) {
                     updateModel(index(), { upstream_model_id: event.currentTarget.value })
                   }
                 />
-                <label class="model-chip-check" title="Supports 1m context">
-                  <input
-                    type="checkbox"
-                    checked={model.supports_1m}
-                    onChange={(event) =>
-                      updateModel(index(), { supports_1m: event.currentTarget.checked })
-                    }
-                  />
-                  1M
-                </label>
                 <label class="model-chip-check" title="Supports images">
                   <input
                     type="checkbox"

@@ -22,16 +22,8 @@ pub enum SessionsError {
     TurnNotInteractive,
     #[error("turn is terminal")]
     TurnTerminal,
-    #[error("steer rejected while turn is waiting for model")]
-    SteerBlockedByModel,
-    #[error("ask not found")]
-    AskNotFound,
-    #[error("ask is not open")]
-    AskNotOpen,
     #[error("no queued turn to promote")]
     NothingQueued,
-    #[error("handoff is not applicable")]
-    HandoffNotApplicable,
     #[error("revision mismatch: expected {expected}, current {current}")]
     VersionMismatch { expected: String, current: String },
     #[error("timeline cursor is invalid")]
@@ -57,15 +49,11 @@ pub enum SessionsError {
 pub enum TurnStatus {
     Queued,
     Running,
-    WaitingForJob,
-    WaitingForAsk,
-    WaitingForModel,
     Canceling,
     Completed,
     Failed,
     Canceled,
     Interrupted,
-    HandedOff,
 }
 
 impl TurnStatus {
@@ -73,38 +61,27 @@ impl TurnStatus {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
-            Self::WaitingForJob => "waiting_for_job",
-            Self::WaitingForAsk => "waiting_for_ask",
-            Self::WaitingForModel => "waiting_for_model",
             Self::Canceling => "canceling",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Canceled => "canceled",
             Self::Interrupted => "interrupted",
-            Self::HandedOff => "handed_off",
         }
     }
 
     pub const fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Running
-                | Self::WaitingForJob
-                | Self::WaitingForAsk
-                | Self::WaitingForModel
-                | Self::Canceling
-        )
+        matches!(self, Self::Running | Self::Canceling)
     }
 
     pub const fn is_interactive(self) -> bool {
-        matches!(
-            self,
-            Self::Running | Self::WaitingForJob | Self::WaitingForAsk | Self::WaitingForModel
-        )
+        matches!(self, Self::Running)
     }
 
     pub const fn advances_queue(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Canceled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Interrupted
+        )
     }
 
     pub const fn can_transition_to(self, target: Self) -> bool {
@@ -112,35 +89,10 @@ impl TurnStatus {
             Self::Queued => matches!(target, Self::Running | Self::Canceled),
             Self::Running => matches!(
                 target,
-                Self::WaitingForJob
-                    | Self::WaitingForAsk
-                    | Self::WaitingForModel
-                    | Self::Canceling
-                    | Self::Completed
-                    | Self::Failed
-                    | Self::Interrupted
+                Self::Canceling | Self::Completed | Self::Failed | Self::Interrupted
             ),
-            Self::WaitingForJob => matches!(
-                target,
-                Self::Running
-                    | Self::WaitingForAsk
-                    | Self::Canceling
-                    | Self::Interrupted
-                    | Self::HandedOff
-            ),
-            Self::WaitingForAsk => matches!(
-                target,
-                Self::Running | Self::WaitingForJob | Self::Canceling | Self::Interrupted
-            ),
-            Self::WaitingForModel => {
-                matches!(target, Self::Running | Self::Canceling | Self::Interrupted)
-            }
             Self::Canceling => matches!(target, Self::Canceled | Self::Interrupted),
-            Self::Completed
-            | Self::Failed
-            | Self::Canceled
-            | Self::Interrupted
-            | Self::HandedOff => false,
+            Self::Completed | Self::Failed | Self::Canceled | Self::Interrupted => false,
         }
     }
 }
@@ -152,15 +104,11 @@ impl std::str::FromStr for TurnStatus {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
-            "waiting_for_job" => Ok(Self::WaitingForJob),
-            "waiting_for_ask" => Ok(Self::WaitingForAsk),
-            "waiting_for_model" => Ok(Self::WaitingForModel),
             "canceling" => Ok(Self::Canceling),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "canceled" => Ok(Self::Canceled),
             "interrupted" => Ok(Self::Interrupted),
-            "handed_off" => Ok(Self::HandedOff),
             other => Err(format!("unknown Turn status {other}")),
         }
     }
@@ -173,12 +121,8 @@ impl std::str::FromStr for TurnStatus {
 pub enum MessageRoute {
     /// Idle Session — a new Turn was promoted to running.
     Started,
-    /// Active Turn not waiting for finite work — appended to the queue.
+    /// An active Turn already exists, so the message is appended to the queue.
     Queued,
-    /// Terminal predecessor handed off, this successor now holds the active Turn.
-    HandedOff,
-    /// Late answer to a finished blocking Ask was re-routed as a Steer.
-    AskAnswerSteer,
 }
 
 impl MessageRoute {
@@ -186,8 +130,6 @@ impl MessageRoute {
         match self {
             Self::Started => "started",
             Self::Queued => "queued",
-            Self::HandedOff => "handed_off",
-            Self::AskAnswerSteer => "ask_answer_steer",
         }
     }
 }
@@ -196,12 +138,8 @@ impl MessageRoute {
 pub struct SessionSummary {
     pub id: String,
     pub project_id: String,
-    pub kind: String,
     pub title: Option<String>,
     pub state: String,
-    pub workspace_handle: String,
-    pub workspace_revision: Option<String>,
-    pub source_main_revision_id: String,
     pub active_turn_id: Option<String>,
     pub model_preference: Option<SessionModelPreference>,
     pub version: String,
@@ -316,7 +254,7 @@ pub enum ModelAttemptStatus {
 
 /// The most recent model attempt for this Turn's active Round, projected onto
 /// `TurnSummary` so the UI can render the live retry counter
-/// ("Reconnecting (X/5): reason") even when the SSE event that announced it has
+/// ("Reconnecting (X): reason") even when the SSE event that announced it has
 /// already been consumed. Absent when the Turn has had no attempts yet.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TurnModelAttempt {
@@ -329,6 +267,15 @@ pub struct TurnModelAttempt {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct TurnTokenExchange {
+    /// Non-cached model input tokens for this Turn, excluding the system and
+    /// developer prompt prefix.
+    pub upload_tokens: i64,
+    /// Model output tokens for this Turn.
+    pub download_tokens: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct TurnSummary {
     pub id: String,
@@ -336,14 +283,17 @@ pub struct TurnSummary {
     pub sequence: i64,
     pub status: String,
     pub input_message_id: Option<String>,
+    pub goal_mode: bool,
     pub model_snapshot: Option<TurnModelSnapshot>,
     pub predecessor_turn_id: Option<String>,
-    pub handoff_from_turn_id: Option<String>,
-    pub handoff_to_turn_id: Option<String>,
     pub cancellation_reason: Option<String>,
     pub completion_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub model_attempt: Option<TurnModelAttempt>,
+    /// The durable whole-Turn model exchange. Live direction remains a
+    /// stream concern and is intentionally not stored here.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub token_exchange: Option<TurnTokenExchange>,
     pub version: String,
     pub created_at: String,
     pub updated_at: String,
@@ -356,8 +306,6 @@ pub struct MessageRouteResult {
     pub message_id: String,
     pub turn_id: String,
     pub session_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handoff_from_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +316,7 @@ pub struct ExecutionTurn {
     pub status: TurnStatus,
     pub sequence: i64,
     pub active: bool,
+    pub goal_mode: bool,
     pub model_snapshot: Option<TurnModelSnapshot>,
 }
 
@@ -404,33 +353,6 @@ pub enum ActiveTurnOutcome<'a> {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TurnBlockers {
-    pub open_ask: bool,
-    pub unfinished_job: bool,
-}
-
-impl TurnBlockers {
-    pub const fn status(self) -> TurnStatus {
-        if self.open_ask {
-            TurnStatus::WaitingForAsk
-        } else if self.unfinished_job {
-            TurnStatus::WaitingForJob
-        } else {
-            TurnStatus::Running
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TurnBlockerOutcome {
-    pub session_id: SessionId,
-    pub status: TurnStatus,
-    pub active: bool,
-    pub session_version: String,
-    pub transition: Option<TurnTransition>,
-}
-
 #[derive(Debug, Clone)]
 pub struct RecoveredTurn {
     pub turn_id: TurnId,
@@ -451,7 +373,6 @@ pub struct TerminalSettlement {
 pub struct SessionCommandState {
     pub project_id: String,
     pub state: String,
-    pub workspace_handle: String,
     pub next_model_ref: Option<String>,
     pub active_turn_id: Option<String>,
     pub session_version: String,
@@ -512,8 +433,11 @@ pub struct CreateTurnInput<'a> {
     pub session_id: SessionId,
     pub content: &'a str,
     pub actor: &'a serde_json::Value,
+    pub message_kind: &'a str,
+    pub timeline_kind: &'a str,
+    pub metadata: Option<&'a serde_json::Value>,
+    pub goal_mode: bool,
     pub predecessor_turn_id: Option<&'a str>,
-    pub source_ask_id: Option<&'a str>,
     pub attachment_ids: &'a [AttachmentId],
     pub model_snapshot: Option<&'a TurnModelSnapshot>,
     pub checkpoint_revision: Option<&'a str>,
@@ -527,7 +451,6 @@ pub struct AppendSteerInput<'a> {
     pub content: &'a str,
     pub expected_version: &'a str,
     pub actor: &'a serde_json::Value,
-    pub source_ask_id: Option<&'a str>,
     pub now: &'a str,
 }
 
@@ -565,6 +488,9 @@ pub struct AppendAssistantMessage<'a> {
     pub round_id: RoundId,
     pub text: &'a str,
     pub reasoning: &'a str,
+    /// Raw provider reasoning, echoed back verbatim on the next request. The
+    /// display-formatted `reasoning` must not be used for echo-back.
+    pub reasoning_content: Option<&'a str>,
     /// Wall-clock ms the round spent producing this assistant message (from
     /// round creation to acceptance). `None` only when the start stamp could not
     /// be parsed. Surfaced in the timeline item projection so the UI can render
@@ -590,27 +516,6 @@ pub struct CancelResult {
 pub struct SteerResult {
     pub turn_id: String,
     pub message_id: String,
-    pub session_version: String,
-}
-
-/// Blocking vs non-blocking Ask. Execution creates the Ask row;
-/// Sessions owns the answer/expiry write that resumes the Turn.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AskSummary {
-    pub id: String,
-    pub turn_id: String,
-    pub mode: String,
-    pub status: String,
-    pub expires_at: Option<String>,
-    pub answered_at: Option<String>,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct AskAnswerResult {
-    pub ask_id: String,
-    pub turn_id: String,
-    pub turn_status_after: String,
     pub session_version: String,
 }
 
@@ -647,4 +552,35 @@ pub struct TimelinePage {
     pub newest_cursor: Option<String>,
     pub has_older: bool,
     pub has_newer: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TurnStatus;
+
+    #[test]
+    fn every_terminal_turn_status_advances_the_queue() {
+        for status in [
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+            TurnStatus::Canceled,
+            TurnStatus::Interrupted,
+        ] {
+            assert!(status.advances_queue(), "{status:?} must advance the queue");
+        }
+    }
+
+    #[test]
+    fn active_turn_statuses_do_not_advance_the_queue() {
+        for status in [
+            TurnStatus::Queued,
+            TurnStatus::Running,
+            TurnStatus::Canceling,
+        ] {
+            assert!(
+                !status.advances_queue(),
+                "{status:?} must remain in control"
+            );
+        }
+    }
 }

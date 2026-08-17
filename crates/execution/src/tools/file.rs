@@ -11,7 +11,7 @@ pub(super) async fn tool_read(
         .get("path")
         .and_then(|p| p.as_str())
         .ok_or_else(|| ExecutionError::ToolPathInvalid)?;
-    let path = match resolve_session_path(repo, raw) {
+    let path = match resolve_workspace_path(repo, raw) {
         Ok(p) => p,
         Err(e) => return Ok(map_path_err(e)),
     };
@@ -61,7 +61,6 @@ pub(super) async fn tool_read(
         }),
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
@@ -338,7 +337,6 @@ fn image_outcome(
         summary,
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
@@ -356,9 +354,9 @@ pub(super) async fn tool_write(
         .and_then(|c| c.as_str())
         .ok_or_else(|| ExecutionError::Internal(anyhow::anyhow!("content required")))?;
     let normalized_path =
-        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
+        normalize_workspace_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
     // Path validation only (mutation API re-validates).
-    let abs = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+    let abs = resolve_workspace_path(ctx.workspace_root, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     // Detect whether this is a create vs an overwrite so the UI can show
     // "Created" vs "Wrote". Best-effort: a metadata error counts as absent.
@@ -390,14 +388,12 @@ pub(super) async fn tool_write(
         summary,
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
 /// Render a compact unified-diff string for the tool summary so the UI can show
-/// `+x -y` line counts and an expandable diff. Reuses the workspace diff LCS so
-/// the algorithm matches the Session diff view. `old=None` means a newly created
-/// file (every new line is an addition).
+/// `+x -y` line counts and an expandable diff. Reuses the Workspace diff LCS.
+/// `old=None` means a newly created file (every new line is an addition).
 fn compute_patch(old: Option<&str>, new: &str) -> Option<String> {
     let new_bytes = new.as_bytes();
     let old_bytes = old.map(str::as_bytes).unwrap_or(&[]);
@@ -448,8 +444,8 @@ pub(super) async fn tool_edit(
         .and_then(|p| p.as_str())
         .ok_or(ExecutionError::ToolPathInvalid)?;
     let normalized_path =
-        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
-    let abs = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+        normalize_workspace_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
+    let abs = resolve_workspace_path(ctx.workspace_root, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     // edit cannot create files — the model must use `write` for new files.
     if tokio::fs::metadata(&abs).await.is_err() {
@@ -533,7 +529,6 @@ pub(super) async fn tool_edit(
         summary,
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
@@ -547,8 +542,8 @@ pub(super) async fn tool_remove(
         .and_then(|p| p.as_str())
         .ok_or(ExecutionError::ToolPathInvalid)?;
     let normalized_path =
-        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
-    let _ = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+        normalize_workspace_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
+    let _ = resolve_workspace_path(ctx.workspace_root, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     let rev = ctx
         .workspace
@@ -570,11 +565,12 @@ pub(super) async fn tool_remove(
         summary: json!({"path": path, "revision": rev.0}),
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
-pub(super) async fn tool_attachment_list(ctx: &ToolContext<'_>) -> Result<ToolOutcome, ExecutionError> {
+pub(super) async fn tool_attachment_list(
+    ctx: &ToolContext<'_>,
+) -> Result<ToolOutcome, ExecutionError> {
     let attachments = ctx.sessions.list_attachments(ctx.session_id).await?;
     let items = attachments
         .iter()
@@ -595,7 +591,6 @@ pub(super) async fn tool_attachment_list(ctx: &ToolContext<'_>) -> Result<ToolOu
         summary: json!({"count": attachments.len()}),
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
@@ -645,7 +640,6 @@ pub(super) async fn tool_attachment_read(
             }),
             error_code: None,
             finish_summary: None,
-            wait: None,
         });
     }
 
@@ -655,7 +649,7 @@ pub(super) async fn tool_attachment_read(
         "mime": attachment.mime,
         "byte_size": attachment.byte_size,
         "kind": "binary",
-        "next_action": "Use attachment.save with this attachment_id and a Session-relative path.",
+        "next_action": "Use attachment.save with this attachment_id and a Main workspace path.",
     });
     Ok(ToolOutcome {
         disposition: ToolExecutionDisposition::Succeeded,
@@ -665,7 +659,6 @@ pub(super) async fn tool_attachment_read(
         summary: metadata,
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
@@ -685,8 +678,8 @@ pub(super) async fn tool_attachment_save(
         .and_then(Value::as_str)
         .ok_or(ExecutionError::ToolPathInvalid)?;
     let normalized_path =
-        normalize_session_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
-    let _ = resolve_session_path(&session_repo(ctx.workspace, ctx.session_id)?, path)
+        normalize_workspace_path(path).map_err(|_| ExecutionError::ToolPathInvalid)?;
+    let _ = resolve_workspace_path(ctx.workspace_root, path)
         .map_err(|_| ExecutionError::ToolPathInvalid)?;
     let Some(bytes) = read_attachment_bytes(ctx.blobs, &attachment).await? else {
         return Ok(fail_text(
@@ -719,7 +712,6 @@ pub(super) async fn tool_attachment_save(
         }),
         error_code: None,
         finish_summary: None,
-        wait: None,
     })
 }
 
@@ -761,4 +753,3 @@ pub(crate) async fn read_attachment_bytes(
 // ---------------------------------------------------------------------------
 // Runtime-backed tools
 // ---------------------------------------------------------------------------
-

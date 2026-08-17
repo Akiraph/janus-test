@@ -5,22 +5,15 @@ import FolderGit2 from "lucide-solid/icons/folder-git-2";
 import Plus from "lucide-solid/icons/plus";
 import RefreshCw from "lucide-solid/icons/refresh-cw";
 import Trash2 from "lucide-solid/icons/trash-2";
-import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import { Button } from "../../components/ui/Button";
 import { Dialog } from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { NotificationEvent, useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
 import type { CreateProjectInput, OperationView, ProjectView, RepoAccess } from "../../lib/api";
-import {
-  createProject,
-  deleteProject,
-  getErrorMessage,
-  getOperation,
-  getProject,
-  retryProject,
-} from "../../lib/api";
-import { useGithubCredentials, useProjects } from "../../lib/queries";
+import { createProject, deleteProject, getErrorMessage, retryProject } from "../../lib/api";
+import { useGithubCredentials, useOperation, useProjects } from "../../lib/queries";
 import "./projects.css";
 
 const ACCESS_OPTIONS: readonly SelectOption[] = [
@@ -47,72 +40,43 @@ export function ProjectsOverview() {
   const [tracking, setTracking] = createSignal<{
     operationId: string;
     projectId?: string;
-    name: string;
     kind: "create" | "retry" | "delete";
   } | null>(null);
-
-  async function refresh() {
-    await queryClient.invalidateQueries({ queryKey: ["projects"] });
-  }
+  const trackedOperation = useOperation(() => tracking()?.operationId);
+  let handledOperationId: string | null = null;
 
   createEffect(() => {
     const current = tracking();
-    if (!current) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    const poll = async () => {
-      try {
-        const operation = await getOperation(current.operationId);
-        if (cancelled) return;
-        if (operation.status === "succeeded") {
-          await refresh();
-          let projectId = current.projectId ?? operation.target_id ?? undefined;
-          if (!projectId) {
-            const list = await queryClient.fetchQuery({
-              queryKey: ["projects"],
-              queryFn: () => import("../../lib/api").then((api) => api.listProjects()),
-            });
-            projectId = list.find((item) => item.name === current.name)?.id;
-          }
-          setTracking(null);
-          if (current.kind === "delete") {
-            notify("Project deleted", { variant: "success" });
-            return;
-          }
-          notify("Project ready", { variant: "success" });
-          if (current.kind === "retry" && projectId) navigate(`/projects/${projectId}`);
-          return;
-        }
-
-        if (
-          operation.status === "failed" ||
-          operation.status === "canceled" ||
-          operation.status === "needs_attention"
-        ) {
-          await refresh();
-          setTracking(null);
-          notify(problemMessage(operation.problem), { variant: "danger" });
-          return;
-        }
-
-        // Still running: also refresh projects so the list stays current.
-        await refresh();
-      } catch (error) {
-        if (!cancelled) {
-          notify(getErrorMessage(error, "Could not poll operation"), {
-            variant: "danger",
-          });
-        }
+    const operation = trackedOperation.data;
+    if (
+      !current ||
+      !operation ||
+      operation.id !== current.operationId ||
+      handledOperationId === operation.id
+    ) {
+      return;
+    }
+    if (operation.status === "succeeded") {
+      handledOperationId = operation.id;
+      setTracking(null);
+      if (current.kind === "delete") {
+        notify("Project deleted", { variant: "success" });
+        return;
       }
-      if (!cancelled) timer = setTimeout(() => void poll(), 1500);
-    };
-
-    void poll();
-    onCleanup(() => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    });
+      notify("Project ready", { variant: "success" });
+      const projectId = current.projectId ?? operation.target_id ?? undefined;
+      if (current.kind === "retry" && projectId) navigate(`/projects/${projectId}`);
+      return;
+    }
+    if (
+      operation.status === "failed" ||
+      operation.status === "canceled" ||
+      operation.status === "needs_attention"
+    ) {
+      handledOperationId = operation.id;
+      setTracking(null);
+      notify(problemMessage(operation.problem), { variant: "danger" });
+    }
   });
 
   async function onRetry(project: ProjectView) {
@@ -121,11 +85,10 @@ export function ProjectsOverview() {
       setTracking({
         operationId: operation.id,
         projectId: project.id,
-        name: project.name,
         kind: "retry",
       });
       notify("Retry started");
-      await refresh();
+      queryClient.setQueryData(["operations", operation.id], operation);
     } catch (error) {
       notify(getErrorMessage(error, "Retry failed"), { variant: "danger" });
     }
@@ -138,11 +101,10 @@ export function ProjectsOverview() {
       setTracking({
         operationId: operation.id,
         projectId: project.id,
-        name: project.name,
         kind: "delete",
       });
       notify("Delete started");
-      await refresh();
+      queryClient.setQueryData(["operations", operation.id], operation);
     } catch (error) {
       notify(getErrorMessage(error, "Delete failed"), { variant: "danger" });
     }
@@ -249,30 +211,15 @@ export function ProjectsOverview() {
       <Show when={formOpen()}>
         <CreateProjectDialog
           close={() => setFormOpen(false)}
-          created={async (operation, input) => {
+          created={async (operation) => {
             setFormOpen(false);
-            // Best-effort: operation target_id may already be the project id.
-            let projectId = operation.target_id ?? undefined;
-            if (!projectId) {
-              try {
-                await refresh();
-              } catch {
-                /* ignore */
-              }
-            } else {
-              try {
-                await getProject(projectId);
-              } catch {
-                projectId = undefined;
-              }
-            }
+            const projectId = operation.target_id ?? undefined;
+            queryClient.setQueryData(["operations", operation.id], operation);
             setTracking({
               operationId: operation.id,
               ...(projectId ? { projectId } : {}),
-              name: input.name,
               kind: "create",
             });
-            await refresh();
           }}
         />
       </Show>

@@ -962,6 +962,7 @@ pub struct WorkClaim<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{
@@ -1024,11 +1025,23 @@ mod tests {
         ops.create(create_request(None), Some(create_work()))
             .await
             .unwrap();
-        let claimed = ops.claim_work("git.clone", 60).await.unwrap().expect("claimable");
+        let claimed = ops
+            .claim_work("git.clone", 60)
+            .await
+            .unwrap()
+            .expect("claimable");
         // Renew with the matching nonce while the lease is live.
-        assert!(ops.renew_work(&claimed.id, &claimed.nonce, 60).await.unwrap());
+        assert!(
+            ops.renew_work(&claimed.id, &claimed.nonce, 60)
+                .await
+                .unwrap()
+        );
         // A stale nonce cannot renew.
-        assert!(!ops.renew_work(&claimed.id, "wrong-nonce", 60).await.unwrap());
+        assert!(
+            !ops.renew_work(&claimed.id, "wrong-nonce", 60)
+                .await
+                .unwrap()
+        );
         // Force the lease into the past.
         sqlx::query("UPDATE work_items SET lease_expires_at = ? WHERE id = ?")
             .bind(format_utc(now_utc() - Duration::seconds(10)))
@@ -1037,7 +1050,11 @@ mod tests {
             .await
             .unwrap();
         // Renewing an expired lease fails.
-        assert!(!ops.renew_work(&claimed.id, &claimed.nonce, 60).await.unwrap());
+        assert!(
+            !ops.renew_work(&claimed.id, &claimed.nonce, 60)
+                .await
+                .unwrap()
+        );
         // The expired item is reclaimable with a new nonce.
         let reclaimed = ops
             .claim_work("git.clone", 60)
@@ -1046,9 +1063,17 @@ mod tests {
             .expect("reclaimable");
         assert_ne!(reclaimed.nonce, claimed.nonce);
         // The old nonce can no longer complete the work.
-        assert!(!ops.complete_work(&reclaimed.id, &claimed.nonce).await.unwrap());
+        assert!(
+            !ops.complete_work(&reclaimed.id, &claimed.nonce)
+                .await
+                .unwrap()
+        );
         // The new nonce can.
-        assert!(ops.complete_work(&reclaimed.id, &reclaimed.nonce).await.unwrap());
+        assert!(
+            ops.complete_work(&reclaimed.id, &reclaimed.nonce)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1109,7 +1134,11 @@ mod tests {
             .await
             .unwrap();
         for attempt in 1..=MAX_WORK_ATTEMPTS {
-            let claimed = ops.claim_work("git.clone", 60).await.unwrap().expect("claimable");
+            let claimed = ops
+                .claim_work("git.clone", 60)
+                .await
+                .unwrap()
+                .expect("claimable");
             let will_dl = ops
                 .work_will_dead_letter(&claimed.id, &claimed.nonce, WorkFailureDisposition::Retry)
                 .await
@@ -1170,7 +1199,11 @@ mod tests {
             .await
             .unwrap();
         let op_id = created.operation.id.clone();
-        let claimed = ops.claim_work("git.clone", 60).await.unwrap().expect("claimable");
+        let claimed = ops
+            .claim_work("git.clone", 60)
+            .await
+            .unwrap()
+            .expect("claimable");
         let claim = WorkClaim {
             id: &claimed.id,
             nonce: &claimed.nonce,

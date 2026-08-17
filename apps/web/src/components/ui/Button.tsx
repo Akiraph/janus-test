@@ -13,6 +13,7 @@ interface ButtonProps {
   class?: string;
   onClick?: JSX.EventHandler<HTMLButtonElement, MouseEvent>;
   "aria-label"?: string;
+  title?: string;
   children?: JSX.Element;
 }
 
@@ -30,6 +31,7 @@ export function Button(props: ButtonProps) {
       disabled={props.disabled}
       onClick={props.onClick}
       aria-label={props["aria-label"]}
+      title={props.title}
     >
       {props.children}
     </button>

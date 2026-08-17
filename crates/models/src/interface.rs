@@ -40,18 +40,11 @@ pub enum ProviderKind {
 }
 
 /// The client surface a provider is intended to serve.
-///
-/// `claude-code` and `codex` are the public client identities used by the
-/// Claude Code/Codex integrations. Existing providers remain Supervisor
-/// providers through the migration default.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelClient {
     #[default]
     Supervisor,
-    ClaudeCode,
-    #[serde(rename = "codex")]
-    Codex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -503,6 +496,8 @@ impl ModelsInterface {
     ) -> Result<ProviderView, ModelsError> {
         validate_provider(&input)?;
         validate_models(&input)?;
+        self.ensure_provider_name_available(owner_id, input.client, &input.display_name, None)
+            .await?;
         let id = ProviderId::new().to_string();
         let now = now_utc_str();
         let (ciphertext, key_fingerprint, key_preview) =
@@ -542,6 +537,8 @@ impl ModelsInterface {
         validate_provider(&input)?;
         validate_models(&input)?;
         let existing = self.provider_row(owner_id, id).await?;
+        self.ensure_provider_name_available(owner_id, input.client, &input.display_name, Some(id))
+            .await?;
         // When no new key is supplied, keep the existing key material (ciphertext,
         // fingerprint, preview) unchanged.
         let (ciphertext, key_fingerprint, key_preview) = if let Some(key) = input.api_key.as_deref()
@@ -681,6 +678,44 @@ impl ModelsInterface {
         id: &str,
     ) -> Result<ProviderRow, ModelsError> {
         sqlx::query_as::<_, ProviderRow>("SELECT id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE id=? AND owner_id=?").bind(id).bind(owner_id).fetch_optional(&self.pool).await?.ok_or(ModelsError::ProviderNotFound)
+    }
+
+    async fn ensure_provider_name_available(
+        &self,
+        owner_id: &str,
+        client: ModelClient,
+        display_name: &str,
+        excluded_id: Option<&str>,
+    ) -> Result<(), ModelsError> {
+        let name = display_name.trim();
+        let exists = if let Some(excluded_id) = excluded_id {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM model_providers \
+                 WHERE owner_id = ? AND client = ? AND display_name = ? AND id <> ?)",
+            )
+            .bind(owner_id)
+            .bind(client_str(client))
+            .bind(name)
+            .bind(excluded_id)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT EXISTS(SELECT 1 FROM model_providers \
+                 WHERE owner_id = ? AND client = ? AND display_name = ?)",
+            )
+            .bind(owner_id)
+            .bind(client_str(client))
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await?
+        };
+        if exists != 0 {
+            return Err(ModelsError::Validation(
+                "provider display names must be unique for each client".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn cipher_ref(&self) -> &SecretCipher {
@@ -991,15 +1026,11 @@ fn default_true() -> bool {
 fn client_str(client: ModelClient) -> &'static str {
     match client {
         ModelClient::Supervisor => "supervisor",
-        ModelClient::ClaudeCode => "claude-code",
-        ModelClient::Codex => "codex",
     }
 }
 fn parse_client(value: &str) -> Result<ModelClient, ModelsError> {
     match value {
         "supervisor" => Ok(ModelClient::Supervisor),
-        "claude-code" => Ok(ModelClient::ClaudeCode),
-        "codex" => Ok(ModelClient::Codex),
         _ => Err(ModelsError::Validation("unknown model client".into())),
     }
 }
@@ -1021,11 +1052,6 @@ fn parse_kind(value: &str) -> Result<ProviderKind, ModelsError> {
 fn validate_provider(input: &ProviderInput) -> Result<(), ModelsError> {
     if input.display_name.trim().is_empty() {
         return Err(ModelsError::Validation("display_name is required".into()));
-    }
-    if input.client == ModelClient::Codex && input.kind != ProviderKind::OpenaiResponses {
-        return Err(ModelsError::Validation(
-            "codex providers must use the OpenAI Responses API".into(),
-        ));
     }
     normalize_url(input.kind, &input.base_url)?;
     Ok(())

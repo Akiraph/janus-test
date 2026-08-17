@@ -4,6 +4,7 @@
 //! event catalogs belong to their owning application modules.
 
 pub mod clock;
+pub mod command_idempotency;
 pub mod database;
 pub mod events;
 pub mod id;

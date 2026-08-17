@@ -8,15 +8,15 @@ use std::{
 
 use futures_util::future::BoxFuture;
 use janus_infrastructure::{
-    id::{JobId, LogStreamId, RuntimeId, ServiceId, TerminalId},
+    id::{AsyncTaskId, LogStreamId, RuntimeId, TerminalId},
     secrets::random_token,
-    shell::{bash_program, bash_search_path, decode_process_output},
+    shell::{bash_program, decode_process_output},
 };
 use janus_runtime::interface::{
-    CommandKind, ExecutionMode, ExecutionResult, ExecutionSpec, ExecutorKind,
-    ExecutorProcessHandle, ExecutorRuntimeHandle, ExitSummary, JobSpec, LogChannel, LogRetention,
-    LogStore, NetworkPolicy, ProcessCompletion, ResourceUsage, RuntimeError, RuntimeExecutor,
-    RuntimeSpec, ServiceSpec, TerminalSignal, TerminalSize, TerminalSpec,
+    AsyncTaskSpec, ExecutionMode, ExecutionResult, ExecutionSpec, ExecutorProcessHandle,
+    ExecutorRuntimeHandle, ExitSummary, LogChannel, LogRetention, LogStore, ProcessCompletion,
+    ResourceUsage, RuntimeError, RuntimeExecutor, RuntimeSpec, TerminalSignal, TerminalSize,
+    TerminalSpec,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -35,8 +35,7 @@ pub(crate) struct LocalExecutor {
 struct LocalExecutorInner {
     logs: LogStore,
     runtimes: RwLock<HashMap<RuntimeId, LocalRuntime>>,
-    jobs: RwLock<HashMap<JobId, ManagedProcess>>,
-    services: RwLock<HashMap<ServiceId, ManagedProcess>>,
+    async_tasks: RwLock<HashMap<AsyncTaskId, ManagedProcess>>,
     terminals: RwLock<HashMap<TerminalId, ManagedProcess>>,
 }
 
@@ -102,8 +101,7 @@ impl LocalExecutor {
             inner: Arc::new(LocalExecutorInner {
                 logs,
                 runtimes: RwLock::new(HashMap::new()),
-                jobs: RwLock::new(HashMap::new()),
-                services: RwLock::new(HashMap::new()),
+                async_tasks: RwLock::new(HashMap::new()),
                 terminals: RwLock::new(HashMap::new()),
             }),
         }
@@ -122,35 +120,21 @@ impl LocalExecutor {
     async fn prepare(
         &self,
         spec: &ExecutionSpec,
-        mode: ExecutionMode,
+        _mode: ExecutionMode,
     ) -> Result<PreparedCommand, RuntimeError> {
         let runtime = self.runtime(spec.runtime_id()).await?;
-        if spec.network_policy() == NetworkPolicy::ProjectRules {
-            return Err(RuntimeError::NetworkPolicyDenied);
-        }
         let working_directory = runtime
             .workspace_root
             .join(spec.working_directory().as_str());
-        let canonical_workspace = tokio::fs::canonicalize(&runtime.workspace_root)
-            .await
-            .map_err(|error| {
-                RuntimeError::unavailable(format!("workspace is unavailable: {error}"))
-            })?;
         let canonical_working = tokio::fs::canonicalize(&working_directory)
             .await
             .map_err(|_| RuntimeError::InvalidSpec("working directory does not exist".into()))?;
-        if !canonical_working.starts_with(&canonical_workspace) {
-            return Err(RuntimeError::InvalidSpec(
-                "working directory escapes the trusted workspace".into(),
-            ));
-        }
 
-        let process_group_marker_name =
-            if cfg!(windows) && matches!(spec.command().kind(), CommandKind::Shell) {
-                Some(format!(".janus-runtime-{}.pid", random_token(12)))
-            } else {
-                None
-            };
+        let process_group_marker_name = if cfg!(windows) {
+            Some(format!(".janus-runtime-{}.pid", random_token(12)))
+        } else {
+            None
+        };
         let command_input = if process_group_marker_name.is_some() {
             format!(
                 "printf '%s\\n' \"$$\" > \"$JANUS_RUNTIME_PID_FILE\"; {}",
@@ -159,45 +143,22 @@ impl LocalExecutor {
         } else {
             spec.command().input().to_owned()
         };
-        let mut command = match spec.command().kind() {
-            CommandKind::Shell => {
-                if mode == ExecutionMode::Sync
-                    && has_forbidden_background_syntax(spec.command().input())
-                {
-                    return Err(RuntimeError::CommandForbidden);
-                }
-                shell_command(&command_input)
-            }
-            CommandKind::DelegatedCli { cli, session_id } => delegated_cli_command(
-                *cli,
-                *session_id,
-                spec.command().input(),
-                spec.command().delegated_cli_options(),
-            ),
-        };
+        let mut command = shell_command(&command_input);
         command
             .current_dir(&canonical_working)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let temporary_root = canonical_workspace.join(".janus-tmp");
-        tokio::fs::create_dir_all(&temporary_root)
-            .await
-            .map_err(|error| {
-                RuntimeError::unavailable(format!("runtime temp directory: {error}"))
-            })?;
-        apply_minimal_environment(&mut command, &canonical_workspace, &temporary_root);
         for (name, value) in spec.environment().ordinary() {
             command.env(name, value);
         }
-        let mut secret_values = spec
+        let secret_values = spec
             .environment()
             .secrets()
             .iter()
             .map(|value| value.value().expose().to_owned())
             .collect::<Vec<_>>();
-        secret_values.extend(runtime_redaction_values(&canonical_workspace));
         for value in spec.environment().secrets() {
             command.env(value.name(), value.value().expose());
         }
@@ -245,7 +206,7 @@ impl LocalExecutor {
             log_stream_id,
             LogChannel::Stdout,
             prepared.secret_values.clone(),
-            LogRetention::JOB_SERVICE,
+            LogRetention::ASYNC_TASK,
         );
         let stderr_task = spawn_output_reader(
             stderr,
@@ -253,7 +214,7 @@ impl LocalExecutor {
             log_stream_id,
             LogChannel::Stderr,
             prepared.secret_values,
-            LogRetention::JOB_SERVICE,
+            LogRetention::ASYNC_TASK,
         );
         let (control, commands) = mpsc::channel(8);
         let (completion_tx, completion) = watch::channel(None);
@@ -321,22 +282,12 @@ impl LocalExecutor {
     ) -> Result<ManagedProcess, RuntimeError> {
         let runtime = self.runtime(spec.runtime_id).await?;
         let working_directory = runtime.workspace_root.join(spec.working_directory.as_str());
-        let canonical_workspace = tokio::fs::canonicalize(&runtime.workspace_root)
-            .await
-            .map_err(|error| {
-                RuntimeError::unavailable(format!("workspace is unavailable: {error}"))
-            })?;
         let canonical_working = tokio::fs::canonicalize(&working_directory)
             .await
             .map_err(|_| RuntimeError::InvalidSpec("working directory does not exist".into()))?;
-        if !canonical_working.starts_with(&canonical_workspace) {
-            return Err(RuntimeError::InvalidSpec(
-                "working directory escapes the trusted workspace".into(),
-            ));
-        }
 
         // Terminal backends intentionally bypass sync-background-command policy:
-        // a Terminal is a long-lived interactive shell where backgrounded jobs
+        // a Terminal is a long-lived interactive shell where backgrounded async_tasks
         // and `&` are expected user input, not Execution Bash.
         let mut command = terminal_command(spec.size);
         command
@@ -345,23 +296,15 @@ impl LocalExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let temporary_root = canonical_workspace.join(".janus-tmp");
-        tokio::fs::create_dir_all(&temporary_root)
-            .await
-            .map_err(|error| {
-                RuntimeError::unavailable(format!("terminal temp directory: {error}"))
-            })?;
-        apply_minimal_environment(&mut command, &canonical_workspace, &temporary_root);
         for (name, value) in spec.environment.ordinary() {
             command.env(name, value);
         }
-        let mut secret_values = spec
+        let secret_values = spec
             .environment
             .secrets()
             .iter()
             .map(|value| value.value().expose().to_owned())
             .collect::<Vec<_>>();
-        secret_values.extend(runtime_redaction_values(&canonical_workspace));
         for value in spec.environment.secrets() {
             command.env(value.name(), value.value().expose());
         }
@@ -428,11 +371,6 @@ impl RuntimeExecutor for LocalExecutor {
         spec: &'a RuntimeSpec,
     ) -> BoxFuture<'a, Result<ExecutorRuntimeHandle, RuntimeError>> {
         Box::pin(async move {
-            if spec.executor() != ExecutorKind::Local {
-                return Err(RuntimeError::InvalidSpec(
-                    "LocalExecutor requires a local Runtime spec".into(),
-                ));
-            }
             if let Some(existing) = self.inner.runtimes.read().await.get(&spec.id()).cloned() {
                 return Ok(ExecutorRuntimeHandle {
                     executor_identity: format!("local:{}", spec.id()),
@@ -502,7 +440,7 @@ impl RuntimeExecutor for LocalExecutor {
                 log_stream_id,
                 LogChannel::Stdout,
                 prepared.secret_values.clone(),
-                LogRetention::JOB_SERVICE,
+                LogRetention::ASYNC_TASK,
             );
             let stderr_task = spawn_output_reader(
                 stderr,
@@ -510,7 +448,7 @@ impl RuntimeExecutor for LocalExecutor {
                 log_stream_id,
                 LogChannel::Stderr,
                 prepared.secret_values,
-                LogRetention::JOB_SERVICE,
+                LogRetention::ASYNC_TASK,
             );
             let timeout = std::time::Duration::from_millis(spec.limits().timeout_ms);
             let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
@@ -544,138 +482,85 @@ impl RuntimeExecutor for LocalExecutor {
         })
     }
 
-    fn start_job<'a>(
+    fn start_async_task<'a>(
         &'a self,
-        spec: JobSpec,
+        spec: AsyncTaskSpec,
         log_stream_id: LogStreamId,
     ) -> BoxFuture<'a, Result<ExecutorProcessHandle, RuntimeError>> {
         Box::pin(async move {
             let id = spec.id;
             let process = self
-                .start_managed(&spec.execution, ExecutionMode::Job, log_stream_id)
+                .start_managed(&spec.execution, ExecutionMode::AsyncTask, log_stream_id)
                 .await?;
             let result = ExecutorProcessHandle {
                 process_identity: process.process_identity.clone(),
                 executor_nonce: process.nonce.clone(),
             };
-            self.inner.jobs.write().await.insert(id, process);
+            self.inner.async_tasks.write().await.insert(id, process);
             Ok(result)
         })
     }
 
-    fn wait_job<'a>(
+    fn wait_async_task<'a>(
         &'a self,
-        id: JobId,
+        id: AsyncTaskId,
         executor_nonce: &'a str,
     ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
         Box::pin(async move {
             let process = self
                 .inner
-                .jobs
+                .async_tasks
                 .read()
                 .await
                 .get(&id)
                 .cloned()
-                .ok_or(RuntimeError::JobLost(id))?;
+                .ok_or(RuntimeError::AsyncTaskLost(id))?;
             Self::wait_managed(process, executor_nonce).await
         })
     }
 
-    fn write_job_stdin<'a>(
+    fn write_async_task_stdin<'a>(
         &'a self,
-        id: JobId,
+        id: AsyncTaskId,
         executor_nonce: &'a str,
         input: Vec<u8>,
     ) -> BoxFuture<'a, Result<(), RuntimeError>> {
         Box::pin(async move {
             let process = self
                 .inner
-                .jobs
+                .async_tasks
                 .read()
                 .await
                 .get(&id)
                 .cloned()
-                .ok_or(RuntimeError::JobLost(id))?;
+                .ok_or(RuntimeError::AsyncTaskLost(id))?;
             ensure_nonce(&process, executor_nonce)?;
             let (sent, received) = oneshot::channel();
             process
                 .control
                 .send(ProcessCommand::Stdin(input, sent))
                 .await
-                .map_err(|_| RuntimeError::JobLost(id))?;
-            received.await.map_err(|_| RuntimeError::JobLost(id))?
+                .map_err(|_| RuntimeError::AsyncTaskLost(id))?;
+            received
+                .await
+                .map_err(|_| RuntimeError::AsyncTaskLost(id))?
         })
     }
 
-    fn cancel_job<'a>(
+    fn cancel_async_task<'a>(
         &'a self,
-        id: JobId,
+        id: AsyncTaskId,
         executor_nonce: &'a str,
     ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
         Box::pin(async move {
             let process = self
                 .inner
-                .jobs
+                .async_tasks
                 .read()
                 .await
                 .get(&id)
                 .cloned()
-                .ok_or(RuntimeError::JobLost(id))?;
-            Self::terminate_managed(process, executor_nonce).await
-        })
-    }
-
-    fn start_service<'a>(
-        &'a self,
-        spec: ServiceSpec,
-        log_stream_id: LogStreamId,
-    ) -> BoxFuture<'a, Result<ExecutorProcessHandle, RuntimeError>> {
-        Box::pin(async move {
-            let id = spec.id;
-            let process = self
-                .start_managed(&spec.execution, ExecutionMode::Service, log_stream_id)
-                .await?;
-            let result = ExecutorProcessHandle {
-                process_identity: process.process_identity.clone(),
-                executor_nonce: process.nonce.clone(),
-            };
-            self.inner.services.write().await.insert(id, process);
-            Ok(result)
-        })
-    }
-
-    fn wait_service<'a>(
-        &'a self,
-        id: ServiceId,
-        executor_nonce: &'a str,
-    ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
-        Box::pin(async move {
-            let process = self
-                .inner
-                .services
-                .read()
-                .await
-                .get(&id)
-                .cloned()
-                .ok_or(RuntimeError::ServiceLost(id))?;
-            Self::wait_managed(process, executor_nonce).await
-        })
-    }
-
-    fn stop_service<'a>(
-        &'a self,
-        id: ServiceId,
-        executor_nonce: &'a str,
-    ) -> BoxFuture<'a, Result<ProcessCompletion, RuntimeError>> {
-        Box::pin(async move {
-            let process = self
-                .inner
-                .services
-                .read()
-                .await
-                .get(&id)
-                .cloned()
-                .ok_or(RuntimeError::ServiceLost(id))?;
+                .ok_or(RuntimeError::AsyncTaskLost(id))?;
             Self::terminate_managed(process, executor_nonce).await
         })
     }
@@ -991,7 +876,7 @@ fn terminal_command(size: TerminalSize) -> Command {
             PathBuf::from("bash")
         });
         let mut command = Command::new(program);
-        command.args(["--noprofile", "--norc", "-i"]);
+        command.args(["-i"]);
         command.env("COLUMNS", size.cols.to_string());
         command.env("LINES", size.rows.to_string());
         command.env("TERM", "dumb");
@@ -1001,7 +886,7 @@ fn terminal_command(size: TerminalSize) -> Command {
     {
         let mut command =
             Command::new(bash_program().unwrap_or_else(|| PathBuf::from("/bin/bash")));
-        command.args(["--noprofile", "--norc", "-i"]);
+        command.args(["-i"]);
         command.env("COLUMNS", size.cols.to_string());
         command.env("LINES", size.rows.to_string());
         command.env("TERM", "dumb");
@@ -1103,7 +988,7 @@ fn shell_command(script: &str) -> Command {
         // when Git for Windows is installed outside PATH.
         let program = bash_program().unwrap_or_else(|| PathBuf::from("bash"));
         let mut command = Command::new(program);
-        command.args(["--noprofile", "--norc", "-c", script]);
+        command.args(["-c", script]);
         command
     }
     #[cfg(not(windows))]
@@ -1112,204 +997,6 @@ fn shell_command(script: &str) -> Command {
         command.args(["-lc", script]);
         command
     }
-}
-
-fn delegated_cli_command(
-    cli: janus_runtime::interface::DelegatedCliKind,
-    session_id: Option<janus_infrastructure::id::CliSessionId>,
-    input: &str,
-    options: Option<&janus_runtime::interface::DelegatedCliLaunchOptions>,
-) -> Command {
-    use janus_runtime::interface::{DelegatedCliAccess, DelegatedCliKind};
-    let options = options.cloned().unwrap_or_default();
-    match cli {
-        DelegatedCliKind::ClaudeCode => {
-            let mut command = Command::new("claude");
-            command.args(["-p", input, "--output-format", "stream-json"]);
-            if let Some(session_id) = session_id {
-                command.args(["--resume", &session_id.to_string()]);
-            }
-            if let Some(model) = options.model.as_deref() {
-                command.args(["--model", model]);
-            }
-            if let Some(effort) = options.effort {
-                command.args(["--effort", claude_effort(effort)]);
-            }
-            command.args([
-                "--permission-mode",
-                match options.access {
-                    DelegatedCliAccess::ReadOnly => "plan",
-                    DelegatedCliAccess::FullAccess => "bypassPermissions",
-                },
-            ]);
-            command
-        }
-        DelegatedCliKind::Codex => {
-            let mut command = Command::new("codex");
-            if let Some(session_id) = session_id {
-                command.args(["exec", "resume", &session_id.to_string(), input]);
-            } else {
-                command.args(["exec", "--json"]);
-                if let Some(model) = options.model.as_deref() {
-                    command.args(["-m", model]);
-                }
-                if let Some(effort) = options.effort {
-                    command.args([
-                        "-c",
-                        &format!("model_reasoning_effort=\"{}\"", effort_str(effort)),
-                    ]);
-                }
-                command.args([
-                    "-C",
-                    ".",
-                    "-s",
-                    match options.access {
-                        DelegatedCliAccess::ReadOnly => "read-only",
-                        DelegatedCliAccess::FullAccess => "danger-full-access",
-                    },
-                    "--",
-                    input,
-                ]);
-            }
-            command
-        }
-    }
-}
-
-fn effort_str(effort: janus_runtime::interface::DelegatedCliEffort) -> &'static str {
-    use janus_runtime::interface::DelegatedCliEffort;
-    match effort {
-        DelegatedCliEffort::Low => "low",
-        DelegatedCliEffort::Medium => "medium",
-        DelegatedCliEffort::High => "high",
-        DelegatedCliEffort::XHigh => "xhigh",
-        DelegatedCliEffort::Max => "max",
-        DelegatedCliEffort::Ultracode => "ultracode",
-    }
-}
-
-fn claude_effort(effort: janus_runtime::interface::DelegatedCliEffort) -> &'static str {
-    use janus_runtime::interface::DelegatedCliEffort;
-    match effort {
-        DelegatedCliEffort::Ultracode => "max",
-        other => effort_str(other),
-    }
-}
-
-fn apply_minimal_environment(command: &mut Command, workspace_root: &Path, temporary_root: &Path) {
-    command.env_clear();
-    const KEYS: &[&str] = if cfg!(windows) {
-        &[
-            "COMSPEC",
-            "PATH",
-            "PATHEXT",
-            "SystemRoot",
-            "TEMP",
-            "TMP",
-            "WINDIR",
-        ]
-    } else {
-        &["HOME", "LANG", "PATH", "TMPDIR"]
-    };
-    for key in KEYS {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    if let Some(path) = bash_search_path() {
-        command.env("PATH", path);
-    }
-    command.env("HOME", workspace_root);
-    command.env("USER", "Janus");
-    command.env("USERNAME", "Janus");
-    command.env("LOGNAME", "Janus");
-    command.env("USERDOMAIN", "Janus");
-    command.env("HOSTNAME", "Janus");
-    command.env("COMPUTERNAME", "Janus");
-    command.env("TMPDIR", temporary_root);
-    command.env("TEMP", temporary_root);
-    command.env("TMP", temporary_root);
-    command.env("GIT_CONFIG_NOSYSTEM", "1");
-    command.env("GIT_OPTIONAL_LOCKS", "0");
-}
-
-fn workspace_redaction_values(workspace_root: &Path) -> Vec<String> {
-    let raw = workspace_root.to_string_lossy().into_owned();
-    let unix = raw.replace('\\', "/");
-    let mut values = vec![raw, unix.clone()];
-    if cfg!(windows) {
-        let bytes = unix.as_bytes();
-        if bytes.len() >= 3 && bytes[1] == b':' && matches!(bytes[2], b'/') {
-            values.push(format!("/{}{}", unix[..1].to_ascii_lowercase(), &unix[2..]));
-        }
-    }
-    values.retain(|value| !value.is_empty());
-    values.sort_by_key(|right| std::cmp::Reverse(right.len()));
-    values.dedup();
-    values
-}
-
-fn runtime_redaction_values(workspace_root: &Path) -> Vec<String> {
-    let mut values = workspace_redaction_values(workspace_root);
-    values.push("CodexSandboxOffline".into());
-    values.push("codexsandboxoffline".into());
-    values.push("CodexOfflineSandbox".into());
-    values.push("codexofflinesandbox".into());
-    for key in ["PATH", "TEMP", "TMP", "TMPDIR", "USERPROFILE"] {
-        if let Some(value) = std::env::var_os(key) {
-            let value = value.to_string_lossy().into_owned();
-            if !value.is_empty() {
-                values.push(value);
-            }
-        }
-    }
-    values.sort_by_key(|right| std::cmp::Reverse(right.len()));
-    values.dedup();
-    values
-}
-
-fn has_forbidden_background_syntax(script: &str) -> bool {
-    let lowercase = script.to_ascii_lowercase();
-    if [
-        "nohup ",
-        "start-process",
-        "start-job",
-        "schtasks",
-        "systemd-run",
-        "setsid ",
-    ]
-    .iter()
-    .any(|value| lowercase.contains(value))
-    {
-        return true;
-    }
-    let bytes = script.as_bytes();
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if byte == b'\\' || (cfg!(windows) && byte == b'`') {
-            escaped = true;
-            continue;
-        }
-        match byte {
-            b'\'' if !double => single = !single,
-            b'"' if !single => double = !double,
-            b'&' if !single && !double => {
-                let previous = index.checked_sub(1).and_then(|value| bytes.get(value));
-                let next = bytes.get(index + 1);
-                if previous != Some(&b'&') && next != Some(&b'&') {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 #[cfg(windows)]
@@ -1421,16 +1108,16 @@ mod tests {
 
     use anyhow::Context;
     use janus_runtime::interface::{
-        ExecutionEnvironment, ExecutionSpec, ExecutorKind, JobSpec, LogChannel, LogCursor,
-        LogOwnerKind, LogStore, NetworkPolicy, RelativeWorkingDirectory, ResourceLimits,
-        RuntimeError, RuntimeExecutor, RuntimeSpec, ValidatedCommand,
+        AsyncTaskSpec, ExecutionEnvironment, ExecutionSpec, LogChannel, LogCursor, LogOwnerKind,
+        LogStore, RelativeWorkingDirectory, ResourceLimits, RuntimeError, RuntimeExecutor,
+        RuntimeSpec, ValidatedCommand,
     };
     use tempfile::TempDir;
     use tokio::process::Command;
 
     use super::LocalExecutor;
     use janus_infrastructure::database::Database;
-    use janus_infrastructure::id::{JobId, SessionId, ToolCallId, TurnId};
+    use janus_infrastructure::id::{AsyncTaskId, ProjectId, SessionId, ToolCallId, TurnId};
 
     fn limits(timeout_ms: u64) -> ResourceLimits {
         ResourceLimits {
@@ -1444,7 +1131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_success_failure_timeout_and_policy() -> anyhow::Result<()> {
+    async fn sync_success_failure_timeout_and_background() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
@@ -1454,11 +1141,9 @@ mod tests {
         let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            janus_runtime::interface::RuntimeScope::session(SessionId::new()),
-            ExecutorKind::Local,
+            janus_runtime::interface::RuntimeScope::project(ProjectId::new()),
             workspace,
             limits(5_000),
-            NetworkPolicy::DenyAll,
         )?;
         executor.ensure_runtime(&runtime).await?;
 
@@ -1496,20 +1181,19 @@ mod tests {
         assert!(timeout.timed_out);
 
         let background_log = logs.create(LogOwnerKind::Sync, "background").await?;
-        assert!(
-            executor
-                .execute_sync(
-                    execution(runtime_id, background_script(), 5_000)?,
-                    background_log.id,
-                )
-                .await
-                .is_err()
-        );
+        let background = executor
+            .execute_sync(
+                execution(runtime_id, background_script(), 5_000)?,
+                background_log.id,
+            )
+            .await?;
+        assert_eq!(background.exit.exit_code, Some(0));
+        assert!(!background.timed_out);
         Ok(())
     }
 
     #[tokio::test]
-    async fn sync_shell_uses_the_janus_runtime_environment() -> anyhow::Result<()> {
+    async fn sync_shell_inherits_the_normal_process_environment() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
@@ -1519,11 +1203,9 @@ mod tests {
         let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            janus_runtime::interface::RuntimeScope::session(SessionId::new()),
-            ExecutorKind::Local,
+            janus_runtime::interface::RuntimeScope::project(ProjectId::new()),
             workspace,
             limits(5_000),
-            NetworkPolicy::DenyAll,
         )?;
         executor.ensure_runtime(&runtime).await?;
 
@@ -1532,28 +1214,20 @@ mod tests {
             .execute_sync(
                 execution(
                     runtime_id,
-                    r#"printf 'USER=%s\nUSERNAME=%s\nLOGNAME=%s\nORIGINAL_PATH=%s\n' "$USER" "$USERNAME" "$LOGNAME" "$ORIGINAL_PATH""#,
+                    r#"printf 'USER=%s\nPATH=%s\n' "$USER" "$PATH""#,
                     5_000,
                 )?,
                 log.id,
             )
             .await?;
 
-        assert!(result.stdout.contains("USER=Janus"));
-        assert!(result.stdout.contains("USERNAME=Janus"));
-        assert!(result.stdout.contains("LOGNAME=Janus"));
-        assert_eq!(
-            result
-                .stdout
-                .lines()
-                .find(|line| line.starts_with("ORIGINAL_PATH=")),
-            Some("ORIGINAL_PATH=")
-        );
+        assert!(result.stdout.lines().any(|line| line.starts_with("USER=")));
+        assert!(result.stdout.lines().any(|line| line.starts_with("PATH=")));
         Ok(())
     }
 
     #[tokio::test]
-    async fn job_rejects_stale_nonce_and_cleans_up_descendants() -> anyhow::Result<()> {
+    async fn async_task_rejects_stale_nonce_and_cleans_up_descendants() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
@@ -1564,19 +1238,19 @@ mod tests {
         let session_id = SessionId::new();
         let runtime = RuntimeSpec::new(
             runtime_id,
-            janus_runtime::interface::RuntimeScope::session(session_id),
-            ExecutorKind::Local,
+            janus_runtime::interface::RuntimeScope::project(ProjectId::new()),
             workspace,
             limits(30_000),
-            NetworkPolicy::DenyAll,
         )?;
         let runtime_handle = executor.ensure_runtime(&runtime).await?;
-        let job_id = JobId::new();
-        let log = logs.create(LogOwnerKind::Job, &job_id.to_string()).await?;
+        let async_task_id = AsyncTaskId::new();
+        let log = logs
+            .create(LogOwnerKind::AsyncTask, &async_task_id.to_string())
+            .await?;
         let process = executor
-            .start_job(
-                JobSpec::new(
-                    job_id,
+            .start_async_task(
+                AsyncTaskSpec::new(
+                    async_task_id,
                     session_id,
                     TurnId::new(),
                     ToolCallId::new(),
@@ -1588,7 +1262,7 @@ mod tests {
         assert_eq!(process.executor_nonce, runtime_handle.executor_nonce);
         assert!(matches!(
             executor
-                .write_job_stdin(job_id, "stale-nonce", b"ignored".to_vec())
+                .write_async_task_stdin(async_task_id, "stale-nonce", b"ignored".to_vec())
                 .await,
             Err(RuntimeError::RuntimeUnavailable)
         ));
@@ -1608,11 +1282,11 @@ mod tests {
             }
         })
         .await
-        .context("wait for descendant PID in the job log")??;
+        .context("wait for descendant PID in the async_task log")??;
         assert!(process_exists(child_pid).await);
 
         executor
-            .cancel_job(job_id, &runtime_handle.executor_nonce)
+            .cancel_async_task(async_task_id, &runtime_handle.executor_nonce)
             .await?;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while process_exists(child_pid).await {
@@ -1635,7 +1309,6 @@ mod tests {
             ValidatedCommand::shell(script)?,
             ExecutionEnvironment::new(BTreeMap::new(), vec![])?,
             limits(timeout_ms),
-            NetworkPolicy::DenyAll,
         )
     }
 
@@ -1648,11 +1321,6 @@ mod tests {
     fn sleep_script() -> &'static str {
         "sleep 5"
     }
-    #[cfg(windows)]
-    fn background_script() -> &'static str {
-        "Start-Process powershell.exe"
-    }
-    #[cfg(not(windows))]
     fn background_script() -> &'static str {
         "sleep 5 &"
     }

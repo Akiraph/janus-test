@@ -6,7 +6,6 @@ export default defineConfig({
   reporter: "line",
   use: {
     baseURL: process.env.JANUS_WEB_URL ?? "http://127.0.0.1:5173",
-    channel: "msedge",
     colorScheme: "light",
   },
   webServer: {

@@ -9,10 +9,10 @@
 //! The engine only reads committed state: EventStore notifies subscribers
 //! after the unit of work commits, so each broadcast carries the
 //! authoritative post-transition projection. It intentionally does NOT
-//! project `model.stream_delta` / `model.attempt_retrying` — those are
-//! consumed by the direct stream-text path — nor the event types that have no
-//! client-side consumer on the SSE channel (`terminal.*`, `service.changed`,
-//! `runtime.changed`, `operation.changed`).
+//! project `model.stream_delta` / `model.attempt_retrying`; those are
+//! consumed by the direct stream-text path. Terminal events also stay off
+//! this channel, while durable operation, runtime, and async-task events are
+//! projected to their corresponding query caches.
 //!
 //! The processed cursor is persisted after every batch, so a restart resumes
 //! from exactly where the engine stopped and reprojects the events that were
@@ -21,7 +21,7 @@
 
 use janus_infrastructure::{
     events::{EventEnvelope, EventType},
-    id::{ProjectId, SessionId, TurnId},
+    id::{ProjectId, SessionId, TerminalId, TurnId},
     state_broadcaster::{StateChange, StateKind},
 };
 use serde_json::Value;
@@ -125,14 +125,6 @@ pub async fn project_event(
             push_sessions_for_session(&mut out, state, session_id, Some(&cursor)).await;
         }
 
-        SessionRevisionChanged => {
-            let Some(session_id) = event_session_id(event) else {
-                return out;
-            };
-            push_session(&mut out, state, session_id, Some(&cursor)).await;
-            push_diff(&mut out, state, session_id, Some(&cursor)).await;
-        }
-
         SessionDeleted => {
             let Some(project_id) = event.payload.get("project_id").and_then(Value::as_str) else {
                 return out;
@@ -140,14 +132,22 @@ pub async fn project_event(
             push_sessions(&mut out, state, project_id, Some(&cursor)).await;
         }
 
+        ContextChanged => {
+            let Some(session_id) = event_session_id(event) else {
+                return out;
+            };
+            push_context(&mut out, state, session_id, Some(&cursor)).await;
+        }
+
         TimelineItemCreated | TimelineItemUpdated | ToolCallCreated => {
             let Some(session_id) = event_session_id(event) else {
                 return out;
             };
             push_timeline(&mut out, state, session_id, Some(&cursor)).await;
+            push_context(&mut out, state, session_id, Some(&cursor)).await;
         }
 
-        ToolCallChanged | AskChanged => {
+        ToolCallChanged => {
             let Some(session_id) = resolve_session_id(state, event).await else {
                 return out;
             };
@@ -164,6 +164,7 @@ pub async fn project_event(
             if let Some(turn_id) = event_turn_id(event) {
                 push_turn(&mut out, state, session_id, turn_id, Some(&cursor)).await;
             }
+            push_context(&mut out, state, session_id, Some(&cursor)).await;
         }
 
         CheckpointCreated => {
@@ -172,14 +173,6 @@ pub async fn project_event(
             };
             push_session(&mut out, state, session_id, Some(&cursor)).await;
             push_timeline(&mut out, state, session_id, Some(&cursor)).await;
-        }
-
-        WorkspaceDiffChanged => {
-            let Some(session_id) = event_session_id(event) else {
-                return out;
-            };
-            push_session(&mut out, state, session_id, Some(&cursor)).await;
-            push_diff(&mut out, state, session_id, Some(&cursor)).await;
         }
 
         ProjectChanged | ProjectMainRevisionChanged => {
@@ -198,11 +191,53 @@ pub async fn project_event(
             push_git(&mut out, state, &owner_id, &project_id, Some(&cursor)).await;
         }
 
-        JobChanged => {
+        AsyncTaskChanged => {
             let Some(session_id) = event_session_id(event) else {
                 return out;
             };
-            push_jobs(&mut out, state, session_id, Some(&cursor)).await;
+            push_async_tasks(&mut out, state, Some(&cursor)).await;
+            push_timeline(&mut out, state, session_id, Some(&cursor)).await;
+            if let Some(async_task_id) = event_resource_id(event, "async_task")
+                && let Ok(async_task_id) = async_task_id.parse()
+                && let Ok(async_task) = state.runtime().async_task(async_task_id).await
+            {
+                push_turn(
+                    &mut out,
+                    state,
+                    session_id,
+                    async_task.controlling_turn_id,
+                    Some(&cursor),
+                )
+                .await;
+            }
+        }
+
+        TerminalChanged => {
+            let Some(terminal_id) = event_resource_id(event, "terminal") else {
+                return out;
+            };
+            push_terminal(&mut out, state, &terminal_id, Some(&cursor)).await;
+            if let Some(project_id) = event_project_id(event) {
+                push_terminals(&mut out, state, &project_id, Some(&cursor)).await;
+            }
+        }
+
+        RuntimeChanged => {
+            if let Some(session_id) = event_session_id(event) {
+                push_session(&mut out, state, session_id, Some(&cursor)).await;
+            }
+        }
+
+        OperationChanged => {
+            if let Some(operation_id) = event_resource_id(event, "operation").or_else(|| {
+                event
+                    .payload
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }) {
+                push_operation(&mut out, state, &operation_id, Some(&cursor)).await;
+            }
         }
 
         NotificationChannelChanged => {
@@ -221,12 +256,19 @@ pub async fn project_event(
             push_providers(&mut out, state, &owner_id, Some(&cursor)).await;
         }
 
-        // Consumed by the direct stream-text path; projecting here would
-        // duplicate live output.
-        ModelStreamDelta | ModelAttemptRetrying => {}
+        // Consumed by the direct stream-text path; projecting stream text here
+        // would duplicate live output. Retry state is durable, however, so the
+        // Turn projection must move with its retry event.
+        ModelStreamDelta => {}
 
-        // No client-side consumer on the SSE channel today.
-        TerminalChanged | ServiceChanged | RuntimeChanged | OperationChanged | SystemStarted => {}
+        ModelAttemptRetrying => {
+            let Some((session_id, turn_id)) = event_session_turn(state, event).await else {
+                return out;
+            };
+            push_turn(&mut out, state, session_id, turn_id, Some(&cursor)).await;
+        }
+
+        SystemStarted => {}
     }
     out
 }
@@ -318,22 +360,6 @@ async fn push_context(
     });
 }
 
-async fn push_diff(
-    out: &mut Vec<StateChange>,
-    state: &Application,
-    session_id: SessionId,
-    cursor: Option<&str>,
-) {
-    if let Ok(diff) = state.workspace().diff_summary(session_id).await {
-        out.push(StateChange {
-            kind: StateKind::SessionDiff,
-            id: Some(session_id.to_string()),
-            data: serde_json::to_value(&diff).unwrap_or_default(),
-            cursor: cursor.map(str::to_owned),
-        });
-    }
-}
-
 async fn push_sessions_for_session(
     out: &mut Vec<StateChange>,
     state: &Application,
@@ -397,7 +423,11 @@ async fn push_git(
     project_id: &str,
     cursor: Option<&str>,
 ) {
-    if let Ok(status) = state.source_control().git_status(owner_id, project_id).await {
+    if let Ok(status) = state
+        .source_control()
+        .git_status(owner_id, project_id)
+        .await
+    {
         out.push(StateChange {
             kind: StateKind::GitStatus,
             id: Some(project_id.to_owned()),
@@ -405,7 +435,11 @@ async fn push_git(
             cursor: cursor.map(str::to_owned),
         });
     }
-    if let Ok(entries) = state.source_control().git_log(owner_id, project_id, 30).await {
+    if let Ok(entries) = state
+        .source_control()
+        .git_log(owner_id, project_id, 50)
+        .await
+    {
         out.push(StateChange {
             kind: StateKind::GitLog,
             id: Some(project_id.to_owned()),
@@ -415,17 +449,66 @@ async fn push_git(
     }
 }
 
-async fn push_jobs(
+async fn push_async_tasks(out: &mut Vec<StateChange>, state: &Application, cursor: Option<&str>) {
+    if let Ok(tasks) = state.runtime().async_tasks(200).await {
+        out.push(StateChange {
+            kind: StateKind::AsyncTasks,
+            id: None,
+            data: serde_json::to_value(&tasks).unwrap_or_default(),
+            cursor: cursor.map(str::to_owned),
+        });
+    }
+}
+
+async fn push_operation(
     out: &mut Vec<StateChange>,
     state: &Application,
-    session_id: SessionId,
+    operation_id: &str,
     cursor: Option<&str>,
 ) {
-    if let Ok(jobs) = state.runtime().jobs(session_id).await {
+    if let Ok(Some(operation)) = state.operations().get(operation_id).await {
         out.push(StateChange {
-            kind: StateKind::Jobs,
-            id: Some(session_id.to_string()),
-            data: serde_json::to_value(&jobs).unwrap_or_default(),
+            kind: StateKind::Operation,
+            id: Some(operation_id.to_owned()),
+            data: serde_json::to_value(operation).unwrap_or_default(),
+            cursor: cursor.map(str::to_owned),
+        });
+    }
+}
+
+async fn push_terminal(
+    out: &mut Vec<StateChange>,
+    state: &Application,
+    terminal_id: &str,
+    cursor: Option<&str>,
+) {
+    let Ok(terminal_id) = terminal_id.parse::<TerminalId>() else {
+        return;
+    };
+    if let Ok(terminal) = state.runtime().terminal(terminal_id).await {
+        out.push(StateChange {
+            kind: StateKind::Terminal,
+            id: Some(terminal_id.to_string()),
+            data: serde_json::to_value(terminal).unwrap_or_default(),
+            cursor: cursor.map(str::to_owned),
+        });
+    }
+}
+
+async fn push_terminals(
+    out: &mut Vec<StateChange>,
+    state: &Application,
+    project_id: &str,
+    cursor: Option<&str>,
+) {
+    let Ok(project_id) = project_id.parse::<ProjectId>() else {
+        return;
+    };
+    if let Ok(terminals) = state.runtime().list_terminals(project_id).await {
+        out.push(StateChange {
+            kind: StateKind::Terminals,
+            id: Some(project_id.to_string()),
+            data: serde_json::to_value(terminals).unwrap_or_default(),
             cursor: cursor.map(str::to_owned),
         });
     }
@@ -469,12 +552,11 @@ fn event_session_id(event: &EventEnvelope) -> Option<SessionId> {
     if let Some(raw) = event.payload.get("session_id").and_then(Value::as_str) {
         return raw.parse().ok();
     }
-    if let Some(resource) = event.resource.as_ref() {
-        if resource.get("kind").and_then(Value::as_str) == Some("session") {
-            if let Some(id) = resource.get("id").and_then(Value::as_str) {
-                return id.parse().ok();
-            }
-        }
+    if let Some(resource) = event.resource.as_ref()
+        && resource.get("kind").and_then(Value::as_str) == Some("session")
+        && let Some(id) = resource.get("id").and_then(Value::as_str)
+    {
+        return id.parse().ok();
     }
     None
 }
@@ -483,18 +565,33 @@ fn event_turn_id(event: &EventEnvelope) -> Option<TurnId> {
     if let Some(raw) = event.payload.get("turn_id").and_then(Value::as_str) {
         return raw.parse().ok();
     }
-    if let Some(resource) = event.resource.as_ref() {
-        if resource.get("kind").and_then(Value::as_str) == Some("turn") {
-            if let Some(id) = resource.get("id").and_then(Value::as_str) {
-                return id.parse().ok();
-            }
-        }
+    if let Some(resource) = event.resource.as_ref()
+        && resource.get("kind").and_then(Value::as_str) == Some("turn")
+        && let Some(id) = resource.get("id").and_then(Value::as_str)
+    {
+        return id.parse().ok();
     }
     None
 }
 
+fn event_resource_id(event: &EventEnvelope, kind: &str) -> Option<String> {
+    if let Some(resource) = event.resource.as_ref()
+        && resource.get("kind").and_then(Value::as_str) == Some(kind)
+    {
+        return resource
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    event
+        .payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Session id for an event, resolving through the turn when the event only
-/// carries a turn id (e.g. ask/tool-call/round changes).
+/// carries a turn id (e.g. tool-call/round changes).
 async fn resolve_session_id(state: &Application, event: &EventEnvelope) -> Option<SessionId> {
     if let Some(session_id) = event_session_id(event) {
         return Some(session_id);
@@ -518,19 +615,22 @@ async fn event_session_turn(
 }
 
 fn event_owner_id(event: &EventEnvelope) -> Option<String> {
-    event.actor.get("id").and_then(Value::as_str).map(str::to_owned)
+    event
+        .actor
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn event_project_id(event: &EventEnvelope) -> Option<String> {
     if let Some(raw) = event.payload.get("project_id").and_then(Value::as_str) {
         return Some(raw.to_owned());
     }
-    if let Some(resource) = event.resource.as_ref() {
-        if resource.get("kind").and_then(Value::as_str) == Some("project") {
-            if let Some(id) = resource.get("id").and_then(Value::as_str) {
-                return Some(id.to_owned());
-            }
-        }
+    if let Some(resource) = event.resource.as_ref()
+        && resource.get("kind").and_then(Value::as_str) == Some("project")
+        && let Some(id) = resource.get("id").and_then(Value::as_str)
+    {
+        return Some(id.to_owned());
     }
     None
 }

@@ -42,6 +42,12 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<CompletedToolCall>,
+    /// Assistant reasoning from the provider. Thinking-mode providers
+    /// (OpenAI-compatible `reasoning_content`) require this to be echoed back
+    /// verbatim on the next request; dropping it makes the provider reject the
+    /// conversation with an HTTP 400. Populated only for assistant messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,10 +186,9 @@ pub enum ModelStreamEvent {
         channel: StreamChannel,
         text: String,
         provisional: bool,
-        /// Provider usage snapshot carried alongside a delta so the UI can
-        /// render a live `Working (↓ Xk · ↑ Xk)` line. Absent until the
-        /// provider reports usage (Anthropic `message_start`/`message_delta`,
-        /// OpenAI final chunk).
+        /// Provider usage snapshot carried alongside a delta for durable
+        /// accounting. Absent until the provider reports usage (Anthropic
+        /// `message_start`/`message_delta`, OpenAI final chunk).
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
     },
@@ -200,7 +205,13 @@ pub enum ModelStreamEvent {
         tool_calls: Vec<CompletedToolCall>,
         /// Final assistant text assembled from deltas (for Round commit).
         text: String,
+        /// Display-formatted reasoning summary (readable line breaks injected).
         reasoning: String,
+        /// Raw reasoning deltas echoed back verbatim. Thinking-mode providers
+        /// require the exact reasoning to be passed back on the next request;
+        /// this must never be reformatted. None when the provider does not
+        /// expose raw reasoning.
+        reasoning_content: Option<String>,
         /// Time from the first reasoning delta to the first answer/tool delta.
         /// If there is no answer/tool delta, this ends at stream completion.
         reasoning_duration_ms: Option<u64>,
@@ -211,10 +222,10 @@ pub enum ModelStreamEvent {
         detail: String,
     },
     /// Emitted just before an in-Round retry. `attempt` is the retry index the
-    /// model_attempts ledger is about to record (1-based; `MAX_ATTEMPTS_PER_CANDIDATE`),
+    /// model_attempts ledger is about to record (1-based; there is no retry cap),
     /// and `detail` is the human-facing failure reason for the attempt that just
     /// failed. The model stream publisher forwards it as `model.attempt_retrying`
-    /// so the UI can render `Reconnecting ({attempt}/5): {detail}`.
+    /// so the UI can render the retry count without an artificial maximum.
     Retrying {
         attempt_id: String,
         attempt: usize,

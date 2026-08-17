@@ -1,17 +1,15 @@
 //! Public Workspace capability boundary.
 //!
-//! Owns copy lifecycle, content revision identity, manifests, diffs, controlled
-//! file mutations, and the filesystem part of Apply/Sync. Session lifecycle
-//! checks and public event composition remain workflow responsibilities.
+//! Owns the Main workspace revision, manifest, and controlled file mutations.
+//! Session lifecycle checks and public event composition remain workflow
+//! responsibilities.
 //!
 //! The `impl WorkspaceInterface` surface is split by domain into the private
-//! submodules `diff` (propagation and conflicts), `manifest` (revisions and
-//! manifests), `session_copy` (copy lifecycle), and `working_tree` (file ops
-//! and the mutation pipeline). The shared helpers below belong to the facade.
+//! submodules `manifest` (revisions and manifests), `main_copy` (Main copy
+//! lifecycle), and `working_tree` (file ops and the mutation pipeline).
 
-mod diff;
+mod main_copy;
 mod manifest;
-mod session_copy;
 mod working_tree;
 
 use std::{
@@ -19,48 +17,28 @@ use std::{
     fmt::Display,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::Duration,
 };
 
 use anyhow::anyhow;
 use janus_infrastructure::clock::now_utc_str;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
-use tracing::warn;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use janus_infrastructure::events::EventType;
 use janus_infrastructure::managed_storage::BlobStore;
 
-pub use super::diff::{
-    DiffLineKind, DiffSummary, PropagationConflict, PropagationConflictPath, PropagationDirection,
-    PropagationResult, line_hunks,
-};
+pub use super::diff::{DiffLineKind, line_hunks};
 use super::manifest::{
     ManifestNode, ManifestRoot, NodeKind, collect_manifest as walk_manifest, hash_file_node,
-    is_text_bytes, is_workspace_internal_path,
+    is_text_bytes,
 };
 pub use super::path::{PathError, validate_workspace_path};
-use super::session_copy::{
-    create_session_worktree, main_repo_abs, main_worktree_is_clean, remove_session_tree,
-    session_managed_dir, session_repo_abs,
-};
-use super::working_tree::{
-    diff_working_trees, git_head, hash_working_tree, propagate_paths, read_manifest_node,
-    rehash_working_tree_paths, seed_session_from_main, working_tree_fingerprint,
-};
-
-#[derive(Debug, thiserror::Error)]
-pub enum PropagationError {
-    #[error("workspace propagation conflict")]
-    Conflict(PropagationConflict),
-    #[error(transparent)]
-    Workspace(#[from] WorkspaceError),
-}
+use super::working_tree::hash_working_tree;
 
 /// Opaque handle for a workspace copy, stored in `workspace_copies.handle`.
-/// Main: `main:<project-id>`; Session: `session:<session-id>`.
+/// Main: `main:<project-id>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(transparent)]
 pub struct WorkspaceHandle(pub String);
@@ -68,10 +46,6 @@ pub struct WorkspaceHandle(pub String);
 impl WorkspaceHandle {
     pub fn main(project_id: impl Display) -> Self {
         Self(format!("main:{project_id}"))
-    }
-
-    pub fn session(session_id: impl Display) -> Self {
-        Self(format!("session:{session_id}"))
     }
 
     pub fn as_str(&self) -> &str {
@@ -88,16 +62,6 @@ impl RevisionRef {
     pub fn new(id: impl Display) -> Self {
         Self(format!("rev_{id}"))
     }
-}
-
-/// Result of ensuring a Session workspace copy exists.
-#[derive(Debug, Clone, Serialize)]
-pub struct SessionCopyResult {
-    pub handle: WorkspaceHandle,
-    pub revision: RevisionRef,
-    pub source_main_revision: RevisionRef,
-    pub manifest_root_hash: String,
-    pub managed_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -138,14 +102,6 @@ pub struct FileMetaView {
     pub main_revision: Option<String>,
 }
 
-type ExistingSessionCopy = (
-    Option<String>,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<String>,
-);
-
 type StoredFileMutationIntentRow = (
     String,
     String,
@@ -157,55 +113,6 @@ type StoredFileMutationIntentRow = (
     String,
     Option<String>,
 );
-
-struct CopyRoots {
-    session_handle: WorkspaceHandle,
-    main_handle: WorkspaceHandle,
-    project_id: String,
-    session_dir: PathBuf,
-    main_dir: PathBuf,
-}
-
-struct PropagationStatus {
-    sync_enabled: bool,
-    apply_enabled: bool,
-    pending_conflict: Option<PropagationConflict>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PropagationBaseline {
-    root_hash: String,
-    nodes: BTreeMap<String, ManifestNode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    main_head: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    session_head: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PropagationIntent {
-    direction: PropagationDirection,
-    actor: serde_json::Value,
-    baseline: PropagationBaseline,
-    main_head: String,
-    session_head: String,
-    paths: Vec<String>,
-    #[serde(default)]
-    source_preimage: BTreeMap<String, Option<ManifestNode>>,
-    #[serde(default)]
-    target_preimage: BTreeMap<String, Option<ManifestNode>>,
-}
-
-struct PropagationFinalizeRequest<'a> {
-    session_id: &'a str,
-    roots: &'a CopyRoots,
-    direction: PropagationDirection,
-    next_baseline: &'a PropagationBaseline,
-    session_after: &'a ManifestRoot,
-    main_after: &'a ManifestRoot,
-    actor: &'a serde_json::Value,
-    transfer_paths: &'a [String],
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMutationEventContext {
@@ -254,33 +161,10 @@ impl PreparedFileMutation {
     }
 }
 
-impl PropagationBaseline {
-    fn from_manifest(
-        manifest: ManifestRoot,
-        main_head: Option<String>,
-        session_head: Option<String>,
-    ) -> Self {
-        Self {
-            root_hash: manifest.root_hash,
-            nodes: manifest.nodes,
-            main_head,
-            session_head,
-        }
-    }
-
-    fn manifest(&self) -> ManifestRoot {
-        ManifestRoot {
-            root_hash: self.root_hash.clone(),
-            nodes: self.nodes.clone(),
-        }
-    }
-}
-
-static HEAD_MANIFESTS: OnceLock<Mutex<HashMap<String, ManifestRoot>>> = OnceLock::new();
 static WORKSPACE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
 
-/// Exclusive in-process ownership of one project's Main and Session copies.
+/// Exclusive in-process ownership of one project's Main copy.
 ///
 /// The durable revision precondition remains authoritative across processes;
 /// this guard closes the local race between filesystem transfer and its
@@ -288,31 +172,6 @@ static WORKSPACE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<(
 pub struct WorkspaceMutationGuard {
     project_id: String,
     _guard: tokio::sync::OwnedMutexGuard<()>,
-}
-
-const SESSION_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-
-fn cached_head_manifest(head: &str) -> Option<ManifestRoot> {
-    HEAD_MANIFESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .ok()?
-        .get(head)
-        .cloned()
-}
-
-fn cache_head_manifest(head: &str, manifest: &ManifestRoot) {
-    if let Ok(mut manifests) = HEAD_MANIFESTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-    {
-        // This is an optimization only: a bounded cache prevents repeated
-        // clean-head scans without making revision correctness depend on it.
-        if manifests.len() >= 16 && !manifests.contains_key(head) {
-            manifests.clear();
-        }
-        manifests.insert(head.to_owned(), manifest.clone());
-    }
 }
 
 fn workspace_lock(data_root: &Path, project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -390,8 +249,8 @@ impl WorkspaceInterface {
         }
     }
 
-    /// Acquire the exclusive project lock used by filesystem mutations and
-    /// propagation. Callers that also write a related projection can hold it
+    /// Acquire the exclusive project lock used by filesystem mutations.
+    /// Callers that also write a related projection can hold it
     /// across their Unit of Work transaction.
     pub async fn acquire_mutation_lock(
         &self,
@@ -420,7 +279,6 @@ impl WorkspaceInterface {
             _guard: lock.lock_owned().await,
         }
     }
-
 }
 
 async fn validate_file_mutation(
@@ -700,124 +558,6 @@ fn manifests_match_scope(
             .collect::<BTreeMap<_, _>>()
     };
     project(current) == project(expected)
-}
-
-async fn refresh_manifest(
-    root: &Path,
-    previous: &ManifestRoot,
-    previous_head: Option<&str>,
-) -> Result<(ManifestRoot, String), WorkspaceError> {
-    let previous_files = previous
-        .nodes
-        .iter()
-        .filter(|(_, node)| node.kind == NodeKind::File)
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
-    let root_for_scan = root.to_path_buf();
-    let fingerprint = tokio::task::spawn_blocking(move || {
-        working_tree_fingerprint(&root_for_scan, &previous_files)
-    })
-    .await
-    .map_err(|error| WorkspaceError::Internal(anyhow!(error.to_string())))?
-    .map_err(WorkspaceError::Internal)?;
-
-    let manifest = if previous_head == Some(fingerprint.head.as_str()) {
-        if fingerprint.changed_paths.is_empty() {
-            previous.clone()
-        } else {
-            rehash_working_tree_paths(root, previous, &fingerprint.changed_paths)
-                .await
-                .map_err(WorkspaceError::Internal)?
-        }
-    } else {
-        hash_working_tree(root)
-            .await
-            .map_err(WorkspaceError::Internal)?
-    };
-    Ok((manifest, fingerprint.head))
-}
-
-fn same_node(left: Option<&ManifestNode>, right: Option<&ManifestNode>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => left.kind == right.kind && left.node_hash == right.node_hash,
-        (None, None) => true,
-        _ => false,
-    }
-}
-
-/// Advance only the parts of the baseline where both copies now agree. A
-/// propagation can legitimately leave unrelated edits on the opposite side;
-/// those paths must continue comparing against the old baseline so the next
-/// Apply or Sync still detects them.
-fn merge_propagation_baseline(
-    previous: &ManifestRoot,
-    main: &ManifestRoot,
-    session: &ManifestRoot,
-) -> ManifestRoot {
-    let mut paths = BTreeSet::new();
-    paths.extend(previous.nodes.keys().cloned());
-    paths.extend(main.nodes.keys().cloned());
-    paths.extend(session.nodes.keys().cloned());
-
-    let mut nodes = previous.nodes.clone();
-    for path in paths {
-        let main_node = main.nodes.get(&path);
-        let session_node = session.nodes.get(&path);
-        if !same_node(main_node, session_node) {
-            continue;
-        }
-        match main_node {
-            Some(node) => {
-                nodes.insert(path, node.clone());
-            }
-            None => {
-                nodes.remove(&path);
-            }
-        }
-    }
-
-    ManifestRoot {
-        root_hash: if main.root_hash == session.root_hash {
-            main.root_hash.clone()
-        } else {
-            previous.root_hash.clone()
-        },
-        nodes,
-    }
-}
-
-fn node_hash(node: Option<&ManifestNode>) -> Option<String> {
-    node.map(|node| node.node_hash.clone())
-}
-
-fn conflict_path(
-    path: &str,
-    base: Option<&ManifestNode>,
-    main: Option<&ManifestNode>,
-    session: Option<&ManifestNode>,
-) -> PropagationConflictPath {
-    let kind = match (base, main, session) {
-        (Some(_), None, Some(_)) => "deleted_in_main",
-        (Some(_), Some(_), None) => "deleted_in_session",
-        (None, Some(_), Some(_)) => "added_both",
-        _ => "modified",
-    };
-    PropagationConflictPath {
-        path: path.to_owned(),
-        kind: kind.to_owned(),
-        base_hash: node_hash(base),
-        main_hash: node_hash(main),
-        session_hash: node_hash(session),
-    }
-}
-
-fn pending_path_resolved(
-    pending: &PropagationConflictPath,
-    main: Option<&ManifestNode>,
-    session: Option<&ManifestNode>,
-) -> bool {
-    node_hash(main).as_deref() == pending.main_hash.as_deref()
-        && node_hash(session).as_deref() != pending.session_hash.as_deref()
 }
 
 fn is_git_path(rel: &Path) -> bool {

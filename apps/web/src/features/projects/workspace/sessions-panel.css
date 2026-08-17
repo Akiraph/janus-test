@@ -37,9 +37,8 @@
   flex-direction: column;
   gap: 2px;
 }
-/* Row mirrors the legacy panel: rounded, pl-2 / pr-1, group-hover reveals the
-   trailing action. Selected state is a soft blue fill (info-soft) — no inset
-   border accent. */
+/* Rows keep the secondary action quiet until hover or focus. Selected state is
+   a soft blue fill (info-soft), without an inset border accent. */
 .sessions-panel__item {
   position: relative;
   width: 100%;
@@ -116,8 +115,7 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* Trailing action — invisible until hover/focus so the panel reads as a quiet
-   list, then reveals on row hover (legacy affordance). */
+/* Keep the list quiet until the row receives hover or keyboard focus. */
 .sessions-panel__action {
   display: inline-flex;
   flex: none;

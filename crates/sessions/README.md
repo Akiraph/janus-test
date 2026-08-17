@@ -4,7 +4,8 @@
 
 Sessions owns session, turn, message, timeline, checkpoint, upload, and
 attachment state. Its public behavior is exposed through `interface.rs`; the
-server supplies the Workspace implementation and composes execution workflows.
+server supplies the Main Workspace implementation and composes execution
+workflows.
 
 ## Observable behavior
 
@@ -26,14 +27,13 @@ server supplies the Workspace implementation and composes execution workflows.
 must preserve those table names and published event names.
 
 `janus-workspace` owns workspace bytes and revision handles. Model rounds,
-tool calls, attempts, jobs, and runtime state belong to their capability or to
+tool calls, attempts, async_tasks, and runtime state belong to their capability or to
 the application workflow that composes them. This crate does not execute model
 or runtime work.
 
 ## Design decision
 
-The Session HTTP surface remains compatible while Session-owned Turn and
-Message persistence moves into a standalone crate. Application code can call
-the narrow interface without importing server modules, and cross-capability
+Session persistence is a standalone capability. Application code calls its
+narrow interface without importing server modules, while cross-capability
 creation, deletion, recovery, and execution orchestration remain in
-`apps/server/application/`.
+`apps/server/application/`. Sessions never create a private Workspace.

@@ -2,10 +2,6 @@
 use serde_json::Value;
 use utoipa::ToSchema;
 
-pub use janus_runtime::interface::{
-    CapabilityReason, CapabilityScope, CapabilityState, RuntimeCapability, RuntimeCapabilityId,
-};
-
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct LiveResponse {
     pub status: &'static str,
@@ -59,7 +55,6 @@ pub struct SystemInfo {
     pub mode: String,
     pub database: DatabaseInfo,
     pub events: EventInfo,
-    pub capabilities: Vec<RuntimeCapability>,
     pub update_available: bool,
 }
 

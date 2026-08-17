@@ -8,6 +8,24 @@ interface StateFrame {
   kind: string;
   id?: string | null;
   data: unknown;
+  cursor?: string | null;
+}
+
+/** Return whether a frame belongs at or after the last applied event cursor. */
+export function shouldApplyCursor(
+  lastCursor: number | null,
+  rawCursor: string | null | undefined,
+): boolean {
+  if (rawCursor == null || rawCursor === "") return true;
+  const cursor = Number(rawCursor);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) return false;
+  return lastCursor === null || cursor >= lastCursor;
+}
+
+function numericCursor(rawCursor: string | null | undefined): number | null {
+  if (rawCursor == null || rawCursor === "") return null;
+  const cursor = Number(rawCursor);
+  return Number.isSafeInteger(cursor) && cursor >= 0 ? cursor : null;
 }
 
 export function useEventStream() {
@@ -16,8 +34,13 @@ export function useEventStream() {
     navigator.onLine ? "connecting" : "offline",
   );
   let source: EventSource | undefined;
+  let lastCursor: number | null = null;
 
-  const handleState = (frame: StateFrame) => {
+  const handleState = (frame: StateFrame, eventCursor?: string | null) => {
+    const cursorValue = frame.cursor ?? eventCursor;
+    if (!shouldApplyCursor(lastCursor, cursorValue)) return;
+    const cursor = numericCursor(cursorValue);
+    if (cursor !== null) lastCursor = Math.max(lastCursor ?? cursor, cursor);
     const { kind, id, data } = frame;
 
     switch (kind) {
@@ -27,20 +50,31 @@ export function useEventStream() {
       case "session_timeline":
         queryClient.setQueryData(["session-timeline", id], data);
         break;
-      case "session_diff":
-        queryClient.setQueryData(["session-diff", id], data);
-        break;
       case "session_context":
         queryClient.setQueryData(["session-context", id], data);
         break;
       case "turn":
-        queryClient.setQueryData(["turn", ...(id ?? "").split("_")], data);
+        if (id) {
+          const separator = id.indexOf("_");
+          if (separator > 0 && separator < id.length - 1) {
+            queryClient.setQueryData(
+              ["turn", id.slice(0, separator), id.slice(separator + 1)],
+              data,
+            );
+          }
+        }
         break;
       case "queued_turns":
         queryClient.setQueryData(["queued-turns", id], data);
         break;
-      case "jobs":
-        queryClient.setQueryData(["jobs", id], data);
+      case "async_tasks":
+        queryClient.setQueryData(["async-tasks"], data);
+        break;
+      case "terminal":
+        queryClient.setQueryData(["terminal", id], data);
+        break;
+      case "terminals":
+        queryClient.setQueryData(["terminals", id], data);
         break;
       case "notification_channels":
         queryClient.setQueryData(["notification-channels"], data);
@@ -51,11 +85,14 @@ export function useEventStream() {
       case "projects":
         queryClient.setQueryData(["projects"], data);
         break;
+      case "operation":
+        queryClient.setQueryData(["operations", id], data);
+        break;
       case "git_status":
         queryClient.setQueryData(["git-status", id], data);
         break;
       case "git_log":
-        queryClient.setQueryData(["git-log", id], data);
+        queryClient.setQueryData(["git-log", id, 50], data);
         break;
       case "sessions":
         queryClient.setQueryData(["sessions", id], data);
@@ -82,7 +119,10 @@ export function useEventStream() {
   // Apply the server snapshot. Each field maps to the same query key the GET
   // endpoints use, so a connect/reconnect converges without invalidating
   // anything (invalidation would refetch and flash stale UI).
-  const handleSnapshot = (frame: Record<string, unknown>) => {
+  const handleSnapshot = (frame: Record<string, unknown>, eventCursor?: string | null) => {
+    if (!shouldApplyCursor(lastCursor, eventCursor)) return;
+    const cursor = numericCursor(eventCursor);
+    if (cursor !== null) lastCursor = Math.max(lastCursor ?? cursor, cursor);
     for (const [kind, data] of Object.entries(frame)) {
       if (data === null || data === undefined) continue;
       switch (kind) {
@@ -122,8 +162,9 @@ export function useEventStream() {
 
     nextSource.addEventListener("state", (event) => {
       try {
-        const frame = JSON.parse((event as MessageEvent).data) as StateFrame;
-        handleState(frame);
+        const message = event as MessageEvent;
+        const frame = JSON.parse(message.data) as StateFrame;
+        handleState(frame, message.lastEventId || null);
       } catch {
         // Malformed frame — ignore.
       }
@@ -131,8 +172,9 @@ export function useEventStream() {
 
     nextSource.addEventListener("snapshot", (event) => {
       try {
-        const frame = JSON.parse((event as MessageEvent).data) as Record<string, unknown>;
-        handleSnapshot(frame);
+        const message = event as MessageEvent;
+        const frame = JSON.parse(message.data) as Record<string, unknown>;
+        handleSnapshot(frame, message.lastEventId || null);
       } catch {
         // Malformed snapshot — ignore.
       }

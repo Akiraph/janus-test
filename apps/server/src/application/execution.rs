@@ -5,23 +5,21 @@ use std::{
 
 use tracing::{debug, error, warn};
 
-use janus_execution::interface::{
-    ExecutionError, ExecutionInterface, ToolCallSettlement, TurnWait,
-};
+use janus_execution::interface::{ExecutionError, ExecutionInterface};
 use janus_infrastructure::unit_of_work::{UnitOfWork, UnitOfWorkTransaction};
 use janus_infrastructure::{
     events::{EventType, NewEvent},
-    id::{CorrelationId, JobId, SessionId, TurnId},
+    id::{CorrelationId, TurnId},
     operations::OperationInterface,
 };
 use janus_models::interface::{ModelPreference, ModelsError, ModelsInterface};
 use janus_projects::interface::{ProjectsError, ProjectsInterface};
-use janus_runtime::interface::{JobProjection, RuntimeError, RuntimeInterface};
+use janus_runtime::interface::RuntimeError;
 use janus_sessions::interface::{
-    ReasoningEffort, ReplaceToolResultInput, SessionModelPreference, SessionsError,
-    SessionsInterface, TurnBlockerOutcome, TurnBlockers, TurnModelCandidateSnapshot,
-    TurnModelSnapshot, TurnStatus,
+    ReasoningEffort, SessionModelPreference, SessionsError, SessionsInterface,
+    TurnModelCandidateSnapshot, TurnModelSnapshot, TurnStatus,
 };
+use janus_workspace::interface::{WorkspaceHandle, WorkspaceInterface};
 
 use super::operation_kinds::KIND_TURN_WAKE;
 
@@ -50,20 +48,11 @@ pub(crate) struct ExecutionCoordinator {
     models: ModelsInterface,
     projects: ProjectsInterface,
     sessions: SessionsInterface,
+    workspace: WorkspaceInterface,
     execution: ExecutionInterface,
-    runtime: RuntimeInterface,
     unit_of_work: UnitOfWork,
     operations: OperationInterface,
     active_turns: Arc<Mutex<HashMap<TurnId, bool>>>,
-}
-
-pub(crate) struct ToolResultRecord<'a> {
-    pub(crate) session_id: SessionId,
-    pub(crate) settlement: &'a ToolCallSettlement,
-    pub(crate) actor: &'a serde_json::Value,
-    pub(crate) correlation_id: &'a str,
-    pub(crate) job_id: Option<&'a JobId>,
-    pub(crate) now: &'a str,
 }
 
 impl ExecutionCoordinator {
@@ -71,8 +60,8 @@ impl ExecutionCoordinator {
         models: ModelsInterface,
         projects: ProjectsInterface,
         sessions: SessionsInterface,
+        workspace: WorkspaceInterface,
         execution: ExecutionInterface,
-        runtime: RuntimeInterface,
         unit_of_work: UnitOfWork,
         operations: OperationInterface,
     ) -> Self {
@@ -80,8 +69,8 @@ impl ExecutionCoordinator {
             models,
             projects,
             sessions,
+            workspace,
             execution,
-            runtime,
             unit_of_work,
             operations,
             active_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -160,8 +149,8 @@ impl ExecutionCoordinator {
             if !before.active {
                 return Ok(None);
             }
-            let execution = match self.execution.execute_turn(turn_id).await {
-                Ok(execution) => execution,
+            match self.execution.execute_turn(turn_id).await {
+                Ok(_) => {}
                 Err(execution_error) => {
                     // Preserve the provider or tool error as the Turn's
                     // completion reason so operators can act on the real cause.
@@ -172,13 +161,6 @@ impl ExecutionCoordinator {
                         .await?;
                     return Err(execution_error.into());
                 }
-            };
-            if let Some(wait) = execution.coordination {
-                let session_id = before.session_id;
-                if self.coordinate_wait(session_id, turn_id, wait).await? {
-                    return Ok(Some(turn_id));
-                }
-                return Ok(None);
             }
         }
 
@@ -340,7 +322,13 @@ impl ExecutionCoordinator {
         terminal_turn_id: TurnId,
         session_id: janus_infrastructure::id::SessionId,
     ) -> Result<Option<TurnId>, TurnExecutionError> {
-        let workspace_revision = self.sessions.current_workspace_revision(session_id).await?;
+        let session = self.sessions.get_session(session_id).await?;
+        let workspace_revision = self
+            .workspace
+            .current_revision(&WorkspaceHandle::main(session.project_id))
+            .await
+            .map_err(SessionsError::from)?
+            .0;
         let now = self.sessions.now();
         let mut work = self.unit_of_work.begin().await?;
         let candidate = self
@@ -391,295 +379,6 @@ impl ExecutionCoordinator {
             .await?;
         work.commit().await?;
         Ok(Some(candidate.turn_id))
-    }
-
-    async fn coordinate_wait(
-        &self,
-        session_id: janus_infrastructure::id::SessionId,
-        turn_id: TurnId,
-        wait: TurnWait,
-    ) -> Result<bool, TurnExecutionError> {
-        let now = self.sessions.now();
-        let mut work = self.unit_of_work.begin().await?;
-        let correlation_id = CorrelationId::new().to_string();
-        let actor = serde_json::json!({"kind": "execution"});
-        if !self
-            .sessions
-            .turn_is_runnable_in_tx(work.connection(), session_id, turn_id)
-            .await?
-        {
-            work.rollback().await?;
-            return Ok(false);
-        }
-        for ask in wait.asks() {
-            if !self
-                .execution
-                .create_ask_in_tx(work.connection(), ask, &now)
-                .await?
-            {
-                work.rollback().await?;
-                return Ok(false);
-            }
-            work.append_event(NewEvent {
-                event_type: EventType::AskChanged,
-                actor: actor.clone(),
-                resource: Some(serde_json::json!({
-                    "kind": "ask",
-                    "id": ask.id.to_string(),
-                })),
-                correlation_id: correlation_id.clone(),
-                causation_id: None,
-                payload: serde_json::json!({
-                    "ask_id": ask.id.to_string(),
-                    "turn_id": ask.turn_id.to_string(),
-                    "tool_call_id": ask.tool_call_id.to_string(),
-                    "mode": ask.mode.as_str(),
-                    "status": "open",
-                    "expires_at": ask.expires_at,
-                }),
-            })
-            .await?;
-        }
-
-        let blockers = TurnBlockers {
-            open_ask: wait.has_ask(),
-            unfinished_job: wait.waits_for_job(),
-        };
-        let target_status = blockers.status();
-        if target_status != TurnStatus::Running {
-            let outcome = self
-                .sessions
-                .reconcile_turn_blockers_in_tx(work.connection(), turn_id, blockers, &now)
-                .await?;
-            let Some(transition) = outcome.transition else {
-                work.rollback().await?;
-                return Ok(false);
-            };
-            work.append_event(NewEvent {
-                event_type: EventType::TurnStatusChanged,
-                actor,
-                resource: Some(serde_json::json!({
-                    "kind": "turn",
-                    "id": turn_id.to_string(),
-                })),
-                correlation_id,
-                causation_id: None,
-                payload: serde_json::json!({
-                    "turn_id": turn_id.to_string(),
-                    "from": transition.from_status.as_str(),
-                    "to": transition.to_status.as_str(),
-                    "session_version": transition.session_version,
-                }),
-            })
-            .await?;
-        }
-        work.commit().await?;
-        Ok(target_status == TurnStatus::Running)
-    }
-
-    pub(crate) async fn inspect_and_reconcile_turn_blockers_in_tx(
-        &self,
-        tx: &mut sqlx::SqliteConnection,
-        turn_id: TurnId,
-        now: &str,
-    ) -> Result<TurnBlockerOutcome, TurnExecutionError> {
-        let open_ask = self.execution.has_open_asks_in_tx(tx, turn_id).await?;
-        let unfinished_job = self.runtime.has_unfinished_jobs_in_tx(tx, turn_id).await?;
-        Ok(self
-            .sessions
-            .reconcile_turn_blockers_in_tx(
-                tx,
-                turn_id,
-                TurnBlockers {
-                    open_ask,
-                    unfinished_job,
-                },
-                now,
-            )
-            .await?)
-    }
-
-    pub(crate) async fn settle_job(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<TurnId>, TurnExecutionError> {
-        let job = self.runtime.job(job_id).await?;
-        if !job.status.is_terminal() {
-            return Ok(None);
-        }
-        let now = self.sessions.now();
-        let mut work = self.unit_of_work.begin().await?;
-        if !self.record_job_result_in_tx(&mut work, &job, &now).await? {
-            work.rollback().await?;
-            return Ok(None);
-        }
-        let blocker_outcome = self
-            .inspect_and_reconcile_turn_blockers_in_tx(
-                work.connection(),
-                job.controlling_turn_id,
-                &now,
-            )
-            .await?;
-        let transition = blocker_outcome.transition;
-
-        if let Some(transition) = transition.as_ref() {
-            let correlation_id = CorrelationId::new().to_string();
-            work.append_event(NewEvent {
-                event_type: EventType::TurnStatusChanged,
-                actor: serde_json::json!({"kind": "runtime"}),
-                resource: Some(serde_json::json!({
-                    "kind": "turn",
-                    "id": job.controlling_turn_id.to_string(),
-                })),
-                correlation_id,
-                causation_id: None,
-                payload: serde_json::json!({
-                    "turn_id": job.controlling_turn_id.to_string(),
-                    "from": transition.from_status.as_str(),
-                    "to": transition.to_status.as_str(),
-                    "session_version": transition.session_version,
-                    "settled_job_id": job.id.to_string(),
-                }),
-            })
-            .await?;
-        }
-        let runnable_turn = transition
-            .filter(|transition| transition.to_status == TurnStatus::Running)
-            .map(|_| job.controlling_turn_id);
-        if let Some(turn_id) = runnable_turn {
-            self.enqueue_turn_wake_in_tx(&mut work, turn_id).await?;
-        }
-        work.commit().await?;
-        Ok(runnable_turn)
-    }
-
-    pub(crate) async fn settle_terminal_jobs_for_turn_in_tx(
-        &self,
-        work: &mut UnitOfWorkTransaction<'_>,
-        turn_id: TurnId,
-        now: &str,
-    ) -> Result<u64, TurnExecutionError> {
-        let jobs = self
-            .runtime
-            .terminal_jobs_for_turn_in_tx(work.connection(), turn_id)
-            .await?;
-        let mut settled = 0;
-        for job in jobs {
-            if self.record_job_result_in_tx(work, &job, now).await? {
-                settled += 1;
-            }
-        }
-        Ok(settled)
-    }
-
-    async fn record_job_result_in_tx(
-        &self,
-        work: &mut UnitOfWorkTransaction<'_>,
-        job: &JobProjection,
-        now: &str,
-    ) -> Result<bool, TurnExecutionError> {
-        let Some(settlement) = self
-            .execution
-            .settle_job_tool_call_in_tx(work.connection(), job, now)
-            .await?
-        else {
-            return Ok(false);
-        };
-        let correlation_id = CorrelationId::new().to_string();
-        let actor = serde_json::json!({"kind": "runtime"});
-        self.record_tool_result_in_tx(
-            work,
-            ToolResultRecord {
-                session_id: job.session_id,
-                settlement: &settlement,
-                actor: &actor,
-                correlation_id: &correlation_id,
-                job_id: Some(&job.id),
-                now,
-            },
-        )
-        .await?;
-        Ok(true)
-    }
-
-    pub(crate) async fn record_tool_result_in_tx(
-        &self,
-        work: &mut UnitOfWorkTransaction<'_>,
-        record: ToolResultRecord<'_>,
-    ) -> Result<(), TurnExecutionError> {
-        let settlement = record.settlement;
-        let source_turn_id: TurnId = settlement
-            .source_turn_id
-            .parse()
-            .map_err(|_| SessionsError::Internal(anyhow::anyhow!("invalid source Turn id")))?;
-        let timeline_item_id = self
-            .sessions
-            .replace_tool_result_in_tx(
-                work.connection(),
-                ReplaceToolResultInput {
-                    session_id: record.session_id,
-                    source_turn_id,
-                    tool_call_id: &settlement.tool_call_id,
-                    provider_call_id: &settlement.provider_call_id,
-                    tool_name: &settlement.tool_name,
-                    status: settlement.status.as_str(),
-                    summary: &settlement.summary,
-                    model_parts: &settlement.model_parts,
-                    now: record.now,
-                },
-            )
-            .await?;
-        let mut payload = serde_json::json!({
-            "tool_call_id": settlement.tool_call_id,
-            "provider_call_id": settlement.provider_call_id,
-            "tool_name": settlement.tool_name,
-            "status": settlement.status.as_str(),
-            "summary": settlement.summary,
-            "timeline_item_id": timeline_item_id,
-            "session_id": record.session_id.to_string(),
-            "turn_id": source_turn_id.to_string(),
-        });
-        if let Some(job_id) = record.job_id {
-            payload["job_id"] = serde_json::Value::String(job_id.to_string());
-        }
-        work.append_event(NewEvent {
-            event_type: EventType::ToolCallChanged,
-            actor: record.actor.clone(),
-            resource: Some(serde_json::json!({
-                "kind": "tool_call",
-                "id": settlement.tool_call_id,
-            })),
-            correlation_id: record.correlation_id.to_owned(),
-            causation_id: None,
-            payload,
-        })
-        .await?;
-        work.append_event(NewEvent {
-            event_type: EventType::TimelineItemUpdated,
-            actor: record.actor.clone(),
-            resource: Some(serde_json::json!({
-                "kind": "session",
-                "id": record.session_id.to_string(),
-            })),
-            correlation_id: record.correlation_id.to_owned(),
-            causation_id: None,
-            payload: serde_json::json!({
-                "timeline_item_id": timeline_item_id,
-                "tool_call_id": settlement.tool_call_id,
-            }),
-        })
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn reconcile_waiting_jobs(&self) -> Result<u64, TurnExecutionError> {
-        let mut resumed = 0;
-        for job_id in self.execution.waiting_job_ids(100).await? {
-            if self.settle_job(job_id).await?.is_some() {
-                resumed += 1;
-            }
-        }
-        Ok(resumed)
     }
 }
 

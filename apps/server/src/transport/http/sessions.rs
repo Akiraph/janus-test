@@ -5,13 +5,13 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use janus_infrastructure::id::{AskId, AttachmentId, ProjectId, SessionId, TurnId, UploadId};
+use janus_infrastructure::id::{AttachmentId, ProjectId, SessionId, TurnId, UploadId};
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::{
     AppState,
-    application::{session_flow::PostSessionMessage, workspace_sync::WorkspacePropagationError},
+    application::{context::CompactContextRequest, session_flow::PostSessionMessage},
     transport::http::{
         auth::authenticate,
         conditions::{RawBody, if_match_version, require_idempotency},
@@ -26,7 +26,6 @@ use janus_sessions::interface::{
     SessionModelPreference, SessionSummary, SessionsError, SteerResult, TimelinePage, TurnSummary,
     UploadAttachmentInput,
 };
-use janus_workspace::interface::{DiffSummary, PropagationResult};
 
 #[derive(Debug, Deserialize)]
 pub struct ListSessionsQuery {
@@ -59,10 +58,12 @@ impl From<janus_execution::interface::ContextUsageView> for ContextUsageView {
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PostMessageRequest {
     pub content: String,
     pub expected_session_version: String,
+    #[serde(default)]
+    pub goal_mode: bool,
     #[serde(default)]
     pub attachment_ids: Vec<AttachmentId>,
     #[serde(default, deserialize_with = "deserialize_model_preference")]
@@ -94,19 +95,6 @@ pub struct CancelTurnRequest {
     pub expected_session_version: String,
     #[serde(default)]
     pub reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct AnswerAskRequest {
-    pub answer: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct AnswerAskResult {
-    pub ask_id: String,
-    pub turn_id: String,
-    pub route_or_status: String,
-    pub session_version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +230,49 @@ pub async fn session_context(
 }
 
 #[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{id}/context/compact",
+    params(("id" = String, Path)),
+    responses((status = 202, body = DataResponse<OperationView>), (status = 404, body = Problem), (status = 409, body = Problem))
+)]
+pub async fn compact_context(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Extension(context): Extension<RequestContext>,
+    RawBody(body): RawBody,
+) -> Result<(StatusCode, Json<DataResponse<OperationView>>), Problem> {
+    let auth = authenticate(&state, &headers).await?;
+    let session_id: SessionId = id
+        .parse()
+        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "POST",
+        &format!("/api/v1/sessions/{session_id}/context/compact"),
+        body.as_ref(),
+    )?;
+    let data = state
+        .application()
+        .request_context_compact(CompactContextRequest {
+            owner_id: auth.owner_id.clone(),
+            session_id,
+            actor: serde_json::json!({
+                "kind": "owner",
+                "id": auth.owner_id,
+                "request_id": context.request_id,
+            }),
+            correlation_id: CorrelationId::new(),
+            idempotency,
+            context_limit: None,
+        })
+        .await
+        .map_err(sessions_problem)?;
+    Ok((StatusCode::ACCEPTED, Json(DataResponse { data })))
+}
+
+#[utoipa::path(
     delete,
     path = "/api/v1/sessions/{id}",
     params(("id" = String, Path)),
@@ -302,6 +333,19 @@ pub async fn post_message(
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
+    let request_bytes = serde_json::to_vec(&body).map_err(|error| {
+        Problem::from_code(
+            codes::VALIDATION_FAILED,
+            format!("invalid message: {error}"),
+        )
+    })?;
+    let idempotency = require_idempotency(
+        &headers,
+        &auth.owner_id,
+        "POST",
+        &format!("/api/v1/sessions/{session_id}/messages"),
+        &request_bytes,
+    )?;
     let actor = serde_json::json!({"kind": "owner", "id": auth.owner_id});
     let data = state
         .application()
@@ -316,6 +360,8 @@ pub async fn post_message(
                 .map(|preference| preference.as_ref()),
             attachment_ids: &body.attachment_ids,
             actor,
+            goal_mode: body.goal_mode,
+            idempotency: Some(idempotency),
         })
         .await
         .map_err(sessions_problem)?;
@@ -503,101 +549,6 @@ pub async fn get_turn(
 }
 
 #[utoipa::path(
-    get,
-    path = "/api/v1/sessions/{id}/diff",
-    params(("id" = String, Path)),
-    responses((status = 200, body = DataResponse<DiffSummary>), (status = 404, body = Problem))
-)]
-pub async fn session_diff(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<DataResponse<DiffSummary>>, Problem> {
-    let _auth = authenticate(&state, &headers).await?;
-    let session_id: SessionId = id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
-    // Ensure session exists.
-    let _ = state
-        .sessions()
-        .get_session(session_id)
-        .await
-        .map_err(sessions_problem)?;
-    let summary = state
-        .workspace()
-        .diff_summary(session_id)
-        .await
-        .map_err(|e| Problem::from_code(codes::INTERNAL_ERROR, format!("diff failed: {e}")))?;
-    Ok(Json(DataResponse { data: summary }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/sessions/{id}/sync",
-    params(("id" = String, Path)),
-    responses(
-        (status = 200, body = DataResponse<PropagationResult>),
-        (status = 404, body = Problem),
-        (status = 409, body = Problem)
-    )
-)]
-pub async fn sync(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Extension(context): Extension<RequestContext>,
-) -> Result<Json<DataResponse<PropagationResult>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
-    let session_id: SessionId = id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
-    let actor = serde_json::json!({
-        "kind": "owner",
-        "id": auth.owner_id,
-        "request_id": context.request_id,
-    });
-    let data = state
-        .application()
-        .sync_session_workspace(session_id, actor)
-        .await
-        .map_err(workspace_propagation_problem)?;
-    Ok(Json(DataResponse { data }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/sessions/{id}/apply",
-    params(("id" = String, Path)),
-    responses(
-        (status = 200, body = DataResponse<PropagationResult>),
-        (status = 404, body = Problem),
-        (status = 409, body = Problem)
-    )
-)]
-pub async fn apply(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Extension(context): Extension<RequestContext>,
-) -> Result<Json<DataResponse<PropagationResult>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
-    let session_id: SessionId = id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
-    let actor = serde_json::json!({
-        "kind": "owner",
-        "id": auth.owner_id,
-        "request_id": context.request_id,
-    });
-    let data = state
-        .application()
-        .apply_session_workspace(session_id, actor)
-        .await
-        .map_err(workspace_propagation_problem)?;
-    Ok(Json(DataResponse { data }))
-}
-
-#[utoipa::path(
     post,
     path = "/api/v1/sessions/{id}/steer",
     request_body = SteerRequest,
@@ -674,81 +625,6 @@ pub async fn cancel_turn(
     Ok(Json(DataResponse { data }))
 }
 
-#[utoipa::path(
-    post,
-    path = "/api/v1/asks/{ask_id}/answer",
-    request_body = AnswerAskRequest,
-    params(("ask_id" = String, Path)),
-    responses((status = 200, body = DataResponse<AnswerAskResult>), (status = 404, body = Problem))
-)]
-pub async fn answer_ask(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(ask_id): Path<String>,
-    Extension(context): Extension<RequestContext>,
-    Json(body): Json<AnswerAskRequest>,
-) -> Result<Json<DataResponse<AnswerAskResult>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
-    let ask_id: AskId = ask_id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::ASK_NOT_FOUND, "invalid ask id"))?;
-    let actor = serde_json::json!({
-        "kind": "owner",
-        "id": auth.owner_id,
-        "request_id": context.request_id,
-    });
-    let (turn_id, route_or_status, session_version) = state
-        .application()
-        .answer_ask(&auth.owner_id, ask_id, &body.answer, actor)
-        .await
-        .map_err(sessions_problem)?;
-    Ok(Json(DataResponse {
-        data: AnswerAskResult {
-            ask_id: ask_id.to_string(),
-            turn_id: turn_id.to_string(),
-            route_or_status,
-            session_version,
-        },
-    }))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/sessions/{id}/turns/{turn_id}/retry-model",
-    params(("id" = String, Path), ("turn_id" = String, Path)),
-    responses((status = 200, body = DataResponse<serde_json::Value>), (status = 404, body = Problem))
-)]
-pub async fn retry_model(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((id, turn_id)): Path<(String, String)>,
-) -> Result<Json<DataResponse<serde_json::Value>>, Problem> {
-    let _auth = authenticate(&state, &headers).await?;
-    let session_id: SessionId = id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
-    let turn_id: TurnId = turn_id
-        .parse()
-        .map_err(|_| Problem::from_code(codes::RESOURCE_NOT_FOUND, "invalid turn id"))?;
-    // Ensure the Turn belongs to the Session before scheduling retry.
-    let _ = state
-        .sessions()
-        .get_turn(session_id, turn_id)
-        .await
-        .map_err(sessions_problem)?;
-    let scheduled = state
-        .application()
-        .retry_waiting_model(turn_id)
-        .await
-        .map_err(sessions_problem)?;
-    Ok(Json(DataResponse {
-        data: serde_json::json!({
-            "turn_id": turn_id.to_string(),
-            "scheduled": scheduled,
-        }),
-    }))
-}
-
 fn sessions_problem(error: SessionsError) -> Problem {
     match error {
         SessionsError::NotFound => Problem::from_code(codes::SESSION_NOT_FOUND, error.to_string()),
@@ -762,8 +638,6 @@ fn sessions_problem(error: SessionsError) -> Problem {
             Problem::from_code(codes::TURN_NOT_INTERACTIVE, error.to_string())
         }
         SessionsError::TurnTerminal => Problem::from_code(codes::TURN_TERMINAL, error.to_string()),
-        SessionsError::AskNotFound => Problem::from_code(codes::ASK_NOT_FOUND, error.to_string()),
-        SessionsError::AskNotOpen => Problem::from_code(codes::ASK_NOT_OPEN, error.to_string()),
         SessionsError::VersionMismatch { .. } => {
             Problem::from_code(codes::RESOURCE_VERSION_MISMATCH, error.to_string())
         }
@@ -780,33 +654,6 @@ fn sessions_problem(error: SessionsError) -> Problem {
             Problem::from_code(codes::VALIDATION_FAILED, error.to_string())
         }
         other => Problem::from_code(codes::INTERNAL_ERROR, other.to_string()),
-    }
-}
-
-fn workspace_propagation_problem(error: WorkspacePropagationError) -> Problem {
-    match error {
-        WorkspacePropagationError::Sessions(error) => sessions_problem(error),
-        WorkspacePropagationError::Conflict(conflict) => {
-            let paths = conflict
-                .paths
-                .iter()
-                .map(|path| path.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Problem::from_code(
-                codes::WORKSPACE_PROPAGATION_CONFLICT,
-                format!(
-                    "workspace {} has conflicts: {paths}",
-                    conflict.direction.as_str()
-                ),
-            )
-        }
-        WorkspacePropagationError::Workspace(error) => {
-            Problem::from_code(codes::INTERNAL_ERROR, error.to_string())
-        }
-        WorkspacePropagationError::Internal(error) => {
-            Problem::from_code(codes::INTERNAL_ERROR, error.to_string())
-        }
     }
 }
 
