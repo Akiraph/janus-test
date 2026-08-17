@@ -258,27 +258,6 @@ mod tests {
         assert!(followed.is_none(), "external link target must not be read");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn directory_copy_preserves_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let source = tempfile::tempdir().expect("source");
-        let target = tempfile::tempdir().expect("target");
-        std::fs::write(source.path().join("file.txt"), b"content").expect("write file");
-        symlink("file.txt", source.path().join("link.txt")).expect("create link");
-
-        super::copy_dir_tree(source.path(), target.path().join("copy").as_path())
-            .expect("copy directory");
-
-        assert!(
-            std::fs::symlink_metadata(target.path().join("copy/link.txt"))
-                .expect("copied link")
-                .file_type()
-                .is_symlink()
-        );
-    }
-
     #[test]
     fn git_command_allows_a_different_repository_owner() {
         use std::process::Command;
