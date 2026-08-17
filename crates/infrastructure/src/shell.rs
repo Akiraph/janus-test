@@ -114,11 +114,12 @@ pub fn bash_search_path() -> Option<OsString> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bash_program, bash_search_path, decode_process_output};
+    use super::decode_process_output;
 
     #[cfg(windows)]
     #[test]
     fn windows_bash_provider_resolves_git_bash() {
+        use super::bash_program;
         let program = bash_program().expect("Git Bash must be discoverable on a supported host");
         assert_eq!(
             program
@@ -133,6 +134,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_bash_path_includes_git_utilities() {
+        use super::bash_search_path;
         let path = bash_search_path().expect("Git Bash PATH must be available");
         let entries = std::env::split_paths(&path).collect::<Vec<_>>();
         assert!(entries.iter().any(|entry| entry.ends_with("usr\\bin")));
