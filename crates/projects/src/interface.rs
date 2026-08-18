@@ -698,6 +698,56 @@ impl ProjectsInterface {
         self.get_project(owner_id, id).await
     }
 
+    /// Attach an explicitly Automation-enabled GitHub credential to an
+    /// existing Project without recloning its workspace. Fork-sync reuses
+    /// Projects by repository URL, so an older public clone may need the
+    /// dedicated push credential before its repair Session runs.
+    pub async fn set_project_github_credential(
+        &self,
+        owner_id: &str,
+        id: &str,
+        credential_id: &str,
+        correlation_id: &str,
+    ) -> Result<ProjectView, ProjectsError> {
+        let credential = self.fetch_credential(owner_id, credential_id).await?;
+        if credential.pat_ciphertext.is_none() || !credential.automation_enabled {
+            return Err(ProjectsError::Validation(
+                "github credential must have a PAT and Automation enabled".into(),
+            ));
+        }
+        let now = now_utc_str();
+        let new_version = format!("v_{}", ProjectId::new());
+        let mut work = self.unit_of_work.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE projects SET repo_access = ?, github_credential_id = ?, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ? AND owner_id = ? AND state != 'deleting'",
+        )
+        .bind(REPO_KIND_GITHUB_PRIVATE)
+        .bind(credential_id)
+        .bind(&new_version)
+        .bind(&now)
+        .bind(&now)
+        .bind(id)
+        .bind(owner_id)
+        .execute(work.connection())
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            work.rollback().await?;
+            return Err(ProjectsError::NotFound);
+        }
+        self.append_project_changed_in_tx(
+            &mut work,
+            owner_id,
+            id,
+            "project",
+            "github_credential_attached",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
+        self.get_project(owner_id, id).await
+    }
+
     /// Mark a Project `deleting` and enqueue the cascade delete Operation. The
     /// worker stops/cleans Workspace, Git metadata and config; it never touches
     /// the remote repo or global models.

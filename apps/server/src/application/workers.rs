@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 use crate::application::Application;
 use crate::application::operation_kinds::{
     KIND_CLONE, KIND_CONTEXT_COMPACT, KIND_CREATE_SESSION, KIND_DELETE_PROJECT,
-    KIND_DELETE_SESSION, KIND_PULL_REQUEST_AUTOMATION, KIND_TURN_WAKE,
+    KIND_DELETE_SESSION, KIND_FORK_SYNC_BATCH, KIND_PULL_REQUEST_AUTOMATION, KIND_TURN_WAKE,
 };
 use janus_infrastructure::id::TurnId;
 use janus_infrastructure::operations::{
@@ -27,7 +27,7 @@ use janus_infrastructure::operations::{
 /// is reclaimed quickly, long enough for a clone to finish.
 const LEASE_TTL_SECONDS: i64 = 120;
 const MAX_CONCURRENT_WORK: usize = 4;
-const MAX_CONCURRENT_AUTOMATION: usize = 2;
+const MAX_CONCURRENT_AUTOMATION: usize = 1;
 const LEASE_RENEW_INTERVAL_SECONDS: u64 = 30;
 
 /// Session creation and deletion both touch workspace-owned tables. Keep
@@ -45,6 +45,7 @@ const HANDLED_KINDS: &[&str] = &[
     KIND_TURN_WAKE,
     KIND_CONTEXT_COMPACT,
     KIND_PULL_REQUEST_AUTOMATION,
+    KIND_FORK_SYNC_BATCH,
 ];
 
 #[derive(Debug)]
@@ -127,7 +128,7 @@ async fn run_once(
     automation_concurrency: &Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
-        let is_automation = *kind == KIND_PULL_REQUEST_AUTOMATION;
+        let is_automation = matches!(*kind, KIND_PULL_REQUEST_AUTOMATION | KIND_FORK_SYNC_BATCH);
         let work_permit = if is_automation {
             None
         } else {
@@ -331,6 +332,14 @@ async fn dispatch(
         }
         KIND_PULL_REQUEST_AUTOMATION => {
             crate::application::automation::run_pull_request_automation(
+                state, payload, work_id, work_nonce,
+            )
+            .await
+            .map_err(WorkFailure::retry)?;
+            Ok(())
+        }
+        KIND_FORK_SYNC_BATCH => {
+            crate::application::automation::run_fork_sync_batch(
                 state, payload, work_id, work_nonce,
             )
             .await

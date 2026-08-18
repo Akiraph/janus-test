@@ -210,6 +210,27 @@
   color: var(--accent-strong);
 }
 
+.automation-run__repositories {
+  display: grid;
+  width: 100%;
+  gap: var(--space-1);
+}
+
+.automation-run__repository {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+}
+
+.automation-run__repository > a:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .automation-status,
 .record-chip {
   display: inline-flex;

@@ -516,7 +516,7 @@
         "operationId": "webhook",
         "requestBody": {
           "content": {
-            "text/html": {
+            "application/json": {
               "schema": {
                 "type": "string"
               }
@@ -546,6 +546,16 @@
             }
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "415": {
             "description": "",
             "content": {
               "application/json": {
@@ -4762,6 +4772,47 @@
           "development"
         ]
       },
+      "AutomationRepositoryView": {
+        "type": "object",
+        "required": [
+          "repository_url",
+          "pull_request_url",
+          "status",
+          "push_status"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pull_request_url": {
+            "type": "string"
+          },
+          "push_status": {
+            "type": "string"
+          },
+          "repository_url": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
       "AutomationRunView": {
         "type": "object",
         "required": [
@@ -4769,7 +4820,8 @@
           "workflow",
           "source",
           "push_enabled",
-          "push_status"
+          "push_status",
+          "repositories"
         ],
         "properties": {
           "operation": {
@@ -4792,6 +4844,12 @@
           },
           "push_status": {
             "type": "string"
+          },
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AutomationRepositoryView"
+            }
           },
           "session_id": {
             "type": [
@@ -6545,7 +6603,8 @@
                 "workflow",
                 "source",
                 "push_enabled",
-                "push_status"
+                "push_status",
+                "repositories"
               ],
               "properties": {
                 "operation": {
@@ -6568,6 +6627,12 @@
                 },
                 "push_status": {
                   "type": "string"
+                },
+                "repositories": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AutomationRepositoryView"
+                  }
                 },
                 "session_id": {
                   "type": [

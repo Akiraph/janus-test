@@ -25,12 +25,16 @@ use serde_json::{Value, json};
 use utoipa::ToSchema;
 
 use crate::application::session_flow::PostSessionMessage;
-use crate::application::{Application, lifecycle, operation_kinds::KIND_PULL_REQUEST_AUTOMATION};
+use crate::application::{
+    Application, lifecycle,
+    operation_kinds::{KIND_FORK_SYNC_BATCH, KIND_PULL_REQUEST_AUTOMATION},
+};
 
 const GITHUB_HOST: &str = "github.com";
 const AUTOMATION_WAIT: StdDuration = StdDuration::from_secs(20 * 60);
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct PullRequestAutomationRequest {
     pub(crate) owner_id: String,
     pub(crate) workflow: String,
@@ -39,6 +43,35 @@ pub(crate) struct PullRequestAutomationRequest {
     pub(crate) repository_url: String,
     pub(crate) branch: Option<String>,
     pub(crate) project_name: String,
+    pub(crate) github_credential_id: Option<String>,
+    pub(crate) github_token: Option<String>,
+    pub(crate) actor: Value,
+    pub(crate) correlation_id: CorrelationId,
+    pub(crate) idempotency: IdempotencyRequest,
+}
+
+/// One repository repair item delivered by the fork-sync webhook. The item is
+/// deliberately small: the email/report body is parsed at the HTTP boundary,
+/// while the durable work payload contains only canonical repository metadata.
+#[derive(Debug, Clone)]
+pub(crate) struct ForkSyncAutomationItem {
+    pub(crate) pull_request_url: String,
+    pub(crate) repository_url: String,
+    pub(crate) parent_repository_url: Option<String>,
+    pub(crate) default_branch: Option<String>,
+    pub(crate) parent_default_branch: Option<String>,
+    pub(crate) message: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) project_name: String,
+    pub(crate) github_credential_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ForkSyncAutomationRequest {
+    pub(crate) owner_id: String,
+    pub(crate) workflow: String,
+    pub(crate) source: String,
+    pub(crate) items: Vec<ForkSyncAutomationItem>,
     pub(crate) github_credential_id: Option<String>,
     pub(crate) github_token: Option<String>,
     pub(crate) actor: Value,
@@ -74,11 +107,52 @@ struct PullRequestAutomationWork {
     source: String,
     pull_request_url: String,
     repository_url: String,
+    #[serde(default)]
+    parent_repository_url: Option<String>,
+    #[serde(default)]
+    default_branch: Option<String>,
+    #[serde(default)]
+    parent_default_branch: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
     branch: Option<String>,
     project_name: String,
     github_credential_id: Option<String>,
     #[serde(default)]
     model_preference: Option<SessionModelPreference>,
+    #[serde(default)]
+    child_scope: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForkSyncAutomationWork {
+    operation_id: String,
+    owner_id: String,
+    workflow: String,
+    source: String,
+    items: Vec<PullRequestAutomationItemWork>,
+    #[serde(default)]
+    model_preference: Option<SessionModelPreference>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PullRequestAutomationItemWork {
+    pull_request_url: String,
+    repository_url: String,
+    #[serde(default)]
+    parent_repository_url: Option<String>,
+    #[serde(default)]
+    default_branch: Option<String>,
+    #[serde(default)]
+    parent_default_branch: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    branch: Option<String>,
+    project_name: String,
+    github_credential_id: Option<String>,
+    /// Stable per-repository scope used for child idempotency keys. It is
+    /// derived from the parent operation and repository URL at enqueue time.
+    child_scope: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +170,28 @@ struct AutomationResult {
     push_status: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ForkSyncItemResult {
+    repository_url: String,
+    pull_request_url: String,
+    project_id: Option<String>,
+    session_id: Option<String>,
+    status: String,
+    push_status: String,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct AutomationRepositoryView {
+    pub repository_url: String,
+    pub pull_request_url: String,
+    pub project_id: Option<String>,
+    pub session_id: Option<String>,
+    pub status: String,
+    pub push_status: String,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct AutomationRunView {
     pub operation: OperationView,
@@ -106,6 +202,7 @@ pub(crate) struct AutomationRunView {
     pub session_id: Option<String>,
     pub push_enabled: bool,
     pub push_status: String,
+    pub repositories: Vec<AutomationRepositoryView>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -235,8 +332,168 @@ impl Application {
         )))
     }
 
+    async fn validate_automation_credential(
+        &self,
+        owner_id: &str,
+        credential_id: &str,
+    ) -> Result<(), AutomationError> {
+        let credential = self
+            .projects()
+            .get_credential(owner_id, credential_id)
+            .await?;
+        if !credential.automation_enabled {
+            return Err(AutomationError::Validation(
+                "github credential is not enabled for Automation pushes".into(),
+            ));
+        }
+        if !credential.pat_is_set {
+            return Err(AutomationError::Validation(
+                "github credential has no PAT; add a classic token before enabling Automation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn resolve_automation_credential(
+        &self,
+        owner_id: &str,
+        explicit_id: Option<String>,
+        token: Option<&str>,
+        required: bool,
+        correlation_id: &CorrelationId,
+    ) -> Result<Option<String>, AutomationError> {
+        let credential_id = match explicit_id {
+            Some(id) => {
+                self.validate_automation_credential(owner_id, &id).await?;
+                Some(id)
+            }
+            None => match token {
+                Some(token) if !token.trim().is_empty() => Some(
+                    self.projects()
+                        .ensure_automation_credential(
+                            owner_id,
+                            GITHUB_HOST,
+                            token,
+                            &correlation_id.to_string(),
+                        )
+                        .await?,
+                ),
+                _ => {
+                    let credentials = self
+                        .projects()
+                        .list_automation_credentials(owner_id)
+                        .await?;
+                    if credentials.len() == 1 && credentials[0].pat_is_set {
+                        Some(credentials[0].id.clone())
+                    } else {
+                        None
+                    }
+                }
+            },
+        };
+        if let Some(id) = credential_id.as_deref() {
+            self.validate_automation_credential(owner_id, id).await?;
+        } else if required {
+            return Err(AutomationError::Validation(
+                "fork-sync Automation requires exactly one Automation-enabled GitHub classic PAT"
+                    .into(),
+            ));
+        }
+        Ok(credential_id)
+    }
+
+    /// Enqueue one durable parent operation for a fork-sync report. The parent
+    /// worker processes `items` in order, so each repository gets its own
+    /// Project and Session while the report remains one auditable run.
+    pub(crate) async fn request_fork_sync_automation(
+        &self,
+        input: ForkSyncAutomationRequest,
+    ) -> Result<OperationView, AutomationError> {
+        if input.items.is_empty() {
+            return Err(AutomationError::Validation(
+                "fork-sync webhook contains no repository items".into(),
+            ));
+        }
+        let workflow = normalize_label(&input.workflow, "fork-sync");
+        let source = normalize_label(&input.source, "webhook");
+        let settings = self.get_automation_settings(&input.owner_id).await?;
+        let model_preference = match (settings.model_provider_id, settings.model_upstream_id) {
+            (Some(provider_id), Some(upstream_model_id)) => Some(SessionModelPreference {
+                provider_id,
+                upstream_model_id,
+                reasoning_effort: Default::default(),
+            }),
+            _ => None,
+        };
+        let default_credential = self
+            .resolve_automation_credential(
+                &input.owner_id,
+                input.github_credential_id.clone(),
+                input.github_token.as_deref(),
+                true,
+                &input.correlation_id,
+            )
+            .await?;
+        let mut item_values = Vec::with_capacity(input.items.len());
+        for item in input.items {
+            let credential_id = match item.github_credential_id {
+                Some(id) => {
+                    self.validate_automation_credential(&input.owner_id, &id)
+                        .await?;
+                    Some(id)
+                }
+                None => default_credential.clone(),
+            };
+            item_values.push(json!({
+                "pull_request_url": item.pull_request_url,
+                "repository_url": item.repository_url,
+                "parent_repository_url": item.parent_repository_url,
+                "default_branch": item.default_branch,
+                "parent_default_branch": item.parent_default_branch,
+                "message": item.message,
+                "branch": item.branch,
+                "project_name": item.project_name,
+                "github_credential_id": credential_id,
+                "child_scope": normalize_repository_url(&item.repository_url),
+            }));
+        }
+        let target_id = format!("fork-sync:{}", input.idempotency.key);
+        let payload = json!({
+            "owner_id": input.owner_id,
+            "workflow": workflow.clone(),
+            "source": source.clone(),
+            "items": item_values,
+            "model_preference": model_preference,
+        });
+        let created = self
+            .operations()
+            .create(
+                CreateOperation {
+                    kind: KIND_FORK_SYNC_BATCH,
+                    actor: input.actor,
+                    target_kind: "fork_sync_batch",
+                    target_id: Some(&target_id),
+                    conditions: json!({
+                        "workflow": workflow,
+                        "source": source,
+                        "items": payload.get("items"),
+                    }),
+                    correlation_id: input.correlation_id,
+                    idempotency: Some(input.idempotency),
+                },
+                Some(CreateWork {
+                    handler_kind: KIND_FORK_SYNC_BATCH,
+                    payload,
+                }),
+            )
+            .await?;
+        Ok(created.operation)
+    }
+
     /// Enqueue a webhook automation operation. The PAT is used only to create
     /// or reuse an encrypted project credential; it never enters this payload.
+    #[allow(dead_code)]
     pub(crate) async fn request_pull_request_automation(
         &self,
         input: PullRequestAutomationRequest,
@@ -305,6 +562,7 @@ impl Application {
             "github_credential_id": credential_id,
             "model_preference": model_preference,
             "repository_access": access,
+            "child_scope": normalize_repository_url(&input.repository_url),
         });
         let created = self
             .operations()
@@ -338,10 +596,17 @@ impl Application {
         owner_id: &str,
         limit: i64,
     ) -> Result<Vec<AutomationRunView>, AutomationError> {
-        let operations = self
+        let mut operations = self
             .operations()
             .list_by_kind_owner(KIND_PULL_REQUEST_AUTOMATION, owner_id, limit)
             .await?;
+        let mut batches = self
+            .operations()
+            .list_by_kind_owner(KIND_FORK_SYNC_BATCH, owner_id, limit)
+            .await?;
+        operations.append(&mut batches);
+        operations.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        operations.truncate(limit.clamp(1, 200) as usize);
         Ok(operations.into_iter().map(automation_run_view).collect())
     }
 }
@@ -385,39 +650,181 @@ pub(crate) async fn run_pull_request_automation(
     Ok(())
 }
 
+/// Run a fork-sync batch. The parent owns the lease for the complete report,
+/// so repository items are intentionally awaited one at a time. Each item gets
+/// a stable child idempotency scope and its Project/Session IDs are published
+/// immediately for the UI.
+pub(crate) async fn run_fork_sync_batch(
+    state: &Application,
+    payload: &Value,
+    work_id: &str,
+    work_nonce: &str,
+) -> Result<(), anyhow::Error> {
+    let input: ForkSyncAutomationWork = serde_json::from_value(payload.clone())?;
+    let claim = WorkClaim {
+        id: work_id,
+        nonce: work_nonce,
+    };
+    let mut results = Vec::with_capacity(input.items.len());
+    let mut failures = 0usize;
+    for (index, item) in input.items.iter().cloned().enumerate() {
+        let child = PullRequestAutomationWork {
+            operation_id: input.operation_id.clone(),
+            owner_id: input.owner_id.clone(),
+            workflow: input.workflow.clone(),
+            source: input.source.clone(),
+            pull_request_url: item.pull_request_url.clone(),
+            repository_url: item.repository_url.clone(),
+            parent_repository_url: item.parent_repository_url.clone(),
+            default_branch: item.default_branch.clone(),
+            parent_default_branch: item.parent_default_branch.clone(),
+            message: item.message.clone(),
+            branch: item.branch.clone(),
+            project_name: item.project_name.clone(),
+            github_credential_id: item.github_credential_id.clone(),
+            model_preference: input.model_preference.clone(),
+            child_scope: format!("{}:{index}", item.child_scope),
+        };
+        publish_progress(
+            state,
+            claim,
+            &input.operation_id,
+            "repository_started",
+            json!({
+                "workflow": input.workflow,
+                "source": input.source,
+                "current_index": index,
+                "total": input.items.len(),
+                "repository_url": child.repository_url,
+                "pull_request_url": child.pull_request_url,
+                "items": results,
+            }),
+        )
+        .await?;
+        match execute_pull_request_automation(state, &child, claim).await {
+            Ok(result) => {
+                results.push(ForkSyncItemResult {
+                    repository_url: child.repository_url.clone(),
+                    pull_request_url: result.pull_request_url.clone(),
+                    project_id: Some(result.project_id.clone()),
+                    session_id: Some(result.session_id.clone()),
+                    status: "succeeded".into(),
+                    push_status: result.push_status.clone(),
+                    detail: None,
+                });
+            }
+            Err(error) => {
+                failures += 1;
+                results.push(ForkSyncItemResult {
+                    repository_url: child.repository_url.clone(),
+                    pull_request_url: child.pull_request_url.clone(),
+                    project_id: None,
+                    session_id: None,
+                    status: "failed".into(),
+                    push_status: "needs_attention".into(),
+                    detail: Some(error.to_string()),
+                });
+            }
+        }
+        publish_progress(
+            state,
+            claim,
+            &input.operation_id,
+            "repository_completed",
+            json!({
+                "workflow": input.workflow,
+                "source": input.source,
+                "current_index": index + 1,
+                "total": input.items.len(),
+                "items": results,
+            }),
+        )
+        .await?;
+    }
+    let status = if failures == 0 {
+        "succeeded"
+    } else {
+        "needs_attention"
+    };
+    let completion = OperationCompletion {
+        status: if failures == 0 {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::NeedsAttention
+        },
+        result: Some(json!({
+            "workflow": input.workflow,
+            "source": input.source,
+            "status": status,
+            "items": results,
+        })),
+        problem: (failures > 0).then(|| {
+            json!({
+                "code": "FORK_SYNC_PARTIAL_FAILURE",
+                "detail": format!("{failures} of {} repository item(s) need attention", input.items.len()),
+            })
+        }),
+        correlation_id: CorrelationId::new(),
+    };
+    state
+        .operations()
+        .finish_claimed(&input.operation_id, work_id, work_nonce, completion)
+        .await?;
+    Ok(())
+}
+
 async fn execute_pull_request_automation(
     state: &Application,
     input: &PullRequestAutomationWork,
     claim: WorkClaim<'_>,
 ) -> Result<AutomationResult, AutomationError> {
-    let project_idem = child_idempotency(
-        &input.owner_id,
-        &input.operation_id,
-        "/api/v1/projects",
-        "project",
-    );
-    let (project, clone_operation) = state
-        .projects()
-        .create_project(
-            &input.owner_id,
-            CreateProjectInput {
-                name: input.project_name.clone(),
-                repository: RepositoryInput {
-                    access: if input.github_credential_id.is_some() {
-                        RepoAccess::GithubPrivate
-                    } else {
-                        RepoAccess::PublicHttps
+    let child_scope = if input.child_scope.trim().is_empty() {
+        input.operation_id.clone()
+    } else {
+        format!("{}:{}", input.operation_id, input.child_scope)
+    };
+    let project = if let Some(mut existing) =
+        find_matching_project(state, &input.owner_id, &input.repository_url).await?
+    {
+        if let Some(credential_id) = input.github_credential_id.as_deref()
+            && existing.repository.github_credential_id.as_deref() != Some(credential_id)
+        {
+            existing = state
+                .projects()
+                .set_project_github_credential(
+                    &input.owner_id,
+                    &existing.id,
+                    credential_id,
+                    &CorrelationId::new().to_string(),
+                )
+                .await?;
+        }
+        wait_for_project_ready(state, &input.owner_id, &existing.id).await?
+    } else {
+        let project_idem = project_idempotency(&input.owner_id, &input.repository_url);
+        let (project, clone_operation) = state
+            .projects()
+            .create_project(
+                &input.owner_id,
+                CreateProjectInput {
+                    name: input.project_name.clone(),
+                    repository: RepositoryInput {
+                        access: RepoAccess::GithubPrivate,
+                        url: input.repository_url.clone(),
+                        branch: input
+                            .default_branch
+                            .clone()
+                            .or_else(|| input.branch.clone()),
+                        github_credential_id: input.github_credential_id.clone(),
                     },
-                    url: input.repository_url.clone(),
-                    branch: input.branch.clone(),
-                    github_credential_id: input.github_credential_id.clone(),
                 },
-            },
-            CorrelationId::new(),
-            Some(project_idem),
-        )
-        .await?;
-    wait_for_operation(state, &clone_operation.id).await?;
+                CorrelationId::new(),
+                Some(project_idem),
+            )
+            .await?;
+        let _ = clone_operation;
+        wait_for_project_ready(state, &input.owner_id, &project.id).await?
+    };
 
     publish_progress(
         state,
@@ -452,7 +859,7 @@ async fn execute_pull_request_automation(
         CorrelationId::new(),
         child_idempotency(
             &input.owner_id,
-            &input.operation_id,
+            &child_scope,
             &format!("/api/v1/projects/{project_id}/sessions"),
             "session",
         ),
@@ -502,7 +909,7 @@ async fn execute_pull_request_automation(
             goal_mode: true,
             idempotency: Some(child_idempotency(
                 &input.owner_id,
-                &input.operation_id,
+                &child_scope,
                 &format!("/api/v1/sessions/{session_id}/messages"),
                 "message",
             )),
@@ -603,14 +1010,35 @@ fn automation_run_view(operation: OperationView) -> AutomationRunView {
             })
             .unwrap_or(false)
     };
+    let item_value = progress
+        .and_then(|value| value.get("items"))
+        .or_else(|| result.and_then(|value| value.get("items")));
+    let repositories = item_value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    serde_json::from_value::<AutomationRepositoryView>(item.clone()).ok()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let first_repository = repositories.first();
     AutomationRunView {
-        pull_request_url: operation.target_id.clone(),
+        pull_request_url: string_field("pull_request_url")
+            .or_else(|| first_repository.map(|item| item.pull_request_url.clone())),
         workflow: string_field("workflow").unwrap_or_else(|| "github-pr-repair".to_owned()),
         source: string_field("source").unwrap_or_else(|| "webhook".to_owned()),
-        project_id: string_field("project_id"),
-        session_id: string_field("session_id"),
-        push_enabled: bool_field("push_enabled"),
-        push_status: string_field("push_status").unwrap_or_else(|| "pending".to_owned()),
+        project_id: string_field("project_id")
+            .or_else(|| first_repository.and_then(|item| item.project_id.clone())),
+        session_id: string_field("session_id")
+            .or_else(|| first_repository.and_then(|item| item.session_id.clone())),
+        push_enabled: bool_field("push_enabled") || !repositories.is_empty(),
+        push_status: string_field("push_status")
+            .or_else(|| first_repository.map(|item| item.push_status.clone()))
+            .unwrap_or_else(|| "pending".to_owned()),
+        repositories,
         operation,
     }
 }
@@ -628,6 +1056,86 @@ fn normalize_label(value: &str, fallback: &str) -> String {
         fallback.to_owned()
     } else {
         value
+    }
+}
+
+fn normalize_repository_url(value: &str) -> String {
+    let mut normalized = value.trim().to_ascii_lowercase();
+    if let Some(rest) = normalized.strip_prefix("git@github.com:") {
+        normalized = format!("github.com/{rest}");
+    }
+    for prefix in ["https://", "http://", "ssh://", "git://"] {
+        if let Some(rest) = normalized.strip_prefix(prefix) {
+            normalized = rest.to_owned();
+            break;
+        }
+    }
+    normalized = normalized
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_owned();
+    normalized
+}
+
+fn project_idempotency(owner_id: &str, repository_url: &str) -> IdempotencyRequest {
+    let normalized = normalize_repository_url(repository_url);
+    let digest = format!("automation-project:{normalized}");
+    IdempotencyRequest {
+        key: format!("automation-project:{owner_id}:{normalized}"),
+        owner_id: owner_id.to_owned(),
+        method: "POST".into(),
+        normalized_route: "/api/v1/projects".into(),
+        digest,
+        expires_at: format_utc(Utc::now() + Duration::days(3650)),
+    }
+}
+
+async fn find_matching_project(
+    state: &Application,
+    owner_id: &str,
+    repository_url: &str,
+) -> Result<Option<janus_projects::interface::ProjectView>, AutomationError> {
+    let normalized = normalize_repository_url(repository_url);
+    let projects = state.projects().list_projects(owner_id, 100).await?;
+    Ok(projects.into_iter().find(|project| {
+        normalize_repository_url(&project.repository.url) == normalized
+            && project.state != "deleting"
+    }))
+}
+
+async fn wait_for_project_ready(
+    state: &Application,
+    owner_id: &str,
+    project_id: &str,
+) -> Result<janus_projects::interface::ProjectView, AutomationError> {
+    let deadline = tokio::time::Instant::now() + AUTOMATION_WAIT;
+    loop {
+        let project = state.projects().get_project(owner_id, project_id).await?;
+        match project.state.as_str() {
+            "ready" => return Ok(project),
+            "error" => {
+                let detail = project
+                    .restrictions
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "project clone failed".into());
+                return Err(AutomationError::Validation(detail));
+            }
+            "deleting" => {
+                return Err(AutomationError::Validation(
+                    "matching project is being deleted".into(),
+                ));
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AutomationError::Validation(format!(
+                "project {project_id} did not become ready within {} seconds",
+                AUTOMATION_WAIT.as_secs()
+            )));
+        }
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
     }
 }
 
@@ -713,15 +1221,31 @@ fn child_idempotency(
 
 fn supervisor_prompt(input: &PullRequestAutomationWork) -> String {
     let branch = input
-        .branch
+        .default_branch
         .as_deref()
-        .unwrap_or("the current checked-out branch");
+        .or(input.branch.as_deref())
+        .unwrap_or("the repository default branch");
+    let parent = input
+        .parent_repository_url
+        .as_deref()
+        .unwrap_or("the upstream parent repository from the conflict report");
+    let parent_branch = input
+        .parent_default_branch
+        .as_deref()
+        .unwrap_or("the parent repository default branch");
+    let message = input
+        .message
+        .as_deref()
+        .unwrap_or("No additional conflict message was provided.");
     format!(
-        "A webhook identified a GitHub pull request that needs an automated repair.\n\n\
-Pull request: {pr}\nRepository: {repo}\nWorking branch: {branch}\n\n\
-Work directly in the current Main workspace. First inspect the pull request with `gh pr view {pr}` and, when possible, use `gh pr checkout {pr}` so the actual PR head repository and branch are selected; do not blindly push the repository default branch. Resolve the repository/PR address conflict represented by this report while preserving the intended behavior. Run the relevant tests, create a focused git commit, and push it to the PR head branch. When GH_TOKEN or GITHUB_TOKEN is available, run `gh auth setup-git` before `git push`. Do not only explain the fix; complete the edit, commit, and push.",
+        "A fork-sync webhook identified a GitHub pull request whose repository needs an automated repair.\n\n\
+Pull request: {pr}\nFork repository: {repo}\nFork default branch: {branch}\nParent repository: {parent}\nParent default branch: {parent_branch}\nConflict report: {message}\n\n\
+Work directly in the current Main workspace. Begin with `git status --short` and preserve every existing change: never run `git reset --hard`, `git clean`, or any command that discards/stashes local work. Inspect the pull request with `gh pr view {pr}`. Fetch the parent repository and merge/reconcile its `{parent_branch}` into the fork's `{branch}` as needed to resolve the reported conflict. Run the relevant tests, create a focused commit containing the repair (and any pre-existing changes that are clearly part of this repair), then push directly to the fork repository default branch with `git push origin HEAD:{branch}`. Do not push the PR head branch or the parent repository. If existing changes are unrelated and cannot be safely separated, stop without deleting or pushing them and report that the Session needs attention. When GH_TOKEN or GITHUB_TOKEN is available, run `gh auth setup-git` before pushing. Do not only explain the fix; complete the edit, commit, and push or leave an explicit needs-attention report.",
         pr = input.pull_request_url,
         repo = input.repository_url,
         branch = branch,
+        parent = parent,
+        parent_branch = parent_branch,
+        message = message,
     )
 }

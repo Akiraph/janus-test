@@ -30,10 +30,16 @@ function ProjectRoute() {
   return <ProjectWorkspace projectId={params.id} />;
 }
 
+function ProjectSessionRoute() {
+  const params = useParams<{ id: string; sessionId: string }>();
+  return <ProjectWorkspace projectId={params.id} sessionId={params.sessionId} />;
+}
+
 export function App() {
   return (
     <Router root={AppShell}>
       <Route path="/" component={ProjectsRoute} />
+      <Route path="/projects/:id/sessions/:sessionId" component={ProjectSessionRoute} />
       <Route path="/projects/:id" component={ProjectRoute} />
       <Route path="/settings" component={ModelsRoute} />
       <Route path="/system" component={SystemRoute} />

@@ -194,8 +194,8 @@ export function SessionConversation(props: SessionConversationProps) {
               }
             >
               <div class="session-message session-message--status" role="status">
-                <span class="session-message__dot" data-tone="warning" data-pulse="true" />
-                <div class="session-message__body" data-tone="warning">
+                <span class="session-message__dot" data-tone="normal" data-pulse="true" />
+                <div class="session-message__body" data-tone="normal">
                   Compacting...
                 </div>
               </div>
@@ -247,6 +247,9 @@ export function SessionConversation(props: SessionConversationProps) {
             <Show when={props.provisionalText}>
               {(text) => <AssistantOutput text={text()} provisional />}
             </Show>
+            <Show when={props.turn}>
+              {(turn) => <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />}
+            </Show>
           </div>
         </Show>
       </div>
@@ -260,14 +263,6 @@ export function SessionConversation(props: SessionConversationProps) {
           }}
           {...(props.onQueuedTurnSteer ? { onSteer: props.onQueuedTurnSteer } : {})}
         />
-      </Show>
-
-      <Show when={props.turn}>
-        {(turn) => (
-          <div class="session-conversation__status-bar">
-            <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />
-          </div>
-        )}
       </Show>
 
       <SessionComposer

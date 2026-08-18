@@ -444,10 +444,56 @@ function AutomationRunCard(props: { run: AutomationRunView }) {
               </a>
             )}
           </Show>
-          <Show when={run().project_id}>
-            {(projectId) => <A href={`/projects/${projectId()}`}>Project {projectId()}</A>}
+          <Show
+            when={(run().repositories ?? []).length > 0}
+            fallback={
+              <>
+                <Show when={run().project_id}>
+                  {(projectId) => <A href={`/projects/${projectId()}`}>Project {projectId()}</A>}
+                </Show>
+                <Show when={run().session_id}>
+                  {(sessionId) => (
+                    <Show when={run().project_id}>
+                      {(projectId) => (
+                        <A href={`/projects/${projectId()}/sessions/${sessionId()}`}>
+                          Session {sessionId()}
+                        </A>
+                      )}
+                    </Show>
+                  )}
+                </Show>
+              </>
+            }
+          >
+            <div class="automation-run__repositories">
+              <For each={run().repositories ?? []}>
+                {(repository) => (
+                  <div class="automation-run__repository">
+                    <a href={repository.repository_url} target="_blank" rel="noreferrer">
+                      {repository.repository_url.replace(/^https?:\/\//, "")}
+                      <ExternalLink size={13} />
+                    </a>
+                    <span class={`automation-status automation-status--${repository.status}`}>
+                      {repository.status}
+                    </span>
+                    <Show when={repository.project_id}>
+                      {(projectId) => <A href={`/projects/${projectId()}`}>Project</A>}
+                    </Show>
+                    <Show when={repository.project_id && repository.session_id}>
+                      <A
+                        href={`/projects/${repository.project_id}/sessions/${repository.session_id}`}
+                      >
+                        Session
+                      </A>
+                    </Show>
+                    <Show when={repository.detail}>
+                      {(detail) => <span class="muted">{detail()}</span>}
+                    </Show>
+                  </div>
+                )}
+              </For>
+            </div>
           </Show>
-          <Show when={run().session_id}>{(sessionId) => <span>Session {sessionId()}</span>}</Show>
         </div>
       </div>
     </article>

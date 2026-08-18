@@ -10,6 +10,7 @@ import "./workspace/workspace.css";
 
 interface ProjectWorkspaceProps {
   projectId: string;
+  sessionId?: string | undefined;
 }
 
 export function ProjectWorkspace(props: ProjectWorkspaceProps) {
@@ -21,6 +22,7 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
   const [sessionCreating, setSessionCreating] = createSignal(false);
   let trackedProjectId: string | undefined;
   let lastMainRevision: string | null | undefined;
+  let openedRouteSession = "";
 
   createEffect(() => {
     const id = projectId();
@@ -29,6 +31,7 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
       setTreeRefresh(0);
       setSessionCreating(false);
       lastMainRevision = undefined;
+      openedRouteSession = "";
     }
     trackedProjectId = id;
   });
@@ -52,6 +55,16 @@ export function ProjectWorkspace(props: ProjectWorkspaceProps) {
 
   const ready = () => project.data?.state === "ready";
   const branch = () => project.data?.current_branch ?? project.data?.repository.branch ?? null;
+
+  createEffect(() => {
+    const projectKey = projectId();
+    const sessionId = props.sessionId?.trim();
+    if (!projectKey || !sessionId || !ready()) return;
+    const routeKey = `${projectKey}:${sessionId}`;
+    if (openedRouteSession === routeKey) return;
+    openedRouteSession = routeKey;
+    workspace.openSession(sessionId);
+  });
 
   return (
     <section class="project-page project-page--ide" aria-labelledby="project-title">

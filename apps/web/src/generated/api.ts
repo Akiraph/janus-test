@@ -1297,12 +1297,22 @@ export interface components {
     };
     /** @enum {string} */
     AuthenticationMode: "passkey" | "development";
+    AutomationRepositoryView: {
+      detail?: string | null;
+      project_id?: string | null;
+      pull_request_url: string;
+      push_status: string;
+      repository_url: string;
+      session_id?: string | null;
+      status: string;
+    };
     AutomationRunView: {
       operation: components["schemas"]["OperationView"];
       project_id?: string | null;
       pull_request_url?: string | null;
       push_enabled: boolean;
       push_status: string;
+      repositories: components["schemas"]["AutomationRepositoryView"][];
       session_id?: string | null;
       source: string;
       workflow: string;
@@ -1748,6 +1758,7 @@ export interface components {
         pull_request_url?: string | null;
         push_enabled: boolean;
         push_status: string;
+        repositories: components["schemas"]["AutomationRepositoryView"][];
         session_id?: string | null;
         source: string;
         workflow: string;
@@ -2961,7 +2972,7 @@ export interface operations {
     };
     requestBody: {
       content: {
-        "text/html": string;
+        "application/json": string;
       };
     };
     responses: {
@@ -2982,6 +2993,14 @@ export interface operations {
         };
       };
       404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      415: {
         headers: {
           [name: string]: unknown;
         };
