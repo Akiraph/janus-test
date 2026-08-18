@@ -90,7 +90,7 @@ test("a browser message completes through live execution", async ({ page }) => {
   // completes. The durable assistant message contains the heading + list item,
   // so "Live fixture reply" is the stable visible signal across both phases.
   await expect(page.locator(".session-message--status")).toContainText(
-    /^(Working \d+[smh]|Reconnecting \(|Worked for \d+[smh])/,
+    /^(Working \(\d+[smh]\)|Reconnecting \(|Worked for \d+[smh])/,
     { timeout: 10_000 },
   );
   await expect(page.getByText("Live fixture reply")).toBeVisible({ timeout: 30_000 });

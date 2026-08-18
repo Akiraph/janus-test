@@ -737,6 +737,101 @@ impl OperationInterface {
         row.map(view_from_row).transpose()
     }
 
+    /// List operations owned by an authenticated caller. The owner is carried
+    /// by the idempotency record, which is already required for public
+    /// operation-producing commands and keeps this read path scoped without
+    /// exposing the operation journal globally.
+    pub async fn list_by_kind_owner(
+        &self,
+        kind: &str,
+        owner_id: &str,
+        limit: i64,
+    ) -> Result<Vec<OperationView>, OperationError> {
+        let limit = limit.clamp(1, 200);
+        let rows = sqlx::query_as::<_, OperationRow>(
+            "SELECT o.id, o.kind, o.status, o.target_kind, o.target_id, o.current_step, \
+                    o.progress_json, o.result_json, o.problem_json, o.correlation_id, \
+                    o.version, o.created_at, o.updated_at \
+             FROM operations o \
+             INNER JOIN idempotency_records i ON i.operation_id = o.id \
+             WHERE o.kind = ? AND i.owner_id = ? \
+             ORDER BY o.created_at DESC, o.id DESC LIMIT ?",
+        )
+        .bind(kind)
+        .bind(owner_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(view_from_row).collect()
+    }
+
+    /// Publish durable workflow progress while fencing the update to the
+    /// current worker lease. This lets clients discover child resources before
+    /// the parent operation reaches a terminal state.
+    pub async fn update_progress_claimed(
+        &self,
+        claim: WorkClaim<'_>,
+        operation_id: &str,
+        current_step: &str,
+        progress: Value,
+        correlation_id: CorrelationId,
+    ) -> Result<bool, OperationError> {
+        let now = now_utc_str();
+        let version = format!("v_{}", OperationId::new());
+        let mut work = self.unit_of_work.begin().await?;
+        let kind: Option<(String,)> = sqlx::query_as(
+            "SELECT kind FROM operations \
+             WHERE id = ? AND status IN ('queued', 'running') \
+               AND EXISTS(SELECT 1 FROM work_items \
+                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
+                            AND lease_expires_at >= ?)",
+        )
+        .bind(operation_id)
+        .bind(claim.id)
+        .bind(claim.nonce)
+        .bind(&now)
+        .fetch_optional(work.connection())
+        .await?;
+        let Some((kind,)) = kind else {
+            work.rollback().await?;
+            return Ok(false);
+        };
+        let changed = sqlx::query(
+            "UPDATE operations SET status = 'running', current_step = ?, \
+                    progress_json = ?, version = ?, updated_at = ? \
+             WHERE id = ? AND status IN ('queued', 'running') \
+               AND EXISTS(SELECT 1 FROM work_items \
+                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
+                            AND lease_expires_at >= ?)",
+        )
+        .bind(current_step)
+        .bind(serde_json::to_string(&progress)?)
+        .bind(&version)
+        .bind(&now)
+        .bind(operation_id)
+        .bind(claim.id)
+        .bind(claim.nonce)
+        .bind(&now)
+        .execute(work.connection())
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            work.rollback().await?;
+            return Ok(false);
+        }
+        self.emit_operation_changed(
+            &mut work,
+            operation_id,
+            &kind,
+            "running",
+            &version,
+            &correlation_id,
+        )
+        .await?;
+        work.commit().await?;
+        Ok(true)
+    }
+
     async fn get_in_tx(
         &self,
         tx: &mut SqliteConnection,

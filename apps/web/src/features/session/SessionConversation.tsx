@@ -104,15 +104,6 @@ export function SessionConversation(props: SessionConversationProps) {
     }
   }
 
-  const hasRenderedTurnStatus = createMemo(() => {
-    const turnId = props.turn?.id;
-    return Boolean(turnId && props.items.some((item) => item.turnStatus?.id === turnId));
-  });
-  const fallbackTurn = createMemo<TurnStatusLike | null>(() => {
-    const turn = props.turn;
-    return turn && !hasRenderedTurnStatus() ? turn : null;
-  });
-
   function isLastItemForTurn(index: number): boolean {
     const current = props.items[index];
     if (!current?.turnStatus) return false;
@@ -187,7 +178,11 @@ export function SessionConversation(props: SessionConversationProps) {
                 <>
                   <ConversationEntry item={item} />
                   <Show when={isLastItemForTurn(index()) && item.turnStatus}>
-                    {(turn) => <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />}
+                    {(turn) => (
+                      <Show when={turn().id !== props.turn?.id}>
+                        <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />
+                      </Show>
+                    )}
                   </Show>
                 </>
               )}
@@ -252,9 +247,6 @@ export function SessionConversation(props: SessionConversationProps) {
             <Show when={props.provisionalText}>
               {(text) => <AssistantOutput text={text()} provisional />}
             </Show>
-            <Show when={fallbackTurn()}>
-              {(turn) => <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />}
-            </Show>
           </div>
         </Show>
       </div>
@@ -268,6 +260,14 @@ export function SessionConversation(props: SessionConversationProps) {
           }}
           {...(props.onQueuedTurnSteer ? { onSteer: props.onQueuedTurnSteer } : {})}
         />
+      </Show>
+
+      <Show when={props.turn}>
+        {(turn) => (
+          <div class="session-conversation__status-bar">
+            <TurnStatusOutput turn={turn()} sessionId={props.sessionId} />
+          </div>
+        )}
       </Show>
 
       <SessionComposer
@@ -348,8 +348,8 @@ interface TurnStatusVisual {
 }
 
 /**
- * The single persistent status row that lives in the conversation stream. It
- * renders turn progress as a dot + label and is the *only* place failure
+ * The single persistent status row that lives below the scrollable conversation
+ * stream. It renders turn progress as a dot + label and is the *only* place failure
  * reasons surface (BUG 3 + BUG 4):
  * - live model retries → `Reconnecting (X): reason` (dot pulses), fed by
  *   `model.attempt_retrying` SSE events via `retryState`, falling back to the
@@ -384,7 +384,7 @@ function turnStatusVisual(turn: TurnStatusLike | null, sessionId: string): TurnS
         };
       }
       const elapsed = formatElapsed(Date.now() - Date.parse(turn.created_at));
-      return { text: `Working ${elapsed}`, tone: "muted", pulse: true };
+      return { text: `Working (${elapsed})`, tone: "muted", pulse: true };
     }
     case "canceling":
       return { text: "Canceling...", tone: "warning", pulse: true };

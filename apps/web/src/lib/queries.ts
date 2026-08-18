@@ -1,5 +1,7 @@
 import { createQuery } from "@tanstack/solid-query";
 import {
+  getAutomationSettings,
+  getAutomationWebhookConfig,
   getBootstrap,
   getMe,
   getNotificationChannels,
@@ -15,6 +17,7 @@ import {
   gitLog,
   gitStatus,
   listAsyncTasks,
+  listAutomations,
   listFileTree,
   listGithubCredentials,
   listProjects,
@@ -91,6 +94,27 @@ export function useGithubCredentials() {
   return createQuery(() => ({
     queryKey: ["github-credentials"],
     queryFn: listGithubCredentials,
+  }));
+}
+
+export function useAutomations() {
+  return createQuery(() => ({
+    queryKey: ["automations"],
+    queryFn: () => listAutomations(),
+  }));
+}
+
+export function useAutomationWebhookConfig() {
+  return createQuery(() => ({
+    queryKey: ["automation-webhook-config"],
+    queryFn: () => getAutomationWebhookConfig(),
+  }));
+}
+
+export function useAutomationSettings() {
+  return createQuery(() => ({
+    queryKey: ["automation-settings"],
+    queryFn: getAutomationSettings,
   }));
 }
 

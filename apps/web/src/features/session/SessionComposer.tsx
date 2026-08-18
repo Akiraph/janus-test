@@ -5,7 +5,7 @@ import Paperclip from "lucide-solid/icons/paperclip";
 import Send from "lucide-solid/icons/send";
 import Square from "lucide-solid/icons/square";
 import X from "lucide-solid/icons/x";
-import { createEffect, createMemo, createSignal, For, Show, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import { Button } from "../../components/ui/Button";
 import { useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
@@ -70,6 +70,29 @@ export function SessionComposer(props: SessionComposerProps) {
   const [uploading, setUploading] = createSignal(false);
   const [compacting, setCompacting] = createSignal(false);
   const [goalMode, setGoalMode] = createSignal(false);
+  const [contextOpen, setContextOpen] = createSignal(false);
+  let contextCloseTimer: number | undefined;
+
+  function cancelContextClose() {
+    if (contextCloseTimer !== undefined) {
+      window.clearTimeout(contextCloseTimer);
+      contextCloseTimer = undefined;
+    }
+  }
+
+  function openContext() {
+    cancelContextClose();
+    setContextOpen(true);
+  }
+
+  function scheduleContextClose() {
+    cancelContextClose();
+    contextCloseTimer = window.setTimeout(() => {
+      contextCloseTimer = undefined;
+      setContextOpen(false);
+    }, 220);
+  }
+  onCleanup(cancelContextClose);
   const [canceling, setCanceling] = createSignal(false);
   let textarea: HTMLTextAreaElement | undefined;
   let fileInput: HTMLInputElement | undefined;
@@ -244,10 +267,6 @@ export function SessionComposer(props: SessionComposerProps) {
     Math.min(100, Math.max(0, Math.round((contextTokens() / contextLimit()) * 100)));
   const contextLabel = () => `${contextPercent()}%`;
 
-  const contextTitle = () => {
-    return `${formatContextTokens(contextTokens())}/${formatContextTokens(contextLimit())} ${contextPercent()}%`;
-  };
-
   const compactStatus = () => props.contextUsage?.compact_status;
   const compactInProgress = () => compactStatus() === "scheduled" || compactStatus() === "running";
   const compactDisabled = () =>
@@ -386,7 +405,7 @@ export function SessionComposer(props: SessionComposerProps) {
             type="button"
             variant={goalMode() ? "outline" : "ghost"}
             size="sm"
-            iconOnly
+            class={`session-composer__goal${goalMode() ? " session-composer__goal--active" : ""}`}
             aria-label={goalMode() ? "Disable goal mode" : "Enable goal mode"}
             aria-pressed={goalMode()}
             title="Goal mode"
@@ -394,39 +413,74 @@ export function SessionComposer(props: SessionComposerProps) {
             onClick={() => setGoalMode((current) => !current)}
           >
             <Flag size={15} />
+            <span>Goal mode</span>
           </Button>
-          <span
-            class="session-composer__context"
-            role="progressbar"
-            aria-label="Context usage"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={contextPercent()}
-            title={contextTitle()}
-            style={`--context-progress: ${contextPercent()}%`}
-          >
-            <span class="session-composer__context-ring" aria-hidden="true">
-              <span>{contextLabel()}</span>
-            </span>
-          </span>
-          <Show when={props.onCompact}>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              iconOnly
-              disabled={compactDisabled()}
-              aria-label={
-                compacting() || compactInProgress() ? "Compacting context" : "Compact context"
+          <div
+            class="session-composer__context-anchor"
+            onPointerEnter={openContext}
+            onPointerLeave={scheduleContextClose}
+            onFocusIn={openContext}
+            onFocusOut={(event) => {
+              const next = event.relatedTarget;
+              if (!(next instanceof Node) || !event.currentTarget.contains(next)) {
+                scheduleContextClose();
               }
-              title="Compact context"
-              onClick={() => void compact()}
+            }}
+          >
+            <span
+              class="session-composer__context"
+              role="progressbar"
+              aria-label="Context usage"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={contextPercent()}
+              aria-describedby="session-context-details"
+              style={`--context-progress: ${contextPercent()}%`}
             >
-              <Show when={compacting() || compactInProgress()} fallback={<Minimize2 size={15} />}>
-                <Loader2 size={15} class="ui-spinner" />
-              </Show>
-            </Button>
-          </Show>
+              <span class="session-composer__context-ring" aria-hidden="true">
+                <span>{contextLabel()}</span>
+              </span>
+            </span>
+            <Show when={contextOpen()}>
+              <div
+                class="session-composer__context-popover"
+                id="session-context-details"
+                role="dialog"
+                onPointerEnter={openContext}
+                onPointerLeave={scheduleContextClose}
+              >
+                <div class="session-composer__context-values">
+                  <strong>Context</strong>
+                  <span>
+                    {formatContextTokens(contextTokens())} / {formatContextTokens(contextLimit())}
+                  </span>
+                  <span>{contextPercent()}%</span>
+                </div>
+                <Show when={props.onCompact}>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={compactDisabled()}
+                    aria-label={
+                      compacting() || compactInProgress() ? "Compacting context" : "Compact context"
+                    }
+                    onClick={() => {
+                      void compact().finally(() => setContextOpen(false));
+                    }}
+                  >
+                    <Show
+                      when={compacting() || compactInProgress()}
+                      fallback={<Minimize2 size={15} />}
+                    >
+                      <Loader2 size={15} class="ui-spinner" />
+                    </Show>
+                    {compacting() || compactInProgress() ? "Compacting" : "Compact"}
+                  </Button>
+                </Show>
+              </div>
+            </Show>
+          </div>
           <span class="session-composer__delivery">
             {props.delivery === "queue" ? "Next turn" : "Send now"}
           </span>

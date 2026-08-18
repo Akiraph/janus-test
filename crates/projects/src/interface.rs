@@ -123,6 +123,9 @@ pub struct CreateGithubCredentialInput {
     pub github_host: String,
     #[serde(default)]
     pub pat: Option<String>,
+    /// Explicit opt-in for use by webhook-driven Automation pushes.
+    #[serde(default)]
+    pub automation_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -132,6 +135,7 @@ pub struct GithubCredentialView {
     pub github_host: String,
     pub pat_is_set: bool,
     pub pat_fingerprint: Option<String>,
+    pub automation_enabled: bool,
     pub version: String,
     pub created_at: String,
     pub updated_at: String,
@@ -161,6 +165,9 @@ pub struct UpdateGithubCredentialInput {
     /// When set, replaces the stored PAT. When omitted, the existing PAT is kept.
     #[serde(default)]
     pub pat: Option<String>,
+    /// When set, changes whether Automation may use this PAT for pushes.
+    #[serde(default)]
+    pub automation_enabled: Option<bool>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -839,7 +846,23 @@ impl ProjectsInterface {
         owner_id: &str,
     ) -> Result<Vec<GithubCredentialView>, ProjectsError> {
         let rows = sqlx::query_as::<_, CredentialRow>(
-            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, version, created_at, updated_at FROM github_credentials WHERE owner_id = ? ORDER BY name",
+            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, version, created_at, updated_at FROM github_credentials WHERE owner_id = ? ORDER BY name",
+        )
+        .bind(owner_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(credential_view).collect()
+    }
+
+    /// List only credentials explicitly allowed to perform Automation pushes.
+    /// Project/private-repository credentials remain outside this selection by
+    /// default, even when they are the owner's only GitHub PAT.
+    pub async fn list_automation_credentials(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<GithubCredentialView>, ProjectsError> {
+        let rows = sqlx::query_as::<_, CredentialRow>(
+            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, version, created_at, updated_at FROM github_credentials WHERE owner_id = ? AND automation_enabled = 1 ORDER BY name",
         )
         .bind(owner_id)
         .fetch_all(&self.pool)
@@ -861,13 +884,14 @@ impl ProjectsInterface {
         let version = format!("v_{}", GithubCredentialId::new());
         let (ciphertext, fingerprint) = self.encrypt_pat(owner_id, &id.to_string(), input.pat)?;
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query("INSERT INTO github_credentials (id, owner_id, name, github_host, pat_ciphertext, pat_fingerprint, probe_summary_json, state, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, 'ready', ?, ?, ?)")
+        sqlx::query("INSERT INTO github_credentials (id, owner_id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, probe_summary_json, state, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'ready', ?, ?, ?)")
             .bind(id.to_string())
             .bind(owner_id)
             .bind(input.name.trim())
             .bind(input.github_host.trim())
             .bind(ciphertext)
             .bind(fingerprint)
+            .bind(input.automation_enabled)
             .bind(&version)
             .bind(&now)
             .bind(&now)
@@ -903,8 +927,8 @@ impl ProjectsInterface {
         }
         let name = "Janus webhook automation";
         let pat_fingerprint = fingerprint(pat);
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM github_credentials \
+        let existing: Option<(String, bool)> = sqlx::query_as(
+            "SELECT id, automation_enabled FROM github_credentials \
              WHERE owner_id = ? AND name = ? AND github_host = ? AND pat_fingerprint = ? \
              ORDER BY updated_at DESC LIMIT 1",
         )
@@ -914,7 +938,11 @@ impl ProjectsInterface {
         .bind(pat_fingerprint)
         .fetch_optional(&self.pool)
         .await?;
-        if let Some((id,)) = existing {
+        if let Some((id, automation_enabled)) = existing {
+            if !automation_enabled {
+                self.set_automation_enabled(owner_id, &id, true, correlation_id)
+                    .await?;
+            }
             return Ok(id);
         }
         Ok(self
@@ -924,11 +952,55 @@ impl ProjectsInterface {
                     name: name.into(),
                     github_host: github_host.trim().into(),
                     pat: Some(pat.into()),
+                    automation_enabled: true,
                 },
                 correlation_id,
             )
             .await?
             .id)
+    }
+
+    async fn set_automation_enabled(
+        &self,
+        owner_id: &str,
+        id: &str,
+        enabled: bool,
+        correlation_id: &str,
+    ) -> Result<(), ProjectsError> {
+        let existing = self.fetch_credential(owner_id, id).await?;
+        if existing.automation_enabled == enabled {
+            return Ok(());
+        }
+        let now = now_utc_str();
+        let version = format!("v_{}", GithubCredentialId::new());
+        let mut work = self.unit_of_work.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE github_credentials SET automation_enabled = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
+        )
+        .bind(enabled)
+        .bind(&version)
+        .bind(&now)
+        .bind(id)
+        .bind(owner_id)
+        .bind(&existing.version)
+        .execute(work.connection())
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            work.rollback().await?;
+            return Err(ProjectsError::CredentialNotFound);
+        }
+        self.append_project_changed_in_tx(
+            &mut work,
+            owner_id,
+            id,
+            "github_credential",
+            "automation_scope_updated",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
+        Ok(())
     }
 
     pub async fn get_credential(
@@ -979,14 +1051,18 @@ impl ProjectsInterface {
                 existing.pat_fingerprint.clone(),
             )
         };
+        let automation_enabled = input
+            .automation_enabled
+            .unwrap_or(existing.automation_enabled);
         let mut work = self.unit_of_work.begin().await?;
         let changed = sqlx::query(
-            "UPDATE github_credentials SET name = ?, github_host = ?, pat_ciphertext = ?, pat_fingerprint = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
+            "UPDATE github_credentials SET name = ?, github_host = ?, pat_ciphertext = ?, pat_fingerprint = ?, automation_enabled = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
         )
         .bind(name)
         .bind(host)
         .bind(ciphertext)
         .bind(fingerprint)
+        .bind(automation_enabled)
         .bind(&new_version)
         .bind(&now)
         .bind(id)
@@ -1130,7 +1206,7 @@ impl ProjectsInterface {
         id: &str,
     ) -> Result<CredentialRow, ProjectsError> {
         sqlx::query_as::<_, CredentialRow>(
-            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, version, created_at, updated_at FROM github_credentials WHERE id = ? AND owner_id = ?",
+            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, version, created_at, updated_at FROM github_credentials WHERE id = ? AND owner_id = ?",
         )
         .bind(id)
         .bind(owner_id)
@@ -1565,6 +1641,7 @@ struct CredentialRow {
     github_host: String,
     pat_ciphertext: Option<Vec<u8>>,
     pat_fingerprint: Option<String>,
+    automation_enabled: bool,
     version: String,
     created_at: String,
     updated_at: String,
@@ -1577,6 +1654,7 @@ fn credential_view(row: CredentialRow) -> Result<GithubCredentialView, ProjectsE
         github_host: row.github_host,
         pat_is_set: row.pat_ciphertext.is_some(),
         pat_fingerprint: row.pat_fingerprint,
+        automation_enabled: row.automation_enabled,
         version: row.version,
         created_at: row.created_at,
         updated_at: row.updated_at,

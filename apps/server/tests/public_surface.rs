@@ -6,6 +6,7 @@ use janus_infrastructure::{
     database::Database,
     events::{EventEnvelope, EventType, NewEvent},
 };
+use janus_projects::interface::{CreateGithubCredentialInput, UpdateGithubCredentialInput};
 use janus_server::{
     AppState,
     config::{Config, RunMode},
@@ -117,6 +118,32 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
     enabled_state.identity().authenticate(None).await?;
     let (enabled_base, enabled_task) = spawn(enabled_state).await?;
 
+    let webhook_config = client
+        .get(format!("{enabled_base}/api/v1/automation/webhook/config"))
+        .send()
+        .await?;
+    assert_eq!(webhook_config.status(), reqwest::StatusCode::OK);
+    let config_body: Value = webhook_config.json().await?;
+    assert_eq!(config_body["data"]["enabled"], true);
+    assert_eq!(config_body["data"]["secret"], Value::Null);
+    let revealed = client
+        .get(format!(
+            "{enabled_base}/api/v1/automation/webhook/config?reveal=true"
+        ))
+        .send()
+        .await?;
+    assert_eq!(revealed.status(), reqwest::StatusCode::OK);
+    let revealed_body: Value = revealed.json().await?;
+    assert_eq!(revealed_body["data"]["secret"], "test-secret");
+
+    let automation_settings = client
+        .get(format!("{enabled_base}/api/v1/automation/settings"))
+        .send()
+        .await?;
+    assert_eq!(automation_settings.status(), reqwest::StatusCode::OK);
+    let settings_body: Value = automation_settings.json().await?;
+    assert_eq!(settings_body["data"]["model_provider_id"], Value::Null);
+
     let unauthorized = client
         .post(format!("{enabled_base}/api/v1/automation/webhook"))
         .header("content-type", "text/html")
@@ -142,6 +169,67 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
     );
 
     enabled_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn github_credentials_require_explicit_automation_opt_in() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let owner_id = "owner-automation-scope";
+    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
+        .bind(owner_id)
+        .bind("Automation scope test")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(state.pool())
+        .await?;
+
+    let created = state
+        .projects()
+        .create_credential(
+            owner_id,
+            CreateGithubCredentialInput {
+                name: "private-repo-pat".into(),
+                github_host: "github.com".into(),
+                pat: Some("ghp-test-project-only".into()),
+                automation_enabled: false,
+            },
+            "credential-create",
+        )
+        .await?;
+    assert!(!created.automation_enabled);
+    assert!(
+        state
+            .projects()
+            .list_automation_credentials(owner_id)
+            .await?
+            .is_empty()
+    );
+
+    let updated = state
+        .projects()
+        .update_credential(
+            owner_id,
+            &created.id,
+            &created.version,
+            UpdateGithubCredentialInput {
+                name: None,
+                github_host: None,
+                pat: None,
+                automation_enabled: Some(true),
+            },
+            "credential-scope-update",
+        )
+        .await?;
+    assert!(updated.automation_enabled);
+    assert_eq!(
+        state
+            .projects()
+            .list_automation_credentials(owner_id)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -251,6 +339,9 @@ fn openapi_contains_every_public_route() {
         "/api/v1/system/info",
         "/api/v1/events",
         "/api/v1/automation/webhook",
+        "/api/v1/automation/webhook/config",
+        "/api/v1/automations",
+        "/api/v1/automation/settings",
         "/api/v1/auth/initialize/options",
         "/api/v1/auth/initialize/complete",
         "/api/v1/auth/logout",

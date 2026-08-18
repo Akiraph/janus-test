@@ -32,6 +32,8 @@ use crate::{
 
 #[derive(Debug, Clone)]
 struct ParsedWebhook {
+    workflow: String,
+    source: String,
     pull_request_url: String,
     repository_url: String,
     branch: Option<String>,
@@ -100,6 +102,8 @@ pub async fn webhook(
         .application()
         .request_pull_request_automation(PullRequestAutomationRequest {
             owner_id: owner_id.clone(),
+            workflow: parsed.workflow.clone(),
+            source: parsed.source.clone(),
             pull_request_url: parsed.pull_request_url,
             repository_url: parsed.repository_url,
             branch: parsed.branch,
@@ -108,7 +112,8 @@ pub async fn webhook(
             github_token: state.config().automation_github_token.clone(),
             actor: serde_json::json!({
                 "kind": "automation",
-                "source": "github_webhook",
+                "source": parsed.source,
+                "workflow": parsed.workflow,
                 "owner_id": owner_id,
             }),
             correlation_id: CorrelationId::new(),
@@ -156,6 +161,16 @@ fn parse_webhook(body: &[u8]) -> Result<ParsedWebhook, String> {
     let source = decode_html_entities(&text_fragments.join("\n"));
     let (pull_request_url, owner, repository, number) = find_pull_request(&source)
         .ok_or_else(|| "payload does not contain a GitHub pull-request URL".to_owned())?;
+    let workflow = json
+        .as_ref()
+        .and_then(|value| first_string_field(value, &["workflow", "automation", "kind"]))
+        .map(|value| normalize_label(&value, "github-pr-repair"))
+        .unwrap_or_else(|| "github-pr-repair".to_owned());
+    let source_name = json
+        .as_ref()
+        .and_then(|value| first_string_field(value, &["source", "trigger", "provider"]))
+        .map(|value| normalize_label(&value, "webhook"))
+        .unwrap_or_else(|| "webhook".to_owned());
     let branch = json
         .as_ref()
         .and_then(|value| {
@@ -174,12 +189,30 @@ fn parse_webhook(body: &[u8]) -> Result<ParsedWebhook, String> {
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     Ok(ParsedWebhook {
+        workflow,
+        source: source_name,
         pull_request_url,
         repository_url: format!("https://github.com/{owner}/{repository}.git"),
         branch,
         project_name,
         github_credential_id,
     })
+}
+
+fn normalize_label(value: &str, fallback: &str) -> String {
+    let value = value
+        .trim()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || *character == '-' || *character == '_'
+        })
+        .take(64)
+        .collect::<String>();
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value
+    }
 }
 
 fn collect_strings(value: &Value, output: &mut Vec<String>) {
@@ -325,7 +358,9 @@ fn webhook_idempotency(
         return request;
     }
     let normalized = format!(
-        "{}\0{}",
+        "{}\0{}\0{}\0{}",
+        parsed.workflow,
+        parsed.source,
         parsed.pull_request_url,
         parsed.branch.as_deref().unwrap_or_default()
     );
@@ -379,9 +414,11 @@ mod tests {
 
     #[test]
     fn accepts_json_email_envelope_and_branch() {
-        let input = br#"{"email_html":"<a href=\"https://github.com/acme/widget/pull/7\">conflict</a>","head_branch":"fix/address"}"#;
+        let input = br#"{"workflow":"fork-sync","source":"happy-tts","email_html":"<a href=\"https://github.com/acme/widget/pull/7\">conflict</a>","head_branch":"fix/address"}"#;
         let parsed = parse_webhook(input).expect("PR URL");
         assert_eq!(parsed.branch.as_deref(), Some("fix/address"));
+        assert_eq!(parsed.workflow, "fork-sync");
+        assert_eq!(parsed.source, "happy-tts");
     }
 
     #[test]

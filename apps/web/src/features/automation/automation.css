@@ -1,0 +1,316 @@
+.automation-settings {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.automation-config-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--accent-strong);
+  border-radius: var(--radius);
+  background: var(--accent);
+}
+
+.automation-config-callout > div {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.automation-config-callout h3,
+.automation-config-callout p {
+  margin: 0;
+}
+
+.automation-config-callout h3 {
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.automation-config-callout p {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.automation-config-link {
+  flex: none;
+  color: var(--accent-strong);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.automation-section {
+  display: grid;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+.automation-section__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.automation-section__heading > div {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.automation-section__heading h3 {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+.automation-section__heading p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.automation-model-setting {
+  display: grid;
+  max-width: 560px;
+  gap: var(--space-1);
+}
+
+.automation-model-setting > span {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.automation-model-setting > small {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.automation-endpoint {
+  flex: none;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--canvas);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.automation-webhook-card {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--canvas);
+}
+
+.automation-webhook-row {
+  display: grid;
+  grid-template-columns: minmax(80px, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.automation-webhook-row > span {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.automation-webhook-row > code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: var(--text-xs);
+}
+
+.automation-webhook-row > strong {
+  color: var(--success);
+  font-size: var(--text-sm);
+}
+
+.automation-webhook-card > small {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.automation-runs,
+.automation-credentials {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.automation-run,
+.automation-credential {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.automation-run__main,
+.automation-credential__copy {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.automation-run__title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.automation-run__title strong,
+.automation-credential__copy strong {
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.automation-run__meta,
+.automation-credential__copy span,
+.automation-credential__copy small {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.automation-run__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.automation-run__links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--accent-strong);
+}
+
+.automation-status,
+.record-chip {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  padding: 2px var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1.2;
+}
+
+.automation-status--succeeded {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.automation-status--failed,
+.automation-status--needs_attention {
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+
+.automation-status--running,
+.automation-status--queued {
+  border-color: var(--warning-border);
+  color: var(--warning);
+}
+
+.automation-credential__copy small {
+  font-family: var(--font-mono);
+}
+
+.automation-credential__copy small.automation-enabled {
+  color: var(--success);
+  font-family: var(--font-sans);
+  font-weight: var(--weight-semibold);
+}
+
+.automation-credential-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--canvas);
+}
+
+.automation-credential-toggle input {
+  margin-top: 2px;
+}
+
+.automation-credential-toggle span {
+  display: grid;
+  gap: 2px;
+}
+
+.automation-credential-toggle strong {
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.automation-credential-toggle small {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+@media (max-width: 640px) {
+  .automation-config-callout {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .automation-section__heading,
+  .automation-run,
+  .automation-credential {
+    flex-direction: column;
+  }
+
+  .automation-section__heading {
+    display: grid;
+  }
+
+  .automation-webhook-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .automation-webhook-row > code {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .automation-webhook-row > .record-actions {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .automation-run .record-actions,
+  .automation-credential .record-actions {
+    align-self: flex-end;
+  }
+}

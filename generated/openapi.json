@@ -430,6 +430,84 @@
         }
       }
     },
+    "/api/v1/automation/settings": {
+      "get": {
+        "tags": [
+          "automations"
+        ],
+        "operationId": "get_automation_settings",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_AutomationSettingsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "automations"
+        ],
+        "operationId": "update_automation_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAutomationSettingsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_AutomationSettingsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/automation/webhook": {
       "post": {
         "tags": [
@@ -488,6 +566,89 @@
             }
           },
           "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/automation/webhook/config": {
+      "get": {
+        "tags": [
+          "automations"
+        ],
+        "operationId": "webhook_config",
+        "parameters": [
+          {
+            "name": "reveal",
+            "in": "query",
+            "description": "Reveal the configured secret to the authenticated owner",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_AutomationWebhookConfigView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/automations": {
+      "get": {
+        "tags": [
+          "automations"
+        ],
+        "operationId": "list_automations",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum number of recent runs",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Vec_AutomationRunView"
+                }
+              }
+            }
+          },
+          "401": {
             "description": "",
             "content": {
               "application/json": {
@@ -4601,6 +4762,99 @@
           "development"
         ]
       },
+      "AutomationRunView": {
+        "type": "object",
+        "required": [
+          "operation",
+          "workflow",
+          "source",
+          "push_enabled",
+          "push_status"
+        ],
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/OperationView"
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pull_request_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "push_enabled": {
+            "type": "boolean"
+          },
+          "push_status": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "type": "string"
+          },
+          "workflow": {
+            "type": "string"
+          }
+        }
+      },
+      "AutomationSettingsView": {
+        "type": "object",
+        "properties": {
+          "model_display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_provider_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_upstream_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "AutomationWebhookConfigView": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "endpoint",
+          "secret_configured"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "secret": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secret_configured": {
+            "type": "boolean"
+          }
+        }
+      },
       "BootstrapData": {
         "type": "object",
         "required": [
@@ -4745,6 +4999,10 @@
           "github_host"
         ],
         "properties": {
+          "automation_enabled": {
+            "type": "boolean",
+            "description": "Explicit opt-in for use by webhook-driven Automation pushes."
+          },
           "github_host": {
             "type": "string"
           },
@@ -4961,6 +5219,70 @@
               },
               "version": {
                 "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_AutomationSettingsView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "properties": {
+              "model_display_name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "model_provider_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "model_upstream_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "DataResponse_AutomationWebhookConfigView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "enabled",
+              "endpoint",
+              "secret_configured"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "endpoint": {
+                "type": "string"
+              },
+              "secret": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "secret_configured": {
+                "type": "boolean"
               }
             }
           }
@@ -5248,11 +5570,15 @@
               "name",
               "github_host",
               "pat_is_set",
+              "automation_enabled",
               "version",
               "created_at",
               "updated_at"
             ],
             "properties": {
+              "automation_enabled": {
+                "type": "boolean"
+              },
               "created_at": {
                 "type": "string"
               },
@@ -6204,6 +6530,62 @@
           }
         }
       },
+      "DataResponse_Vec_AutomationRunView": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "operation",
+                "workflow",
+                "source",
+                "push_enabled",
+                "push_status"
+              ],
+              "properties": {
+                "operation": {
+                  "$ref": "#/components/schemas/OperationView"
+                },
+                "project_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "pull_request_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "push_enabled": {
+                  "type": "boolean"
+                },
+                "push_status": {
+                  "type": "string"
+                },
+                "session_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "source": {
+                  "type": "string"
+                },
+                "workflow": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
       "DataResponse_Vec_FileTreeView": {
         "type": "object",
         "required": [
@@ -6316,11 +6698,15 @@
                 "name",
                 "github_host",
                 "pat_is_set",
+                "automation_enabled",
                 "version",
                 "created_at",
                 "updated_at"
               ],
               "properties": {
+                "automation_enabled": {
+                  "type": "boolean"
+                },
                 "created_at": {
                   "type": "string"
                 },
@@ -7322,11 +7708,15 @@
           "name",
           "github_host",
           "pat_is_set",
+          "automation_enabled",
           "version",
           "created_at",
           "updated_at"
         ],
         "properties": {
+          "automation_enabled": {
+            "type": "boolean"
+          },
           "created_at": {
             "type": "string"
           },
@@ -9087,9 +9477,33 @@
           }
         }
       },
+      "UpdateAutomationSettingsInput": {
+        "type": "object",
+        "properties": {
+          "model_provider_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_upstream_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "UpdateGithubCredentialInput": {
         "type": "object",
         "properties": {
+          "automation_enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "When set, changes whether Automation may use this PAT for pushes."
+          },
           "github_host": {
             "type": [
               "string",

@@ -87,6 +87,7 @@ export function useEventStream() {
         break;
       case "operation":
         queryClient.setQueryData(["operations", id], data);
+        queryClient.invalidateQueries({ queryKey: ["automations"] });
         break;
       case "git_status":
         queryClient.setQueryData(["git-status", id], data);

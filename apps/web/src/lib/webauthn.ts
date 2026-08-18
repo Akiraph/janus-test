@@ -12,15 +12,27 @@ function encode(value: ArrayBuffer): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function normalizePublicKeyOptions(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error("Janus returned invalid WebAuthn options.");
+  const source = isRecord(value.publicKey) ? value.publicKey : value;
+  if (typeof source.challenge !== "string")
+    throw new Error("Janus returned WebAuthn options without a challenge.");
+  return { ...source };
+}
+
 function decodeFields(value: unknown, fields: string[]): Record<string, unknown> {
-  const source = { ...(value as Record<string, unknown>) };
+  const source = isRecord(value) ? { ...value } : {};
   for (const field of fields)
     if (typeof source[field] === "string") source[field] = decode(source[field] as string);
   return source;
 }
 
 export function registrationOptions(value: unknown): PublicKeyCredentialCreationOptions {
-  const source = { ...(value as Record<string, unknown>) };
+  const source = normalizePublicKeyOptions(value);
   source.challenge = decode(source.challenge as string);
   source.user = decodeFields(source.user, ["id"]);
   if (Array.isArray(source.excludeCredentials))
@@ -29,7 +41,7 @@ export function registrationOptions(value: unknown): PublicKeyCredentialCreation
 }
 
 export function authenticationOptions(value: unknown): PublicKeyCredentialRequestOptions {
-  const source = { ...(value as Record<string, unknown>) };
+  const source = normalizePublicKeyOptions(value);
   source.challenge = decode(source.challenge as string);
   if (Array.isArray(source.allowCredentials))
     source.allowCredentials = source.allowCredentials.map((item) => decodeFields(item, ["id"]));

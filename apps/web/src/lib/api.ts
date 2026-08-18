@@ -13,7 +13,12 @@ export type ProjectView = components["schemas"]["ProjectView"];
 export type CreateProjectInput = components["schemas"]["CreateProjectInput"];
 export type RetryProjectInput = components["schemas"]["RetryProjectInput"];
 export type OperationView = components["schemas"]["OperationView"];
+export type AutomationRunView = components["schemas"]["AutomationRunView"];
+export type AutomationWebhookConfigView = components["schemas"]["AutomationWebhookConfigView"];
+export type AutomationSettingsView = components["schemas"]["AutomationSettingsView"];
+export type UpdateAutomationSettingsInput = components["schemas"]["UpdateAutomationSettingsInput"];
 export type GithubCredentialView = components["schemas"]["GithubCredentialView"];
+export type CredentialProbeResult = components["schemas"]["CredentialProbeResult"];
 export type CreateGithubCredentialInput = components["schemas"]["CreateGithubCredentialInput"];
 export type UpdateGithubCredentialInput = components["schemas"]["UpdateGithubCredentialInput"];
 export type FileMetaView = components["schemas"]["FileMetaView"];
@@ -199,6 +204,15 @@ export async function recoveryComplete(
 
 export async function logout(): Promise<void> {
   await requestJson("/api/v1/auth/logout", { method: "POST" }, () => true);
+}
+
+export async function regenerateRecoveryCodes(): Promise<string[]> {
+  const response = await requestJson<{ data: string[] }>(
+    "/api/v1/me/recovery-codes/regenerate",
+    { method: "POST" },
+    isStringArrayResponse,
+  );
+  return response.data;
 }
 export async function getProviders(): Promise<ProviderView[]> {
   return (
@@ -689,6 +703,16 @@ export async function listGithubCredentials(): Promise<GithubCredentialView[]> {
   ).data;
 }
 
+export async function probeGithubCredential(id: string): Promise<CredentialProbeResult> {
+  return (
+    await requestJson<{ data: CredentialProbeResult }>(
+      `/api/v1/github-credentials/${id}/probe`,
+      { method: "POST" },
+      isDataResponse,
+    )
+  ).data;
+}
+
 export async function createGithubCredential(
   input: CreateGithubCredentialInput,
 ): Promise<GithubCredentialView> {
@@ -721,6 +745,52 @@ export async function updateGithubCredential(
 
 export async function deleteGithubCredential(id: string): Promise<void> {
   await requestJson(`/api/v1/github-credentials/${id}`, { method: "DELETE" }, () => true);
+}
+
+export async function listAutomations(limit = 50): Promise<AutomationRunView[]> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return (
+    await requestJson<{ data: AutomationRunView[] }>(
+      `/api/v1/automations?${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getAutomationWebhookConfig(
+  reveal = false,
+): Promise<AutomationWebhookConfigView> {
+  const query = reveal ? "?reveal=true" : "";
+  return (
+    await requestJson<{ data: AutomationWebhookConfigView }>(
+      `/api/v1/automation/webhook/config${query}`,
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function getAutomationSettings(): Promise<AutomationSettingsView> {
+  return (
+    await requestJson<{ data: AutomationSettingsView }>(
+      "/api/v1/automation/settings",
+      { method: "GET" },
+      isDataResponse,
+    )
+  ).data;
+}
+
+export async function updateAutomationSettings(
+  input: UpdateAutomationSettingsInput,
+): Promise<AutomationSettingsView> {
+  return (
+    await requestJson<{ data: AutomationSettingsView }>(
+      "/api/v1/automation/settings",
+      { method: "PATCH", body: JSON.stringify(input) },
+      isDataResponse,
+    )
+  ).data;
 }
 
 export async function listFileTree(projectId: string, path?: string): Promise<FileTreeView[]> {
@@ -1015,5 +1085,13 @@ function isSystemInfoResponse(value: unknown): value is SystemInfoResponse {
     typeof data.mode === "string" &&
     isRecord(data.database) &&
     isRecord(data.events)
+  );
+}
+
+function isStringArrayResponse(value: unknown): value is { data: string[] } {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.data) &&
+    value.data.every((item) => typeof item === "string")
   );
 }

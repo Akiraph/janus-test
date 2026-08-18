@@ -180,6 +180,22 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/automation/settings": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["get_automation_settings"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch: operations["update_automation_settings"];
+    trace?: never;
+  };
   "/api/v1/automation/webhook": {
     parameters: {
       query?: never;
@@ -190,6 +206,38 @@ export interface paths {
     get?: never;
     put?: never;
     post: operations["webhook"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/automation/webhook/config": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["webhook_config"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/automations": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get: operations["list_automations"];
+    put?: never;
+    post?: never;
     delete?: never;
     options?: never;
     head?: never;
@@ -1249,6 +1297,27 @@ export interface components {
     };
     /** @enum {string} */
     AuthenticationMode: "passkey" | "development";
+    AutomationRunView: {
+      operation: components["schemas"]["OperationView"];
+      project_id?: string | null;
+      pull_request_url?: string | null;
+      push_enabled: boolean;
+      push_status: string;
+      session_id?: string | null;
+      source: string;
+      workflow: string;
+    };
+    AutomationSettingsView: {
+      model_display_name?: string | null;
+      model_provider_id?: string | null;
+      model_upstream_id?: string | null;
+    };
+    AutomationWebhookConfigView: {
+      enabled: boolean;
+      endpoint: string;
+      secret?: string | null;
+      secret_configured: boolean;
+    };
     BootstrapData: {
       development_auth: boolean;
       limits: components["schemas"]["PublicLimits"];
@@ -1292,6 +1361,8 @@ export interface components {
       estimated_input_tokens: number;
     };
     CreateGithubCredentialInput: {
+      /** @description Explicit opt-in for use by webhook-driven Automation pushes. */
+      automation_enabled?: boolean;
       github_host: string;
       name: string;
       pat?: string | null;
@@ -1344,6 +1415,21 @@ export interface components {
         name: string;
         session_id: string;
         version: string;
+      };
+    };
+    DataResponse_AutomationSettingsView: {
+      data: {
+        model_display_name?: string | null;
+        model_provider_id?: string | null;
+        model_upstream_id?: string | null;
+      };
+    };
+    DataResponse_AutomationWebhookConfigView: {
+      data: {
+        enabled: boolean;
+        endpoint: string;
+        secret?: string | null;
+        secret_configured: boolean;
       };
     };
     DataResponse_CancelResult: {
@@ -1417,6 +1503,7 @@ export interface components {
     };
     DataResponse_GithubCredentialView: {
       data: {
+        automation_enabled: boolean;
         created_at: string;
         github_host: string;
         id: string;
@@ -1654,6 +1741,18 @@ export interface components {
         version: string;
       }[];
     };
+    DataResponse_Vec_AutomationRunView: {
+      data: {
+        operation: components["schemas"]["OperationView"];
+        project_id?: string | null;
+        pull_request_url?: string | null;
+        push_enabled: boolean;
+        push_status: string;
+        session_id?: string | null;
+        source: string;
+        workflow: string;
+      }[];
+    };
     DataResponse_Vec_FileTreeView: {
       data: {
         kind: string;
@@ -1679,6 +1778,7 @@ export interface components {
     };
     DataResponse_Vec_GithubCredentialView: {
       data: {
+        automation_enabled: boolean;
         created_at: string;
         github_host: string;
         id: string;
@@ -1928,6 +2028,7 @@ export interface components {
       remote: string;
     };
     GithubCredentialView: {
+      automation_enabled: boolean;
       created_at: string;
       github_host: string;
       id: string;
@@ -2433,7 +2534,13 @@ export interface components {
        */
       upload_tokens: number;
     };
+    UpdateAutomationSettingsInput: {
+      model_provider_id?: string | null;
+      model_upstream_id?: string | null;
+    };
     UpdateGithubCredentialInput: {
+      /** @description When set, changes whether Automation may use this PAT for pushes. */
+      automation_enabled?: boolean | null;
       github_host?: string | null;
       name?: string | null;
       /** @description When set, replaces the stored PAT. When omitted, the existing PAT is kept. */
@@ -2779,6 +2886,72 @@ export interface operations {
       };
     };
   };
+  get_automation_settings: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_AutomationSettingsView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  update_automation_settings: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["UpdateAutomationSettingsInput"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_AutomationSettingsView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   webhook: {
     parameters: {
       query?: never;
@@ -2825,6 +2998,66 @@ export interface operations {
         };
       };
       503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  webhook_config: {
+    parameters: {
+      query?: {
+        /** @description Reveal the configured secret to the authenticated owner */
+        reveal?: boolean;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_AutomationWebhookConfigView"];
+        };
+      };
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  list_automations: {
+    parameters: {
+      query?: {
+        /** @description Maximum number of recent runs */
+        limit?: number;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_Vec_AutomationRunView"];
+        };
+      };
+      401: {
         headers: {
           [name: string]: unknown;
         };

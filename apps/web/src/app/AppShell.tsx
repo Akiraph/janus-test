@@ -2,12 +2,13 @@ import { A, useLocation } from "@solidjs/router";
 import ArrowLeft from "lucide-solid/icons/arrow-left";
 import Bell from "lucide-solid/icons/bell";
 import Database from "lucide-solid/icons/database";
+import GitPullRequest from "lucide-solid/icons/git-pull-request";
 import Loader2 from "lucide-solid/icons/loader-2";
 import Server from "lucide-solid/icons/server";
 import Settings from "lucide-solid/icons/settings";
 import ShieldCheck from "lucide-solid/icons/shield-check";
 import type { JSX } from "solid-js";
-import { Show, Suspense } from "solid-js";
+import { Match, Show, Suspense, Switch } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
 import { type TabItem, Tabs } from "../components/ui/Tabs";
 import { LoginView, SetupView } from "../features/auth/AuthViews";
@@ -37,9 +38,63 @@ interface AppShellProps {
 }
 
 export function AppShell(props: AppShellProps) {
-  const location = useLocation();
   const bootstrap = useBootstrap();
+
+  return (
+    <Switch
+      fallback={
+        <main class="route-loading" role="alert">
+          <span>Unable to load Janus deployment state.</span>
+          <button type="button" class="text-button" onClick={() => void bootstrap.refetch()}>
+            Retry
+          </button>
+        </main>
+      }
+    >
+      <Match when={bootstrap.isPending}>
+        <RouteLoading />
+      </Match>
+      <Match
+        when={
+          bootstrap.data?.data.state === "uninitialized" && !bootstrap.data.data.development_auth
+        }
+      >
+        <SetupView />
+      </Match>
+      <Match when={bootstrap.data?.data.development_auth}>
+        <AuthenticatedShell route={() => props.children} />
+      </Match>
+      <Match when={bootstrap.data?.data.state === "initialized"}>
+        <OwnerGate route={() => props.children} />
+      </Match>
+    </Switch>
+  );
+}
+
+interface RoutedShellProps {
+  route: () => JSX.Element | undefined;
+}
+
+function OwnerGate(props: RoutedShellProps) {
   const me = useMe();
+
+  return (
+    <Switch fallback={<RouteLoading />}>
+      <Match when={me.isPending}>
+        <RouteLoading />
+      </Match>
+      <Match when={me.isError}>
+        <LoginView />
+      </Match>
+      <Match when={me.isSuccess}>
+        <AuthenticatedShell route={props.route} />
+      </Match>
+    </Switch>
+  );
+}
+
+function AuthenticatedShell(props: RoutedShellProps) {
+  const location = useLocation();
   // Keep SSE live for project/git/operation invalidation across routes.
   useEventStream();
   const isImmersive = () => location.pathname.startsWith("/projects");
@@ -48,32 +103,19 @@ export function AppShell(props: AppShellProps) {
       location.pathname.startsWith("/system") ||
       location.pathname.startsWith("/models") ||
       location.pathname.startsWith("/security") ||
-      location.pathname === "/notifications") &&
+      location.pathname === "/notifications" ||
+      location.pathname.startsWith("/automation")) &&
     !isImmersive();
   const isModels = () => location.pathname === "/settings" || location.pathname === "/models";
   const isNotifications = () => location.pathname === "/notifications";
-
-  // Bootstrap pending: the Setup/Login/normal decision needs it. We do NOT
-  // return a full-screen splash here as a gate — if bootstrap ever hung (HMR
-  // dirty state, a stalled fetch) it would freeze the whole app and block even
-  // a refresh. Instead, fall through: the Suspense/Lazy layer below paints an
-  // inline route-loading marker while chunks/queries resolve, and mode
-  // selection just re-runs the instant bootstrap lands.
-  if (bootstrap.data?.data.state === "uninitialized" && !bootstrap.data?.data.development_auth)
-    return <SetupView />;
-  if (
-    bootstrap.data?.data.state === "initialized" &&
-    me.isError &&
-    !bootstrap.data?.data.development_auth
-  )
-    return <LoginView />;
+  const isAutomation = () => location.pathname.startsWith("/automation");
 
   return (
     <Show
       when={!isImmersive()}
       fallback={
         <main class="home-route home-route--immersive">
-          <Suspense fallback={<IdeShellScaffold />}>{props.children}</Suspense>
+          <Suspense fallback={<IdeShellScaffold />}>{props.route()}</Suspense>
         </main>
       }
     >
@@ -104,10 +146,14 @@ export function AppShell(props: AppShellProps) {
                   <Bell size={16} />
                   Notifications
                 </A>
+                <A href="/automation" classList={{ active: isAutomation() }}>
+                  <GitPullRequest size={16} />
+                  Automation
+                </A>
               </nav>
               <div class="settings-content">
                 <main class="settings-route">
-                  <Suspense fallback={<RouteLoading />}>{props.children}</Suspense>
+                  <Suspense fallback={<RouteLoading />}>{props.route()}</Suspense>
                 </main>
               </div>
             </div>
@@ -132,6 +178,10 @@ export function AppShell(props: AppShellProps) {
                 />
               </div>
               <div class="topbar-actions">
+                <A class="settings-link" href="/automation">
+                  <GitPullRequest size={16} />
+                  Automation
+                </A>
                 <A class="settings-link" href="/settings">
                   <Settings size={16} />
                   Settings
@@ -140,7 +190,7 @@ export function AppShell(props: AppShellProps) {
             </div>
           </header>
           <main class="home-route">
-            <Suspense fallback={<RouteLoading />}>{props.children}</Suspense>
+            <Suspense fallback={<RouteLoading />}>{props.route()}</Suspense>
           </main>
         </div>
       </Show>

@@ -2,9 +2,10 @@ import { useQueryClient } from "@tanstack/solid-query";
 import KeyRound from "lucide-solid/icons/key-round";
 import LogOut from "lucide-solid/icons/log-out";
 import RefreshCw from "lucide-solid/icons/refresh-cw";
+import { createSignal, For, Show } from "solid-js";
 import { Button } from "../../components/ui/Button";
 import { useNotifications } from "../../components/ui/notifications";
-import { logout } from "../../lib/api";
+import { getErrorMessage, logout, regenerateRecoveryCodes } from "../../lib/api";
 import { useMe } from "../../lib/queries";
 import "./security.css";
 
@@ -12,11 +13,25 @@ export function SecuritySettings() {
   const me = useMe();
   const client = useQueryClient();
   const notify = useNotifications().notify;
+  const [codes, setCodes] = createSignal<string[]>([]);
+  const [generating, setGenerating] = createSignal(false);
 
   async function signOut() {
     await logout();
     notify("Signed out", { variant: "success" });
     await client.invalidateQueries({ queryKey: ["me"] });
+  }
+
+  async function generateRecoveryCodes() {
+    setGenerating(true);
+    try {
+      setCodes(await regenerateRecoveryCodes());
+      notify("New recovery codes generated. Save them now.", { variant: "success", duration: 0 });
+    } catch (error) {
+      notify(getErrorMessage(error, "Recovery code regeneration failed."), { variant: "danger" });
+    } finally {
+      setGenerating(false);
+    }
   }
 
   return (
@@ -55,15 +70,30 @@ export function SecuritySettings() {
           </div>
           <Button
             variant="outline"
-            onClick={() =>
-              notify("Recovery code regeneration is available from the authenticated API.", {
-                variant: "info",
-              })
-            }
+            disabled={generating()}
+            onClick={() => void generateRecoveryCodes()}
           >
-            Manage
+            {generating() ? "Generating..." : "Generate new set"}
           </Button>
         </div>
+        <Show when={codes().length > 0}>
+          <div class="security-recovery-codes" role="status">
+            <strong>Save these codes now</strong>
+            <span>Each code works once. Generating another set revokes this set.</span>
+            <ol>
+              <For each={codes()}>
+                {(code) => (
+                  <li>
+                    <code>{code}</code>
+                  </li>
+                )}
+              </For>
+            </ol>
+            <Button variant="outline" onClick={() => setCodes([])}>
+              Hide codes
+            </Button>
+          </div>
+        </Show>
 
         <div class="account-row">
           <div class="account-label-with-icon">

@@ -1,5 +1,6 @@
 mod async_tasks;
 mod auth;
+mod automations;
 mod conditions;
 pub mod dto;
 mod git;
@@ -34,6 +35,8 @@ pub use problem::Problem;
         handlers::system_info,
         sse::events
         , webhooks::webhook
+        , automations::list_automations, automations::webhook_config,
+        automations::get_automation_settings, automations::update_automation_settings
         , auth::initialize_options, auth::initialize_complete, auth::login_options,
         auth::login_complete, auth::me, auth::logout, auth::passkeys, auth::passkey_options,
         auth::passkey_complete, auth::rename_passkey, auth::revoke_passkey,
@@ -113,6 +116,10 @@ pub use problem::Problem;
         janus_source_control::interface::ResolveGitUpdateConflictPath,
         janus_infrastructure::operations::OperationView,
         janus_infrastructure::operations::OperationStatus,
+        crate::application::automation::AutomationRunView,
+        automations::AutomationWebhookConfigView,
+        crate::application::automation::AutomationSettingsView,
+        crate::application::automation::UpdateAutomationSettingsInput,
         janus_workspace::interface::RevisionRef,
         projects::UpdateProjectRequest,
         git::GitStatusView,
@@ -172,6 +179,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/system/info", get(handlers::system_info))
         .route("/api/v1/events", get(sse::events))
         .route("/api/v1/automation/webhook", post(webhooks::webhook))
+        .route(
+            "/api/v1/automation/webhook/config",
+            get(automations::webhook_config),
+        )
+        .route("/api/v1/automations", get(automations::list_automations))
+        .route(
+            "/api/v1/automation/settings",
+            get(automations::get_automation_settings)
+                .patch(automations::update_automation_settings),
+        )
         .route("/api/v1/async-tasks", get(async_tasks::list_async_tasks))
         .route(
             "/api/v1/async-tasks/{id}/log",
