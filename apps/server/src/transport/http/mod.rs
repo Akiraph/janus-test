@@ -1,3 +1,4 @@
+mod assets;
 mod async_tasks;
 mod auth;
 mod automations;
@@ -172,7 +173,8 @@ pub use problem::Problem;
 pub struct ApiDoc;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let serves_web_client = state.config().web_dist.is_some();
+    let router = Router::new()
         .route("/health/live", get(handlers::live))
         .route("/health/ready", get(handlers::ready))
         .route("/api/v1/bootstrap", get(handlers::bootstrap))
@@ -408,7 +410,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/terminals/{id}/connect",
             get(terminal::connect_terminal),
-        )
+        );
+    let router = if serves_web_client {
+        router.fallback(assets::spa)
+    } else {
+        router
+    };
+    router
         .layer(middleware::from_fn(request_id::middleware))
         .with_state(state)
 }

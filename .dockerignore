@@ -1,0 +1,14 @@
+.git
+.github
+target
+apps/web/node_modules
+apps/web/dist
+apps/web/playwright-report
+apps/web/test-results
+.janus-dev
+docs
+scripts/node_modules
+*.db
+*.db-shm
+*.db-wal
+*.log

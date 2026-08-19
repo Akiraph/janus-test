@@ -1,57 +1,179 @@
-name: CI
+name: Docker
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main, master]
+    paths-ignore:
+      - ".github/**"
+  push:
+    branches: [main, master, dev]
+    paths-ignore:
+      - ".github/**"
+  workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  quality:
-    name: Quality
+  verify:
+    name: Docker Build Verification
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.97.0"
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: "1.3.14"
-      - name: Install web dependencies
-        run: bun install --cwd apps/web --frozen-lockfile
-      - name: Configure git identity for tests
-        run: |
-          git config --global user.email "janus-ci@example.invalid"
-          git config --global user.name "Janus CI"
-      - name: Quality checks
-        run: cargo xtask check
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-  release:
-    name: Release build
-    needs: quality
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image for verification
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          BUILDKIT_MEM_LIMIT: 13g
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          tags: janus:pr-check
+          no-cache: true
+
+      - name: Verify build success
+        run: |
+          echo "Docker image build completed successfully."
+          echo "Platform: linux/amd64"
+
+  publish-amd64:
+    name: Publish Docker (amd64)
+    if: >
+      github.event_name != 'pull_request' &&
+      (
+        github.actor == 'SynapticArch' ||
+        github.actor == 'actions-user' ||
+        github.actor == 'Chloemlla'
+      ) &&
+      !contains(github.event.head_commit.message || '', 'deps):')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Compute metadata
+        id: meta
+        run: |
+          # Registry paths must be lowercase; GITHUB_REPOSITORY keeps the owner's casing.
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ref_tag=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare tags
+        id: tags
+        run: |
+          TAGS=$(cat <<EOF
+          ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.ref_tag }}-amd64
+          ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}-amd64
+          EOF
+          )
+
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Login to GitHub Packages
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
-          toolchain: "1.97.0"
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare buildx cache dirs
+        run: |
+          mkdir -p /tmp/.buildx-cache
+          mkdir -p /tmp/.buildx-cache-new
+
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          BUILDKIT_MEM_LIMIT: 13g
         with:
-          bun-version: "1.3.14"
-      - name: Install web dependencies
-        run: bun install --cwd apps/web --frozen-lockfile
-      - name: Release build
-        run: cargo xtask build
-      - name: Upload server binary
-        uses: actions/upload-artifact@v4
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+          cache-from: |
+            type=local,src=/tmp/.buildx-cache
+            type=gha
+            type=registry,ref=${{ steps.meta.outputs.image }}:cache
+          cache-to: |
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+            type=gha,mode=max
+            type=registry,ref=${{ steps.meta.outputs.image }}:cache,mode=max
+          tags: ${{ steps.tags.outputs.tags }}
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  deploy-amd64:
+    name: Deploy AMD64 image
+    needs: publish-amd64
+    if: >
+      github.event_name != 'pull_request' &&
+      (
+        github.actor == 'SynapticArch' ||
+        github.actor == 'actions-user' ||
+        github.actor == 'Chloemlla'
+      ) &&
+      needs['publish-amd64'].result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          name: janus-server
-          path: target/release/janus-server
-          if-no-files-found: error
+          node-version: 22
+
+      - name: Install deployment dependencies
+        run: npm install --prefix scripts --ignore-scripts --no-audit --fund=false
+
+      - name: Set script permissions
+        run: chmod +x scripts/deploy_image.js
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Run deployment script
+        env:
+          SERVER_ADDRESS: ${{ secrets.SERVER_ADDRESS }}
+          USERNAME: ${{ secrets.USERNAME }}
+          PORT: ${{ secrets.PORT }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          CONTAINER_NAMES: ${{ secrets.CONTAINER_NAMES }}
+          IMAGE_URL: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}-amd64
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: node scripts/deploy_image.js

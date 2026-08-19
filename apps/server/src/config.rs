@@ -21,6 +21,11 @@ impl RunMode {
 pub struct Config {
     pub bind: SocketAddr,
     pub data_root: PathBuf,
+    /// Directory holding the built web client. When set, the HTTP transport
+    /// serves it from the same origin as `/api` and `/health`, which is how the
+    /// deployment image ships frontend and backend as one process. Unset in
+    /// development, where Vite serves the client and proxies the API.
+    pub web_dist: Option<PathBuf>,
     pub mode: RunMode,
     pub development_auth: bool,
     pub webauthn_rp_name: String,
@@ -96,6 +101,9 @@ impl Config {
         let config = Self {
             bind,
             data_root,
+            web_dist: env::var_os("JANUS_WEB_DIST")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty()),
             mode,
             development_auth,
             webauthn_rp_name: env::var("JANUS_WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Janus".into()),
@@ -163,6 +171,7 @@ mod tests {
         let config = Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             data_root: PathBuf::from("unused"),
+            web_dist: None,
             mode: RunMode::Production,
             development_auth: true,
             webauthn_rp_name: "Janus".into(),

@@ -13,6 +13,7 @@ fn test_config(data_root: PathBuf) -> Config {
     Config {
         bind: SocketAddr::from(([127, 0, 0, 1], 0)),
         data_root,
+        web_dist: None,
         mode: RunMode::Development,
         development_auth: true,
         webauthn_rp_name: "Janus Test".into(),

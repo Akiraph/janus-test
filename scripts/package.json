@@ -1,0 +1,11 @@
+{
+  "name": "janus-deploy-scripts",
+  "private": true,
+  "description": "Deployment helper for the GHCR image; installed only by the deploy CI job.",
+  "dependencies": {
+    "axios": "1.19.0",
+    "dotenv": "17.4.2",
+    "form-data": "4.0.6",
+    "ssh2": "1.17.0"
+  }
+}

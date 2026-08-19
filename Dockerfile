@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1
+
+# Single deployment image: the Rust control plane serves the built web client
+# from the same origin as /api and /health, so one container starts frontend
+# and backend together as one process.
+
+# ============================================
+# Stage 1: Web client build
+# ============================================
+FROM oven/bun:1.3.14 AS web-builder
+
+WORKDIR /app/apps/web
+
+# Dependency manifests first so image rebuilds skip the install on source-only
+# changes.
+COPY apps/web/package.json apps/web/bun.lock ./
+RUN bun install --frozen-lockfile
+
+COPY apps/web/ ./
+
+# src/generated/api.ts is committed, so the bundle builds without the Rust
+# OpenAPI generation chain.
+RUN bun run build
+
+# ============================================
+# Stage 2: Server build
+# ============================================
+FROM rust:1.97.0-bookworm AS server-builder
+
+# ring and the bundled SQLite compile C sources; pkg-config keeps -sys crates
+# able to probe the sysroot.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Every workspace member must be present for cargo to resolve the workspace.
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY apps/server/ apps/server/
+COPY crates/ crates/
+COPY tools/ tools/
+
+RUN cargo build --release -p janus-server
+
+# ============================================
+# Stage 3: Runtime
+# ============================================
+FROM debian:bookworm-slim
+
+# git backs the source-control adapter; tini reaps the session and terminal
+# processes Janus spawns.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# JANUS_DEV_AUTH must be off because the listener is not loopback. Real
+# deployments additionally set JANUS_MODE=production and an https
+# JANUS_PUBLIC_ORIGIN pointing at the public hostname.
+ENV JANUS_BIND=0.0.0.0:4317 \
+    JANUS_DEV_AUTH=false \
+    JANUS_DATA_ROOT=/data \
+    JANUS_WEB_DIST=/app/web
+
+WORKDIR /app
+
+COPY --from=server-builder /app/target/release/janus-server /usr/local/bin/janus-server
+COPY --from=web-builder /app/apps/web/dist /app/web
+
+RUN useradd --system --create-home --home-dir /home/janus --shell /usr/sbin/nologin janus \
+    && mkdir -p /data \
+    && chown -R janus:janus /app /data
+
+USER janus
+
+VOLUME ["/data"]
+
+EXPOSE 4317
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["janus-server"]

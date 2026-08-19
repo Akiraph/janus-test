@@ -4,6 +4,8 @@
 /apps/web/playwright-report/
 /apps/web/test-results/
 /.janus-dev/
+/scripts/node_modules/
+/scripts/.deploy_image.lock
 *.db
 *.db-shm
 *.db-wal
