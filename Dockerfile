@@ -65,6 +65,10 @@ ENV JANUS_BIND=0.0.0.0:4317 \
 WORKDIR /app
 
 COPY --from=server-builder /app/target/release/janus-server /usr/local/bin/janus-server
+# janus-admin issues the initialization and recovery tokens. It opens the data
+# root exclusively, so it runs as a one-off container against the same volume
+# while the server container is stopped.
+COPY --from=server-builder /app/target/release/janus-admin /usr/local/bin/janus-admin
 COPY --from=web-builder /app/apps/web/dist /app/web
 
 RUN useradd --system --create-home --home-dir /home/janus --shell /usr/sbin/nologin janus \
