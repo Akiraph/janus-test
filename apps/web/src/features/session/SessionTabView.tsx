@@ -7,6 +7,7 @@ import {
   compactSession,
   deleteSessionAttachment,
   getErrorMessage,
+  getSessionTimeline,
   postSessionMessage,
   type QueuedTurnItem,
   type SessionModelPreference,
@@ -30,6 +31,7 @@ import {
   useSession,
   useSessionContext,
   useSessionTimeline,
+  useSessionTimelineHistory,
   useTurn,
 } from "../../lib/queries";
 import { visibleTurnData } from "../../lib/queryPolicy";
@@ -61,6 +63,7 @@ export function SessionTabView(props: SessionTabViewProps) {
   const session = useSession(props.sessionId, queriesEnabled);
   const bootstrap = useBootstrap();
   const timeline = useSessionTimeline(props.sessionId, queriesEnabled);
+  const timelineHistory = useSessionTimelineHistory(props.sessionId, queriesEnabled);
   const context = useSessionContext(props.sessionId, queriesEnabled);
   const tasks = useAsyncTasks(queriesEnabled);
   const providers = useProviders();
@@ -89,6 +92,58 @@ export function SessionTabView(props: SessionTabViewProps) {
     if (!page || page.items.some((item) => item.session_id !== sessionId)) return undefined;
     return page;
   });
+  // Older pages fetched while scrolling up. Merged in front of the newest
+  // window (dedup by item id, newest-window wins on conflict) so the
+  // conversation renders one continuous document.
+  const [loadingOlder, setLoadingOlder] = createSignal(false);
+  const timelineWithHistory = createMemo(() => {
+    const page = timelineForSession();
+    const history = timelineHistory.data;
+    if (!page) return undefined;
+    if (!history || history.items.length === 0) return page;
+    const newestIds = new Set(page.items.map((item) => item.id));
+    const olderItems = history.items.filter((item) => !newestIds.has(item.id));
+    const merged: TimelinePage = {
+      ...page,
+      items: [...olderItems, ...page.items],
+      has_older: history.has_older,
+    };
+    if (history.oldest_cursor != null) merged.oldest_cursor = history.oldest_cursor;
+    return merged;
+  });
+  const timelineHasOlder = createMemo(() => Boolean(timelineWithHistory()?.has_older));
+  async function loadOlderTimeline() {
+    const sessionId = props.sessionId();
+    const page = timelineWithHistory();
+    if (!sessionId || loadingOlder()) return;
+    // Cursor to fetch before: the oldest item we currently hold.
+    const oldest = page?.items[0]?.id;
+    if (!oldest) return;
+    setLoadingOlder(true);
+    try {
+      const older = await getSessionTimeline(sessionId, { before: oldest, limit: 100 });
+      queryClient.setQueryData<TimelinePage | null>(
+        ["session-timeline-history", sessionId],
+        (current) => {
+          const existing = current?.items ?? [];
+          const existingIds = new Set(existing.map((item) => item.id));
+          const merged = [...existing];
+          for (const item of older.items) {
+            if (!existingIds.has(item.id)) merged.push(item);
+          }
+          return {
+            items: merged,
+            has_older: older.has_older,
+            has_newer: false,
+            oldest_cursor: older.oldest_cursor ?? null,
+            newest_cursor: current?.newest_cursor ?? null,
+          };
+        },
+      );
+    } finally {
+      setLoadingOlder(false);
+    }
+  }
 
   // A tab can be reused for another Session. Local optimistic state belongs
   // to the old Session and must never select its Turn or message in the new
@@ -104,11 +159,13 @@ export function SessionTabView(props: SessionTabViewProps) {
     setAcceptedTurn(null);
     setVisibleTurnId(undefined);
     setTimelineSnapshot(null);
+    // Old session's older pages must never bleed into the new one.
+    queryClient.setQueryData<TimelinePage | null>(["session-timeline-history", sessionId], null);
   });
 
   createEffect(() => {
     const sessionId = props.sessionId();
-    const page = timelineForSession();
+    const page = timelineWithHistory();
     const snapshot = timelineSnapshot();
     if (snapshot?.sessionId !== sessionId) {
       if (page) setTimelineSnapshot({ sessionId, page });
@@ -118,7 +175,7 @@ export function SessionTabView(props: SessionTabViewProps) {
   });
   const visibleTimelinePage = createMemo(() => {
     const sessionId = props.sessionId();
-    const page = timelineForSession();
+    const page = timelineWithHistory();
     const snapshot = timelineSnapshot();
     if (snapshot?.sessionId !== sessionId) return page;
     if (
@@ -395,8 +452,11 @@ export function SessionTabView(props: SessionTabViewProps) {
         setAcceptedVersion(result.session_version);
         setAcceptedTurn({ id: result.turn_id, route: result.route });
         setPendingTurnId(result.turn_id);
-        setPendingUserMessage({ turnId: result.turn_id, text: content });
+        // The provisional user bubble is only for turns that started running
+        // immediately. A queued turn has no live bubble — it renders in
+        // QueuedMessagesBar until it is consumed (or cancelled).
         if (result.route === "started") {
+          setPendingUserMessage({ turnId: result.turn_id, text: content });
           setVisibleTurnId(result.turn_id);
         }
       }
@@ -469,6 +529,9 @@ export function SessionTabView(props: SessionTabViewProps) {
           delivery={active() ? "queue" : "send"}
           composerDisabled={!canMessage()}
           composerSettingsDisabled={!props.creating() && !session.data}
+          hasOlder={timelineHasOlder()}
+          loadingOlder={loadingOlder()}
+          onLoadOlder={loadOlderTimeline}
           onCancel={active() ? handleCancel : undefined}
           queuedTurns={queuedTurns.data ?? []}
           onQueuedTurnCancel={handleQueuedTurnCancel}

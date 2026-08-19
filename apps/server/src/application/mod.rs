@@ -24,7 +24,7 @@ use serde_json::json;
 
 pub(crate) mod async_tasks;
 pub(crate) mod automation;
-pub(crate) mod context;
+pub mod context;
 pub(crate) mod execution;
 pub mod lifecycle;
 pub mod notification_worker;

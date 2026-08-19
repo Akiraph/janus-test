@@ -15,8 +15,8 @@ use janus_infrastructure::{
     unit_of_work::UnitOfWork,
 };
 use janus_models::interface::{
-    ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest, ModelStreamEvent,
-    ModelsInterface, StreamChannel, ToolSpec,
+    AttemptType, ChatMessage, ChatRole, CompletedToolCall, ContentPart, ModelRequest,
+    ModelStreamEvent, ModelsInterface, StreamChannel, ToolSpec,
 };
 use janus_projects::interface::ProjectsInterface;
 use janus_sessions::interface::{

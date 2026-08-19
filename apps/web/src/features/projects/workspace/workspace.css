@@ -495,7 +495,7 @@
 @media (max-width: 900px) {
   .project-page--ide {
     height: auto;
-    min-height: calc(100vh - 74px);
+    min-height: calc(100dvh - 74px);
     border-right: 0;
     border-left: 0;
     border-radius: 0;
@@ -503,7 +503,7 @@
 
   .ide-shell.ide-shell--compact {
     grid-template-rows: minmax(0, 1fr);
-    min-height: 70vh;
+    min-height: 70dvh;
   }
 
   .ide-shell.ide-shell--compact:not(.ide-shell--sidebar-collapsed) {

@@ -238,6 +238,21 @@ impl Application {
             )
             .await?;
 
+        // First message names the session. Sessions are created with a
+        // placeholder title ("New session") and nothing else ever set it, so
+        // the list showed the placeholder forever. Derive the title from this
+        // first user message in the same transaction: the appended
+        // SessionChanged event re-projects the row, so the UI renames live.
+        Self::maybe_derive_session_title_in_tx(
+            work,
+            session_id,
+            &created.turn_id,
+            content,
+            &actor,
+            now,
+        )
+        .await?;
+
         match route {
             MessageRoute::Started => {
                 let activated = self
@@ -275,6 +290,59 @@ impl Application {
             turn_id: created.turn_id.clone(),
             session_version: command.session_version.clone(),
         })
+    }
+
+    /// Set the session title from its first user message if the title is
+    /// still the creation placeholder. Best-effort and cheap: one UPDATE
+    /// guarded by "no user turns yet", so second and later messages never
+    /// rewrite a name the user may have set manually.
+    async fn maybe_derive_session_title_in_tx(
+        work: &mut UnitOfWorkTransaction<'_>,
+        session_id: SessionId,
+        created_turn_id: &str,
+        content: &str,
+        actor: &serde_json::Value,
+        now: &str,
+    ) -> Result<(), SessionsError> {
+        const PLACEHOLDER: &str = "New session";
+        const MAX_TITLE_CHARS: usize = 80;
+        let derived = derive_session_title(content, MAX_TITLE_CHARS);
+        if derived.is_empty() {
+            return Ok(());
+        }
+        let changed = sqlx::query(
+            "UPDATE sessions SET title = ?, updated_at = ? \
+             WHERE id = ? AND title = ? AND NOT EXISTS \
+             (SELECT 1 FROM turns WHERE turns.session_id = sessions.id AND turns.id != ?)",
+        )
+        .bind(&derived)
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(PLACEHOLDER)
+        // The turn carrying this very message was inserted a moment ago;
+        // exclude it so "first turn" means "no earlier turn exists".
+        .bind(created_turn_id)
+        .execute(work.connection())
+        .await
+        .map_err(SessionsError::from)?;
+        if changed.rows_affected() != 1 {
+            return Ok(());
+        }
+        work.append_event(NewEvent {
+            event_type: EventType::SessionChanged,
+            actor: actor.clone(),
+            resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+            correlation_id: CorrelationId::new().to_string(),
+            causation_id: None,
+            payload: json!({
+                "session_id": session_id.to_string(),
+                "state": "titled",
+                "detail": "first message",
+            }),
+        })
+        .await
+        .map_err(SessionsError::Internal)?;
+        Ok(())
     }
 
     pub(crate) fn message_accepted_events(
@@ -586,5 +654,87 @@ impl Application {
             to_status: turn.status,
             session_version: session.version,
         })
+    }
+}
+
+/// Collapse a user message into a session title: take the first line, trim
+/// decoration (common markdown headings and surrounding quotes), collapse
+/// runs of whitespace, and cap the length on a word boundary.
+fn derive_session_title(content: &str, max_chars: usize) -> String {
+    let first_line = content.lines().next().unwrap_or("").trim();
+    let stripped = first_line
+        .trim_start_matches('#')
+        .trim_matches(|c: char| c == '"' || c == '`')
+        .trim();
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for ch in stripped.chars() {
+        if ch.is_whitespace() {
+            if !normalized.is_empty() {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.push(ch);
+    }
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    // Cut on a word boundary and mark the truncation.
+    let mut cut = max_chars;
+    while cut > 0 && !normalized.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut truncated = normalized[..cut].trim_end().to_owned();
+    truncated.push('…');
+    truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_session_title;
+
+    #[test]
+    fn first_line_becomes_the_title() {
+        assert_eq!(derive_session_title("Fix the login bug", 80), "Fix the login bug");
+    }
+
+    #[test]
+    fn later_lines_are_dropped() {
+        assert_eq!(
+            derive_session_title("Summarize this\n\nand that", 80),
+            "Summarize this"
+        );
+    }
+
+    #[test]
+    fn whitespace_runs_collapse() {
+        assert_eq!(derive_session_title("  hello   world  ", 80), "hello world");
+    }
+
+    #[test]
+    fn markdown_heading_is_stripped() {
+        assert_eq!(derive_session_title("## Ship the release", 80), "Ship the release");
+    }
+
+    #[test]
+    fn surrounding_quotes_are_stripped() {
+        assert_eq!(derive_session_title("\"Ship the release\"", 80), "Ship the release");
+    }
+
+    #[test]
+    fn long_input_is_truncated_on_a_word_boundary() {
+        let title = derive_session_title(&"word ".repeat(40), 20);
+        assert!(title.chars().count() <= 21, "got {title}");
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn blank_input_yields_no_title() {
+        assert_eq!(derive_session_title("   \n\t", 80), "");
     }
 }

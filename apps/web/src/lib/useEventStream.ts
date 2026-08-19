@@ -11,6 +11,25 @@ interface StateFrame {
   cursor?: string | null;
 }
 
+/**
+ * Query keys that the SSE snapshot does NOT cover. Any snapshot after the
+ * first means events may have been missed for these, so they are invalidated
+ * to force an authoritative refetch. Kept as data so tests can pin coverage.
+ */
+export const SESSION_SCOPED_QUERY_KEYS: ReadonlyArray<readonly unknown[]> = [
+  ["session"],
+  ["session-timeline"],
+  ["session-timeline-history"],
+  ["session-context"],
+  ["turn"],
+  ["queued-turns"],
+  ["sessions"],
+  ["git-status"],
+  ["git-log"],
+  ["async-tasks"],
+  ["operations"],
+] as const;
+
 /** Return whether a frame belongs at or after the last applied event cursor. */
 export function shouldApplyCursor(
   lastCursor: number | null,
@@ -35,6 +54,12 @@ export function useEventStream() {
   );
   let source: EventSource | undefined;
   let lastCursor: number | null = null;
+  // Only the very first snapshot after page load may skip invalidation: at
+  // that point nothing stale can be cached yet. Every later snapshot (manual
+  // reconnect, browser auto-reconnect, or the server's Lagged self-heal
+  // frame) implies events may have been missed, so the session-scoped
+  // queries must refetch.
+  let sawSnapshot = false;
 
   const handleState = (frame: StateFrame, eventCursor?: string | null) => {
     const cursorValue = frame.cursor ?? eventCursor;
@@ -120,10 +145,26 @@ export function useEventStream() {
   // Apply the server snapshot. Each field maps to the same query key the GET
   // endpoints use, so a connect/reconnect converges without invalidating
   // anything (invalidation would refetch and flash stale UI).
+  // The snapshot only covers bootstrap/system_info/projects/providers. On a
+  // reconnect (not the first connect) any session-scoped state that changed
+  // while the stream was down is missing from both the snapshot and the
+  // event replay (the cursor skips it), so those queries are invalidated to
+  // force a refetch of the authoritative rows.
+  const invalidateSessionScopedQueries = () => {
+    for (const queryKey of SESSION_SCOPED_QUERY_KEYS) {
+      queryClient.invalidateQueries({ queryKey: [...queryKey] });
+    }
+  };
+
   const handleSnapshot = (frame: Record<string, unknown>, eventCursor?: string | null) => {
     if (!shouldApplyCursor(lastCursor, eventCursor)) return;
     const cursor = numericCursor(eventCursor);
     if (cursor !== null) lastCursor = Math.max(lastCursor ?? cursor, cursor);
+    const isFirstSnapshot = !sawSnapshot;
+    sawSnapshot = true;
+    if (!isFirstSnapshot) {
+      invalidateSessionScopedQueries();
+    }
     for (const [kind, data] of Object.entries(frame)) {
       if (data === null || data === undefined) continue;
       switch (kind) {
@@ -156,9 +197,10 @@ export function useEventStream() {
 
     nextSource.addEventListener("open", () => {
       setState("live");
-      // No invalidateQueries here: the server replays missed projections from
-      // the browser's Last-Event-ID and sends a fresh snapshot, which converge
-      // the cache without refetching.
+      // No invalidateQueries here: the server replays missed projections
+      // from the browser's Last-Event-ID and sends a fresh snapshot. The
+      // snapshot handler invalidates the session-scoped queries the snapshot
+      // does not cover, except on the very first connect.
     });
 
     nextSource.addEventListener("state", (event) => {

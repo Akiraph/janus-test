@@ -22,6 +22,16 @@ pub use super::stream_types::{
     StreamChannel, TokenUsage, ToolCallDelta, ToolSpec,
 };
 
+pub(crate) struct AttemptRunningRecord<'a> {
+    pub(crate) attempt_id: &'a str,
+    pub(crate) round_id: &'a str,
+    pub(crate) provider_id: &'a str,
+    pub(crate) upstream_model_id: &'a str,
+    pub(crate) candidate_order: i64,
+    pub(crate) attempt_type: AttemptType,
+    pub(crate) created_at: &'a str,
+}
+
 pub(crate) struct AttemptFinalization<'a> {
     pub(crate) status: &'a str,
     pub(crate) input_tokens: Option<i64>,
@@ -29,6 +39,26 @@ pub(crate) struct AttemptFinalization<'a> {
     pub(crate) cache_tokens: Option<i64>,
     pub(crate) error_json: Option<&'a serde_json::Value>,
     pub(crate) request: &'a ModelRequest,
+}
+
+/// Ledger classification for one Provider stream attempt. Mirrors the
+/// `model_attempts.attempt_type` CHECK constraint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptType {
+    Normal,
+    RecoveryProbe,
+    Compact,
+}
+
+impl AttemptType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AttemptType::Normal => "normal",
+            AttemptType::RecoveryProbe => "recovery_probe",
+            AttemptType::Compact => "compact",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -736,25 +766,30 @@ impl ModelsInterface {
 
     pub(crate) async fn insert_attempt_running(
         &self,
-        attempt_id: &str,
-        round_id: &str,
-        provider_id: &str,
-        upstream_model_id: &str,
-        candidate_order: i64,
-        created_at: &str,
+        record: AttemptRunningRecord<'_>,
     ) -> Result<(), ModelsError> {
+        let AttemptRunningRecord {
+            attempt_id,
+            round_id,
+            provider_id,
+            upstream_model_id,
+            candidate_order,
+            attempt_type,
+            created_at,
+        } = record;
         sqlx::query(
             "INSERT INTO model_attempts \
              (id, round_id, candidate_order, provider_id, upstream_model_id, attempt_type, \
               status, normalized_error_json, upstream_request_id, input_tokens, output_tokens, \
               created_at, ended_at) \
-             VALUES (?, ?, ?, ?, ?, 'normal', 'running', NULL, NULL, NULL, NULL, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, NULL, NULL, ?, NULL)",
         )
         .bind(attempt_id)
         .bind(round_id)
         .bind(candidate_order)
         .bind(provider_id)
         .bind(upstream_model_id)
+        .bind(attempt_type.as_str())
         .bind(created_at)
         .execute(&self.pool)
         .await?;

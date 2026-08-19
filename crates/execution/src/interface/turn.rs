@@ -27,6 +27,16 @@ fn estimate_prompt_tokens(prompt: &str) -> i64 {
     i64::try_from(prompt.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
 }
 
+/// Partial model output captured before a round failed upstream, kept for the
+/// durable assistant-message fallback.
+struct FailedRoundOutput<'a> {
+    round_id: &'a RoundId,
+    text: &'a str,
+    reasoning: &'a str,
+    detail: &'a str,
+    actor: &'a Value,
+}
+
 struct ToolExecutionContext<'a> {
     session_id: SessionId,
     project_id: ProjectId,
@@ -258,6 +268,8 @@ impl ExecutionInterface {
             let stream_round_id = round_id.to_string();
             let accumulated_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
             let accumulated_reasoning = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let failure_text_reader = accumulated_text.clone();
+            let failure_reasoning_reader = accumulated_reasoning.clone();
             // Server-side thinking interval: from the first reasoning delta to
             // the first answer delta. Pushed with the stream so the client can
             // label the Thought row with its duration the moment thinking
@@ -511,8 +523,11 @@ impl ExecutionInterface {
             )) = completed
             else {
                 // Failed stream — no tool execution. Retryable provider faults
-                // Retryable provider faults stay inside the round retry loop;
-                // deterministic faults fail the Turn immediately.
+                // stay inside the round retry loop; deterministic faults fail
+                // the Turn immediately. Whatever the provider already streamed
+                // before the fault is durable content, not scratch state: it is
+                // persisted as an assistant message so a refresh (or a client
+                // that reconnected mid-stream) still shows it.
                 let detail = events
                     .iter()
                     .find_map(|e| match e {
@@ -522,6 +537,30 @@ impl ExecutionInterface {
                         _ => None,
                     })
                     .unwrap_or_else(|| "stream failed".into());
+                let streamed_text = failure_text_reader
+                    .lock()
+                    .ok()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let streamed_reasoning = failure_reasoning_reader
+                    .lock()
+                    .ok()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                if !streamed_text.is_empty() || !streamed_reasoning.is_empty() {
+                    self.persist_failed_round_output(
+                        session_id,
+                        turn_id,
+                        FailedRoundOutput {
+                            round_id: &round_id,
+                            text: &streamed_text,
+                            reasoning: &streamed_reasoning,
+                            detail: &detail,
+                            actor: &actor,
+                        },
+                    )
+                    .await?;
+                }
                 self.fail_round(session_id, turn_id, &round_id, &detail)
                     .await?;
                 self.fail_turn(session_id, turn_id, &detail).await?;
@@ -642,7 +681,7 @@ impl ExecutionInterface {
         goal_mode: bool,
     ) -> Result<String, ExecutionError> {
         let memory = self.projects.memory_context(project_id).await?;
-        let active_sessions = self.sessions.active_sessions(50).await?;
+        let active_sessions = self.sessions.active_sessions(project_id, 50).await?;
         let async_tasks = self.runtime.async_tasks(100).await?;
         let mut prompt = SYSTEM_PROMPT.to_owned();
         if goal_mode {
@@ -797,7 +836,7 @@ impl ExecutionInterface {
             loop {
                 let events = self
                     .models
-                    .stream_completion_with_candidate(req.clone(), candidate_order, on_event)
+                    .stream_completion_with_candidate(req.clone(), candidate_order, AttemptType::Normal, on_event)
                     .await?;
                 let failed = events.iter().rev().find_map(|e| match e {
                     ModelStreamEvent::Failed {
@@ -907,26 +946,61 @@ impl ExecutionInterface {
             .await?;
         let mut persisted_calls = Vec::with_capacity(tool_calls.len());
         for (ordinal, request) in tool_calls.iter().enumerate() {
-            let id = ToolCallId::new();
             let input = serde_json::from_str::<Value>(&request.arguments_json)
                 .unwrap_or_else(|_| json!({}));
-            sqlx::query(
-                "INSERT INTO tool_calls \
-                 (id, round_id, ord, tool_name, schema_version, input_json, result_summary_json, \
-                  status, actor_json, error_code, provider_call_id, started_at, ended_at, version) \
-                 VALUES (?, ?, ?, ?, ?, ?, NULL, 'requested', ?, NULL, ?, NULL, NULL, ?)",
+            // Idempotent accept on the provider identity (round_id,
+            // provider_call_id). A duplicated provider tool call — the same
+            // logical call delivered through two event shapes — used to hit
+            // the unique index and abort the whole round as a storage error.
+            // Re-accepting replaces the pending row instead of failing.
+            let existing_id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM tool_calls WHERE round_id = ? AND provider_call_id = ?",
             )
-            .bind(id.to_string())
             .bind(round_id.to_string())
-            .bind(ordinal as i64)
-            .bind(&request.name)
-            .bind(SCHEMA_VERSION)
-            .bind(input.to_string())
-            .bind(actor.to_string())
             .bind(&request.id)
-            .bind(format!("v_{}", ToolCallId::new()))
-            .execute(work.connection())
+            .fetch_optional(work.connection())
             .await?;
+            let id = if let Some(stored) = existing_id {
+                let id: ToolCallId = stored.parse().map_err(|error| {
+                    ExecutionError::Internal(anyhow::anyhow!(
+                        "stored Tool Call id is not a ToolCallId: {error}"
+                    ))
+                })?;
+                sqlx::query(
+                    "UPDATE tool_calls SET ord = ?, tool_name = ?, input_json = ?, \
+                      status = 'requested', actor_json = ?, error_code = NULL, \
+                      started_at = NULL, ended_at = NULL, version = ? WHERE id = ?",
+                )
+                .bind(ordinal as i64)
+                .bind(&request.name)
+                .bind(input.to_string())
+                .bind(actor.to_string())
+                .bind(format!("v_{}", ToolCallId::new()))
+                .bind(&stored)
+                .execute(work.connection())
+                .await?;
+                id
+            } else {
+                let id = ToolCallId::new();
+                sqlx::query(
+                    "INSERT INTO tool_calls \
+                     (id, round_id, ord, tool_name, schema_version, input_json, result_summary_json, \
+                      status, actor_json, error_code, provider_call_id, started_at, ended_at, version) \
+                     VALUES (?, ?, ?, ?, ?, ?, NULL, 'requested', ?, NULL, ?, NULL, NULL, ?)",
+                )
+                .bind(id.to_string())
+                .bind(round_id.to_string())
+                .bind(ordinal as i64)
+                .bind(&request.name)
+                .bind(SCHEMA_VERSION)
+                .bind(input.to_string())
+                .bind(actor.to_string())
+                .bind(&request.id)
+                .bind(format!("v_{}", ToolCallId::new()))
+                .execute(work.connection())
+                .await?;
+                id
+            };
             persisted_calls.push(AcceptedToolCall {
                 id,
                 ordinal: ordinal as i64,
@@ -984,6 +1058,86 @@ impl ExecutionInterface {
         }
         work.commit().await?;
         Ok(Some(persisted_calls))
+    }
+
+    /// Persist the partial output a provider streamed before a round failed.
+    /// Without this, a refresh loses everything the user watched stream in —
+    /// the text only lived in the in-memory overlay and the SSE push path.
+    async fn persist_failed_round_output(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        output: FailedRoundOutput<'_>,
+    ) -> Result<(), ExecutionError> {
+        let FailedRoundOutput {
+            round_id,
+            text,
+            reasoning,
+            detail,
+            actor,
+        } = output;
+        let now = now_utc_str();
+        let mut work = self.unit_of_work.begin().await?;
+        if !self
+            .sessions
+            .turn_is_runnable_in_tx(work.connection(), session_id, turn_id)
+            .await?
+        {
+            return Ok(());
+        }
+        // Idempotent: a retried failure path can try to persist the same
+        // round's partial output twice.
+        let already: Option<String> = sqlx::query_scalar(
+            "SELECT source_resource_id FROM timeline_items \
+             WHERE session_id = ? AND turn_id = ? AND kind = 'assistant_message' \
+               AND json_extract(projection_json, '$.round_id') = ? AND status = 'active'",
+        )
+        .bind(session_id.to_string())
+        .bind(turn_id.to_string())
+        .bind(round_id.to_string())
+        .fetch_optional(work.connection())
+        .await?;
+        if already.is_some() {
+            return Ok(());
+        }
+        let (_, timeline_item_id, _) = self
+            .sessions
+            .append_assistant_message_in_tx(
+                work.connection(),
+                AppendAssistantMessage {
+                    session_id,
+                    turn_id,
+                    round_id: *round_id,
+                    text,
+                    reasoning,
+                    reasoning_content: None,
+                    duration_ms: None,
+                    tool_calls: &serde_json::json!([]),
+                    actor,
+                    now: &now,
+                },
+            )
+            .await?;
+        if let Some(timeline_item_id) = timeline_item_id {
+            work.append_event(NewEvent {
+                event_type: EventType::TimelineItemCreated,
+                actor: actor.clone(),
+                resource: Some(json!({"kind": "session", "id": session_id.to_string()})),
+                correlation_id: CorrelationId::new().to_string(),
+                causation_id: None,
+                payload: json!({
+                    "session_id": session_id.to_string(),
+                    "timeline_item_id": timeline_item_id,
+                    "kind": "assistant_message",
+                    "round_id": round_id.to_string(),
+                    "partial": true,
+                    "error": detail,
+                }),
+            })
+            .await?;
+        }
+        work.commit().await?;
+        Ok(())
     }
 
     async fn fail_round(

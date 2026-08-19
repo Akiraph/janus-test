@@ -138,9 +138,19 @@ pub struct OpenaiResponsesAssembler {
 
 #[derive(Debug, Default)]
 struct ResponseToolCall {
+    /// Canonical provider call id (`call_id`), falling back to the item id.
     id: String,
     name: String,
     arguments: String,
+    /// Every alias the provider used for this call (`id`, `call_id`). Events
+    /// can arrive keyed by either, so the aliases all resolve here.
+    aliases: Vec<String>,
+}
+
+impl ResponseToolCall {
+    fn alias(&self) -> &str {
+        self.aliases.first().map(String::as_str).unwrap_or(&self.id)
+    }
 }
 
 impl OpenaiResponsesAssembler {
@@ -261,7 +271,7 @@ impl OpenaiResponsesAssembler {
             sequence: self.seq,
             delta: ToolCallDelta {
                 index: index as u32,
-                id: Some(self.tools[index].id.clone()),
+                id: Some(self.tools[index].alias().to_owned()),
                 name: Some(self.tools[index].name.clone()),
                 arguments_delta: (!delta.is_empty()).then(|| delta.to_owned()),
             },
@@ -289,6 +299,7 @@ impl OpenaiResponsesAssembler {
         let call_id = value.get("call_id").and_then(Value::as_str);
         let name = value.get("name").and_then(Value::as_str);
         let index = self.ensure_tool(item_id, call_id, name);
+        // The canonical id is the call_id the API expects on function_call_output.
         if let Some(call_id) = call_id {
             self.tools[index].id = call_id.to_owned();
         }
@@ -297,29 +308,57 @@ impl OpenaiResponsesAssembler {
         }
     }
 
+    /// Resolve or create the tool slot for one provider function call. The
+    /// Responses API identifies a call by both `id` (the item id, e.g.
+    /// `fc_1`) and `call_id` (e.g. `call_1`), and different event shapes
+    /// carry different subsets, so every non-empty alias is registered to the
+    /// same slot. Calls with neither id get a per-slot synthesized id so
+    /// multiple anonymous calls can never collide downstream (they used to
+    /// all share `"call_unknown"` and violate the tool_calls unique index).
     fn ensure_tool(
         &mut self,
         item_id: Option<&str>,
         call_id: Option<&str>,
         name: Option<&str>,
     ) -> usize {
-        if let Some(key) = item_id.or(call_id)
-            && let Some(index) = self.tool_indexes.get(key).copied()
-        {
-            if let Some(name) = name {
-                self.tools[index].name = name.to_owned();
-            }
-            return index;
+        let mut keys: Vec<String> = Vec::with_capacity(2);
+        if let Some(item_id) = item_id.filter(|value| !value.is_empty()) {
+            keys.push(item_id.to_owned());
         }
-        let id = call_id.or(item_id).unwrap_or("call_unknown").to_owned();
+        if let Some(call_id) = call_id.filter(|value| !value.is_empty()) {
+            keys.push(call_id.to_owned());
+        }
+        // Try every alias before creating a slot.
+        for key in &keys {
+            if let Some(index) = self.tool_indexes.get(key).copied() {
+                // A later event can reveal the other alias; link it too so all
+                // future events resolve to this slot regardless of shape.
+                for other in keys.iter().filter(|candidate| candidate != &key) {
+                    self.tool_indexes
+                        .entry(other.clone())
+                        .or_insert_with(|| index);
+                    self.tools[index].aliases.push(other.clone());
+                }
+                if let Some(name) = name {
+                    self.tools[index].name = name.to_owned();
+                }
+                return index;
+            }
+        }
+        let id = call_id
+            .or(item_id)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("call_{}", self.tools.len()));
+        let aliases = keys.clone();
         let index = self.tools.len();
         self.tools.push(ResponseToolCall {
-            id: id.clone(),
+            id,
             name: name.unwrap_or("").to_owned(),
             arguments: String::new(),
+            aliases,
         });
-        if let Some(key) = item_id.or(call_id) {
-            self.tool_indexes.insert(key.to_owned(), index);
+        for key in keys {
+            self.tool_indexes.insert(key, index);
         }
         index
     }
@@ -353,11 +392,13 @@ impl OpenaiResponsesAssembler {
         if !self.saw_terminal {
             return truncated_stream_event(attempt_id);
         }
-        let tool_calls = self
-            .tools
-            .iter()
-            .filter(|tool| !tool.name.is_empty())
-            .map(|tool| CompletedToolCall {
+        // The provider can emit the same logical call through several event
+        // shapes (item added + completed output list). Merge aliases into one
+        // CompletedToolCall per canonical id so the durable tool_calls unique
+        // index (round_id, provider_call_id) can never collide.
+        let mut merged: Vec<CompletedToolCall> = Vec::new();
+        for tool in self.tools.iter().filter(|tool| !tool.name.is_empty()) {
+            let call = CompletedToolCall {
                 id: tool.id.clone(),
                 name: self
                     .tool_names
@@ -369,13 +410,22 @@ impl OpenaiResponsesAssembler {
                 } else {
                     tool.arguments.clone()
                 },
-            })
-            .collect();
+            };
+            if let Some(existing) = merged.iter_mut().find(|candidate| candidate.id == call.id) {
+                // Keep the longest arguments seen; shorter ones are prefixes
+                // from partial argument streams.
+                if call.arguments_json.len() > existing.arguments_json.len() {
+                    existing.arguments_json = call.arguments_json;
+                }
+            } else {
+                merged.push(call);
+            }
+        }
         ModelStreamEvent::Completed {
             attempt_id: attempt_id.to_owned(),
             usage: self.usage.clone().unwrap_or_default(),
             stop_reason: None,
-            tool_calls,
+            tool_calls: merged,
             text: self.text.clone(),
             reasoning: self.reasoning.clone(),
             reasoning_content: None,
@@ -586,5 +636,87 @@ mod tests {
             assembler.finish("attempt"),
             crate::stream_types::ModelStreamEvent::Completed { .. }
         ));
+    }
+
+    #[test]
+    fn item_id_and_call_id_aliases_merge_into_one_call() {
+        // Regression for the tool_calls UNIQUE(round_id, provider_call_id)
+        // violation: arguments streamed by item_id must merge with the
+        // completed output item identified by call_id instead of producing
+        // two entries that share an id (or the "call_unknown" placeholder).
+        let mut assembler = OpenaiResponsesAssembler::for_tools(&request().tools);
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","id":"fc_1","name":"read_file"}}"#,
+            )
+            .expect("valid event");
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.function_call_arguments.delta",
+                r#"{"item_id":"fc_1","delta":"{\"path\":\"README.md\"}"}"#,
+            )
+            .expect("valid event");
+        // The completed output arrives keyed by both aliases with the call_id
+        // spelling — previously this created a second, duplicate slot.
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.completed",
+                r#"{"response":{"output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read_file","arguments":"{\"path\":\"README.md\"}"}]}}"#,
+            )
+            .expect("valid event");
+
+        match assembler.finish("attempt") {
+            crate::stream_types::ModelStreamEvent::Completed { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1, "aliases must merge into one call");
+                assert_eq!(tool_calls[0].id, "call_1");
+                assert_eq!(tool_calls[0].name, "read_file");
+            }
+            other => panic!("expected completed response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anonymous_calls_get_unique_ids_and_duplicate_ids_merge() {
+        // Two function calls that carry no ids at all must not collide on a
+        // shared placeholder id, and two events describing the same id must
+        // collapse into one CompletedToolCall.
+        let mut assembler =
+            OpenaiResponsesAssembler::for_tools(&[request().tools[0].clone()]);
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","name":"read_file","arguments":"{}"}}"#,
+            )
+            .expect("valid event");
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.output_item.added",
+                r#"{"item":{"type":"function_call","name":"read_file","arguments":"{}"}}"#,
+            )
+            .expect("valid event");
+        assembler
+            .ingest_event(
+                "attempt",
+                "response.completed",
+                r#"{"type":"response.completed"}"#,
+            )
+            .expect("valid event");
+
+        match assembler.finish("attempt") {
+            crate::stream_types::ModelStreamEvent::Completed { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 2, "anonymous calls must stay distinct");
+                let ids: Vec<&str> = tool_calls.iter().map(|c| c.id.as_str()).collect();
+                assert_eq!(ids.len(), 2);
+                assert_ne!(ids[0], ids[1], "anonymous ids must be unique");
+                assert!(ids.iter().all(|id| *id != "call_unknown"));
+            }
+            other => panic!("expected completed response, got {other:?}"),
+        }
     }
 }

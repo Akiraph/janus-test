@@ -161,15 +161,21 @@ impl SessionsInterface {
         Ok(out)
     }
 
-    pub async fn active_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>, SessionsError> {
+    pub async fn active_sessions(
+        &self,
+        project_id: ProjectId,
+        limit: i64,
+    ) -> Result<Vec<SessionSummary>, SessionsError> {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query(
             "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
                     version, created_at, updated_at, last_activity_at \
              FROM sessions WHERE state != 'deleting' \
                AND active_turn_id IS NOT NULL \
+               AND project_id = ? \
              ORDER BY last_activity_at DESC LIMIT ?",
         )
+        .bind(project_id.to_string())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

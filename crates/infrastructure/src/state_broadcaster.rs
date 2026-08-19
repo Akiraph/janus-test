@@ -12,7 +12,11 @@
 //! channel capacity is bounded), forcing the client to reconnect and
 //! receive a fresh `snapshot`.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -88,7 +92,13 @@ pub struct StateChange {
 /// Bounded broadcast channel for state push. Capacity is set high enough
 /// for bursty Turn execution but low enough that a lagging consumer will
 /// disconnect rather than accumulate unbounded memory.
-const BROADCAST_CAPACITY: usize = 1024;
+const BROADCAST_CAPACITY: usize = 4096;
+
+/// How long a pending stream-text frame waits for more deltas before it is
+/// flushed to subscribers. Streaming rounds emit one frame per provider delta;
+/// coalescing them keeps the broadcast far below capacity and stops clients
+/// from re-rendering markdown per token.
+const STREAM_COALESCE: Duration = Duration::from_millis(40);
 
 #[derive(Clone)]
 pub struct StateBroadcaster {
@@ -97,14 +107,89 @@ pub struct StateBroadcaster {
 
 struct StateBroadcasterInner {
     tx: broadcast::Sender<Arc<StateChange>>,
+    /// Latest not-yet-flushed stream-text frame per (session, turn), plus the
+    /// deadline after which it is flushed regardless. Guarded so `push` from
+    /// any execution task can coalesce without spawning a timer per delta.
+    pending_stream: std::sync::Mutex<HashMap<String, (StateChange, Instant)>>,
+    /// Signalled whenever a stream frame is queued, so the flusher wakes early.
+    stream_wake: std::sync::Condvar,
 }
 
 impl StateBroadcaster {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
-        Self {
-            inner: Arc::new(StateBroadcasterInner { tx }),
-        }
+        let broadcaster = Self {
+            inner: Arc::new(StateBroadcasterInner {
+                tx,
+                pending_stream: std::sync::Mutex::new(HashMap::new()),
+                stream_wake: std::sync::Condvar::new(),
+            }),
+        };
+        broadcaster.spawn_stream_flusher();
+        broadcaster
+    }
+
+    fn spawn_stream_flusher(&self) {
+        let inner = Arc::clone(&self.inner);
+        std::thread::spawn(move || loop {
+            let deadline: Option<Instant> = {
+                let guard = inner
+                    .pending_stream
+                    .lock()
+                    .expect("state broadcaster stream lock poisoned");
+                guard
+                    .values()
+                    .map(|(_, at)| *at + STREAM_COALESCE)
+                    .min()
+            };
+            match deadline {
+                None => {
+                    // Sleep until new work arrives.
+                    let guard = inner
+                        .pending_stream
+                        .lock()
+                        .expect("state broadcaster stream lock poisoned");
+                    let _unused = inner
+                        .stream_wake
+                        .wait_timeout(guard, Duration::from_secs(1))
+                        .expect("state broadcaster stream lock poisoned");
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if deadline > now {
+                        let guard = inner
+                            .pending_stream
+                            .lock()
+                            .expect("state broadcaster stream lock poisoned");
+                        let _unused = inner
+                            .stream_wake
+                            .wait_timeout(guard, deadline - now)
+                            .expect("state broadcaster stream lock poisoned");
+                    }
+                    let due: Vec<StateChange> = {
+                        let mut guard = inner
+                            .pending_stream
+                            .lock()
+                            .expect("state broadcaster stream lock poisoned");
+                        let now = Instant::now();
+                        guard
+                            .iter()
+                            .filter(|(_, (_, at))| *at + STREAM_COALESCE <= now)
+                            .map(|(key, (change, _))| (key.clone(), change.clone()))
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .map(|(key, change)| {
+                                guard.remove(&key);
+                                change
+                            })
+                            .collect()
+                    };
+                    for change in due {
+                        let _ = inner.tx.send(Arc::new(change));
+                    }
+                }
+            }
+        });
     }
 
     /// Subscribe to state changes. Returns a receiver that may lag behind;
@@ -150,14 +235,25 @@ impl StateBroadcaster {
         });
     }
 
-    /// Convenience: push a stream text change (accumulated full text).
+    /// Convenience: push a stream text change (accumulated full text). Frames
+    /// for the same (session, turn) are coalesced for `STREAM_COALESCE` so one
+    /// provider delta does not become one broadcast per token.
     pub fn push_stream_text(&self, session_id: &str, turn_id: &str, data: Value) {
-        self.push(StateChange {
+        let change = StateChange {
             kind: StateKind::StreamText,
             id: Some(format!("{session_id}:{turn_id}")),
             data,
             cursor: None,
-        });
+        };
+        let key = change.id.clone().unwrap_or_default();
+        let mut pending = self
+            .inner
+            .pending_stream
+            .lock()
+            .expect("state broadcaster stream lock poisoned");
+        pending.insert(key, (change, Instant::now()));
+        drop(pending);
+        self.inner.stream_wake.notify_all();
     }
 
     /// Convenience: push projects list.

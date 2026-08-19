@@ -52,6 +52,27 @@ impl ExecutionInterface {
             .map_err(ExecutionError::Internal)
     }
 
+    pub async fn finalize_compact_summary_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        compact_summary_id: &str,
+        summary: Value,
+        model_attempt_id: Option<&str>,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> Result<(), ExecutionError> {
+        super::super::context::finalize_compact_summary_in_tx(
+            tx,
+            compact_summary_id,
+            summary,
+            model_attempt_id,
+            input_tokens,
+            output_tokens,
+        )
+        .await
+        .map_err(ExecutionError::Internal)
+    }
+
     pub async fn complete_context_compact_in_tx(
         &self,
         tx: &mut SqliteConnection,

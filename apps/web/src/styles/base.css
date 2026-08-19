@@ -44,6 +44,12 @@ body {
   background: var(--canvas);
 }
 
+@supports (height: 100dvh) {
+  body {
+    min-height: 100dvh;
+  }
+}
+
 button,
 a {
   font: inherit;

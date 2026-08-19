@@ -8,7 +8,7 @@ use std::str::FromStr;
 pub(super) async fn tool_active_sessions(
     ctx: &ToolContext<'_>,
 ) -> Result<ToolOutcome, ExecutionError> {
-    let sessions = ctx.sessions.active_sessions(100).await?;
+    let sessions = ctx.sessions.active_sessions(ctx.project_id, 100).await?;
     let summary = json!({
         "sessions": sessions,
         "async_tasks": ctx.runtime.async_tasks(200).await?,
@@ -29,6 +29,15 @@ pub(super) async fn tool_read_session(
         ExecutionError::Internal(anyhow::anyhow!("invalid session_id: {error}"))
     })?;
     let session = ctx.sessions.get_session(session_id).await?;
+    // Sessions are project-scoped. Reading another project's session (or its
+    // timeline) would leak cross-project user content into this Turn's
+    // context, so treat it as not found unless it belongs to ctx.project_id.
+    if session.project_id != ctx.project_id.to_string() {
+        return Ok(super::fail_text(
+            "session not found in this project",
+            "NOT_FOUND",
+        ));
+    }
     let limit = input
         .get("limit")
         .and_then(Value::as_i64)

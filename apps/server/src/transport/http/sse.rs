@@ -26,7 +26,7 @@ use axum::{
 use futures_util::Stream;
 use janus_infrastructure::state_broadcaster::StateKind;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::{
@@ -243,6 +243,14 @@ pub async fn events(
         const REPLAY_CAP: usize = 2000;
         let mut replay_cursor = cursor;
         let mut replayed = 0usize;
+        // `model.stream_delta` events are not projected by the engine (the
+        // live path pushes accumulated text directly), so a client that
+        // reconnects mid-stream would otherwise lose every token streamed
+        // while it was down. Accumulate the deltas per (session, turn) during
+        // the replay and emit one stream_text frame per stream, exactly like
+        // the live push shape the client already understands.
+        let mut replayed_streams: std::collections::HashMap<(String, String), Value> =
+            std::collections::HashMap::new();
         loop {
             let events = match state.system().events_after(replay_cursor, 100).await {
                 Ok(events) => events,
@@ -256,6 +264,52 @@ pub async fn events(
             }
             for event in events {
                 replay_cursor = event.cursor.parse().unwrap_or(replay_cursor);
+                if event.event_type == "model.stream_delta" {
+                    let Some(session_id) = event.payload.get("session_id").and_then(Value::as_str) else {
+                        replayed += 1;
+                        continue;
+                    };
+                    let Some(turn_id) = event.payload.get("turn_id").and_then(Value::as_str) else {
+                        replayed += 1;
+                        continue;
+                    };
+                    let Some(round_id) = event.payload.get("round_id").and_then(Value::as_str) else {
+                        replayed += 1;
+                        continue;
+                    };
+                    let channel = event.payload.get("channel").and_then(Value::as_str).unwrap_or("");
+                    let delta = event.payload.get("delta").and_then(Value::as_str).unwrap_or("");
+                    let entry = replayed_streams
+                        .entry((session_id.to_owned(), turn_id.to_owned()))
+                        .or_insert_with(|| {
+                            json!({
+                                "text": "",
+                                "reasoning": "",
+                                "seq": 0,
+                                "round_id": round_id,
+                            })
+                        });
+                    match channel {
+                        "text" => {
+                            if let Value::String(text) = entry.get_mut("text").unwrap_or(&mut Value::Null) {
+                                text.push_str(delta);
+                            }
+                        }
+                        "reasoning_summary" => {
+                            if let Value::String(reasoning) =
+                                entry.get_mut("reasoning").unwrap_or(&mut Value::Null)
+                            {
+                                reasoning.push_str(delta);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if let Some(seq) = entry.get_mut("seq") {
+                        *seq = json!(replayed);
+                    }
+                    replayed += 1;
+                    continue;
+                }
                 let changes = state.system().project(Some(&owner_id), &event).await;
                 for change in changes {
                     let frame = StateFrame {
@@ -284,6 +338,20 @@ pub async fn events(
             }
             if replayed >= REPLAY_CAP {
                 break;
+            }
+        }
+        // Emit the reconstructed live streams as stream_text frames. The
+        // cursor is absent by design: this is transient overlay state, not a
+        // durable projection, and the client treats it accordingly.
+        for ((session_id, turn_id), data) in replayed_streams {
+            let frame = StateFrame {
+                kind: StateKind::StreamText,
+                id: Some(format!("{session_id}:{turn_id}")),
+                data,
+                cursor: None,
+            };
+            if let Ok(event) = Event::default().event("state").json_data(&frame) {
+                yield Ok(event);
             }
         }
 
@@ -329,9 +397,25 @@ pub async fn events(
                                 return;
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            tracing::warn!(request_id = %context.request_id, "state broadcast consumer lagged, disconnecting");
-                            return;
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Dropping the connection here was the root cause
+                            // of "must refresh to see updates": the browser
+                            // auto-reconnects with Last-Event-ID, replays
+                            // events, and the snapshot then heals whatever the
+                            // replay could not cover. A lag burst is now a
+                            // resumable hiccup instead of a dead stream.
+                            tracing::warn!(request_id = %context.request_id, skipped, "state broadcast consumer lagged, healing with snapshot");
+                            let heal_cursor = state.system().events_bounds().await.map(|b| b.max).unwrap_or_default();
+                            let snapshot = build_snapshot(&state, &owner_id).await;
+                            if let Ok(event) = Event::default()
+                                .event("snapshot")
+                                .id(heal_cursor.to_string())
+                                .json_data(&snapshot)
+                            {
+                                yield Ok(event);
+                            } else {
+                                return;
+                            }
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
                     }

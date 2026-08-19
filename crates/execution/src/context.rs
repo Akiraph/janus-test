@@ -256,6 +256,33 @@ pub async fn complete_compact_in_tx(
     Ok(changed == 1)
 }
 
+/// Backfill a compact summary row with the model-generated summary and its
+/// real token usage once the summary attempt settles. The row is created at
+/// schedule time with the placeholder digest; this records what the model
+/// actually produced and how much it cost.
+pub async fn finalize_compact_summary_in_tx(
+    tx: &mut SqliteConnection,
+    compact_summary_id: &str,
+    summary: Value,
+    model_attempt_id: Option<&str>,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE compact_summaries \
+         SET summary_json = ?, model_attempt_id = ?, input_tokens = ?, output_tokens = ? \
+         WHERE id = ?",
+    )
+    .bind(summary.to_string())
+    .bind(model_attempt_id)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(compact_summary_id)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
 /// Load the latest compact summary for a session, if any. Used by the next
 /// Round's context assembly to decide whether a compacted prefix should be
 /// prepended instead of the raw history. Returns `(summary_json, source_last)`.

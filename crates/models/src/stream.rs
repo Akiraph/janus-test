@@ -6,7 +6,10 @@ use futures_util::StreamExt;
 use janus_infrastructure::clock::now_utc_str;
 
 use super::anthropic::{AnthropicAssembler, build_messages_body};
-use super::interface::{AttemptFinalization, ModelsError, ModelsInterface, ProviderKind};
+use super::interface::{
+    AttemptFinalization, AttemptRunningRecord, AttemptType, ModelsError, ModelsInterface,
+    ProviderKind,
+};
 use super::openai_chat::{OpenaiChatAssembler, build_chat_body};
 use super::openai_responses::{OpenaiResponsesAssembler, build_responses_body};
 use super::sse::SseParser;
@@ -44,7 +47,23 @@ impl ModelsInterface {
         F: FnMut(ModelStreamEvent) -> Fut,
         Fut: Future<Output = ()>,
     {
-        self.stream_completion_with_candidate(req, 0, on_event)
+        self.stream_completion_with_attempt(req, AttemptType::Normal, on_event)
+            .await
+    }
+
+    /// Run one Provider stream attempt tagged with a ledger `attempt_type`
+    /// (for example `compact` for context-compaction summaries).
+    pub async fn stream_completion_with_attempt<F, Fut>(
+        &self,
+        req: ModelRequest,
+        attempt_type: AttemptType,
+        on_event: &mut F,
+    ) -> Result<Vec<ModelStreamEvent>, ModelsError>
+    where
+        F: FnMut(ModelStreamEvent) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.stream_completion_with_candidate(req, 0, attempt_type, on_event)
             .await
     }
 
@@ -52,6 +71,7 @@ impl ModelsInterface {
         &self,
         req: ModelRequest,
         candidate_order: i64,
+        attempt_type: AttemptType,
         on_event: &mut F,
     ) -> Result<Vec<ModelStreamEvent>, ModelsError>
     where
@@ -77,14 +97,15 @@ impl ModelsInterface {
 
         let attempt_id = AttemptId::new().to_string();
         let started = now_utc_str();
-        self.insert_attempt_running(
-            &attempt_id,
-            req.round_id.as_deref().unwrap_or("round-unset"),
-            &req.provider_id,
-            &req.upstream_model_id,
+        self.insert_attempt_running(AttemptRunningRecord {
+            attempt_id: &attempt_id,
+            round_id: req.round_id.as_deref().unwrap_or("round-unset"),
+            provider_id: &req.provider_id,
+            upstream_model_id: &req.upstream_model_id,
             candidate_order,
-            &started,
-        )
+            attempt_type,
+            created_at: &started,
+        })
         .await?;
 
         let result = match kind {

@@ -1,4 +1,5 @@
 import { createQuery } from "@tanstack/solid-query";
+import type { TimelinePage } from "./api";
 import {
   getAutomationSettings,
   getAutomationWebhookConfig,
@@ -204,6 +205,27 @@ export function useSessionTimeline(
       },
       placeholderData: (previous) => previous,
       enabled: Boolean(id) && shouldLoad(),
+    };
+  });
+}
+
+/** Accumulated older pages for a session's timeline. The live query
+ * (["session-timeline", id]) only ever holds the newest window — SSE
+ * `session_timeline` frames overwrite it wholesale — so pages fetched while
+ * scrolling up live here and are merged in front of the newest window. */
+export function useSessionTimelineHistory(
+  sessionId: () => string | undefined,
+  shouldLoad: () => boolean = () => true,
+) {
+  return createQuery(() => {
+    const id = sessionId();
+    return {
+      queryKey: ["session-timeline-history", id],
+      queryFn: () => Promise.resolve(null as TimelinePage | null),
+      enabled: Boolean(id) && shouldLoad(),
+      initialData: null,
+      staleTime: Infinity,
+      gcTime: Infinity,
     };
   });
 }

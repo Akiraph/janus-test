@@ -7,10 +7,25 @@
   background: var(--canvas);
 }
 
+@supports (height: 100dvh) {
+  .home-canvas,
+  .settings-canvas {
+    min-height: 100dvh;
+  }
+}
+
 .settings-canvas {
   display: flex;
   height: 100vh;
   padding: var(--space-3);
+  padding-left: max(var(--space-3), env(safe-area-inset-left));
+  padding-right: max(var(--space-3), env(safe-area-inset-right));
+}
+
+@supports (height: 100dvh) {
+  .settings-canvas {
+    height: 100dvh;
+  }
 }
 
 .home-bar {
@@ -47,6 +62,13 @@
   height: 100vh;
   min-height: 0;
   padding: 0;
+}
+
+@supports (height: 100dvh) {
+  .home-route:has(.project-page--ide),
+  .home-route--immersive {
+    height: 100dvh;
+  }
 }
 
 .brand {
@@ -230,6 +252,12 @@
     border-radius: 0;
   }
 
+  @supports (height: 100dvh) {
+    .settings-shell {
+      min-height: 100dvh;
+    }
+  }
+
   .settings-rail {
     width: 180px;
     flex-basis: 180px;
@@ -241,6 +269,12 @@
     height: auto;
     min-height: calc(100vh - 74px);
     padding: 0;
+  }
+
+  @supports (height: 100dvh) {
+    .home-route:has(.project-page--ide) {
+      min-height: calc(100dvh - 74px);
+    }
   }
 }
 

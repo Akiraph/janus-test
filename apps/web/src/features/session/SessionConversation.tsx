@@ -34,6 +34,9 @@ interface SessionConversationProps {
   delivery: "send" | "queue";
   composerDisabled?: boolean;
   composerSettingsDisabled?: boolean;
+  hasOlder?: boolean;
+  loadingOlder?: boolean;
+  onLoadOlder?: () => void;
   contextUsage: ContextUsageView | null;
   limits: PublicLimits | undefined;
   modelPreference: SessionModelPreference | null;
@@ -63,6 +66,8 @@ interface SessionConversationProps {
   onQueuedTurnSteer?: ((turn: QueuedTurnItem) => Promise<void>) | undefined;
 }
 
+const TOP_LOAD_THRESHOLD_PX = 48;
+
 export function SessionConversation(props: SessionConversationProps) {
   let scroller: HTMLDivElement | undefined;
   let activityObserver: ResizeObserver | undefined;
@@ -80,6 +85,12 @@ export function SessionConversation(props: SessionConversationProps) {
   function updateFollowLatest() {
     if (!scroller) return;
     followLatest = isNearLatest(scroller.scrollHeight, scroller.scrollTop, scroller.clientHeight);
+    // Near the top with older pages available — fetch them without a manual
+    // click. Auto-load only on scroll events so it cannot loop while the user
+    // has not touched the viewport.
+    if (scroller.scrollTop <= TOP_LOAD_THRESHOLD_PX && props.hasOlder && !props.loadingOlder) {
+      props.onLoadOlder?.();
+    }
   }
 
   function scheduleScrollToLatest() {
@@ -173,6 +184,22 @@ export function SessionConversation(props: SessionConversationProps) {
             class="session-conversation__items"
             ref={(element) => observeActivityContainer(element)}
           >
+            <Show when={props.hasOlder || props.loadingOlder}>
+              <div class="session-conversation__older">
+                <Show
+                  when={!props.loadingOlder}
+                  fallback={<Loader2 size={14} class="ui-spinner" />}
+                >
+                  <button
+                    type="button"
+                    class="session-conversation__older-btn"
+                    onClick={() => props.onLoadOlder?.()}
+                  >
+                    Load earlier messages
+                  </button>
+                </Show>
+              </div>
+            </Show>
             <For each={props.items}>
               {(item, index) => (
                 <>
@@ -525,7 +552,22 @@ function ConversationEntry(props: { item: SessionTimelineItem }) {
           <span class="session-message__dot" data-tone="success" aria-hidden="true" />
           <div class="session-message__body" data-tone="success">
             {props.item.title}
+            {props.item.itemCount != null ? (
+              <span class="session-message__meta">
+                {" · "}
+                {props.item.itemCount} items
+              </span>
+            ) : null}
+            {props.item.modelStatus != null ? (
+              <span class="session-message__meta">
+                {" · "}
+                summary model: {props.item.modelStatus}
+              </span>
+            ) : null}
           </div>
+          {props.item.summaryText != null ? (
+            <pre class="session-message__summary">{props.item.summaryText}</pre>
+          ) : null}
         </div>
       );
     case "unknown":

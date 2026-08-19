@@ -113,6 +113,10 @@ export type SessionTimelineItem =
       sourceFirst: string | null;
       sourceLast: string | null;
       itemCount: number | null;
+      /** Model-generated summary text; null on the degraded digest path. */
+      summaryText: string | null;
+      /** Degradation marker when the summary model pass failed. */
+      modelStatus: string | null;
     })
   | (TimelineItemBase & {
       type: "async_task";
@@ -217,6 +221,8 @@ export function decodeSessionTimelineItem(item: TimelineItemView): SessionTimeli
             : typeof summary.item_count === "number"
               ? summary.item_count
               : null,
+        summaryText: optionalText(summary.text ?? projection.text),
+        modelStatus: optionalText(summary.summary_model_status),
       };
   }
 
