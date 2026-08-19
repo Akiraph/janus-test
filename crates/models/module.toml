@@ -6,6 +6,7 @@ owned_tables = [
   "model_failover",
   "model_attempts",
   "model_usage_ledger",
+  "automation_settings",
 ]
 publishes = ["model_config.changed"]
 allowed_module_dependencies = []

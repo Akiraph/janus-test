@@ -225,15 +225,7 @@ impl Application {
         &self,
         owner_id: &str,
     ) -> Result<AutomationSettingsView, AutomationError> {
-        let mut work = self.unit_of_work().begin().await?;
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT model_provider_id, model_upstream_id FROM automation_settings WHERE owner_id = ?",
-        )
-        .bind(owner_id)
-        .fetch_optional(work.connection())
-        .await?;
-        work.rollback().await?;
-        let Some((provider_id, upstream_id)) = row else {
+        let Some(selection) = self.models().automation_model_selection(owner_id).await? else {
             return Ok(AutomationSettingsView {
                 model_provider_id: None,
                 model_upstream_id: None,
@@ -241,11 +233,15 @@ impl Application {
             });
         };
         let display_name = self
-            .model_display_name(owner_id, provider_id.as_deref(), upstream_id.as_deref())
+            .model_display_name(
+                owner_id,
+                selection.model_provider_id.as_deref(),
+                selection.model_upstream_id.as_deref(),
+            )
             .await?;
         Ok(AutomationSettingsView {
-            model_provider_id: provider_id,
-            model_upstream_id: upstream_id,
+            model_provider_id: selection.model_provider_id,
+            model_upstream_id: selection.model_upstream_id,
             model_display_name: display_name,
         })
     }
@@ -276,18 +272,14 @@ impl Application {
             .model_display_name(owner_id, provider_id.as_deref(), upstream_id.as_deref())
             .await?;
         let now = now_utc_str();
-        let mut work = self.unit_of_work().begin().await?;
-        sqlx::query(
-            "INSERT INTO automation_settings (owner_id, model_provider_id, model_upstream_id, updated_at) VALUES (?, ?, ?, ?) \
-             ON CONFLICT(owner_id) DO UPDATE SET model_provider_id = excluded.model_provider_id, model_upstream_id = excluded.model_upstream_id, updated_at = excluded.updated_at",
-        )
-        .bind(owner_id)
-        .bind(provider_id.as_deref())
-        .bind(upstream_id.as_deref())
-        .bind(&now)
-        .execute(work.connection())
-        .await?;
-        work.commit().await?;
+        self.models()
+            .set_automation_model_selection(
+                owner_id,
+                provider_id.as_deref(),
+                upstream_id.as_deref(),
+                &now,
+            )
+            .await?;
         Ok(AutomationSettingsView {
             model_provider_id: provider_id,
             model_upstream_id: upstream_id,

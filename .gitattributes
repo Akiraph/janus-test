@@ -1,3 +1,5 @@
 /apps/server/migrations/*.sql text eol=lf
-# Migration 0003 was historically applied with CRLF bytes; keep its checksum stable.
+# Migration 0003 shipped with CRLF bytes; keep the endings pinned so every
+# checkout hashes it the same way. Its checksum changed once, when the
+# janus-module owner header was added.
 /apps/server/migrations/0003_automation_settings.sql text eol=crlf

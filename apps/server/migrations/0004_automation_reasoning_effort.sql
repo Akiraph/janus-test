@@ -1,3 +1,4 @@
+-- janus-module: models
 -- Automation execution model thinking level. Defaults to 'high' so new
 -- Automation sessions request high reasoning effort for their first turn
 -- unless the owner overrides it. Values match ReasoningEffort

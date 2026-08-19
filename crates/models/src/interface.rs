@@ -260,6 +260,15 @@ struct ModelRow {
     updated_at: String,
 }
 
+/// The model an owner picked for Automation runs. Both fields are nullable
+/// because the row also carries `reasoning_effort`, so a row can exist with no
+/// model chosen.
+#[derive(Debug, Clone, FromRow)]
+pub struct AutomationModelSelection {
+    pub model_provider_id: Option<String>,
+    pub model_upstream_id: Option<String>,
+}
+
 impl ModelsInterface {
     pub fn new(pool: SqlitePool, cipher: SecretCipher, events: EventStore) -> anyhow::Result<Self> {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
@@ -292,6 +301,45 @@ impl ModelsInterface {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(model_view).collect()
+    }
+
+    pub async fn automation_model_selection(
+        &self,
+        owner_id: &str,
+    ) -> Result<Option<AutomationModelSelection>, ModelsError> {
+        let selection = sqlx::query_as::<_, AutomationModelSelection>(
+            "SELECT model_provider_id, model_upstream_id FROM automation_settings \
+             WHERE owner_id = ?",
+        )
+        .bind(owner_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(selection)
+    }
+
+    pub async fn set_automation_model_selection(
+        &self,
+        owner_id: &str,
+        model_provider_id: Option<&str>,
+        model_upstream_id: Option<&str>,
+        now: &str,
+    ) -> Result<(), ModelsError> {
+        sqlx::query(
+            "INSERT INTO automation_settings \
+             (owner_id, model_provider_id, model_upstream_id, updated_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(owner_id) DO UPDATE SET \
+                    model_provider_id = excluded.model_provider_id, \
+                    model_upstream_id = excluded.model_upstream_id, \
+                    updated_at = excluded.updated_at",
+        )
+        .bind(owner_id)
+        .bind(model_provider_id)
+        .bind(model_upstream_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn provider_kind_in_tx(
