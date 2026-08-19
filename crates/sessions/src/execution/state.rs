@@ -37,6 +37,34 @@ impl SessionsInterface {
         Ok(claimed.rows_affected() == 1)
     }
 
+    /// Rename a session that still carries its creation placeholder, guarded by
+    /// "no turn other than `created_turn_id` exists" so only the first message
+    /// can name it and a title the user set manually is never overwritten.
+    /// Returns whether the row changed.
+    pub async fn retitle_placeholder_session_in_tx(
+        &self,
+        tx: &mut SqliteConnection,
+        session_id: SessionId,
+        title: &str,
+        placeholder_title: &str,
+        created_turn_id: &str,
+        now: &str,
+    ) -> Result<bool, SessionsError> {
+        let changed = sqlx::query(
+            "UPDATE sessions SET title = ?, updated_at = ? \
+             WHERE id = ? AND title = ? AND NOT EXISTS \
+             (SELECT 1 FROM turns WHERE turns.session_id = sessions.id AND turns.id != ?)",
+        )
+        .bind(title)
+        .bind(now)
+        .bind(session_id.to_string())
+        .bind(placeholder_title)
+        .bind(created_turn_id)
+        .execute(&mut *tx)
+        .await?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     pub async fn settle_active_turn_in_tx(
         &self,
         tx: &mut SqliteConnection,

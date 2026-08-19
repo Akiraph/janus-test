@@ -243,7 +243,7 @@ impl Application {
         // the list showed the placeholder forever. Derive the title from this
         // first user message in the same transaction: the appended
         // SessionChanged event re-projects the row, so the UI renames live.
-        Self::maybe_derive_session_title_in_tx(
+        self.maybe_derive_session_title_in_tx(
             work,
             session_id,
             &created.turn_id,
@@ -293,10 +293,11 @@ impl Application {
     }
 
     /// Set the session title from its first user message if the title is
-    /// still the creation placeholder. Best-effort and cheap: one UPDATE
-    /// guarded by "no user turns yet", so second and later messages never
-    /// rewrite a name the user may have set manually.
+    /// still the creation placeholder. Best-effort and cheap: one guarded
+    /// write through the sessions interface, so second and later messages
+    /// never rewrite a name the user may have set manually.
     async fn maybe_derive_session_title_in_tx(
+        &self,
         work: &mut UnitOfWorkTransaction<'_>,
         session_id: SessionId,
         created_turn_id: &str,
@@ -310,22 +311,20 @@ impl Application {
         if derived.is_empty() {
             return Ok(());
         }
-        let changed = sqlx::query(
-            "UPDATE sessions SET title = ?, updated_at = ? \
-             WHERE id = ? AND title = ? AND NOT EXISTS \
-             (SELECT 1 FROM turns WHERE turns.session_id = sessions.id AND turns.id != ?)",
-        )
-        .bind(&derived)
-        .bind(now)
-        .bind(session_id.to_string())
-        .bind(PLACEHOLDER)
-        // The turn carrying this very message was inserted a moment ago;
-        // exclude it so "first turn" means "no earlier turn exists".
-        .bind(created_turn_id)
-        .execute(work.connection())
-        .await
-        .map_err(SessionsError::from)?;
-        if changed.rows_affected() != 1 {
+        let retitled = self
+            .sessions()
+            .retitle_placeholder_session_in_tx(
+                work.connection(),
+                session_id,
+                &derived,
+                PLACEHOLDER,
+                // The turn carrying this very message was inserted a moment
+                // ago; exclude it so "first turn" means "no earlier turn".
+                created_turn_id,
+                now,
+            )
+            .await?;
+        if !retitled {
             return Ok(());
         }
         work.append_event(NewEvent {

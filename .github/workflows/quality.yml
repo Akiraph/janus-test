@@ -1,0 +1,32 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.97.0"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install web dependencies
+        run: bun install --cwd apps/web --frozen-lockfile
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.email "janus-ci@example.invalid"
+          git config --global user.name "Janus CI"
+      - name: Quality checks
+        run: cargo xtask check
