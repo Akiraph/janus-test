@@ -125,6 +125,9 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
     let mut config = test_config(enabled_directory.path().into());
     config.automation_webhook_enabled = true;
     config.automation_webhook_secret = Some("test-secret".into());
+    // The intake refuses to enqueue without an Automation-enabled PAT; a
+    // deployment supplies one through JANUS_AUTOMATION_GITHUB_TOKEN.
+    config.automation_github_token = Some("ghp-test-automation".into());
     let enabled_state = AppState::initialize(config).await?;
     enabled_state.identity().authenticate(None).await?;
     let (enabled_base, enabled_task) = spawn(enabled_state).await?;
