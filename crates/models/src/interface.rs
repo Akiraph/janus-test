@@ -825,16 +825,29 @@ impl ModelsInterface {
             attempt_type,
             created_at,
         } = record;
+        // The retry index has to survive a reload: the UI reads it back from
+        // this ledger to keep its reconnect counter after the announcing SSE
+        // event is gone. Deriving it from the attempts already recorded for
+        // this Round and candidate keeps the column authoritative without the
+        // caller having to thread the loop counter through.
+        let attempt_number = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(1) FROM model_attempts WHERE round_id = ? AND candidate_order = ?",
+        )
+        .bind(round_id)
+        .bind(candidate_order)
+        .fetch_one(&self.pool)
+        .await?;
         sqlx::query(
             "INSERT INTO model_attempts \
-             (id, round_id, candidate_order, provider_id, upstream_model_id, attempt_type, \
-              status, normalized_error_json, upstream_request_id, input_tokens, output_tokens, \
-              created_at, ended_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, NULL, NULL, ?, NULL)",
+             (id, round_id, candidate_order, attempt_number, provider_id, upstream_model_id, \
+              attempt_type, status, normalized_error_json, upstream_request_id, input_tokens, \
+              output_tokens, created_at, ended_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NULL, NULL, NULL, NULL, ?, NULL)",
         )
         .bind(attempt_id)
         .bind(round_id)
         .bind(candidate_order)
+        .bind(attempt_number)
         .bind(provider_id)
         .bind(upstream_model_id)
         .bind(attempt_type.as_str())
