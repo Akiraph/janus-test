@@ -320,6 +320,17 @@ pub async fn run_context_compact_operation(
         .map_err(|error| anyhow::anyhow!("generate compact summary: {error:#}"))?;
     let summary = summary_outcome.summary;
     let estimated_input_tokens = summary_outcome.input_tokens;
+    // A digest-only compact still succeeds, but saying only "succeeded" hides
+    // that the summary is mechanical. Publish the model outcome alongside it so
+    // a client can tell the user why the summary reads thin.
+    let summary_model_status = summary_outcome
+        .fallback
+        .as_ref()
+        .map_or("succeeded", |fallback| fallback.status.as_str());
+    let summary_model_detail = summary_outcome
+        .fallback
+        .as_ref()
+        .map(|fallback| fallback.detail.as_str());
 
     let now = now_utc_str();
     let mut work = state.unit_of_work().begin().await?;
@@ -385,6 +396,8 @@ pub async fn run_context_compact_operation(
                 "session_id": input.session_id,
                 "compact_summary_id": input.compact_summary_id,
                 "compact_status": "succeeded",
+                "summary_model_status": summary_model_status,
+                "summary_model_detail": summary_model_detail,
                 "timeline_item_id": timeline_item_id,
             }),
         })
@@ -410,6 +423,8 @@ pub async fn run_context_compact_operation(
                     "session_id": input.session_id,
                     "compact_summary_id": input.compact_summary_id,
                     "timeline_item_id": timeline_item_id,
+                    "summary_model_status": summary_model_status,
+                    "summary_model_detail": summary_model_detail,
                 })),
                 problem: None,
                 correlation_id: CorrelationId::new(),
@@ -438,6 +453,15 @@ struct CompactSummaryOutcome {
     attempt_id: Option<String>,
     input_tokens: i64,
     output_tokens: i64,
+    /// Set when the model pass could not produce the summary and the compact
+    /// fell back to the mechanical digest.
+    fallback: Option<CompactFallback>,
+}
+
+/// Why a compact completed without a model-written summary.
+struct CompactFallback {
+    status: String,
+    detail: String,
 }
 
 const COMPACT_SUMMARY_SYSTEM_PROMPT: &str = r#"You are summarizing a coding-agent session transcript for context compaction. Produce a dense, self-contained summary a future assistant turn can use to continue the work without rereading the transcript.
@@ -510,17 +534,22 @@ impl Application {
             snapshot
         };
         let Some(model_snapshot) = request.take() else {
+            let fallback = CompactFallback {
+                status: "no_model_configured".to_owned(),
+                detail: "no default model is configured for the project".to_owned(),
+            };
             return Ok(CompactSummaryOutcome {
                 summary: fallback_compact_summary(
                     &summary_base,
                     &transcript,
                     &digest,
-                    "no_model_configured",
-                    "no default model is configured for the project",
+                    &fallback.status,
+                    &fallback.detail,
                 ),
                 attempt_id: None,
                 input_tokens: 0,
                 output_tokens: 0,
+                fallback: Some(fallback),
             });
         };
 
@@ -590,6 +619,7 @@ impl Application {
                     attempt_id: Some(attempt_id),
                     input_tokens: i64::try_from(usage.input_tokens).unwrap_or(i64::MAX),
                     output_tokens: i64::try_from(usage.output_tokens).unwrap_or(i64::MAX),
+                    fallback: None,
                 })
             }
             _ => {
@@ -601,17 +631,22 @@ impl Application {
                         _ => None,
                     })
                     .unwrap_or_else(|| "model produced no summary text".to_owned());
+                let fallback = CompactFallback {
+                    status: "model_failed".to_owned(),
+                    detail,
+                };
                 Ok(CompactSummaryOutcome {
                     summary: fallback_compact_summary(
                         &summary_base,
                         &transcript,
                         &digest,
-                        "model_failed",
-                        &detail,
+                        &fallback.status,
+                        &fallback.detail,
                     ),
                     attempt_id: None,
                     input_tokens: 0,
                     output_tokens: 0,
+                    fallback: Some(fallback),
                 })
             }
         }
