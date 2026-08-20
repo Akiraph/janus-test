@@ -100,11 +100,21 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
         AppState::initialize(test_config(disabled_directory.path().into())).await?;
     let (disabled_base, disabled_task) = spawn(disabled_state).await?;
     let client = Client::new();
-    let body = r#"<a href="https://github.com/acme/widget/pull/42">conflict</a>"#;
+    let body = r#"{
+      "event": "fork_sync_conflict",
+      "timestamp": "2026-08-19T06:00:00.000Z",
+      "summary": {"scanned": 1, "conflicts": 1},
+      "conflicts": [
+        {"fullName": "acme/widget", "htmlUrl": "https://github.com/acme/widget",
+         "parentFullName": "acme/upstream", "defaultBranch": "main",
+         "parentDefaultBranch": "main", "prNumber": 42,
+         "prUrl": "https://github.com/acme/widget/pull/42", "message": "conflict"}
+      ]
+    }"#;
 
     let disabled = client
         .post(format!("{disabled_base}/api/v1/automation/webhook"))
-        .header("content-type", "text/html")
+        .header("content-type", "application/json")
         .body(body)
         .send()
         .await?;
@@ -147,15 +157,29 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
 
     let unauthorized = client
         .post(format!("{enabled_base}/api/v1/automation/webhook"))
-        .header("content-type", "text/html")
+        .header("content-type", "application/json")
         .body(body)
         .send()
         .await?;
     assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let accepted = client
+    // The contract is JSON-only: an authorized request with any other media
+    // type is a protocol error, not a parse attempt.
+    let wrong_media_type = client
         .post(format!("{enabled_base}/api/v1/automation/webhook"))
         .header("content-type", "text/html")
+        .header("x-janus-webhook-secret", "test-secret")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(
+        wrong_media_type.status(),
+        reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+
+    let accepted = client
+        .post(format!("{enabled_base}/api/v1/automation/webhook"))
+        .header("content-type", "application/json")
         .header("x-janus-webhook-secret", "test-secret")
         .header("idempotency-key", "webhook-test-1")
         .body(body)
@@ -163,10 +187,11 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
         .await?;
     assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
     let accepted_body: Value = accepted.json().await?;
-    assert_eq!(accepted_body["data"]["kind"], "automation.pull_request");
+    assert_eq!(accepted_body["data"]["kind"], "automation.fork_sync_batch");
+    assert_eq!(accepted_body["data"]["target_kind"], "fork_sync_batch");
     assert_eq!(
         accepted_body["data"]["target_id"],
-        "https://github.com/acme/widget/pull/42"
+        "fork-sync:webhook-test-1"
     );
 
     enabled_task.abort();
