@@ -426,6 +426,92 @@ function buildDockerImageAndCommand(image, config = {}) {
   return [shellQuote(image), ...commandArgs.map(shellQuote)].join(" ");
 }
 
+/**
+ * 收集容器的全部挂载。顶层 .Mounts 是唯一同时覆盖三种来源的字段：`--mount` 创建的
+ * 挂载、`-v` 创建的 bind，以及镜像 VOLUME 指令生成的匿名卷。只读 HostConfig.Mounts
+ * 会漏掉后两种，重建出来的容器会挂到一个全新的空卷上，原有数据被留在孤立卷里。
+ * @param {Object} inspectData - 单个容器的 docker inspect 数据
+ * @returns {Array<{type: string, source: string, target: string, readOnly: boolean, mode: string}>}
+ */
+function collectContainerMounts(inspectData) {
+  const hostConfig = inspectData.HostConfig || {};
+  const mounts = [];
+
+  for (const mount of hostConfig.Mounts || []) {
+    mounts.push({
+      type: mount.Type || "volume",
+      // HostConfig.Mounts 里卷的 Source 已经是卷名
+      source: mount.Source,
+      target: mount.Target,
+      readOnly: Boolean(mount.ReadOnly),
+      mode: mount.Mode,
+    });
+  }
+
+  for (const mount of inspectData.Mounts || []) {
+    // tmpfs 由 HostConfig.Tmpfs 单独继承，这里跳过避免重复
+    if (mount.Type === "tmpfs") {
+      continue;
+    }
+    mounts.push({
+      type: mount.Type || "volume",
+      // 顶层 .Mounts 里卷的 Source 是宿主机路径，卷名在 Name
+      source: mount.Type === "volume" ? mount.Name : mount.Source,
+      target: mount.Destination,
+      readOnly: mount.RW === false,
+      mode: mount.Mode,
+    });
+  }
+
+  for (const bind of hostConfig.Binds || []) {
+    const [source, target, mode] = String(bind).split(":");
+    mounts.push({
+      type: "bind",
+      source,
+      target,
+      readOnly: mode === "ro",
+      mode,
+    });
+  }
+
+  return mounts;
+}
+
+/**
+ * 把收集到的挂载渲染成 docker run 参数。卷用 --mount 表达，因为只有 --mount 会写进
+ * HostConfig.Mounts，下一次重建才能继续继承；bind 保留 -v，以免丢掉 -v 自动创建宿主
+ * 机目录的行为。
+ * @param {Object} inspectData - 单个容器的 docker inspect 数据
+ * @param {Object} compatibility - getDockerCompatibility 的返回值
+ * @returns {string[]} docker run 挂载参数
+ */
+function buildMountArgs(inspectData, compatibility = {}) {
+  const args = [];
+  const seenTargets = new Set();
+
+  for (const mount of collectContainerMounts(inspectData)) {
+    if (!mount.source || !mount.target || seenTargets.has(mount.target)) {
+      continue;
+    }
+    seenTargets.add(mount.target);
+
+    if (mount.type === "volume" && compatibility.supportsMount) {
+      const readonly = mount.readOnly ? ",readonly" : "";
+      args.push(
+        `--mount type=volume,source=${shellQuote(mount.source)},target=${shellQuote(mount.target)}${readonly}`,
+      );
+      continue;
+    }
+
+    const mode = mount.mode && mount.mode !== "rw" ? `:${mount.mode}` : "";
+    args.push(
+      `-v ${shellQuote(mount.source)}:${shellQuote(mount.target)}${mode}`,
+    );
+  }
+
+  return args;
+}
+
 function isSpecialNetworkMode(networkMode) {
   return (
     networkMode === "host" ||
@@ -758,61 +844,9 @@ async function recreateContainer(ssh, oldContainerName, newImageUrl) {
     }
 
     // 继承挂载卷和权限（兼容性处理）
-    const mounts = hostConfig.Mounts || [];
-    const mountPoints = containerInfo[0].MountPoints || {};
-    const volumes = containerInfo[0].Volumes || {};
-    const allMountTargets = new Set();
-
-    // 处理 Mounts 中的挂载
-    for (const mount of mounts) {
-      if (mount.Target) {
-        allMountTargets.add(mount.Target);
-        if (mount.Source) {
-          if (compatibility.supportsMount && mount.Type) {
-            // 使用新的 --mount 语法（Docker 17.06+）
-            let mountCmd = `--mount type=${mount.Type},source=${mount.Source},target=${mount.Target}`;
-            if (mount.ReadOnly) {
-              mountCmd += ",readonly";
-            }
-            if (mount.BindOptions && mount.BindOptions.Propagation) {
-              mountCmd += `,bind-propagation=${mount.BindOptions.Propagation}`;
-            }
-            createCommand += `${mountCmd} `;
-          } else {
-            // 使用传统的 -v 语法
-            let mountCmd = `-v ${mount.Source}:${mount.Target}`;
-            if (mount.Mode && mount.Mode !== "rw") {
-              mountCmd += `:${mount.Mode}`;
-            }
-            createCommand += `${mountCmd} `;
-          }
-        }
-      }
-    }
-
-    // 检查MountPoints
-    for (const [target, mp] of Object.entries(mountPoints)) {
-      if (!allMountTargets.has(target)) {
-        const source = mp.Source;
-        if (source) {
-          logInfo(`自动补全挂载: ${source} -> ${target}`);
-          let mountCmd = `-v ${source}:${target}`;
-          if (mp.Mode && mp.Mode !== "rw") {
-            mountCmd += `:${mp.Mode}`;
-          }
-          createCommand += `${mountCmd} `;
-          allMountTargets.add(target);
-        }
-      }
-    }
-
-    // 检查Volumes
-    for (const [target, source] of Object.entries(volumes)) {
-      if (!allMountTargets.has(target)) {
-        logInfo(`自动补全挂载: ${source} -> ${target}`);
-        createCommand += `-v ${source}:${target} `;
-        allMountTargets.add(target);
-      }
+    const mountArgs = buildMountArgs(containerInfo[0], compatibility);
+    if (mountArgs.length > 0) {
+      createCommand += `${mountArgs.join(" ")} `;
     }
 
     // 继承网络模式：docker run 只能指定一个主网络，附加网络需要创建后 connect
@@ -1362,26 +1396,9 @@ function generateDockerRunCommand(inspectData, overrideImage) {
     }
   }
 
-  // 挂载卷 - 优先使用 Mounts，再补充 Binds
-  const mountTargets = new Set();
-  const mounts = hostConfig.Mounts || [];
-  for (const mount of mounts) {
-    if (mount.Source && mount.Target) {
-      mountTargets.add(mount.Target);
-      let vol = `-v ${mount.Source}:${mount.Target}`;
-      if (mount.Mode && mount.Mode !== "rw") vol += `:${mount.Mode}`;
-      cmd += ` \\\n  ${vol}`;
-    }
-  }
-  const binds = hostConfig.Binds || [];
-  for (const bind of binds) {
-    // bind 格式: source:target[:mode]
-    const parts = bind.split(":");
-    const target = parts.length >= 2 ? parts[1] : null;
-    if (target && !mountTargets.has(target)) {
-      mountTargets.add(target);
-      cmd += ` \\\n  -v ${bind}`;
-    }
+  // 挂载卷 - 覆盖 --mount、-v 的 bind 以及镜像 VOLUME 生成的匿名卷
+  for (const mountArg of buildMountArgs(inspectData, { supportsMount: true })) {
+    cmd += ` \\\n  ${mountArg}`;
   }
 
   // 网络模式：docker run 只保留主网络，附加网络在容器创建后 connect
