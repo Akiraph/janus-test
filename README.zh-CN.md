@@ -508,8 +508,20 @@ docker run --rm -p 4317:4317 -v janus-data:/data janus:local
 镜像默认值是 `JANUS_BIND=0.0.0.0:4317`、`JANUS_DEV_AUTH=false`、
 `JANUS_DATA_ROOT=/data` 和 `JANUS_WEB_DIST=/app/web`;`/data` 是一个卷,进程以非特权的
 `janus` 用户运行,4317 端口同时提供 API、健康探针和 Web 客户端。真实部署还需设置
-`JANUS_MODE=production`,以及与公开主机名匹配的 https `JANUS_PUBLIC_ORIGIN`。镜像里只
-带 `janus-server` 二进制,因此管理令牌需要从代码检出或单独构建的 `janus-admin` 签发。
+`JANUS_MODE=production`,以及与公开主机名匹配的 https `JANUS_PUBLIC_ORIGIN`。
+
+`janus-admin` 与 `janus-server` 一起打进镜像,因此管理令牌直接用部署好的镜像签发,不
+需要代码检出。它会独占打开数据根,所以要在服务端容器停止时,以一次性容器的形式针对同
+一个卷运行,并给它和服务端相同的环境 —— `Config::from_env` 会校验整份配置,所以生产环
+境下仍需 `JANUS_MASTER_KEY` 和 https 的 `JANUS_PUBLIC_ORIGIN`。
+
+```text
+docker run --rm -v janus-data:/data \
+  -e JANUS_MODE=production \
+  -e JANUS_PUBLIC_ORIGIN=https://janus.example.com \
+  -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
+  janus:local janus-admin issue-initialization-token
+```
 
 ## Fork-sync 自动化
 

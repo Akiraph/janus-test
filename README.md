@@ -566,8 +566,23 @@ Image defaults are `JANUS_BIND=0.0.0.0:4317`, `JANUS_DEV_AUTH=false`,
 the process runs as the unprivileged `janus` user, and port 4317 serves the API,
 the health probes, and the web client. A real deployment additionally sets
 `JANUS_MODE=production` and an https `JANUS_PUBLIC_ORIGIN` matching the public
-hostname. Only the `janus-server` binary ships in the image, so administration
-tokens are issued from a checkout or a separate build of `janus-admin`.
+hostname.
+
+`janus-admin` ships in the image next to `janus-server`, so administration
+tokens are issued from the deployed image rather than from a checkout. It opens
+the data root exclusively, so run it as a one-off container against the same
+volume while the server container is stopped, with the same environment the
+server gets — `Config::from_env` validates the whole configuration, so a
+production run still needs `JANUS_MASTER_KEY` and an https
+`JANUS_PUBLIC_ORIGIN`.
+
+```text
+docker run --rm -v janus-data:/data \
+  -e JANUS_MODE=production \
+  -e JANUS_PUBLIC_ORIGIN=https://janus.example.com \
+  -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
+  janus:local janus-admin issue-initialization-token
+```
 
 ## Fork-sync automation
 
