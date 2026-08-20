@@ -9,11 +9,11 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::post;
-use axum::Router;
 use janus_infrastructure::operations::IdempotencyRequest;
 use janus_infrastructure::{
     clock::format_utc,
@@ -21,7 +21,10 @@ use janus_infrastructure::{
 };
 use janus_models::interface::{ModelClient, ProviderInput, ProviderKind};
 use janus_server::application::context::{CompactContextRequest, run_context_compact_operation};
-use janus_server::{AppState, config::{Config, RunMode}};
+use janus_server::{
+    AppState,
+    config::{Config, RunMode},
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -240,12 +243,11 @@ async fn compact_generates_a_model_summary_with_real_tokens() -> anyhow::Result<
     assert!(summary.get("timeline_digest").is_none());
 
     // The attempt ledger row is tagged as a compact attempt.
-    let attempt_type: String = sqlx::query_scalar(
-        "SELECT attempt_type FROM model_attempts WHERE id = ?",
-    )
-    .bind(&attempt_id)
-    .fetch_one(state.pool())
-    .await?;
+    let attempt_type: String =
+        sqlx::query_scalar("SELECT attempt_type FROM model_attempts WHERE id = ?")
+            .bind(&attempt_id)
+            .fetch_one(state.pool())
+            .await?;
     assert_eq!(attempt_type, "compact");
 
     // The context version completed with the real token count.
@@ -269,7 +271,9 @@ async fn compact_generates_a_model_summary_with_real_tokens() -> anyhow::Result<
     .await?;
     let projection: Value = serde_json::from_str(&projection)?;
     assert_eq!(
-        projection["summary"]["text"].as_str().expect("timeline summary"),
+        projection["summary"]["text"]
+            .as_str()
+            .expect("timeline summary"),
         "The user fixed the login bug by editing auth.rs and running cargo test."
     );
     Ok(())
@@ -295,6 +299,10 @@ async fn compact_without_a_model_degrades_to_the_digest() -> anyhow::Result<()> 
     let summary: Value = serde_json::from_str(&summary_json)?;
     assert_eq!(summary["summary_model_status"], "no_model_configured");
     assert_eq!(status, "succeeded");
-    assert!(summary["timeline_digest"].as_str().is_some_and(|d| !d.is_empty()));
+    assert!(
+        summary["timeline_digest"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty())
+    );
     Ok(())
 }

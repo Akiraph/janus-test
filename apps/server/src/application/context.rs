@@ -14,15 +14,15 @@ use super::operation_kinds::KIND_CONTEXT_COMPACT;
 use janus_execution::interface::{
     DEFAULT_CONTEXT_LIMIT, ScheduleCompactInput, context_usage_near_limit,
 };
-use janus_models::interface::{
-    AttemptType, ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
-};
 use janus_infrastructure::clock::{format_utc, now_utc, now_utc_str};
 use janus_infrastructure::events::{EventType, NewEvent};
 use janus_infrastructure::id::{CompactSummaryId, CorrelationId, SessionId};
 use janus_infrastructure::operations::{
     CreateOperation, CreateWork, IdempotencyOutcome, IdempotencyRequest, OperationStatus,
     OperationView, StepState, WorkClaim,
+};
+use janus_models::interface::{
+    AttemptType, ChatMessage, ChatRole, ContentPart, ModelRequest, ModelStreamEvent,
 };
 use janus_sessions::interface::{ContextCompactedTimelineInput, SessionsError};
 
@@ -566,11 +566,7 @@ impl Application {
         let mut ignore_event = |_| std::future::ready(());
         let events = self
             .models()
-            .stream_completion_with_attempt(
-                req,
-                AttemptType::Compact,
-                &mut ignore_event,
-            )
+            .stream_completion_with_attempt(req, AttemptType::Compact, &mut ignore_event)
             .await
             .map_err(|error| anyhow::anyhow!("compact model stream: {error}"))?;
 

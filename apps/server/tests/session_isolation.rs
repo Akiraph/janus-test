@@ -9,7 +9,10 @@
 //! guard is unit-tested in `janus-execution`.
 
 use janus_infrastructure::id::{ProjectId, SessionId, TurnId};
-use janus_server::{AppState, config::{Config, RunMode}};
+use janus_server::{
+    AppState,
+    config::{Config, RunMode},
+};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 
@@ -41,13 +44,11 @@ async fn seed_project_with_active_session(
     let project_id = ProjectId::new();
     let session_id = SessionId::new();
     let turn_id = TurnId::new();
-    sqlx::query(
-        "INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Owner', ?)",
-    )
-    .bind(format!("owner-{label}"))
-    .bind(NOW)
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Owner', ?)")
+        .bind(format!("owner-{label}"))
+        .bind(NOW)
+        .execute(pool)
+        .await?;
     sqlx::query(
         "INSERT INTO projects \
          (id, owner_id, name, state, repo_access, repo_url, version, \
@@ -141,10 +142,8 @@ async fn read_session_tool_fails_closed_across_projects() -> anyhow::Result<()> 
     let (project_a, session_a) = seed_project_with_active_session(&state, "alpha").await?;
     let (_project_b, session_b) = seed_project_with_active_session(&state, "beta").await?;
 
-    let blobs = janus_infrastructure::managed_storage::BlobStore::new(
-        state.pool().clone(),
-        temp.path(),
-    )?;
+    let blobs =
+        janus_infrastructure::managed_storage::BlobStore::new(state.pool().clone(), temp.path())?;
     let workspace_root = temp.path().join("workspace-root");
     std::fs::create_dir_all(&workspace_root)?;
     let ctx = janus_execution::ToolContext {

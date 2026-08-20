@@ -21,8 +21,11 @@ pub(super) async fn spa(State(state): State<AppState>, request: Request) -> Resp
     // Unmatched public-protocol paths stay protocol errors. Without this guard
     // the SPA shell would answer unknown API routes with 200 and HTML.
     if path.starts_with("/api/") || path.starts_with("/health/") {
-        return Problem::from_code(codes::RESOURCE_NOT_FOUND, format!("no route matches {path}"))
-            .into_response();
+        return Problem::from_code(
+            codes::RESOURCE_NOT_FOUND,
+            format!("no route matches {path}"),
+        )
+        .into_response();
     }
 
     let Some(dist) = state.config().web_dist.clone() else {

@@ -836,7 +836,12 @@ impl ExecutionInterface {
             loop {
                 let events = self
                     .models
-                    .stream_completion_with_candidate(req.clone(), candidate_order, AttemptType::Normal, on_event)
+                    .stream_completion_with_candidate(
+                        req.clone(),
+                        candidate_order,
+                        AttemptType::Normal,
+                        on_event,
+                    )
                     .await?;
                 let failed = events.iter().rev().find_map(|e| match e {
                     ModelStreamEvent::Failed {

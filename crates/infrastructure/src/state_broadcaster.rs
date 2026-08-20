@@ -131,61 +131,60 @@ impl StateBroadcaster {
 
     fn spawn_stream_flusher(&self) {
         let inner = Arc::clone(&self.inner);
-        std::thread::spawn(move || loop {
-            let deadline: Option<Instant> = {
-                let guard = inner
-                    .pending_stream
-                    .lock()
-                    .expect("state broadcaster stream lock poisoned");
-                guard
-                    .values()
-                    .map(|(_, at)| *at + STREAM_COALESCE)
-                    .min()
-            };
-            match deadline {
-                None => {
-                    // Sleep until new work arrives.
+        std::thread::spawn(move || {
+            loop {
+                let deadline: Option<Instant> = {
                     let guard = inner
                         .pending_stream
                         .lock()
                         .expect("state broadcaster stream lock poisoned");
-                    let _unused = inner
-                        .stream_wake
-                        .wait_timeout(guard, Duration::from_secs(1))
-                        .expect("state broadcaster stream lock poisoned");
-                }
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if deadline > now {
+                    guard.values().map(|(_, at)| *at + STREAM_COALESCE).min()
+                };
+                match deadline {
+                    None => {
+                        // Sleep until new work arrives.
                         let guard = inner
                             .pending_stream
                             .lock()
                             .expect("state broadcaster stream lock poisoned");
                         let _unused = inner
                             .stream_wake
-                            .wait_timeout(guard, deadline - now)
+                            .wait_timeout(guard, Duration::from_secs(1))
                             .expect("state broadcaster stream lock poisoned");
                     }
-                    let due: Vec<StateChange> = {
-                        let mut guard = inner
-                            .pending_stream
-                            .lock()
-                            .expect("state broadcaster stream lock poisoned");
+                    Some(deadline) => {
                         let now = Instant::now();
-                        guard
-                            .iter()
-                            .filter(|(_, (_, at))| *at + STREAM_COALESCE <= now)
-                            .map(|(key, (change, _))| (key.clone(), change.clone()))
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .map(|(key, change)| {
-                                guard.remove(&key);
-                                change
-                            })
-                            .collect()
-                    };
-                    for change in due {
-                        let _ = inner.tx.send(Arc::new(change));
+                        if deadline > now {
+                            let guard = inner
+                                .pending_stream
+                                .lock()
+                                .expect("state broadcaster stream lock poisoned");
+                            let _unused = inner
+                                .stream_wake
+                                .wait_timeout(guard, deadline - now)
+                                .expect("state broadcaster stream lock poisoned");
+                        }
+                        let due: Vec<StateChange> = {
+                            let mut guard = inner
+                                .pending_stream
+                                .lock()
+                                .expect("state broadcaster stream lock poisoned");
+                            let now = Instant::now();
+                            guard
+                                .iter()
+                                .filter(|(_, (_, at))| *at + STREAM_COALESCE <= now)
+                                .map(|(key, (change, _))| (key.clone(), change.clone()))
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .map(|(key, change)| {
+                                    guard.remove(&key);
+                                    change
+                                })
+                                .collect()
+                        };
+                        for change in due {
+                            let _ = inner.tx.send(Arc::new(change));
+                        }
                     }
                 }
             }

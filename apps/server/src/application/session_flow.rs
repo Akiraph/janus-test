@@ -699,7 +699,10 @@ mod tests {
 
     #[test]
     fn first_line_becomes_the_title() {
-        assert_eq!(derive_session_title("Fix the login bug", 80), "Fix the login bug");
+        assert_eq!(
+            derive_session_title("Fix the login bug", 80),
+            "Fix the login bug"
+        );
     }
 
     #[test]
@@ -717,12 +720,18 @@ mod tests {
 
     #[test]
     fn markdown_heading_is_stripped() {
-        assert_eq!(derive_session_title("## Ship the release", 80), "Ship the release");
+        assert_eq!(
+            derive_session_title("## Ship the release", 80),
+            "Ship the release"
+        );
     }
 
     #[test]
     fn surrounding_quotes_are_stripped() {
-        assert_eq!(derive_session_title("\"Ship the release\"", 80), "Ship the release");
+        assert_eq!(
+            derive_session_title("\"Ship the release\"", 80),
+            "Ship the release"
+        );
     }
 
     #[test]

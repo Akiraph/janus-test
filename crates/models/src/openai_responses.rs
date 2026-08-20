@@ -684,8 +684,7 @@ mod tests {
         // Two function calls that carry no ids at all must not collide on a
         // shared placeholder id, and two events describing the same id must
         // collapse into one CompletedToolCall.
-        let mut assembler =
-            OpenaiResponsesAssembler::for_tools(&[request().tools[0].clone()]);
+        let mut assembler = OpenaiResponsesAssembler::for_tools(&[request().tools[0].clone()]);
         assembler
             .ingest_event(
                 "attempt",
