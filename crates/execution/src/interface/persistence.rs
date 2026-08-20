@@ -160,7 +160,7 @@ impl ExecutionInterface {
             }
         };
         Ok(Some(TurnModelAttempt {
-            attempt: attempt.attempt,
+            attempt: durable_retry_index(attempt.attempt, status),
             status,
             detail: attempt.detail,
         }))
@@ -390,5 +390,51 @@ impl ExecutionInterface {
             .execute(&mut *tx)
             .await?;
         Ok(())
+    }
+}
+
+/// Translate a stored 0-based ledger retry index into the 1-based reconnect
+/// counter the conversation status row renders.
+///
+/// A `failed` attempt means the next retry is already scheduled, so it advances
+/// the counter; a `running` attempt reports the retry it is itself executing,
+/// which is `0` for the Round's first attempt. Settled attempts have no retry in
+/// flight and report `0` so the status row does not keep a stale reconnect
+/// notice on screen.
+fn durable_retry_index(ledger_attempt: i64, status: ModelAttemptStatus) -> i64 {
+    match status {
+        ModelAttemptStatus::Failed => ledger_attempt.saturating_add(1),
+        ModelAttemptStatus::Running => ledger_attempt.max(0),
+        ModelAttemptStatus::Succeeded
+        | ModelAttemptStatus::Canceled
+        | ModelAttemptStatus::Interrupted => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelAttemptStatus, durable_retry_index};
+
+    #[test]
+    fn a_failed_attempt_announces_the_retry_that_follows_it() {
+        assert_eq!(durable_retry_index(0, ModelAttemptStatus::Failed), 1);
+        assert_eq!(durable_retry_index(4, ModelAttemptStatus::Failed), 5);
+    }
+
+    #[test]
+    fn a_running_attempt_reports_the_retry_it_is_executing() {
+        assert_eq!(durable_retry_index(0, ModelAttemptStatus::Running), 0);
+        assert_eq!(durable_retry_index(3, ModelAttemptStatus::Running), 3);
+    }
+
+    #[test]
+    fn settled_attempts_do_not_leave_a_reconnect_notice_behind() {
+        for status in [
+            ModelAttemptStatus::Succeeded,
+            ModelAttemptStatus::Canceled,
+            ModelAttemptStatus::Interrupted,
+        ] {
+            assert_eq!(durable_retry_index(7, status), 0, "{status:?}");
+        }
     }
 }

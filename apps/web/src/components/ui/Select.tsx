@@ -17,6 +17,8 @@ interface SelectProps {
   class?: string;
 }
 
+const OPEN_KEYS = new Set(["Enter", " ", "ArrowDown", "ArrowUp"]);
+
 /**
  * Lightweight custom dropdown. Native <select> styling varies across platforms
  * and cannot match the ui-input look, so we render a trigger button + a portal
@@ -32,9 +34,24 @@ export function Select(props: SelectProps) {
   );
   let triggerRef: HTMLButtonElement | undefined;
   let listRef: HTMLDivElement | undefined;
+  let openedByKeyboard = false;
 
   const selectedLabel = () =>
     props.options.find((option) => option.value === props.value)?.label ?? props.value;
+
+  const optionButtons = (): HTMLButtonElement[] =>
+    listRef ? Array.from(listRef.querySelectorAll<HTMLButtonElement>(".ui-select-option")) : [];
+
+  const focusOptionAt = (index: number) => {
+    const buttons = optionButtons();
+    if (buttons.length === 0) return;
+    buttons[((index % buttons.length) + buttons.length) % buttons.length]?.focus();
+  };
+
+  const activeIndex = () => {
+    const buttons = optionButtons();
+    return buttons.findIndex((button) => button === document.activeElement);
+  };
 
   const position = () => {
     if (!triggerRef) return;
@@ -66,13 +83,18 @@ export function Select(props: SelectProps) {
     setCoords({ top, left: rect.left, width: rect.width });
   };
 
-  const openList = () => {
+  const openList = (viaKeyboard = false) => {
     if (props.disabled) return;
+    openedByKeyboard = viaKeyboard;
     position();
     setOpen(true);
   };
 
-  const closeList = () => setOpen(false);
+  const closeList = () => {
+    // Never drop focus on the floor when the list unmounts under it.
+    if (listRef?.contains(document.activeElement)) triggerRef?.focus();
+    setOpen(false);
+  };
 
   const toggle = () => {
     if (open()) {
@@ -87,11 +109,44 @@ export function Select(props: SelectProps) {
     closeList();
   };
 
+  const onListKeyDown = (event: KeyboardEvent) => {
+    const count = optionButtons().length;
+    if (count === 0) return;
+    const current = activeIndex();
+    switch (event.key) {
+      case "ArrowDown":
+        event.preventDefault();
+        focusOptionAt(current < 0 ? 0 : current + 1);
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        focusOptionAt(current < 0 ? count - 1 : current - 1);
+        break;
+      case "Home":
+        event.preventDefault();
+        focusOptionAt(0);
+        break;
+      case "End":
+        event.preventDefault();
+        focusOptionAt(count - 1);
+        break;
+      case "Tab":
+        event.preventDefault();
+        closeList();
+        break;
+    }
+  };
+
   // Close on outside click or any scroll while open.
   createEffect(() => {
     if (!open()) return;
     // Re-measure now that the real list height is known and snap position.
-    requestAnimationFrame(refine);
+    requestAnimationFrame(() => {
+      refine();
+      if (!openedByKeyboard) return;
+      const selected = props.options.findIndex((option) => option.value === props.value);
+      focusOptionAt(selected < 0 ? 0 : selected);
+    });
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as Node;
       if (triggerRef?.contains(target)) return;
@@ -99,11 +154,12 @@ export function Select(props: SelectProps) {
       closeList();
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        closeList();
-        triggerRef?.focus();
-      }
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      // Escape dismisses only the menu — an enclosing Dialog must stay open.
+      event.stopPropagation();
+      closeList();
+      triggerRef?.focus();
     };
     const onScroll = (event: Event) => {
       const target = event.target;
@@ -113,12 +169,12 @@ export function Select(props: SelectProps) {
     };
     const onResize = () => closeList();
     document.addEventListener("pointerdown", onPointerDown, true);
-    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onKeyDown, true);
     window.addEventListener("scroll", onScroll, true);
     window.addEventListener("resize", onResize);
     onCleanup(() => {
       document.removeEventListener("pointerdown", onPointerDown, true);
-      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onKeyDown, true);
       window.removeEventListener("scroll", onScroll, true);
       window.removeEventListener("resize", onResize);
     });
@@ -148,10 +204,9 @@ export function Select(props: SelectProps) {
           toggle();
         }}
         onKeyDown={(event) => {
-          if (event.key === "Enter" || event.key === " " || event.key === "ArrowDown") {
-            event.preventDefault();
-            if (!open()) openList();
-          }
+          if (!OPEN_KEYS.has(event.key)) return;
+          event.preventDefault();
+          if (!open()) openList(true);
         }}
       >
         <span class="ui-select-value">{selectedLabel()}</span>
@@ -167,6 +222,8 @@ export function Select(props: SelectProps) {
               ref={listRef}
               class="ui-select-list"
               role="listbox"
+              aria-label={props["aria-label"]}
+              onKeyDown={onListKeyDown}
               style={{ top: `${box().top}px`, left: `${box().left}px`, width: `${box().width}px` }}
             >
               <For each={props.options}>
@@ -178,6 +235,11 @@ export function Select(props: SelectProps) {
                     classList={{
                       "ui-select-option": true,
                       "ui-select-option--selected": option.value === props.value,
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" && event.key !== " ") return;
+                      event.preventDefault();
+                      choose(option.value);
                     }}
                     onPointerDown={(event) => {
                       if (event.button !== 0) return;

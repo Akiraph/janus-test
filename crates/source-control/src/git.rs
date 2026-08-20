@@ -73,27 +73,75 @@ impl SystemGit {
         if output.status.success() {
             String::from_utf8(output.stdout).map_err(|e| GitError::BadOutput(e.to_string()))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            Err(classify_failure(&stderr))
+            Err(classify_failure(&failure_output(
+                &output.stderr,
+                &output.stdout,
+            )))
         }
     }
 }
 
+/// Pick the stream that carries the reason a git command failed. `git commit`
+/// prints "nothing to commit" on stdout and leaves stderr empty, so a
+/// stderr-only view classifies the most common commit failure as an opaque
+/// process error with no detail at all.
+fn failure_output(stderr: &[u8], stdout: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_owned();
+    if stderr.is_empty() {
+        String::from_utf8_lossy(stdout).trim().to_owned()
+    } else {
+        stderr
+    }
+}
+
 /// Map a git stderr blob to a normalized `GitError`. Covers the failure modes
-/// the public API exposes: auth, unreachable, non-fast-forward, index-not-empty,
-/// diverged, checkout conflict. Unknown failures become `CommandFailed`.
-fn classify_failure(stderr: &str) -> GitError {
-    let lower = stderr.to_ascii_lowercase();
-    if lower.contains("authentication failed")
+/// the public API exposes; unknown failures become `CommandFailed`, which the
+/// transport reports as an opaque internal error, so every failure a user can
+/// act on needs an arm here.
+///
+/// Order matters: a failed `git commit` reprints the whole branch summary, which
+/// can mention "diverged", so the commit-specific arms must be tested first.
+fn classify_failure(output: &str) -> GitError {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("index.lock") || lower.contains("another git process seems to be running") {
+        GitError::RepositoryLocked
+    } else if lower.contains("please tell me who you are")
+        || lower.contains("unable to auto-detect email address")
+        || lower.contains("empty ident name")
+    {
+        GitError::IdentityUnset
+    } else if lower.contains("nothing to commit")
+        || lower.contains("nothing added to commit")
+        || lower.contains("no changes added to commit")
+    {
+        GitError::NothingToCommit
+    } else if lower.contains("repository not found") {
+        GitError::RepositoryNotFound
+    } else if lower.contains("does not appear to be a git repository")
+        || lower.contains("no such remote")
+    {
+        GitError::RemoteNotFound
+    } else if lower.contains("couldn't find remote ref")
+        || lower.contains("not found in upstream")
+        || lower.contains("does not match any")
+        || lower.contains("did not match any")
+        || lower.contains("unknown revision or path not in the working tree")
+    {
+        GitError::RefNotFound
+    } else if lower.contains("authentication failed")
         || lower.contains("could not read username")
         || lower.contains("permission denied")
-        || lower.contains("403")
+        || lower.contains("denied to")
+        || lower.contains("403 forbidden")
+        || lower.contains("returned error: 403")
+        || lower.contains("returned error: 401")
     {
         GitError::AuthFailed
     } else if lower.contains("could not resolve host")
         || lower.contains("connection timed out")
         || lower.contains("failed to connect")
         || lower.contains("connection refused")
+        || lower.contains("network is unreachable")
     {
         GitError::RemoteUnavailable
     } else if lower.contains("non-fast-forward") || lower.contains("rejected") {
@@ -105,7 +153,7 @@ fn classify_failure(stderr: &str) -> GitError {
     {
         GitError::CheckoutConflict
     } else {
-        GitError::CommandFailed(stderr.trim().to_owned())
+        GitError::CommandFailed(output.trim().to_owned())
     }
 }
 
@@ -150,7 +198,10 @@ impl GitRunner for SystemGit {
             if output.status.success() {
                 Ok(())
             } else {
-                Err(classify_failure(&String::from_utf8_lossy(&output.stderr)))
+                Err(classify_failure(&failure_output(
+                    &output.stderr,
+                    &output.stdout,
+                )))
             }
         })
     }
@@ -899,6 +950,7 @@ fn write_askpass_script(username: &str, password: &str) -> Result<std::path::Pat
 #[cfg(test)]
 mod tests {
     use super::classify_failure;
+    use super::failure_output;
     use super::parse_git_log;
     use super::parse_porcelain_v2;
     use crate::interface::GitError;
@@ -924,6 +976,66 @@ mod tests {
         assert!(matches!(
             classify_failure("fatal: refusing to merge unrelated histories (diverged)"),
             GitError::Diverged
+        ));
+    }
+
+    /// `git commit` with an empty index exits non-zero, prints its reason on
+    /// stdout, and leaves stderr empty. The branch summary it reprints can
+    /// mention "diverged", which must not outrank the real reason.
+    #[test]
+    fn classifies_commit_failures_reported_on_stdout() {
+        let stdout = concat!(
+            "On branch main\n",
+            "Your branch and 'origin/main' have diverged.\n",
+            "nothing to commit, working tree clean\n",
+        );
+        assert!(matches!(
+            classify_failure(&failure_output(b"", stdout.as_bytes())),
+            GitError::NothingToCommit
+        ));
+        assert!(matches!(
+            classify_failure("Author identity unknown\n*** Please tell me who you are."),
+            GitError::IdentityUnset
+        ));
+    }
+
+    #[test]
+    fn classifies_recoverable_remote_and_ref_failures() {
+        assert!(matches!(
+            classify_failure("fatal: 'upstream' does not appear to be a git repository"),
+            GitError::RemoteNotFound
+        ));
+        assert!(matches!(
+            classify_failure(
+                "remote: Repository not found.\nfatal: repository 'https://host/x' not found"
+            ),
+            GitError::RepositoryNotFound
+        ));
+        assert!(matches!(
+            classify_failure("fatal: couldn't find remote ref release"),
+            GitError::RefNotFound
+        ));
+        assert!(matches!(
+            classify_failure("error: src refspec release does not match any"),
+            GitError::RefNotFound
+        ));
+        assert!(matches!(
+            classify_failure("fatal: Unable to create '/repo/.git/index.lock': File exists."),
+            GitError::RepositoryLocked
+        ));
+    }
+
+    /// The auth arm used to match a bare "403", so any sha or path containing
+    /// those digits was reported to the user as an authentication failure.
+    #[test]
+    fn digits_in_a_sha_are_not_an_authentication_failure() {
+        assert!(matches!(
+            classify_failure("error: could not apply 403f9ab... rework"),
+            GitError::CommandFailed(_)
+        ));
+        assert!(matches!(
+            classify_failure("fatal: unable to access 'https://host/x': error: 403 Forbidden"),
+            GitError::AuthFailed
         ));
     }
 

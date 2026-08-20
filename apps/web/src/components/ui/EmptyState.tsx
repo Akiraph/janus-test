@@ -13,7 +13,9 @@ interface EmptyStateProps {
 export function EmptyState(props: EmptyStateProps) {
   return (
     <div class="ui-empty" classList={{ [props.class ?? ""]: !!props.class }}>
-      <props.icon size={48} strokeWidth={1.6} />
+      <span class="ui-empty__icon" aria-hidden="true">
+        <props.icon size={48} strokeWidth={1.6} />
+      </span>
       <h2>{props.title}</h2>
       <Show when={props.description}>
         <p>{props.description}</p>

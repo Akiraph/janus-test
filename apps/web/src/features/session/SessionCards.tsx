@@ -11,7 +11,7 @@ export function PlanCard(props: { item: PlanItem }) {
   return (
     <article class="session-card session-card--plan" aria-label="Plan">
       <header class="session-card__head">
-        <ListTree size={14} />
+        <ListTree size={14} aria-hidden="true" />
         <strong>{props.item.title}</strong>
       </header>
       <Show when={props.item.steps.length > 0} fallback={<p class="muted">No plan steps</p>}>
@@ -34,11 +34,11 @@ export function ModelCard(props: { item: ModelItem }) {
     <article
       class="session-card session-card--model"
       classList={{ "session-card--warning": props.item.warning }}
-      aria-label="Model attempt"
+      aria-label={props.item.warning ? "Model attempt warning" : "Model attempt"}
     >
       <header class="session-card__head">
-        <Show when={props.item.warning} fallback={<BookOpen size={14} />}>
-          <AlertTriangle size={14} />
+        <Show when={props.item.warning} fallback={<BookOpen size={14} aria-hidden="true" />}>
+          <AlertTriangle size={14} aria-hidden="true" />
         </Show>
         <strong>{props.item.model}</strong>
       </header>

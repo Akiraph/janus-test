@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/solid-query";
 import Bell from "lucide-solid/icons/bell";
 import ChevronDown from "lucide-solid/icons/chevron-down";
+import Loader2 from "lucide-solid/icons/loader-2";
 import Pencil from "lucide-solid/icons/pencil";
 import Plus from "lucide-solid/icons/plus";
 import Send from "lucide-solid/icons/send";
@@ -47,28 +48,37 @@ export function NotificationsSettings() {
   const [open, setOpen] = createSignal(true);
   const [editing, setEditing] = createSignal<NotificationChannelView | null>(null);
   const [formOpen, setFormOpen] = createSignal(false);
+  const [pendingDelete, setPendingDelete] = createSignal<NotificationChannelView | null>(null);
+  const [deleting, setDeleting] = createSignal(false);
+  const [testing, setTesting] = createSignal<string | null>(null);
 
   async function refresh() {
     await queryClient.invalidateQueries({ queryKey: ["notification-channels"] });
   }
 
-  async function remove(id: string) {
-    if (!confirm("Delete this notification channel?")) return;
+  async function remove(channel: NotificationChannelView) {
+    setDeleting(true);
     try {
-      await deleteNotificationChannel(id);
-      notify("Notification channel deleted", { variant: "success" });
+      await deleteNotificationChannel(channel.id);
+      notify(`${channel.display_name} deleted`, { variant: "success" });
+      setPendingDelete(null);
       await refresh();
     } catch (error) {
       notify(getErrorMessage(error, "Delete failed"), { variant: "danger" });
+    } finally {
+      setDeleting(false);
     }
   }
 
-  async function test(id: string) {
+  async function test(channel: NotificationChannelView) {
+    setTesting(channel.id);
     try {
-      await testNotificationChannel(id);
-      notify("Test notification sent", { variant: "success" });
+      await testNotificationChannel(channel.id);
+      notify(`Test notification sent to ${channel.display_name}`, { variant: "success" });
     } catch (error) {
       notify(getErrorMessage(error, "Test notification failed"), { variant: "danger" });
+    } finally {
+      setTesting(null);
     }
   }
 
@@ -79,21 +89,26 @@ export function NotificationsSettings() {
           class="settings-group-trigger"
           type="button"
           aria-expanded={open()}
+          aria-controls="notification-channels-body"
           onClick={() => setOpen(!open())}
         >
-          <ChevronDown classList={{ collapsed: !open() }} size={16} />
+          <ChevronDown classList={{ collapsed: !open() }} size={16} aria-hidden="true" />
           <div>
             <span class="settings-group-title">
-              <Bell size={15} /> Notifications
+              <Bell size={15} aria-hidden="true" /> Notifications
             </span>
             <small>Deliver turn and async task updates to external channels.</small>
           </div>
         </button>
         <Show when={open()}>
-          <div class="settings-group-body">
+          <div class="settings-group-body" id="notification-channels-body">
             <Show
               when={!channels.isPending}
-              fallback={<p class="surface-note">Loading notification channels...</p>}
+              fallback={
+                <p class="surface-note" role="status">
+                  Loading notification channels...
+                </p>
+              }
             >
               <Show
                 when={(channels.data?.length ?? 0) > 0}
@@ -127,9 +142,19 @@ export function NotificationsSettings() {
                             <Button
                               variant="outline"
                               size="sm"
-                              onClick={() => void test(channel.id)}
+                              disabled={testing() === channel.id}
+                              onClick={() => void test(channel)}
                             >
-                              <Send size={14} /> Test
+                              <Show
+                                when={testing() === channel.id}
+                                fallback={
+                                  <>
+                                    <Send size={14} aria-hidden="true" /> Test
+                                  </>
+                                }
+                              >
+                                <Loader2 size={14} class="ui-spinner" aria-hidden="true" /> Sending…
+                              </Show>
                             </Button>
                             <Button
                               variant="ghost"
@@ -141,16 +166,16 @@ export function NotificationsSettings() {
                                 setFormOpen(true);
                               }}
                             >
-                              <Pencil size={16} />
+                              <Pencil size={16} aria-hidden="true" />
                             </Button>
                             <Button
                               variant="ghost"
                               size="sm"
                               iconOnly
                               aria-label={`Delete ${channel.display_name}`}
-                              onClick={() => void remove(channel.id)}
+                              onClick={() => setPendingDelete(channel)}
                             >
-                              <Trash2 size={16} />
+                              <Trash2 size={16} aria-hidden="true" />
                             </Button>
                           </div>
                         </div>
@@ -168,11 +193,34 @@ export function NotificationsSettings() {
                 setFormOpen(true);
               }}
             >
-              <Plus size={16} /> Add notification channel
+              <Plus size={16} aria-hidden="true" /> Add notification channel
             </Button>
           </div>
         </Show>
       </section>
+
+      <Show when={pendingDelete()}>
+        {(channel) => (
+          <Dialog
+            title="Delete notification channel"
+            description={`"${channel().display_name}" stops receiving updates. Its endpoint and stored secret are deleted; this cannot be undone.`}
+            close={() => setPendingDelete(null)}
+          >
+            <div class="dialog-footer">
+              <Button variant="outline" onClick={() => setPendingDelete(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={deleting()}
+                onClick={() => void remove(channel())}
+              >
+                {deleting() ? "Deleting..." : "Delete channel"}
+              </Button>
+            </div>
+          </Dialog>
+        )}
+      </Show>
 
       <Show when={formOpen()}>
         <ChannelForm
@@ -283,8 +331,11 @@ function ChannelForm(props: ChannelFormProps) {
       <form class="dialog-form" onSubmit={submit}>
         <div class="dialog-form-grid">
           <div>
-            <span class="field-label">Name</span>
+            <label class="field-label" for="notification-name">
+              Name
+            </label>
             <input
+              id="notification-name"
               class="ui-input"
               value={name()}
               onInput={(event) => setName(event.currentTarget.value)}
@@ -301,8 +352,11 @@ function ChannelForm(props: ChannelFormProps) {
             />
           </div>
           <div class="full-field">
-            <span class="field-label">Endpoint URL</span>
+            <label class="field-label" for="notification-endpoint">
+              Endpoint URL
+            </label>
             <input
+              id="notification-endpoint"
               class="ui-input"
               type="url"
               value={endpoint()}
@@ -314,8 +368,11 @@ function ChannelForm(props: ChannelFormProps) {
             />
           </div>
           <div class="full-field">
-            <span class="field-label">Token / secret</span>
+            <label class="field-label" for="notification-secret">
+              Token / secret
+            </label>
             <input
+              id="notification-secret"
               class="ui-input"
               type="password"
               value={secret()}
@@ -324,12 +381,16 @@ function ChannelForm(props: ChannelFormProps) {
                 editing() ? "Leave blank to keep the stored secret" : "Optional for Webhook"
               }
               autocomplete="off"
+              required={kind() === "qqbot" && !editing()}
             />
           </div>
           <Show when={kind() === "qqbot"}>
             <div>
-              <span class="field-label">Private user ID</span>
+              <label class="field-label" for="notification-user-id">
+                Private user ID
+              </label>
               <input
+                id="notification-user-id"
                 class="ui-input"
                 value={userId()}
                 onInput={(event) => setUserId(event.currentTarget.value)}
@@ -337,8 +398,11 @@ function ChannelForm(props: ChannelFormProps) {
               />
             </div>
             <div>
-              <span class="field-label">Group ID</span>
+              <label class="field-label" for="notification-group-id">
+                Group ID
+              </label>
               <input
+                id="notification-group-id"
                 class="ui-input"
                 value={groupId()}
                 onInput={(event) => setGroupId(event.currentTarget.value)}

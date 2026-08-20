@@ -16,16 +16,26 @@ pub(super) async fn tool_read(
         Err(e) => return Ok(map_path_err(e)),
     };
     if !path.is_file() {
-        return Ok(fail_text("file not found", "TOOL_PATH_INVALID"));
+        // Name the actual cause: "file not found" sent the model looking for a
+        // typo when the path was really a directory.
+        let detail = if path.is_dir() {
+            format!("{raw} is a directory, not a file")
+        } else {
+            format!("{raw} does not exist in the workspace")
+        };
+        return Ok(fail_text(&detail, "TOOL_PATH_INVALID"));
     }
     let meta = tokio::fs::metadata(&path)
         .await
         .map_err(|e| ExecutionError::Internal(anyhow::anyhow!(e)))?;
     if meta.len() > MAX_IMAGE_BYTES {
-        // Still allow large text? Cap text at 10MiB for safety.
-        if meta.len() > 10 * 1024 * 1024 {
-            return Ok(fail_text("file too large", "IMAGE_TOO_LARGE"));
-        }
+        return Ok(fail_text(
+            &format!(
+                "{raw} is {} bytes, above the {MAX_IMAGE_BYTES} byte read ceiling",
+                meta.len()
+            ),
+            "IMAGE_TOO_LARGE",
+        ));
     }
     let bytes = tokio::fs::read(&path)
         .await
@@ -35,6 +45,19 @@ pub(super) async fn tool_read(
         return read_image(raw, &bytes, img, handle, ctx).await;
     }
 
+    // A non-image above the text ceiling is refused with its real size and the
+    // ceiling, so the caller can come back with an `offset`/`limit` slice
+    // instead of being told the file is an oversized image.
+    if bytes.len() > MAX_TEXT_BYTES {
+        return Ok(fail_text(
+            &format!(
+                "{raw} is {} bytes, above the {MAX_TEXT_BYTES} byte text ceiling; \
+                 read it in slices with offset and limit",
+                bytes.len()
+            ),
+            "VALIDATION_FAILED",
+        ));
+    }
     // Text: require UTF-8 round-trip.
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
@@ -48,50 +71,107 @@ pub(super) async fn tool_read(
     if text.contains('\0') {
         return Ok(fail_text("binary content", "UNSUPPORTED_IMAGE"));
     }
-    let (text, offset, limit) = apply_read_range(text, input);
+    let range = apply_read_range(text, input);
+    if range.beyond_end {
+        return Ok(fail_text(
+            &format!(
+                "offset {} is past the end of {raw}, which has {} lines",
+                range.offset.unwrap_or(1),
+                range.total_lines
+            ),
+            "VALIDATION_FAILED",
+        ));
+    }
     Ok(ToolOutcome {
         disposition: ToolExecutionDisposition::Succeeded,
-        parts: vec![ToolResultPart::Text { text: text.clone() }],
+        parts: vec![ToolResultPart::Text {
+            text: range.text.clone(),
+        }],
         summary: json!({
             "path": raw,
             "kind": "text",
-            "bytes": text.len(),
-            "offset": offset,
-            "limit": limit,
+            "bytes": range.text.len(),
+            "offset": range.offset,
+            "limit": range.limit,
+            "total_lines": range.total_lines,
+            "truncated": range.truncated,
         }),
         error_code: None,
         finish_summary: None,
     })
 }
 
+/// The slice of a file `read` returned, plus everything the caller needs to
+/// state that it is a slice rather than the whole file.
+struct ReadRange {
+    text: String,
+    /// Effective 1-indexed first line, or `None` when the whole file was read.
+    offset: Option<i64>,
+    /// Number of lines actually returned, or `None` for the whole file.
+    limit: Option<i64>,
+    total_lines: i64,
+    /// Set when lines outside the returned slice exist. The model and the user
+    /// must be told this, otherwise a partial read reads as the entire file.
+    truncated: bool,
+    /// The requested offset starts after the last line, so nothing was returned.
+    beyond_end: bool,
+}
+
 /// Apply the optional `offset` (1-indexed) / `limit` (line count) read range to
-/// the full file text. Returns the slice plus the effective offset/limit used
-/// so the caller can echo them back. When neither is given, the full text is
-/// returned and offset/limit are null.
-fn apply_read_range(text: String, input: &Value) -> (String, Option<i64>, Option<i64>) {
-    let offset = input
+/// the full file text. A `limit` on its own reads from the first line, because
+/// the registered schema offers it as a standalone cap; ignoring it would hand
+/// the model an entire large file after it explicitly asked for a slice.
+fn apply_read_range(text: String, input: &Value) -> ReadRange {
+    let requested_offset = input
         .get("offset")
-        .and_then(|v| v.as_u64())
-        .filter(|v| *v >= 1);
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1);
     let limit = input
         .get("limit")
-        .and_then(|v| v.as_u64())
-        .filter(|v| *v >= 1);
-    let Some(offset) = offset else {
-        return (text, None, None);
-    };
-    let start = (offset as usize).saturating_sub(1);
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1);
+    let total_lines = i64::try_from(text.split_inclusive('\n').count()).unwrap_or(i64::MAX);
+    if requested_offset.is_none() && limit.is_none() {
+        return ReadRange {
+            text,
+            offset: None,
+            limit: None,
+            total_lines,
+            truncated: false,
+            beyond_end: false,
+        };
+    }
+    let offset = requested_offset.unwrap_or(1);
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total = lines.len();
     if start >= total {
-        return (String::new(), Some(offset as i64), Some(0));
+        return ReadRange {
+            text: String::new(),
+            offset: i64::try_from(offset).ok(),
+            limit: Some(0),
+            total_lines,
+            truncated: false,
+            beyond_end: total > 0,
+        };
     }
     let end = match limit {
-        Some(l) => (start + l as usize).min(total),
+        Some(count) => start
+            .saturating_add(usize::try_from(count).unwrap_or(usize::MAX))
+            .min(total),
         None => total,
     };
     let slice: String = lines[start..end].concat();
-    (slice, Some(offset as i64), Some((end - start) as i64))
+    ReadRange {
+        text: slice,
+        offset: i64::try_from(offset).ok(),
+        limit: i64::try_from(end - start).ok(),
+        total_lines,
+        truncated: start > 0 || end < total,
+        beyond_end: false,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -753,3 +833,64 @@ pub(crate) async fn read_attachment_bytes(
 // ---------------------------------------------------------------------------
 // Runtime-backed tools
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::apply_read_range;
+
+    const FILE: &str = "one\ntwo\nthree\nfour\n";
+
+    #[test]
+    fn a_bare_limit_reads_from_the_first_line() {
+        let range = apply_read_range(FILE.to_owned(), &json!({"limit": 2}));
+        assert_eq!(range.text, "one\ntwo\n");
+        assert_eq!(range.offset, Some(1));
+        assert_eq!(range.limit, Some(2));
+        assert_eq!(range.total_lines, 4);
+        assert!(range.truncated);
+    }
+
+    #[test]
+    fn a_whole_file_read_is_not_reported_as_a_slice() {
+        let range = apply_read_range(FILE.to_owned(), &json!({}));
+        assert_eq!(range.text, FILE);
+        assert_eq!(range.offset, None);
+        assert_eq!(range.limit, None);
+        assert_eq!(range.total_lines, 4);
+        assert!(!range.truncated);
+        assert!(!range.beyond_end);
+    }
+
+    #[test]
+    fn a_range_covering_the_tail_is_still_a_slice() {
+        let range = apply_read_range(FILE.to_owned(), &json!({"offset": 3, "limit": 10}));
+        assert_eq!(range.text, "three\nfour\n");
+        assert_eq!(range.limit, Some(2));
+        assert!(range.truncated);
+    }
+
+    #[test]
+    fn an_enormous_limit_does_not_overflow_the_slice_bound() {
+        let range = apply_read_range(FILE.to_owned(), &json!({"limit": u64::MAX}));
+        assert_eq!(range.text, FILE);
+        assert_eq!(range.limit, Some(4));
+        assert!(!range.truncated);
+    }
+
+    #[test]
+    fn an_offset_past_the_last_line_is_reported_rather_than_read_as_empty() {
+        let range = apply_read_range(FILE.to_owned(), &json!({"offset": 99}));
+        assert!(range.beyond_end);
+        assert_eq!(range.total_lines, 4);
+        assert!(range.text.is_empty());
+    }
+
+    #[test]
+    fn an_empty_file_reads_as_empty_rather_than_out_of_range() {
+        let range = apply_read_range(String::new(), &json!({"offset": 1}));
+        assert!(!range.beyond_end);
+        assert_eq!(range.total_lines, 0);
+    }
+}

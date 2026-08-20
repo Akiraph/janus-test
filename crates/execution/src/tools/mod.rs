@@ -42,6 +42,9 @@ use super::types::{
 
 /// Hard image decode limits (SES-TOOL-READ-03 subset).
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+/// Largest text file `read` will return in one call. Above this the caller is
+/// told the size and asked for an `offset`/`limit` slice.
+const MAX_TEXT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_EDGE_PX: u32 = 32_768;
 const MAX_PIXELS: u64 = 100_000_000;
 const MAX_ATTACHMENT_TEXT_BYTES: usize = 256 * 1024;
@@ -127,8 +130,12 @@ fn fail_text(msg: &str, code: &str) -> ToolOutcome {
     }
 }
 
-fn map_path_err(_error: PathError) -> ToolOutcome {
-    fail_text("invalid path", "TOOL_PATH_INVALID")
+fn map_path_err(error: PathError) -> ToolOutcome {
+    // PathError already names the rule that was broken — traversal, not
+    // relative, empty/device name, NUL. Collapsing all four into "invalid path"
+    // left the caller guessing which one, so the rejected path was retried
+    // unchanged. The stable error code is unchanged.
+    fail_text(&error.to_string(), "TOOL_PATH_INVALID")
 }
 
 async fn tool_todo(input: &Value) -> Result<ToolOutcome, ExecutionError> {

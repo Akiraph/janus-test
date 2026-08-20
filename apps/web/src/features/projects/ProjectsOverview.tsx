@@ -2,6 +2,7 @@ import { A, useNavigate } from "@solidjs/router";
 import { useQueryClient } from "@tanstack/solid-query";
 import Folder from "lucide-solid/icons/folder";
 import FolderGit2 from "lucide-solid/icons/folder-git-2";
+import Loader2 from "lucide-solid/icons/loader-2";
 import Plus from "lucide-solid/icons/plus";
 import RefreshCw from "lucide-solid/icons/refresh-cw";
 import Trash2 from "lucide-solid/icons/trash-2";
@@ -29,6 +30,19 @@ function formatActivity(iso: string): string {
 
 function problemMessage(problem: unknown): string {
   return getErrorMessage(problem, "Operation failed");
+}
+
+function stateLabel(state: string): string {
+  switch (state) {
+    case "creating":
+      return "Cloning repository…";
+    case "error":
+      return "Clone failed";
+    case "deleting":
+      return "Deleting…";
+    default:
+      return state;
+  }
 }
 
 export function ProjectsOverview() {
@@ -111,7 +125,7 @@ export function ProjectsOverview() {
   }
 
   return (
-    <section class="projects" aria-labelledby="workspace-title">
+    <section class="projects" aria-labelledby="projects-title">
       <NotificationEvent
         message={
           projects.isError ? getErrorMessage(projects.error, "Failed to load projects") : null
@@ -121,11 +135,11 @@ export function ProjectsOverview() {
       />
       <div class="projects-heading projects-heading-row">
         <div>
-          <h1 id="workspace-title">Projects</h1>
+          <h1 id="projects-title">Projects</h1>
           <p>Pick a repository to start working.</p>
         </div>
         <Button variant="primary" onClick={() => setFormOpen(true)}>
-          <Plus size={16} />
+          <Plus size={16} aria-hidden="true" />
           Create project
         </Button>
       </div>
@@ -167,6 +181,14 @@ export function ProjectsOverview() {
                     </div>
                     <p class="project-repo">{project.repository.url}</p>
                     <div class="record-chips">
+                      <Show when={project.state !== "ready"}>
+                        <span class="project-state" data-state={project.state}>
+                          <Show when={project.state !== "error"}>
+                            <Loader2 size={12} class="ui-spinner" aria-hidden="true" />
+                          </Show>
+                          {stateLabel(project.state)}
+                        </span>
+                      </Show>
                       <span>{project.current_branch ?? project.repository.branch ?? "—"}</span>
                       <span>{project.repository.access}</span>
                       <span>Updated {formatActivity(project.updated_at)}</span>
@@ -179,13 +201,13 @@ export function ProjectsOverview() {
                         size="sm"
                         onClick={() => navigate(`/projects/${project.id}`)}
                       >
-                        <FolderGit2 size={14} />
+                        <FolderGit2 size={14} aria-hidden="true" />
                         Open
                       </Button>
                     </Show>
                     <Show when={project.state === "error"}>
                       <Button variant="outline" size="sm" onClick={() => void onRetry(project)}>
-                        <RefreshCw size={14} />
+                        <RefreshCw size={14} aria-hidden="true" />
                         Retry
                       </Button>
                     </Show>
@@ -197,7 +219,7 @@ export function ProjectsOverview() {
                         aria-label={`Delete ${project.name}`}
                         onClick={() => void onDelete(project)}
                       >
-                        <Trash2 size={16} />
+                        <Trash2 size={16} aria-hidden="true" />
                       </Button>
                     </Show>
                   </div>
@@ -298,17 +320,16 @@ function CreateProjectDialog(props: CreateProjectDialogProps) {
     >
       <form class="dialog-form" onSubmit={submit}>
         <div class="dialog-form-grid">
-          <div class="full-field">
+          <label class="full-field">
             <span class="field-label">Name</span>
             <input
               class="ui-input"
               value={name()}
               onInput={(event) => setName(event.currentTarget.value)}
-              aria-label="Name"
               required
             />
-          </div>
-          <div class="full-field">
+          </label>
+          <label class="full-field">
             <span class="field-label">Repository URL</span>
             <input
               class="ui-input"
@@ -316,20 +337,18 @@ function CreateProjectDialog(props: CreateProjectDialogProps) {
               value={url()}
               onInput={(event) => setUrl(event.currentTarget.value)}
               placeholder="https://github.com/org/repo.git"
-              aria-label="Repository URL"
               required
             />
-          </div>
-          <div>
+          </label>
+          <label>
             <span class="field-label">Branch (optional)</span>
             <input
               class="ui-input"
               value={branch()}
               onInput={(event) => setBranch(event.currentTarget.value)}
               placeholder="main"
-              aria-label="Branch"
             />
-          </div>
+          </label>
           <div>
             <span class="field-label">Access</span>
             <Select
@@ -357,7 +376,7 @@ function CreateProjectDialog(props: CreateProjectDialogProps) {
             Cancel
           </Button>
           <Button variant="primary" type="submit" disabled={submitting()}>
-            Create project
+            {submitting() ? "Creating project…" : "Create project"}
           </Button>
         </div>
       </form>

@@ -223,6 +223,9 @@ pub enum WorkspaceError {
     InvalidPath(#[from] PathError),
     #[error("path not found: {0}")]
     PathNotFound(String),
+    /// The path exists but the host filesystem refused access to it.
+    #[error("permission denied by the filesystem: {0}")]
+    PermissionDenied(String),
     #[error("file is not editable: {0}")]
     NotEditable(String),
     #[error("storage error: {0}")]

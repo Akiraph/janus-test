@@ -1,5 +1,5 @@
 import { ChevronRight, Loader2 } from "lucide-solid";
-import { createSignal, type JSX, Show } from "solid-js";
+import { createSignal, createUniqueId, type JSX, Show } from "solid-js";
 
 type ToolStatus = "running" | "success" | "failure";
 
@@ -17,6 +17,7 @@ interface ToolRowProps {
  */
 export function ToolRow(props: ToolRowProps) {
   const [open, setOpen] = createSignal(false);
+  const detailId = createUniqueId();
 
   const dotTone = () => {
     switch (props.status) {
@@ -35,7 +36,10 @@ export function ToolRow(props: ToolRowProps) {
         when={props.status === "running"}
         fallback={<span class="session-message__dot" data-tone={dotTone()} aria-hidden="true" />}
       >
-        <Loader2 size={14} class="ui-spinner" />
+        <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
+      </Show>
+      <Show when={props.status === "failure"}>
+        <span class="sr-only">Failed</span>
       </Show>
       <span class="tool-row__title">{props.title}</span>
       <Show when={props.meta}>
@@ -53,6 +57,8 @@ export function ToolRow(props: ToolRowProps) {
       <button
         type="button"
         class={`collapsible-row__trigger${open() ? " collapsible-row__trigger--open" : ""}`}
+        aria-expanded={open()}
+        aria-controls={detailId}
         onClick={() => setOpen(!open())}
       >
         {row}
@@ -63,7 +69,9 @@ export function ToolRow(props: ToolRowProps) {
         />
       </button>
       <Show when={open()}>
-        <div class="collapsible-row__detail tool-row__detail">{props.detail}</div>
+        <div id={detailId} class="collapsible-row__detail tool-row__detail">
+          {props.detail}
+        </div>
       </Show>
     </div>
   );
@@ -81,6 +89,7 @@ interface ToolGroupRowProps {
  */
 export function ToolGroupRow(props: ToolGroupRowProps) {
   const [open, setOpen] = createSignal(false);
+  const detailId = createUniqueId();
 
   const row = (
     <>
@@ -95,6 +104,8 @@ export function ToolGroupRow(props: ToolGroupRowProps) {
       <button
         type="button"
         class={`collapsible-row__trigger${open() ? " collapsible-row__trigger--open" : ""}`}
+        aria-expanded={open()}
+        aria-controls={detailId}
         onClick={() => setOpen(!open())}
       >
         {row}
@@ -105,7 +116,7 @@ export function ToolGroupRow(props: ToolGroupRowProps) {
         />
       </button>
       <Show when={open()}>
-        <div class="collapsible-row__detail tool-row__detail tool-group__detail">
+        <div id={detailId} class="collapsible-row__detail tool-row__detail tool-group__detail">
           {props.detail}
         </div>
       </Show>

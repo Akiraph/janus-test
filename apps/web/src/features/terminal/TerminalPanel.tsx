@@ -304,6 +304,37 @@ export function TerminalPanel(props: TerminalPanelProps) {
     fitAddon = undefined;
   });
 
+  const statusLabel = () => {
+    switch (status()) {
+      case "loading":
+      case "connecting":
+        return "Connecting";
+      case "live":
+        return "Connected";
+      case "reconnecting":
+        return "Disconnected";
+      case "error":
+        return "Connection failed";
+      case "closed":
+        return "Session closed";
+      default:
+        return "Not connected";
+    }
+  };
+
+  const notice = () => {
+    switch (status()) {
+      case "reconnecting":
+        return "The connection dropped. Reconnect to resume this session — the scrollback is replayed.";
+      case "error":
+        return "The terminal could not connect. Reconnect to try again.";
+      case "closed":
+        return "This terminal session is closed. Reconnect to start a new one.";
+      default:
+        return "";
+    }
+  };
+
   return (
     <div class="terminal-panel">
       <NotificationEvent
@@ -312,13 +343,16 @@ export function TerminalPanel(props: TerminalPanelProps) {
         action={{ label: "Reconnect", onClick: () => void onReconnect() }}
       />
       <div class="ide-sidebar-header terminal-panel__header">
-        <span>{props.title ?? "Terminal"}</span>
+        <span>
+          {props.title ?? "Terminal"} · <span role="status">{statusLabel()}</span>
+        </span>
         <div class="terminal-panel__actions">
           <Button
             variant="ghost"
             size="sm"
             iconOnly
             aria-label="Reconnect terminal"
+            title="Reconnect terminal"
             disabled={isMobile() || status() === "loading" || status() === "connecting"}
             onClick={() => void onReconnect()}
           >
@@ -329,6 +363,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
             size="sm"
             iconOnly
             aria-label="Send interrupt"
+            title="Send interrupt (Ctrl+C)"
             disabled={status() !== "live"}
             onClick={() => void onInterrupt()}
           >
@@ -339,6 +374,7 @@ export function TerminalPanel(props: TerminalPanelProps) {
             size="sm"
             iconOnly
             aria-label="Close terminal"
+            title="Close terminal session"
             disabled={!terminal() || status() === "closed"}
             onClick={() => void onClose()}
           >
@@ -359,10 +395,18 @@ export function TerminalPanel(props: TerminalPanelProps) {
         }
       >
         <Show when={status() === "loading" || status() === "connecting"}>
-          <div class="terminal-panel__loading" role="status" aria-label="Opening terminal">
-            <Loader2 size={16} class="ui-spinner" />
+          <div class="terminal-panel__loading">
+            <Loader2 size={16} class="ui-spinner" aria-hidden="true" />
             <span>Opening terminal…</span>
           </div>
+        </Show>
+        <Show when={notice()}>
+          <p class="surface-note">
+            {notice()}{" "}
+            <Button variant="outline" size="sm" onClick={() => void onReconnect()}>
+              Reconnect
+            </Button>
+          </p>
         </Show>
         <div
           class="terminal-panel__host"

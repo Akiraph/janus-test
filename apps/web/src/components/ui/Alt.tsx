@@ -146,11 +146,19 @@ export function Alt(props: AltProps) {
 
   createEffect(() => {
     if (!open()) return;
+    // WCAG 1.4.13: hover/focus content must be dismissible without moving away.
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      usingPointer = false;
+      setOpen(false);
+    };
     window.addEventListener("scroll", onScrollOrResize, true);
     window.addEventListener("resize", onScrollOrResize);
+    document.addEventListener("keydown", onKeyDown);
     onCleanup(() => {
       window.removeEventListener("scroll", onScrollOrResize, true);
       window.removeEventListener("resize", onScrollOrResize);
+      document.removeEventListener("keydown", onKeyDown);
     });
   });
 

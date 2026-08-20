@@ -22,6 +22,8 @@ export function FileTreePanel(props: FileTreePanelProps) {
   const [loading, setLoading] = createSignal<Set<string>>(new Set());
   const [errors, setErrors] = createSignal<Record<string, string>>({});
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
+  const [focusedPath, setFocusedPath] = createSignal<string | null>(null);
+  let treeEl: HTMLDivElement | undefined;
   let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function loadPath(path: string, force = false) {
@@ -111,6 +113,95 @@ export function FileTreePanel(props: FileTreePanelProps) {
     });
   }
 
+  // Flattened list of the rows a sighted user can actually see, in render order.
+  // Arrow-key navigation and the roving tabindex both walk this list.
+  const visibleRows = createMemo(() => {
+    const rows: { path: string; kind: string }[] = [];
+    const walk = (parent: string) => {
+      for (const entry of children()[parent] ?? []) {
+        rows.push({ path: entry.path, kind: entry.kind });
+        if (entry.kind === "dir" && expanded().has(entry.path)) walk(entry.path);
+      }
+    };
+    walk("");
+    return rows;
+  });
+
+  // Collapsing a parent can hide the row that last held focus, so fall back to
+  // the first row instead of leaving the tree without a tab stop.
+  const activeRow = createMemo(() => {
+    const rows = visibleRows();
+    const current = focusedPath();
+    if (current && rows.some((row) => row.path === current)) return current;
+    return rows[0]?.path;
+  });
+
+  function focusRow(path: string | undefined) {
+    if (!path) return;
+    setFocusedPath(path);
+    const rows = treeEl?.querySelectorAll<HTMLElement>("[data-tree-path]");
+    if (!rows) return;
+    for (const row of rows) {
+      if (row.dataset.treePath === path) {
+        row.focus();
+        return;
+      }
+    }
+  }
+
+  function onTreeKeyDown(event: KeyboardEvent) {
+    const target = event.target as HTMLElement | null;
+    // Let the inline Retry button keep its own Enter/Space handling.
+    if (!target?.dataset.treePath) return;
+    const rows = visibleRows();
+    if (rows.length === 0) return;
+    const index = rows.findIndex((row) => row.path === activeRow());
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      focusRow(rows[Math.min(index + 1, rows.length - 1)]?.path);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      focusRow(rows[Math.max(index - 1, 0)]?.path);
+      return;
+    }
+    if (event.key === "Home") {
+      event.preventDefault();
+      focusRow(rows[0]?.path);
+      return;
+    }
+    if (event.key === "End") {
+      event.preventDefault();
+      focusRow(rows[rows.length - 1]?.path);
+      return;
+    }
+    const row = rows[index];
+    if (!row) return;
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      if (row.kind !== "dir") return;
+      if (expanded().has(row.path)) focusRow(rows[index + 1]?.path);
+      else toggleDir(row.path);
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      if (row.kind === "dir" && expanded().has(row.path)) {
+        toggleDir(row.path);
+        return;
+      }
+      const separator = row.path.lastIndexOf("/");
+      if (separator > 0) focusRow(row.path.slice(0, separator));
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (row.kind === "dir") toggleDir(row.path);
+      else props.onOpenFile(row.path);
+    }
+  }
+
   return (
     <section class="ide-sidebar-panel" aria-label="Explorer">
       <NotificationEvent
@@ -125,7 +216,9 @@ export function FileTreePanel(props: FileTreePanelProps) {
             when={children()[""] !== undefined}
             fallback={
               <Show when={!errors()[""]}>
-                <p class="surface-note">Loading…</p>
+                <p class="surface-note" role="status">
+                  Loading…
+                </p>
               </Show>
             }
           >
@@ -133,7 +226,17 @@ export function FileTreePanel(props: FileTreePanelProps) {
               when={(children()[""]?.length ?? 0) > 0}
               fallback={<p class="surface-note">Empty repository</p>}
             >
-              <ul class="ide-tree-list">
+              {/* Plain divs rather than a list: an ARIA tree replaces list
+                  semantics, so a list element's implicit role only conflicts
+                  with role="tree". Depth is carried by aria-level per row. */}
+              <div
+                ref={treeEl}
+                class="ide-tree-list"
+                role="tree"
+                aria-label="Files"
+                tabIndex={-1}
+                onKeyDown={onTreeKeyDown}
+              >
                 <For each={children()[""] ?? []}>
                   {(entry) => (
                     <TreeNode
@@ -144,13 +247,15 @@ export function FileTreePanel(props: FileTreePanelProps) {
                       loading={loading()}
                       errors={errors()}
                       activePath={props.activePath()}
+                      focusedPath={activeRow()}
                       onToggle={toggleDir}
                       onOpenFile={props.onOpenFile}
+                      onFocusRow={focusRow}
                       onRetry={(path) => void loadPath(path, true)}
                     />
                   )}
                 </For>
-              </ul>
+              </div>
             </Show>
           </Show>
         </div>
@@ -168,29 +273,41 @@ function TreeNode(props: {
   loading: Set<string>;
   errors: Record<string, string>;
   activePath: string | null;
+  focusedPath: string | undefined;
   onToggle: (path: string) => void;
   onOpenFile: (path: string) => void;
+  onFocusRow: (path: string) => void;
   onRetry: (path: string) => void;
 }) {
   const isDir = () => props.entry.kind === "dir";
   const isOpen = () => props.expanded.has(props.entry.path);
+  const isActiveFile = () => !isDir() && props.activePath === props.entry.path;
   const pad = () => ({ "padding-left": `${8 + props.depth * 12}px` });
   const childEntries = () => props.childrenMap[props.entry.path];
   const isLoading = () =>
     props.loading.has(props.entry.path) || (isOpen() && childEntries() === undefined);
 
   return (
-    <li>
+    <div
+      class="ide-tree-node"
+      role="treeitem"
+      data-tree-path={props.entry.path}
+      tabIndex={props.focusedPath === props.entry.path ? 0 : -1}
+      aria-level={props.depth + 1}
+      aria-expanded={isDir() ? isOpen() : undefined}
+      aria-selected={isDir() ? undefined : isActiveFile()}
+    >
       <button
         type="button"
         class="ide-tree-item"
         classList={{
-          "ide-tree-item--active": !isDir() && props.activePath === props.entry.path,
+          "ide-tree-item--active": isActiveFile(),
           "ide-tree-item--dir": isDir(),
         }}
         style={pad()}
-        aria-expanded={isDir() ? isOpen() : undefined}
+        tabIndex={-1}
         onClick={() => {
+          props.onFocusRow(props.entry.path);
           if (isDir()) props.onToggle(props.entry.path);
           else props.onOpenFile(props.entry.path);
         }}
@@ -222,17 +339,21 @@ function TreeNode(props: {
               when={!isLoading()}
               fallback={
                 <div class="ide-tree-loading" style={pad()}>
-                  Loading...
+                  Loading…
                 </div>
               }
             >
               <Show
                 when={!props.errors[props.entry.path]}
                 fallback={
-                  <div class="ide-tree-loading" style={pad()}>
+                  <div class="ide-tree-loading ide-tree-error" style={pad()}>
+                    <span title={props.errors[props.entry.path] ?? ""}>
+                      {props.errors[props.entry.path]}
+                    </span>
                     <button
                       type="button"
                       class="ide-tree-retry"
+                      aria-label={`Retry loading ${basename(props.entry.path)}`}
                       onClick={() => props.onRetry(props.entry.path)}
                     >
                       Retry
@@ -248,7 +369,7 @@ function TreeNode(props: {
                     </div>
                   }
                 >
-                  <ul class="ide-tree-list">
+                  <div class="ide-tree-list">
                     <For each={childEntries() ?? []}>
                       {(child) => (
                         <TreeNode
@@ -259,19 +380,21 @@ function TreeNode(props: {
                           loading={props.loading}
                           errors={props.errors}
                           activePath={props.activePath}
+                          focusedPath={props.focusedPath}
                           onToggle={props.onToggle}
                           onOpenFile={props.onOpenFile}
+                          onFocusRow={props.onFocusRow}
                           onRetry={props.onRetry}
                         />
                       )}
                     </For>
-                  </ul>
+                  </div>
                 </Show>
               </Show>
             </Show>
           </div>
         </div>
       </Show>
-    </li>
+    </div>
   );
 }

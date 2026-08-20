@@ -27,6 +27,24 @@ fn estimate_prompt_tokens(prompt: &str) -> i64 {
     i64::try_from(prompt.len().saturating_add(3) / 4).unwrap_or(i64::MAX)
 }
 
+/// Decode a provider tool call's argument payload.
+///
+/// An empty payload is how providers spell "this tool takes no arguments", so it
+/// decodes to an empty object. Anything else that fails to parse means the call
+/// was cut short before the provider finished streaming it, and the caller must
+/// refuse to run the tool instead of substituting empty arguments.
+fn parse_tool_arguments(raw: &str) -> Result<Value, String> {
+    if raw.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str::<Value>(raw).map_err(|error| {
+        format!(
+            "the tool arguments are not valid JSON ({error}); the model's call was \
+             most likely cut off before it finished streaming, so it was not run"
+        )
+    })
+}
+
 /// Partial model output captured before a round failed upstream, kept for the
 /// durable assistant-message fallback.
 struct FailedRoundOutput<'a> {
@@ -1319,8 +1337,15 @@ impl ExecutionInterface {
             git_token,
         } = context;
         let now = now_utc_str();
-        let input: Value =
-            serde_json::from_str(&accepted.request.arguments_json).unwrap_or_else(|_| json!({}));
+        // A Round that stopped mid tool call (provider token cap, dropped
+        // stream) leaves truncated argument JSON behind. Falling back to an
+        // empty object would run the tool anyway — deleting the workspace root
+        // or writing an empty file — and report it as the model's intent.
+        let (input, invalid_arguments) =
+            match parse_tool_arguments(&accepted.request.arguments_json) {
+                Ok(value) => (value, None),
+                Err(detail) => (json!({}), Some(detail)),
+            };
         let mut work = self.unit_of_work.begin().await?;
         if !self
             .sessions
@@ -1379,28 +1404,47 @@ impl ExecutionInterface {
             read_paths: &read_paths,
             actor: actor.clone(),
         };
-        let mut outcome = match execute_tool(&ctx, &accepted.request.name, &input).await {
-            Ok(outcome) => outcome,
-            Err(error @ ExecutionError::Storage(_))
-            | Err(error @ ExecutionError::Serde(_))
-            | Err(error @ ExecutionError::Internal(_)) => return Err(error),
-            Err(error) => {
+        let mut outcome = match invalid_arguments {
+            Some(detail) => {
                 let mut outcome = crate::types::ToolOutcome {
                     disposition: ToolExecutionDisposition::Failed,
                     parts: vec![ToolResultPart::Text {
-                        text: error.to_string(),
+                        text: detail.clone(),
                     }],
                     summary: json!({
                         "ok": false,
-                        "error": error.to_string(),
-                        "detail": error.to_string(),
+                        "error": "TOOL_ARGUMENTS_INVALID",
+                        "detail": detail,
                     }),
-                    error_code: Some("TOOL_EXECUTION_FAILED".into()),
+                    error_code: Some("TOOL_ARGUMENTS_INVALID".into()),
                     finish_summary: None,
                 };
                 attach_tool_display(&accepted.request.name, &input, &mut outcome);
                 outcome
             }
+            None => match execute_tool(&ctx, &accepted.request.name, &input).await {
+                Ok(outcome) => outcome,
+                Err(error @ ExecutionError::Storage(_))
+                | Err(error @ ExecutionError::Serde(_))
+                | Err(error @ ExecutionError::Internal(_)) => return Err(error),
+                Err(error) => {
+                    let mut outcome = crate::types::ToolOutcome {
+                        disposition: ToolExecutionDisposition::Failed,
+                        parts: vec![ToolResultPart::Text {
+                            text: error.to_string(),
+                        }],
+                        summary: json!({
+                            "ok": false,
+                            "error": error.to_string(),
+                            "detail": error.to_string(),
+                        }),
+                        error_code: Some("TOOL_EXECUTION_FAILED".into()),
+                        finish_summary: None,
+                    };
+                    attach_tool_display(&accepted.request.name, &input, &mut outcome);
+                    outcome
+                }
+            },
         };
         let ended = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
@@ -1604,7 +1648,9 @@ impl ExecutionInterface {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_turn_token_exchange, estimated_system_prompt_tokens};
+    use super::{
+        aggregate_turn_token_exchange, estimated_system_prompt_tokens, parse_tool_arguments,
+    };
 
     #[test]
     fn turn_exchange_sums_attempts_and_excludes_system_prefix() {
@@ -1623,5 +1669,32 @@ mod tests {
     #[test]
     fn system_prompt_estimate_is_stable_and_positive() {
         assert!(estimated_system_prompt_tokens() > 0);
+    }
+
+    #[test]
+    fn absent_tool_arguments_decode_to_an_empty_object() {
+        assert_eq!(
+            parse_tool_arguments("").expect("an empty payload takes no arguments"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parse_tool_arguments("  ").expect("a blank payload takes no arguments"),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn truncated_tool_arguments_are_refused_instead_of_emptied() {
+        let error = parse_tool_arguments(r#"{"path": "src/ma"#)
+            .expect_err("a cut-off payload must not decode");
+        assert!(error.contains("cut off"), "{error}");
+    }
+
+    #[test]
+    fn complete_tool_arguments_decode_unchanged() {
+        assert_eq!(
+            parse_tool_arguments(r#"{"path":"src/main.rs"}"#).expect("valid arguments decode"),
+            serde_json::json!({"path": "src/main.rs"})
+        );
     }
 }

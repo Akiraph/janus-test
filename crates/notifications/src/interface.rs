@@ -298,7 +298,17 @@ impl NotificationsInterface {
         .await?;
         let mut errors = Vec::new();
         for row in rows {
-            let events: Vec<NotificationEventKind> = serde_json::from_str(&row.events_json)?;
+            // A channel whose stored filter cannot be read must not abort the
+            // dispatch: doing so silences every channel after it, and the user
+            // is told nothing about either failure.
+            let filter = serde_json::from_str::<Vec<NotificationEventKind>>(&row.events_json);
+            let events = match filter {
+                Ok(events) => events,
+                Err(_) => {
+                    errors.push(format!("{}: event filter unreadable", row.display_name));
+                    continue;
+                }
+            };
             if event.kind != NotificationEventKind::Test && !events.contains(&event.kind) {
                 continue;
             }

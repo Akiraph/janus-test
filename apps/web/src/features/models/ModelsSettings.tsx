@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/solid-query";
 import Activity from "lucide-solid/icons/activity";
 import ChevronDown from "lucide-solid/icons/chevron-down";
+import Loader2 from "lucide-solid/icons/loader-2";
 import Pencil from "lucide-solid/icons/pencil";
 import Plus from "lucide-solid/icons/plus";
 import Trash2 from "lucide-solid/icons/trash-2";
@@ -81,28 +82,41 @@ export function ModelsSettings() {
   const [editing, setEditing] = createSignal<ProviderView | null>(null);
   const [formClient, setFormClient] = createSignal<ProviderClient>("supervisor");
   const [formOpen, setFormOpen] = createSignal(false);
+  const [pendingDelete, setPendingDelete] = createSignal<ProviderView | null>(null);
+  const [deleting, setDeleting] = createSignal(false);
+  const [probing, setProbing] = createSignal<string | null>(null);
 
   async function refresh() {
     await queryClient.invalidateQueries({ queryKey: ["model-providers"] });
   }
 
-  async function removeProvider(id: string) {
-    if (!confirm("Delete this provider and its models?")) return;
+  async function removeProvider(provider: ProviderView) {
+    setDeleting(true);
     try {
-      await deleteProvider(id);
-      notify("Provider deleted", { variant: "success" });
+      await deleteProvider(provider.id);
+      notify(`${provider.display_name} deleted`, { variant: "success" });
+      setPendingDelete(null);
       await refresh();
     } catch (error) {
       notify(getErrorMessage(error, "Delete failed"), { variant: "danger" });
+    } finally {
+      setDeleting(false);
     }
   }
 
-  async function probe(id: string) {
+  async function probe(provider: ProviderView) {
+    setProbing(provider.id);
     try {
-      const result = await probeProvider(id);
-      notify(`${result.status}: ${result.detail}`);
+      const result = await probeProvider(provider.id);
+      const ready = result.status === "ready";
+      notify(`${provider.display_name}: ${result.detail}`, {
+        variant: ready ? "success" : "danger",
+        duration: ready ? 4000 : 0,
+      });
     } catch (error) {
-      notify(getErrorMessage(error, "Probe failed"), { variant: "danger" });
+      notify(getErrorMessage(error, "Provider test failed"), { variant: "danger" });
+    } finally {
+      setProbing(null);
     }
   }
 
@@ -124,6 +138,10 @@ export function ModelsSettings() {
 
   return (
     <div class="panel model-provider-settings">
+      <div class="panel-heading">
+        <h2>Model Providers</h2>
+        <p>Upstream endpoints, credentials, and the models each one exposes.</p>
+      </div>
       <div class="provider-section-stack">
         <For each={PROVIDER_SECTIONS}>
           {(section) => (
@@ -136,7 +154,11 @@ export function ModelsSettings() {
                   aria-controls={`provider-section-body-${section.client}`}
                   onClick={() => setOpenSections(section.client, !openSections[section.client])}
                 >
-                  <ChevronDown classList={{ collapsed: !openSections[section.client] }} size={16} />
+                  <ChevronDown
+                    classList={{ collapsed: !openSections[section.client] }}
+                    size={16}
+                    aria-hidden="true"
+                  />
                   <div>
                     <span class="settings-group-title">{section.title}</span>
                     <small>{section.description}</small>
@@ -147,7 +169,7 @@ export function ModelsSettings() {
                   class="provider-client-section-add"
                   onClick={() => openCreate(section.client)}
                 >
-                  <Plus size={16} />
+                  <Plus size={16} aria-hidden="true" />
                   Add {section.title} provider
                 </Button>
               </div>
@@ -157,8 +179,8 @@ export function ModelsSettings() {
                   <Show
                     when={!providers.isPending}
                     fallback={
-                      <p class="surface-note" role="status" aria-label="Loading...">
-                        Loading...
+                      <p class="surface-note" role="status">
+                        Loading providers...
                       </p>
                     }
                   >
@@ -188,10 +210,21 @@ export function ModelsSettings() {
                                   <Button
                                     variant="outline"
                                     size="sm"
-                                    onClick={() => void probe(provider.id)}
+                                    disabled={probing() === provider.id}
+                                    onClick={() => void probe(provider)}
                                   >
-                                    <Activity size={14} />
-                                    Test
+                                    <Show
+                                      when={probing() === provider.id}
+                                      fallback={
+                                        <>
+                                          <Activity size={14} aria-hidden="true" />
+                                          Test
+                                        </>
+                                      }
+                                    >
+                                      <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
+                                      Testing…
+                                    </Show>
                                   </Button>
                                   <Button
                                     variant="ghost"
@@ -200,16 +233,16 @@ export function ModelsSettings() {
                                     aria-label={`Edit ${provider.display_name}`}
                                     onClick={() => openEdit(provider)}
                                   >
-                                    <Pencil size={16} />
+                                    <Pencil size={16} aria-hidden="true" />
                                   </Button>
                                   <Button
                                     variant="ghost"
                                     size="sm"
                                     iconOnly
                                     aria-label={`Delete ${provider.display_name}`}
-                                    onClick={() => void removeProvider(provider.id)}
+                                    onClick={() => setPendingDelete(provider)}
                                   >
-                                    <Trash2 size={16} />
+                                    <Trash2 size={16} aria-hidden="true" />
                                   </Button>
                                 </div>
                               </div>
@@ -259,6 +292,29 @@ export function ModelsSettings() {
           )}
         </For>
       </div>
+
+      <Show when={pendingDelete()}>
+        {(provider) => (
+          <Dialog
+            title="Delete provider"
+            description={`"${provider().display_name}" and its ${provider().models.length} configured model(s) are removed, including the stored API key. This cannot be undone.`}
+            close={() => setPendingDelete(null)}
+          >
+            <div class="dialog-footer">
+              <Button variant="outline" onClick={() => setPendingDelete(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={deleting()}
+                onClick={() => void removeProvider(provider())}
+              >
+                {deleting() ? "Deleting..." : "Delete provider"}
+              </Button>
+            </div>
+          </Dialog>
+        )}
+      </Show>
 
       <Show when={formOpen()}>
         <ProviderForm
@@ -406,13 +462,14 @@ function ProviderForm(props: ProviderFormProps) {
       <form class="dialog-form" onSubmit={submit}>
         <div class="dialog-form-grid">
           <div>
-            <span class="field-label">Name</span>
+            <label class="field-label" for="provider-name">
+              Name
+            </label>
             <input
               id="provider-name"
               class="ui-input"
               value={name()}
               onInput={(event) => setName(event.currentTarget.value)}
-              aria-label="Name"
               required
             />
           </div>
@@ -426,7 +483,9 @@ function ProviderForm(props: ProviderFormProps) {
             />
           </div>
           <div class="full-field">
-            <span class="field-label">Base URL</span>
+            <label class="field-label" for="provider-base-url">
+              Base URL
+            </label>
             <input
               id="provider-base-url"
               class="ui-input"
@@ -434,12 +493,13 @@ function ProviderForm(props: ProviderFormProps) {
               value={url()}
               onInput={(event) => setUrl(event.currentTarget.value)}
               placeholder={KIND_BASE_URL_PLACEHOLDER[kind()]}
-              aria-label="Base URL"
               required
             />
           </div>
           <div class="full-field">
-            <span class="field-label">API key</span>
+            <span class="field-label" id="provider-api-key-label">
+              API key
+            </span>
             <Show
               when={isEditing() && hasKey() && !editingKey()}
               fallback={
@@ -451,7 +511,7 @@ function ProviderForm(props: ProviderFormProps) {
                   onInput={(event) => setKey(event.currentTarget.value)}
                   placeholder={isEditing() ? "Enter a new API key" : "sk-..."}
                   autocomplete="off"
-                  aria-label="API key"
+                  aria-labelledby="provider-api-key-label"
                   required={!isEditing() || !hasKey()}
                 />
               }
@@ -467,7 +527,7 @@ function ProviderForm(props: ProviderFormProps) {
                   aria-label="Change API key"
                   onClick={() => setEditingKey(true)}
                 >
-                  <Pencil size={14} />
+                  <Pencil size={14} aria-hidden="true" />
                 </Button>
               </span>
             </Show>
@@ -478,7 +538,7 @@ function ProviderForm(props: ProviderFormProps) {
           <div class="provider-form-models-heading">
             <span>Models</span>
             <Button variant="ghost" size="sm" type="button" onClick={addModel}>
-              <Plus size={14} />
+              <Plus size={14} aria-hidden="true" />
               Add model
             </Button>
           </div>
@@ -522,7 +582,7 @@ function ProviderForm(props: ProviderFormProps) {
                   disabled={models.length === 1}
                   onClick={() => removeModel(index())}
                 >
-                  <Trash2 size={14} />
+                  <Trash2 size={14} aria-hidden="true" />
                 </Button>
               </div>
             )}

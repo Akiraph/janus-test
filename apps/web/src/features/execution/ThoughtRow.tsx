@@ -25,7 +25,7 @@ export function ThoughtRow(props: ThoughtRowProps) {
         when={props.status === "running"}
         fallback={<span class="session-message__dot" data-tone="muted" aria-hidden="true" />}
       >
-        <Loader2 size={14} class="ui-spinner" />
+        <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
       </Show>
       <span class="thought-row__title">{props.title}</span>
     </>

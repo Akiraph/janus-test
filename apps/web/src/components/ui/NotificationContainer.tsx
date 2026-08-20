@@ -16,6 +16,13 @@ const ICONS: Record<NotificationVariant, typeof Info> = {
   danger: XCircle,
 };
 
+const VARIANT_LABEL: Record<NotificationVariant, string> = {
+  info: "Note",
+  success: "Success",
+  warning: "Warning",
+  danger: "Error",
+};
+
 export function NotificationContainer() {
   const store = useNotifications();
   return (
@@ -25,8 +32,13 @@ export function NotificationContainer() {
           {(item) => {
             const Icon = ICONS[item.variant];
             return (
-              <div class="ui-notification" data-variant={item.variant} role="status">
-                <Icon size={18} class="ui-notification__icon" />
+              <div
+                class="ui-notification"
+                data-variant={item.variant}
+                role={item.variant === "danger" ? "alert" : "status"}
+              >
+                <Icon size={18} class="ui-notification__icon" aria-hidden="true" />
+                <span class="sr-only">{`${VARIANT_LABEL[item.variant]}: `}</span>
                 <span class="ui-notification-message">{item.message}</span>
                 {item.action ? (
                   <button
@@ -46,7 +58,7 @@ export function NotificationContainer() {
                   aria-label="Dismiss"
                   onClick={() => store.dismiss(item.id)}
                 >
-                  <X size={16} />
+                  <X size={16} aria-hidden="true" />
                 </button>
               </div>
             );

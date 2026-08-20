@@ -103,13 +103,16 @@ pub fn fingerprint(value: &str) -> String {
 }
 
 /// Mask an API key while retaining a short prefix and suffix for recognition.
+/// Counts characters, not bytes: slicing a pasted non-ASCII value on a byte
+/// boundary would panic inside the request that saves it.
 pub fn mask_key(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() <= 8 {
-        return "*".repeat(trimmed.len());
+    let length = trimmed.chars().count();
+    if length <= 8 {
+        return "*".repeat(length);
     }
-    let head = &trimmed[..4];
-    let tail = &trimmed[trimmed.len() - 4..];
+    let head: String = trimmed.chars().take(4).collect();
+    let tail: String = trimmed.chars().skip(length - 4).collect();
     format!("{head}{}{tail}", "*".repeat(8))
 }
 
@@ -186,5 +189,13 @@ mod tests {
         assert_eq!(mask_key("sk-real-key"), "sk-r********-key");
         assert_eq!(mask_key("sk-ant-api03-longtoken-xyz"), "sk-a********-xyz");
         assert_eq!(mask_key("  sk-real-key  "), "sk-r********-key");
+    }
+
+    /// A pasted value can hold multi-byte characters; byte slicing panicked on
+    /// them, which took down the request instead of masking the value.
+    #[test]
+    fn mask_key_handles_multi_byte_characters() {
+        assert_eq!(mask_key("键值"), "**");
+        assert_eq!(mask_key("键值键值键值键值键值"), "键值键值********键值键值");
     }
 }

@@ -20,9 +20,23 @@ export function AsyncTasksView(props: AsyncTasksViewProps) {
   return (
     <Show
       when={!props.loading || props.tasks.length > 0}
-      fallback={<p class="session-async__empty">Loading async tasks...</p>}
+      fallback={
+        <p class="session-async__empty" role="status">
+          Loading async tasks...
+        </p>
+      }
     >
-      <Show when={!props.error} fallback={<p class="session-async__empty">{props.error}</p>}>
+      <Show
+        when={!props.error}
+        fallback={
+          <div class="session-async__error" role="alert">
+            <p class="session-async__empty">{props.error}</p>
+            <Button variant="outline" size="sm" onClick={props.onRefresh}>
+              Retry
+            </Button>
+          </div>
+        }
+      >
         <Show
           when={props.tasks.length > 0}
           fallback={<p class="session-async__empty">No async tasks.</p>}
@@ -84,7 +98,7 @@ function AsyncTaskCard(props: { task: AsyncTaskProjection; onRefresh: () => void
     <article class="async-task-card">
       <header class="async-task-card__head">
         <div class="async-task-card__identity">
-          <Briefcase size={15} />
+          <Briefcase size={15} aria-hidden="true" />
           <strong>{label()}</strong>
           <span class={`async-task-card__status async-task-card__status--${props.task.status}`}>
             {props.task.status}
@@ -95,12 +109,12 @@ function AsyncTaskCard(props: { task: AsyncTaskProjection; onRefresh: () => void
             variant="ghost"
             size="sm"
             iconOnly
-            aria-label="Stop async task"
+            aria-label={canceling() ? "Stopping async task" : "Stop async task"}
             disabled={canceling()}
             onClick={() => void stop()}
           >
-            <Show when={canceling()} fallback={<Square size={14} />}>
-              <Loader2 size={14} class="ui-spinner" />
+            <Show when={canceling()} fallback={<Square size={14} aria-hidden="true" />}>
+              <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
             </Show>
           </Button>
         </Show>
@@ -108,8 +122,8 @@ function AsyncTaskCard(props: { task: AsyncTaskProjection; onRefresh: () => void
       <p class="async-task-card__command">{props.task.command_summary}</p>
       <p class="async-task-card__id">{props.task.id}</p>
       <Show when={error()}>
-        <p class="async-task-card__error">
-          <CircleAlert size={14} /> {error()}
+        <p class="async-task-card__error" role="alert">
+          <CircleAlert size={14} aria-hidden="true" /> {error()}
         </p>
       </Show>
       <pre class="async-task-card__output">{output() || "Waiting for output..."}</pre>

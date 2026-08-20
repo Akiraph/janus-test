@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For } from "solid-js";
+import { createEffect, createMemo, createSignal, For } from "solid-js";
 import "./tabs.css";
 
 export interface TabItem {
@@ -27,6 +27,16 @@ export function Tabs(props: TabsProps) {
   const [focused, setFocused] = createSignal(props.value);
 
   const enabled = createMemo(() => props.tabs.filter((t) => !t.disabled));
+
+  createEffect(() => setFocused(props.value));
+
+  /** 唯一可 Tab 到的项;选中项被禁用或不存在时回落,避免整个 tablist 键盘不可达。 */
+  const roving = createMemo(() => {
+    const list = enabled();
+    const current = focused();
+    if (list.some((t) => t.value === current)) return current;
+    return list[0]?.value;
+  });
 
   function focusAt(value: string) {
     setFocused(value);
@@ -97,7 +107,7 @@ export function Tabs(props: TabsProps) {
               }}
               aria-selected={selected()}
               aria-disabled={tab.disabled ?? false}
-              tabIndex={focused() === tab.value ? 0 : -1}
+              tabIndex={roving() === tab.value ? 0 : -1}
               disabled={tab.disabled ?? false}
               onClick={() => {
                 if (tab.disabled) return;

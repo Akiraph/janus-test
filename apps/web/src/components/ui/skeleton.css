@@ -18,3 +18,9 @@
     background-position: -100% 0;
   }
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-skeleton {
+    animation: none;
+  }
+}

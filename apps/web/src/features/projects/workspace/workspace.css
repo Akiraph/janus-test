@@ -183,6 +183,16 @@
   background: var(--surface-muted);
 }
 
+.ide-activity-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ide-activity-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-muted);
+}
+
 .ide-activity-btn--active {
   border-left-color: var(--accent-strong);
   color: var(--text);
@@ -211,8 +221,8 @@
   flex: none;
   align-items: center;
   /* Match the main editor tab strip height so the divider lines up. */
-  height: 36px;
-  min-height: 36px;
+  height: var(--control);
+  min-height: var(--control);
   padding: 0 var(--space-3);
   border-bottom: 1px solid var(--border);
   color: var(--text-muted);
@@ -375,8 +385,8 @@
   display: flex;
   flex: none;
   align-items: stretch;
-  height: 36px;
-  min-height: 36px;
+  height: var(--control);
+  min-height: var(--control);
   border-bottom: 1px solid var(--border);
   background: var(--canvas);
 }
@@ -430,7 +440,7 @@
   min-width: 0;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-2) var(--space-2) var(--space-2);
+  padding: var(--space-2);
   border: 0;
   background: transparent;
   color: inherit;
@@ -477,7 +487,7 @@
 
 .workspace-navigation-button {
   display: grid;
-  width: 36px;
+  width: var(--control);
   flex: none;
   place-items: center;
   border: 0;

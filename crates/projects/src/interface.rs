@@ -209,7 +209,19 @@ impl From<PathError> for ProjectsError {
 fn map_workspace_path_error(error: WorkspaceError, not_found: &'static str) -> ProjectsError {
     match error {
         WorkspaceError::InvalidPath(error) => ProjectsError::InvalidPath(error.to_string()),
-        WorkspaceError::PathNotFound(_) => ProjectsError::Validation(not_found.into()),
+        // Name the path: these routes are also driven by agent tools, where the
+        // caller cannot see which of its paths the workspace rejected.
+        WorkspaceError::PathNotFound(path) => {
+            let detail = format!("{not_found}: {path}");
+            ProjectsError::Validation(detail)
+        }
+        WorkspaceError::NotEditable(path) => ProjectsError::NotEditable(path),
+        // A filesystem refusal is legible and actionable, so keep its reason
+        // instead of folding it into an opaque internal error.
+        denied @ WorkspaceError::PermissionDenied(_) => {
+            let detail = denied.to_string();
+            ProjectsError::Validation(detail)
+        }
         error => ProjectsError::Workspace(error),
     }
 }
@@ -1588,11 +1600,13 @@ impl ProjectsInterface {
                     )),
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| map_workspace_path_error(error, "path not found"))?;
         let applied = self
             .workspace
             .apply_prepared_file_mutation(&lock, &prepared)
-            .await?;
+            .await
+            .map_err(|error| map_workspace_path_error(error, "path not found"))?;
         let mut work = self.unit_of_work.begin().await?;
         let revision = self
             .workspace

@@ -38,6 +38,18 @@
   font-size: var(--text-sm);
 }
 
+.record-chips .project-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-family: var(--font-sans);
+}
+
+.record-chips .project-state[data-state="error"] {
+  color: var(--text);
+  background: var(--danger-soft);
+}
+
 .operation-card {
   display: grid;
   gap: var(--space-2);

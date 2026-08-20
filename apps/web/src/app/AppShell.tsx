@@ -10,6 +10,7 @@ import ShieldCheck from "lucide-solid/icons/shield-check";
 import type { JSX } from "solid-js";
 import { Match, Show, Suspense, Switch } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
+import { Button } from "../components/ui/Button";
 import { type TabItem, Tabs } from "../components/ui/Tabs";
 import { LoginView, SetupView } from "../features/auth/AuthViews";
 import { IdeShellScaffold } from "../features/projects/workspace/IdeShellScaffold";
@@ -27,8 +28,9 @@ const MODE_TABS: TabItem[] = [
  *  never disappears into a bare spinner. */
 function RouteLoading() {
   return (
-    <div class="route-loading" role="status" aria-label="Loading">
-      <Loader2 size={20} class="ui-spinner" />
+    <div class="route-loading" role="status">
+      <Loader2 size={20} class="ui-spinner" aria-hidden="true" />
+      <span class="sr-only">Loading</span>
     </div>
   );
 }
@@ -43,11 +45,20 @@ export function AppShell(props: AppShellProps) {
   return (
     <Switch
       fallback={
-        <main class="route-loading" role="alert">
-          <span>Unable to load Janus deployment state.</span>
-          <button type="button" class="text-button" onClick={() => void bootstrap.refetch()}>
-            Retry
-          </button>
+        <main class="route-loading">
+          <div class="route-error" role="alert">
+            <span>
+              Unable to load Janus deployment state. Check that the Janus server is running.
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={bootstrap.isFetching}
+              onClick={() => void bootstrap.refetch()}
+            >
+              {bootstrap.isFetching ? "Retrying..." : "Retry"}
+            </Button>
+          </div>
         </main>
       }
     >
@@ -126,28 +137,28 @@ function AuthenticatedShell(props: RoutedShellProps) {
             <div class="settings-shell">
               <nav class="settings-rail" aria-label="Settings navigation">
                 <A class="settings-back" href="/" end>
-                  <ArrowLeft size={16} />
+                  <ArrowLeft size={16} aria-hidden="true" />
                   Back
                 </A>
                 <p>Settings</p>
                 <A href="/system" classList={{ active: location.pathname === "/system" }}>
-                  <Database size={16} />
+                  <Database size={16} aria-hidden="true" />
                   System
                 </A>
                 <A href="/settings" classList={{ active: isModels() }}>
-                  <Server size={16} />
+                  <Server size={16} aria-hidden="true" />
                   Model Providers
                 </A>
                 <A href="/security" classList={{ active: location.pathname === "/security" }}>
-                  <ShieldCheck size={16} />
+                  <ShieldCheck size={16} aria-hidden="true" />
                   Security
                 </A>
                 <A href="/notifications" classList={{ active: isNotifications() }}>
-                  <Bell size={16} />
+                  <Bell size={16} aria-hidden="true" />
                   Notifications
                 </A>
                 <A href="/automation" classList={{ active: isAutomation() }}>
-                  <GitPullRequest size={16} />
+                  <GitPullRequest size={16} aria-hidden="true" />
                   Automation
                 </A>
               </nav>
@@ -179,11 +190,11 @@ function AuthenticatedShell(props: RoutedShellProps) {
               </div>
               <div class="topbar-actions">
                 <A class="settings-link" href="/automation">
-                  <GitPullRequest size={16} />
+                  <GitPullRequest size={16} aria-hidden="true" />
                   Automation
                 </A>
                 <A class="settings-link" href="/settings">
-                  <Settings size={16} />
+                  <Settings size={16} aria-hidden="true" />
                   Settings
                 </A>
               </div>
