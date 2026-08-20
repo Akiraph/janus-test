@@ -3,6 +3,8 @@ use http::{HeaderValue, header::HeaderName};
 
 use janus_infrastructure::id::RequestId;
 
+use super::problem::client_error_envelope;
+
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 #[derive(Debug, Clone)]
@@ -21,7 +23,10 @@ pub async fn middleware(mut request: Request<Body>, next: Next) -> Response {
     request.extensions_mut().insert(RequestContext {
         request_id: request_id.clone(),
     });
-    let mut response = next.run(request).await;
+    let response = next.run(request).await;
+    // Requests rejected before a handler ran (unparsable body, missing query
+    // parameter, wrong method) have no Problem envelope yet.
+    let mut response = client_error_envelope(response, &request_id).await;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(&X_REQUEST_ID, value);
     }
