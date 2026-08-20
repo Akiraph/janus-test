@@ -83,6 +83,10 @@ pub(crate) struct ForkSyncAutomationRequest {
 pub(crate) enum AutomationError {
     #[error("automation validation failed: {0}")]
     Validation(String),
+    #[error("automation timed out: {0}")]
+    Timeout(String),
+    #[error("repository clone failed: {0}")]
+    RepositoryClone(String),
     #[error(transparent)]
     Operation(#[from] OperationError),
     #[error(transparent)]
@@ -97,6 +101,51 @@ pub(crate) enum AutomationError {
     Storage(#[from] sqlx::Error),
     #[error("automation serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+impl AutomationError {
+    /// Stable problem code recorded on the durable Operation. Without it every
+    /// automation failure reads the same, so a client cannot tell a rejected
+    /// request from a stalled clone from a broken control plane.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Validation(_) | Self::Models(_) => "VALIDATION_FAILED",
+            Self::Timeout(_) => "AUTOMATION_TIMED_OUT",
+            Self::RepositoryClone(_) => "PROJECT_CLONE_FAILED",
+            Self::Projects(error) => error.code(),
+            Self::SourceControl(error) => error.code(),
+            Self::Sessions(error) => sessions_code(error),
+            Self::Operation(OperationError::StaleWorkClaim) => "OPERATION_LEASE_STALE",
+            Self::Operation(_) | Self::Storage(_) | Self::Serde(_) => "INTERNAL_ERROR",
+        }
+    }
+
+    /// A failure that leaves a Project, Session or Turn half-built needs a human
+    /// to reconcile it; a decided rejection or clone failure is simply failed.
+    fn requires_attention(&self) -> bool {
+        !matches!(
+            self,
+            Self::Validation(_)
+                | Self::Models(_)
+                | Self::RepositoryClone(_)
+                | Self::Projects(ProjectsError::Validation(_) | ProjectsError::NotFound)
+        )
+    }
+}
+
+/// Session failures an automation run can hit, mapped to the same codes the
+/// HTTP session routes publish so both surfaces name them identically.
+fn sessions_code(error: &SessionsError) -> &'static str {
+    match error {
+        SessionsError::NotFound => "SESSION_NOT_FOUND",
+        SessionsError::SessionDeleting => "SESSION_DELETING",
+        SessionsError::ActiveTurnExists => "ACTIVE_TURN_EXISTS",
+        SessionsError::VersionMismatch { .. } => "RESOURCE_VERSION_MISMATCH",
+        SessionsError::ModelNotConfigured => "MODEL_NOT_CONFIGURED",
+        SessionsError::InvalidModelPreference => "VALIDATION_FAILED",
+        SessionsError::Validation(_) => "VALIDATION_FAILED",
+        _ => "INTERNAL_ERROR",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -626,10 +675,14 @@ pub(crate) async fn run_pull_request_automation(
             correlation_id: CorrelationId::new(),
         },
         Err(error) => OperationCompletion {
-            status: OperationStatus::Failed,
+            status: if error.requires_attention() {
+                OperationStatus::NeedsAttention
+            } else {
+                OperationStatus::Failed
+            },
             result: None,
             problem: Some(json!({
-                "code": "PULL_REQUEST_AUTOMATION_FAILED",
+                "code": error.code(),
                 "detail": error.to_string(),
             })),
             correlation_id: CorrelationId::new(),
@@ -791,7 +844,7 @@ async fn execute_pull_request_automation(
                 )
                 .await?;
         }
-        wait_for_project_ready(state, &input.owner_id, &existing.id).await?
+        wait_for_project_ready(state, &input.owner_id, &existing.id, None).await?
     } else {
         let project_idem = project_idempotency(&input.owner_id, &input.repository_url);
         let (project, clone_operation) = state
@@ -814,8 +867,13 @@ async fn execute_pull_request_automation(
                 Some(project_idem),
             )
             .await?;
-        let _ = clone_operation;
-        wait_for_project_ready(state, &input.owner_id, &project.id).await?
+        wait_for_project_ready(
+            state,
+            &input.owner_id,
+            &project.id,
+            Some(clone_operation.id.as_str()),
+        )
+        .await?
     };
 
     publish_progress(
@@ -1100,6 +1158,7 @@ async fn wait_for_project_ready(
     state: &Application,
     owner_id: &str,
     project_id: &str,
+    clone_operation_id: Option<&str>,
 ) -> Result<janus_projects::interface::ProjectView, AutomationError> {
     let deadline = tokio::time::Instant::now() + AUTOMATION_WAIT;
     loop {
@@ -1112,7 +1171,7 @@ async fn wait_for_project_ready(
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "project clone failed".into());
-                return Err(AutomationError::Validation(detail));
+                return Err(AutomationError::RepositoryClone(detail));
             }
             "deleting" => {
                 return Err(AutomationError::Validation(
@@ -1121,9 +1180,26 @@ async fn wait_for_project_ready(
             }
             _ => {}
         }
+        // A clone that dead-letters can leave the Project in `creating`
+        // forever. Report the clone Operation's own problem instead of waiting
+        // out the full deadline and blaming a timeout.
+        if let Some(operation_id) = clone_operation_id
+            && let Some(operation) = state.operations().get(operation_id).await?
+            && matches!(
+                operation.status.as_str(),
+                "failed" | "canceled" | "needs_attention"
+            )
+        {
+            let status = operation.status.as_str();
+            let detail = operation_problem_detail(&operation);
+            return Err(AutomationError::RepositoryClone(format!(
+                "clone operation {operation_id} ended with {status}: {detail}"
+            )));
+        }
         if tokio::time::Instant::now() >= deadline {
-            return Err(AutomationError::Validation(format!(
-                "project {project_id} did not become ready within {} seconds",
+            return Err(AutomationError::Timeout(format!(
+                "project {project_id} was still {} after {} seconds",
+                project.state,
                 AUTOMATION_WAIT.as_secs()
             )));
         }
@@ -1154,7 +1230,7 @@ async fn wait_for_turn(
             TurnStatus::Queued | TurnStatus::Running | TurnStatus::Canceling => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(AutomationError::Validation(format!(
+            return Err(AutomationError::Timeout(format!(
                 "Supervisor turn {} did not finish within {} seconds",
                 turn.id,
                 AUTOMATION_WAIT.as_secs()
@@ -1178,21 +1254,36 @@ async fn wait_for_operation(
         match operation.status.as_str() {
             "succeeded" => return Ok(operation),
             "failed" | "canceled" | "needs_attention" => {
+                // Carry the child's own problem forward: without it the parent
+                // run only says "ended with failed" and the cause is buried in
+                // an Operation the client never sees.
+                let status = operation.status.as_str();
+                let detail = operation_problem_detail(&operation);
                 return Err(AutomationError::Validation(format!(
-                    "child operation {} ended with {}",
-                    operation.id, operation.status
+                    "child operation {operation_id} ended with {status}: {detail}"
                 )));
             }
             _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(AutomationError::Validation(format!(
+            return Err(AutomationError::Timeout(format!(
                 "child operation {operation_id} did not finish within {} seconds",
                 AUTOMATION_WAIT.as_secs()
             )));
         }
         tokio::time::sleep(StdDuration::from_millis(500)).await;
     }
+}
+
+/// The `detail` a worker recorded on an Operation's problem, or an explicit
+/// marker when the Operation failed without one.
+fn operation_problem_detail(operation: &OperationView) -> &str {
+    operation
+        .problem
+        .as_ref()
+        .and_then(|problem| problem.get("detail"))
+        .and_then(Value::as_str)
+        .unwrap_or("no problem detail was recorded")
 }
 
 fn child_idempotency(
@@ -1240,4 +1331,37 @@ Work directly in the current Main workspace. Begin with `git status --short` and
         parent_branch = parent_branch,
         message = message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutomationError;
+    use janus_projects::interface::ProjectsError;
+
+    #[test]
+    fn failure_codes_separate_a_stall_from_a_rejection() {
+        assert_eq!(
+            AutomationError::Timeout("clone".into()).code(),
+            "AUTOMATION_TIMED_OUT"
+        );
+        assert_eq!(
+            AutomationError::Validation("bad repository url".into()).code(),
+            "VALIDATION_FAILED"
+        );
+        assert_eq!(
+            AutomationError::Projects(ProjectsError::NotFound).code(),
+            "RESOURCE_NOT_FOUND"
+        );
+        assert_eq!(
+            AutomationError::RepositoryClone("remote unavailable".into()).code(),
+            "PROJECT_CLONE_FAILED"
+        );
+    }
+
+    #[test]
+    fn only_a_half_built_run_needs_attention() {
+        assert!(AutomationError::Timeout("turn".into()).requires_attention());
+        assert!(!AutomationError::Validation("bad repository url".into()).requires_attention());
+        assert!(!AutomationError::Projects(ProjectsError::NotFound).requires_attention());
+    }
 }
