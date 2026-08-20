@@ -374,17 +374,19 @@ async fn drive_terminal(
                 return;
             }
         }
-        next_cursor = range.stream.next_cursor;
-        if range
-            .chunks
-            .iter()
-            .map(|chunk| chunk.text.len())
-            .sum::<usize>()
-            < 256 * 1024
-        {
-            break;
+        // `stream.next_cursor` is the log's write head, not the end of this
+        // page. Resuming from it skipped everything the byte limit left unread,
+        // so a terminal with more scrollback than one page replayed as its
+        // oldest page followed by a hole up to the moment of connect.
+        let mut page_end = next_cursor;
+        let mut page_bytes = 0usize;
+        for chunk in &range.chunks {
+            page_bytes += chunk.text.len();
+            page_end = page_end.max(chunk.end_cursor);
         }
-        if next_cursor.value() >= range.stream.next_cursor.value() {
+        let advanced = page_end > next_cursor;
+        next_cursor = page_end;
+        if page_bytes < 256 * 1024 || !advanced {
             break;
         }
     }
@@ -398,23 +400,34 @@ async fn drive_terminal(
             recv = socket.recv() => {
                 match recv {
                     Some(Ok(Message::Binary(bytes))) => {
-                        if state
+                        if let Err(error) = state
                             .runtime()
                             .write_terminal_input(terminal_id, bytes.to_vec())
                             .await
-                            .is_err()
                         {
+                            let _ = send_problem(&mut socket, &error).await;
                             break;
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<TerminalControl>(text.as_str()) {
                             Ok(TerminalControl::Input { bytes_base64 }) => {
-                                if let Some(decoded) = base64_decode(&bytes_base64) {
-                                    let _ = state
-                                        .runtime()
-                                        .write_terminal_input(terminal_id, decoded)
-                                        .await;
+                                let Some(decoded) = base64_decode(&bytes_base64) else {
+                                    let _ = send_error_frame(
+                                        &mut socket,
+                                        codes::VALIDATION_FAILED,
+                                        "control frame bytes_base64 is not valid base64",
+                                    )
+                                    .await;
+                                    continue;
+                                };
+                                if let Err(error) = state
+                                    .runtime()
+                                    .write_terminal_input(terminal_id, decoded)
+                                    .await
+                                {
+                                    let _ = send_problem(&mut socket, &error).await;
+                                    break;
                                 }
                             }
                             Ok(TerminalControl::Resize { cols, rows }) => {
@@ -439,13 +452,12 @@ async fn drive_terminal(
                                 break;
                             }
                             Err(_) => {
-                                let _ = socket
-                                    .send(Message::Text(
-                                        serde_json::json!({"kind": "error", "detail": "invalid control frame"})
-                                            .to_string()
-                                            .into(),
-                                    ))
-                                    .await;
+                                let _ = send_error_frame(
+                                    &mut socket,
+                                    codes::VALIDATION_FAILED,
+                                    "control frame is not a known terminal control message",
+                                )
+                                .await;
                             }
                         }
                     }
@@ -473,7 +485,9 @@ async fn drive_terminal(
                         return;
                     }
                 }
-                last_cursor = projection.stream.next_cursor;
+                for chunk in &projection.chunks {
+                    last_cursor = last_cursor.max(chunk.end_cursor);
+                }
                 let status = state.runtime().terminal(terminal_id).await;
                 if let Ok(terminal) = status
                     && matches!(
@@ -506,10 +520,18 @@ async fn send_problem(
     socket: &mut WebSocket,
     error: &janus_runtime::interface::RuntimeError,
 ) -> Result<(), ()> {
+    send_error_frame(socket, error.code().as_str(), &error.to_string()).await
+}
+
+/// Every failure the client is told about arrives as one frame shape: `kind`
+/// `error` plus a stable `code` and a `detail`. Without the `code` the terminal
+/// view can only print the sentence, so it cannot tell a rejected frame from a
+/// dead shell.
+async fn send_error_frame(socket: &mut WebSocket, code: &str, detail: &str) -> Result<(), ()> {
     let message = serde_json::json!({
         "kind": "error",
-        "code": error.code().as_str(),
-        "detail": error.to_string(),
+        "code": code,
+        "detail": detail,
     });
     socket
         .send(Message::Text(message.to_string().into()))
