@@ -75,7 +75,7 @@
   color: inherit;
   background: transparent;
   font: inherit;
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
   cursor: pointer;
 }
 

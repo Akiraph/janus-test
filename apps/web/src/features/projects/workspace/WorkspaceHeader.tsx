@@ -27,7 +27,7 @@ export function WorkspaceHeader(props: WorkspaceHeaderProps) {
         action={{ label: "Retry", onClick: props.onRetry }}
       />
       <A class="project-back" href="/">
-        <ArrowLeft size={16} />
+        <ArrowLeft size={16} aria-hidden="true" />
         Exit
       </A>
       <Show
@@ -36,7 +36,7 @@ export function WorkspaceHeader(props: WorkspaceHeaderProps) {
           <div class="workspace-title-row" aria-busy={props.loading}>
             <div class="workspace-name">
               <span>Workspace:</span>
-              <h1 id="project-title">{props.loading ? "..." : "Unavailable"}</h1>
+              <h1 id="project-title">{props.loading ? "Loading…" : "Unavailable"}</h1>
             </div>
           </div>
         }
@@ -54,7 +54,8 @@ export function WorkspaceHeader(props: WorkspaceHeaderProps) {
                   {(branch) => (
                     <>
                       {" / "}
-                      <GitBranch size={12} class="inline-icon" /> {branch()}
+                      <GitBranch size={12} class="inline-icon" aria-hidden="true" />
+                      <span class="sr-only">Branch</span> {branch()}
                     </>
                   )}
                 </Show>

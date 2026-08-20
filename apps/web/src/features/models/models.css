@@ -115,7 +115,7 @@
 
 .provider-models-heading {
   display: flex;
-  min-height: 28px;
+  min-height: var(--control-sm);
   align-items: center;
   justify-content: space-between;
   gap: var(--space-2);

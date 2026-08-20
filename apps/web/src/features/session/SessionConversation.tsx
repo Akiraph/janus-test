@@ -142,11 +142,13 @@ export function SessionConversation(props: SessionConversationProps) {
         variant="danger"
         action={{ label: "Retry", onClick: props.onRetry }}
       />
+      {/* The transcript is a log for structure only. A live region here would
+          announce every streamed delta, so the status rows own announcements. */}
       <div
         class="session-conversation__timeline"
         ref={scroller}
         role="log"
-        aria-live="polite"
+        aria-live="off"
         onScroll={updateFollowLatest}
       >
         <Show
@@ -175,7 +177,7 @@ export function SessionConversation(props: SessionConversationProps) {
                 role="status"
                 aria-label="Loading conversation"
               >
-                <Loader2 size={16} class="ui-spinner" />
+                <Loader2 size={16} class="ui-spinner" aria-hidden="true" />
               </div>
             </Show>
           }
@@ -188,7 +190,11 @@ export function SessionConversation(props: SessionConversationProps) {
               <div class="session-conversation__older">
                 <Show
                   when={!props.loadingOlder}
-                  fallback={<Loader2 size={14} class="ui-spinner" />}
+                  fallback={
+                    <span role="status" aria-label="Loading earlier messages">
+                      <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
+                    </span>
+                  }
                 >
                   <button
                     type="button"
@@ -221,7 +227,12 @@ export function SessionConversation(props: SessionConversationProps) {
               }
             >
               <div class="session-message session-message--status" role="status">
-                <span class="session-message__dot" data-tone="normal" data-pulse="true" />
+                <span
+                  class="session-message__dot"
+                  data-tone="normal"
+                  data-pulse="true"
+                  aria-hidden="true"
+                />
                 <div class="session-message__body" data-tone="normal">
                   Compacting...
                 </div>
@@ -517,7 +528,7 @@ function ConversationEntry(props: { item: SessionTimelineItem }) {
     case "async_task":
       return (
         <div class="session-message session-message--status" role="status">
-          <span class="session-message__dot" data-tone="normal" />
+          <span class="session-message__dot" data-tone="normal" aria-hidden="true" />
           <div class="session-message__body">
             <strong>Async task {props.item.status}</strong>
             <span class="muted"> {props.item.command}</span>
@@ -538,6 +549,7 @@ function ConversationEntry(props: { item: SessionTimelineItem }) {
           expandable={props.item.view.expandable}
           lowNoise={props.item.view.lowNoise}
           ariaLabel={props.item.view.title}
+          statusLabel={toolStatusLabel(props.item.view)}
         >
           <ToolBody view={props.item.view} />
         </EventRow>
@@ -591,6 +603,17 @@ function toolDotTone(view: ToolView): "muted" | "warning" | "danger" | "success"
   }
 }
 
+function toolStatusLabel(view: ToolView): string {
+  switch (view.status) {
+    case "success":
+      return "";
+    case "failure":
+      return "Failed";
+    case "running":
+      return "Running";
+  }
+}
+
 /** A timeline row that collapses to a one-line summary and expands to reveal a
  * body. One renderer serves both tool calls and thinking rows (BUG 1+2+6):
  * they share a status dot, a verb-style title, and expand/collapse affordance.
@@ -608,10 +631,13 @@ function EventRow(props: {
   trailingChevron?: boolean;
   lowNoise?: boolean;
   ariaLabel?: string;
+  /** Status word for assistive tech; the dot alone encodes it in colour. */
+  statusLabel?: string;
   children?: JSX.Element;
 }) {
   const expandable = () => (props.expandable ?? true) && props.children != null;
   const open = rowOpenState(props.itemId, props.autoOpen);
+  const bodyId = () => `session-event-body-${props.itemId}`;
   const onToggle = () => {
     if (expandable()) toggleRowOpen(props.itemId, open());
   };
@@ -626,6 +652,7 @@ function EventRow(props: {
         type="button"
         class="session-event__summary"
         aria-expanded={expandable() ? open() : undefined}
+        aria-controls={expandable() ? bodyId() : undefined}
         onClick={onToggle}
         disabled={!expandable()}
       >
@@ -635,17 +662,22 @@ function EventRow(props: {
           data-pulse={props.pulse ? "true" : undefined}
           aria-hidden="true"
         />
+        <Show when={props.statusLabel}>
+          <span class="sr-only">{props.statusLabel}</span>
+        </Show>
         <span class="session-event__title">{props.title}</span>
         <Show when={expandable()}>
           <ChevronRight
             size={12}
             class="session-event__chevron"
             classList={{ "session-event__chevron--open": open() }}
+            aria-hidden="true"
           />
         </Show>
       </button>
       <Show when={expandable()}>
         <div
+          id={bodyId()}
           class="session-event__body-wrap"
           classList={{ "session-event__body-wrap--open": open() }}
           aria-hidden={!open()}
@@ -723,6 +755,7 @@ function ActivityBody(props: { items: readonly ToolActivityDetail[] }) {
                 expandable={item.view.expandable}
                 lowNoise={item.view.lowNoise}
                 ariaLabel={item.view.title}
+                statusLabel={toolStatusLabel(item.view)}
               >
                 <ToolBody view={item.view} />
               </EventRow>

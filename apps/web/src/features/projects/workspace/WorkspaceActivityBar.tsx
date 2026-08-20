@@ -37,7 +37,7 @@ export function WorkspaceActivityBar(props: WorkspaceActivityBarProps) {
             }}
             aria-label={item.label}
             aria-pressed={props.activity === item.value && props.navigationOpen}
-            title={item.label}
+            title={props.ready ? item.label : `${item.label} — project is not ready`}
             disabled={!props.ready}
             onClick={() => props.onSelect(item.value)}
           >

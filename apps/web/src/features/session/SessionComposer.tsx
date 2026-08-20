@@ -72,6 +72,9 @@ export function SessionComposer(props: SessionComposerProps) {
   const [goalMode, setGoalMode] = createSignal(false);
   const [contextOpen, setContextOpen] = createSignal(false);
   let contextCloseTimer: number | undefined;
+  // Escape has to dismiss the hover/focus popover and keep it dismissed while
+  // the pointer or focus still rests on the trigger (WCAG 1.4.13).
+  let contextDismissed = false;
 
   function cancelContextClose() {
     if (contextCloseTimer !== undefined) {
@@ -81,16 +84,24 @@ export function SessionComposer(props: SessionComposerProps) {
   }
 
   function openContext() {
+    if (contextDismissed) return;
     cancelContextClose();
     setContextOpen(true);
   }
 
   function scheduleContextClose() {
+    contextDismissed = false;
     cancelContextClose();
     contextCloseTimer = window.setTimeout(() => {
       contextCloseTimer = undefined;
       setContextOpen(false);
     }, 220);
+  }
+
+  function dismissContext() {
+    contextDismissed = true;
+    cancelContextClose();
+    setContextOpen(false);
   }
   onCleanup(cancelContextClose);
   const [canceling, setCanceling] = createSignal(false);
@@ -147,6 +158,7 @@ export function SessionComposer(props: SessionComposerProps) {
   });
 
   const hasContent = () => Boolean(draft().trim()) || attachments().length > 0;
+  const contextDetailsId = () => `session-context-details-${props.sessionId}`;
   const canSubmit = () =>
     !props.disabled &&
     !submitting() &&
@@ -334,9 +346,11 @@ export function SessionComposer(props: SessionComposerProps) {
         }}
         class="session-composer__input"
         rows={1}
+        aria-label={props.delivery === "queue" ? "Queue a message" : "Send a message"}
+        aria-keyshortcuts="Control+Enter Meta+Enter"
         placeholder={props.delivery === "queue" ? "Queue a message..." : "Send a message..."}
         value={draft()}
-        disabled={submitting() || canceling()}
+        disabled={Boolean(props.disabled) || submitting() || canceling()}
         onInput={(event) => {
           setDraft(event.currentTarget.value);
           setReceipt(null);
@@ -374,7 +388,7 @@ export function SessionComposer(props: SessionComposerProps) {
             onClick={() => fileInput?.click()}
           >
             <Show when={uploading()} fallback={<Paperclip size={15} />}>
-              <Loader2 size={15} class="ui-spinner" />
+              <Loader2 size={15} class="ui-spinner" aria-hidden="true" />
             </Show>
           </Button>
           <Select
@@ -426,26 +440,30 @@ export function SessionComposer(props: SessionComposerProps) {
                 scheduleContextClose();
               }
             }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") dismissContext();
+            }}
           >
-            <span
+            <button
+              type="button"
               class="session-composer__context"
-              role="progressbar"
-              aria-label="Context usage"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={contextPercent()}
-              aria-describedby="session-context-details"
+              aria-label={`Context usage ${contextLabel()}`}
+              aria-expanded={contextOpen()}
+              aria-controls={contextDetailsId()}
               style={`--context-progress: ${contextPercent()}%`}
+              onClick={() => {
+                contextDismissed = false;
+                openContext();
+              }}
             >
               <span class="session-composer__context-ring" aria-hidden="true">
                 <span>{contextLabel()}</span>
               </span>
-            </span>
+            </button>
             <Show when={contextOpen()}>
               <div
                 class="session-composer__context-popover"
-                id="session-context-details"
-                role="dialog"
+                id={contextDetailsId()}
                 onPointerEnter={openContext}
                 onPointerLeave={scheduleContextClose}
               >
@@ -473,7 +491,7 @@ export function SessionComposer(props: SessionComposerProps) {
                       when={compacting() || compactInProgress()}
                       fallback={<Minimize2 size={15} />}
                     >
-                      <Loader2 size={15} class="ui-spinner" />
+                      <Loader2 size={15} class="ui-spinner" aria-hidden="true" />
                     </Show>
                     {compacting() || compactInProgress() ? "Compacting" : "Compact"}
                   </Button>
@@ -495,9 +513,10 @@ export function SessionComposer(props: SessionComposerProps) {
               iconOnly
               disabled={!canSubmit()}
               aria-label={submitting() ? `${actionLabel()} in progress` : actionLabel()}
+              title={`${actionLabel()} (Ctrl/Cmd + Enter)`}
             >
               <Show when={submitting()} fallback={<Send size={16} />}>
-                <Loader2 size={16} class="ui-spinner" />
+                <Loader2 size={16} class="ui-spinner" aria-hidden="true" />
               </Show>
             </Button>
           }
@@ -512,7 +531,7 @@ export function SessionComposer(props: SessionComposerProps) {
             onClick={() => void cancel()}
           >
             <Show when={canceling()} fallback={<Square size={16} />}>
-              <Loader2 size={16} class="ui-spinner" />
+              <Loader2 size={16} class="ui-spinner" aria-hidden="true" />
             </Show>
           </Button>
         </Show>

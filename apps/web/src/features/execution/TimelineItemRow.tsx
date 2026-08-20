@@ -1,6 +1,6 @@
 import ChevronRight from "lucide-solid/icons/chevron-right";
 import Loader2 from "lucide-solid/icons/loader-2";
-import { createSignal, For, Show } from "solid-js";
+import { createSignal, createUniqueId, For, Show } from "solid-js";
 import { MarkdownOutput } from "../../components/MarkdownOutput";
 import { ModelCard, PlanCard } from "../session/SessionCards";
 import type { SessionTimelineItem, ToolView } from "../session/sessionTimeline";
@@ -91,6 +91,7 @@ function SteerMessage(props: { item: Extract<SessionTimelineItem, { type: "steer
 function ToolMessage(props: { item: Extract<SessionTimelineItem, { type: "tool" }> }) {
   const [open, setOpen] = createSignal(false);
   const view = props.item.view;
+  const detailId = createUniqueId();
 
   // Check if this is a tool group (compressed)
   const isGroup = () => {
@@ -124,7 +125,10 @@ function ToolMessage(props: { item: Extract<SessionTimelineItem, { type: "tool" 
           when={view.status === "running"}
           fallback={<span class="session-message__dot" data-tone={dotTone()} aria-hidden="true" />}
         >
-          <Loader2 size={14} class="ui-spinner" />
+          <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
+        </Show>
+        <Show when={view.status === "failure"}>
+          <span class="sr-only">Failed</span>
         </Show>
         <span class="tool-row__title">{view.title}</span>
       </div>
@@ -137,13 +141,18 @@ function ToolMessage(props: { item: Extract<SessionTimelineItem, { type: "tool" 
       <button
         type="button"
         class={`collapsible-row__trigger ${open() ? "collapsible-row__trigger--open" : ""}`}
+        aria-expanded={open()}
+        aria-controls={detailId}
         onClick={() => setOpen(!open())}
       >
         <Show
           when={view.status === "running"}
           fallback={<span class="session-message__dot" data-tone={dotTone()} aria-hidden="true" />}
         >
-          <Loader2 size={14} class="ui-spinner" />
+          <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
+        </Show>
+        <Show when={view.status === "failure"}>
+          <span class="sr-only">Failed</span>
         </Show>
         <span class="tool-row__title">{view.title}</span>
         <ChevronRight
@@ -153,7 +162,7 @@ function ToolMessage(props: { item: Extract<SessionTimelineItem, { type: "tool" 
         />
       </button>
       <Show when={open()}>
-        <div class="collapsible-row__detail">
+        <div id={detailId} class="collapsible-row__detail">
           <ToolBodyContent view={view} isGroup={isGroup() === true} />
         </div>
       </Show>
@@ -178,6 +187,9 @@ function ToolBodyContent(props: { view: ToolView; isGroup: boolean }) {
                 data-tone={tool.status === "success" ? "success" : "danger"}
                 aria-hidden="true"
               />
+              <Show when={tool.status !== "success"}>
+                <span class="sr-only">Failed</span>
+              </Show>
               <span class="tool-group__item-title">{tool.title}</span>
             </div>
           )}

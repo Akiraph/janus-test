@@ -57,10 +57,11 @@ a {
 
 button:focus-visible,
 a:focus-visible {
-  outline: none;
+  /* Ring color: --accent-strong cannot reach 3:1 contrast against --surface. */
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
   box-shadow: var(--shadow-focus);
   border-color: var(--border-strong);
-  border-radius: var(--radius-sm);
 }
 
 h1,

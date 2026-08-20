@@ -1,11 +1,28 @@
 /* ================================================================
    System
    ================================================================ */
-.system-section > h2 {
+.system-section > h3 {
   margin: 0 0 var(--space-3);
   font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
   line-height: var(--leading-lg);
+}
+
+.system-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+}
+
+.system-error p {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-sm);
 }
 
 .detail-list {

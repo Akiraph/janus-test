@@ -221,18 +221,26 @@ export function SessionsPanel(props: SessionsPanelProps) {
           type="button"
           class="sessions-panel__new"
           title={props.creating() ? "Creating session..." : "New session"}
+          aria-label={props.creating() ? "Creating session" : "New session"}
           disabled={props.creating() || (props.projectReady ? !props.projectReady() : false)}
           onClick={() => void onCreate()}
         >
-          <Show when={props.creating()} fallback={<Plus size={14} />}>
-            <Loader2 size={14} class="ui-spinner" />
+          <Show when={props.creating()} fallback={<Plus size={14} aria-hidden="true" />}>
+            <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
           </Show>
         </button>
       </div>
 
       <div class="ide-scroll-host sessions-panel__scroll">
         <div class="ide-sidebar-scroll sessions-panel__list" ref={setScrollHost}>
-          <Show when={!sessions.isLoading} fallback={<p class="sessions-panel__hint">Loading…</p>}>
+          <Show
+            when={!sessions.isLoading}
+            fallback={
+              <p class="sessions-panel__hint" role="status">
+                Loading…
+              </p>
+            }
+          >
             <Show
               when={(sessions.data?.length ?? 0) > 0}
               fallback={
@@ -276,6 +284,7 @@ function SessionRow(props: {
   onDelete: () => void;
 }) {
   const status = createStatusInfo(props.session.state);
+  const stateId = `session-state-${props.session.id}`;
   return (
     <div
       class="sessions-panel__item"
@@ -285,9 +294,15 @@ function SessionRow(props: {
       }}
       title={props.session.title ?? "Untitled session"}
     >
+      {/* The status glyph is a tooltip-only affordance; keep the same wording
+          reachable for assistive tech without renaming the row button. */}
+      <span id={stateId} class="sr-only">
+        {status.label}
+      </span>
       <button
         type="button"
         class="sessions-panel__select"
+        aria-describedby={stateId}
         disabled={props.session.state === "creating" || props.deleting()}
         onClick={props.onOpen}
       >
@@ -312,8 +327,8 @@ function SessionRow(props: {
           props.onDelete();
         }}
       >
-        <Show when={props.deleting()} fallback={<Trash2 size={14} />}>
-          <Loader2 size={14} class="ui-spinner" />
+        <Show when={props.deleting()} fallback={<Trash2 size={14} aria-hidden="true" />}>
+          <Loader2 size={14} class="ui-spinner" aria-hidden="true" />
         </Show>
       </button>
     </div>

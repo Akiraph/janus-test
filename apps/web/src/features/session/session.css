@@ -177,8 +177,10 @@
   background: var(--warning);
 }
 
+/* Failure is squared off so it is not signalled by colour alone. */
 .session-message__dot[data-tone="danger"] {
   background: var(--danger);
+  border-radius: 2px;
 }
 
 .session-message__dot[data-tone="success"] {
@@ -261,7 +263,7 @@
   margin-bottom: var(--space-1);
   cursor: pointer;
   font-size: var(--text-xs);
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
 }
 
 .session-markdown > :first-child {
@@ -459,7 +461,7 @@
 
 .session-card__choice > input[type="checkbox"]:focus-visible,
 .session-card__choice > input[type="radio"]:focus-visible {
-  outline: 2px solid var(--accent-strong);
+  outline: 2px solid var(--text);
   outline-offset: 2px;
 }
 
@@ -613,12 +615,19 @@
   padding: var(--space-2) var(--space-2) var(--space-1);
   resize: none;
   border: 0;
-  outline: none;
   background: transparent;
   color: var(--text);
   font: inherit;
   font-size: var(--text-sm);
   line-height: var(--leading-sm);
+}
+
+/* The composer's own :focus-within elevation is too faint to be the focus
+   indicator, and it also fires for the toolbar buttons, so the textarea marks
+   its own focus. Inset so the ring reads inside the composer border. */
+.session-composer__input:focus {
+  outline: 2px solid var(--text);
+  outline-offset: -3px;
 }
 
 .session-composer__input:disabled {
@@ -660,9 +669,13 @@
   flex: none;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--text-muted);
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
 }
 
 .session-composer__goal {
@@ -820,11 +833,6 @@
   cursor: default;
 }
 
-.session-event__summary:focus-visible {
-  outline: 2px solid var(--accent-strong);
-  outline-offset: 2px;
-}
-
 .session-event--trailing .session-event__summary {
   justify-content: flex-start;
 }
@@ -844,6 +852,7 @@
 
 .session-event__dot[data-tone="danger"] {
   background: var(--danger);
+  border-radius: 2px;
 }
 
 .session-event__dot[data-tone="warning"] {
@@ -896,15 +905,19 @@
   margin-top: 0;
   grid-template-rows: 0fr;
   opacity: 0;
+  /* A collapsed body must not keep its links and buttons in the tab order. */
+  visibility: hidden;
   transition:
     grid-template-rows var(--dur) var(--easing),
-    opacity var(--dur-fast) var(--easing);
+    opacity var(--dur-fast) var(--easing),
+    visibility var(--dur) var(--easing);
 }
 
 .session-event__body-wrap--open {
   margin-top: var(--space-2);
   grid-template-rows: 1fr;
   opacity: 1;
+  visibility: visible;
 }
 
 .session-event__body-content {
@@ -1083,7 +1096,7 @@
 
 .session-subtabs__item--active {
   color: var(--text);
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
 }
 
 .session-subtabs__item--active::after {
@@ -1112,6 +1125,12 @@
   margin: 0;
   color: var(--text-muted);
   font-size: var(--text-sm);
+}
+
+.session-async__error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
 }
 
 .session-async__tasks {
@@ -1204,7 +1223,7 @@
 .queued-bar {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   padding: 6px var(--space-2);
   border-top: 1px solid var(--border);
 }
@@ -1212,7 +1231,7 @@
 .queued-bar__label {
   color: var(--text-muted);
   font-size: var(--text-xs);
-  font-weight: 500;
+  font-weight: var(--weight-medium);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }

@@ -54,6 +54,10 @@ export function AutomationSettings() {
   const [webhookSecret, setWebhookSecret] = createSignal<string | null>(null);
   const [secretVisible, setSecretVisible] = createSignal(false);
   const [modelSaving, setModelSaving] = createSignal(false);
+  const [pendingDelete, setPendingDelete] = createSignal<GithubCredentialView | null>(null);
+  const [deleting, setDeleting] = createSignal(false);
+  const [probing, setProbing] = createSignal<string | null>(null);
+  const [secretLoading, setSecretLoading] = createSignal(false);
 
   const modelOptions = () =>
     (providers.data ?? []).flatMap((provider) =>
@@ -74,6 +78,9 @@ export function AutomationSettings() {
     return providerId && upstreamId ? JSON.stringify([providerId, upstreamId]) : "";
   };
 
+  const modelSummary = () =>
+    automationSettings.data?.model_display_name ?? "No Automation-specific model selected";
+
   async function saveModel(value: string) {
     const [providerId, upstreamId] = value ? JSON.parse(value) : [null, null];
     setModelSaving(true);
@@ -92,12 +99,18 @@ export function AutomationSettings() {
   }
 
   async function revealWebhookSecret() {
+    setSecretLoading(true);
     try {
       const config = await getAutomationWebhookConfig(true);
       setWebhookSecret(config.secret ?? null);
       setSecretVisible(Boolean(config.secret));
+      if (!config.secret) {
+        notify("No webhook secret is stored for this deployment", { variant: "warning" });
+      }
     } catch (error) {
       notify(getErrorMessage(error, "Webhook secret could not be loaded"), { variant: "danger" });
+    } finally {
+      setSecretLoading(false);
     }
   }
 
@@ -116,17 +129,21 @@ export function AutomationSettings() {
   }
 
   async function removeCredential(credential: GithubCredentialView) {
-    if (!confirm(`Delete credential "${credential.name}"?`)) return;
+    setDeleting(true);
     try {
       await deleteGithubCredential(credential.id);
-      notify("GitHub credential deleted", { variant: "success" });
+      notify(`${credential.name} deleted`, { variant: "success" });
+      setPendingDelete(null);
       await refreshCredentials();
     } catch (error) {
       notify(getErrorMessage(error, "Credential deletion failed"), { variant: "danger" });
+    } finally {
+      setDeleting(false);
     }
   }
 
   async function probeCredential(credential: GithubCredentialView) {
+    setProbing(credential.id);
     try {
       const result = await probeGithubCredential(credential.id);
       notify(`${credential.name}: ${result.detail}`, {
@@ -135,6 +152,8 @@ export function AutomationSettings() {
       });
     } catch (error) {
       notify(getErrorMessage(error, "Credential probe failed"), { variant: "danger" });
+    } finally {
+      setProbing(null);
     }
   }
 
@@ -182,9 +201,7 @@ export function AutomationSettings() {
               )}
             </For>
           </select>
-          <small>
-            {automationSettings.data?.model_display_name ?? "No Automation-specific model selected"}
-          </small>
+          <small role="status">{modelSaving() ? "Saving..." : modelSummary()}</small>
         </label>
       </section>
 
@@ -192,7 +209,7 @@ export function AutomationSettings() {
         <div class="automation-section__heading">
           <div>
             <h3 id="automation-runs-title">
-              <Bot size={16} /> Runs
+              <Bot size={16} aria-hidden="true" /> Runs
             </h3>
             <p>Recent runs stay linked to their project and session.</p>
           </div>
@@ -204,10 +221,17 @@ export function AutomationSettings() {
             title="Refresh runs"
             onClick={() => void queryClient.invalidateQueries({ queryKey: ["automations"] })}
           >
-            <RefreshCw size={15} />
+            <RefreshCw size={15} aria-hidden="true" />
           </Button>
         </div>
-        <Show when={!automations.isPending} fallback={<p class="surface-note">Loading runs...</p>}>
+        <Show
+          when={!automations.isPending}
+          fallback={
+            <p class="surface-note" role="status">
+              Loading runs...
+            </p>
+          }
+        >
           <Show
             when={(automations.data?.length ?? 0) > 0}
             fallback={
@@ -229,7 +253,7 @@ export function AutomationSettings() {
         <div class="automation-section__heading">
           <div>
             <h3 id="automation-webhook-title">
-              <GitPullRequest size={16} /> Webhook
+              <GitPullRequest size={16} aria-hidden="true" /> Webhook
             </h3>
             <p>Inbound trigger for final email HTML or the compatible JSON envelope.</p>
           </div>
@@ -249,7 +273,7 @@ export function AutomationSettings() {
               title="Copy endpoint"
               onClick={() => void copyValue(webhookConfig.data?.endpoint, "Webhook endpoint")}
             >
-              <Copy size={15} />
+              <Copy size={15} aria-hidden="true" />
             </Button>
           </div>
           <div class="automation-webhook-row">
@@ -270,6 +294,7 @@ export function AutomationSettings() {
                 <Button
                   variant="outline"
                   size="sm"
+                  disabled={secretLoading()}
                   onClick={() => {
                     if (secretVisible()) {
                       setSecretVisible(false);
@@ -282,11 +307,11 @@ export function AutomationSettings() {
                     when={secretVisible()}
                     fallback={
                       <>
-                        <Eye size={14} /> Reveal
+                        <Eye size={14} aria-hidden="true" /> Reveal
                       </>
                     }
                   >
-                    <EyeOff size={14} /> Hide
+                    <EyeOff size={14} aria-hidden="true" /> Hide
                   </Show>
                 </Button>
               </Show>
@@ -299,7 +324,7 @@ export function AutomationSettings() {
                   title="Copy secret"
                   onClick={() => void copyValue(webhookSecret() ?? undefined, "Webhook secret")}
                 >
-                  <Copy size={15} />
+                  <Copy size={15} aria-hidden="true" />
                 </Button>
               </Show>
             </div>
@@ -314,8 +339,8 @@ export function AutomationSettings() {
       <section class="automation-section" aria-labelledby="automation-credentials-title">
         <div class="automation-section__heading">
           <div>
-            <h3 id="automation-credentials-title">
-              <KeyRound size={16} /> GitHub credentials
+            <h3 id="automation-credentials-title" tabIndex={-1}>
+              <KeyRound size={16} aria-hidden="true" /> GitHub credentials
             </h3>
             <p>
               Encrypted PATs can be used for private projects and, only after explicit opt-in, for
@@ -330,12 +355,16 @@ export function AutomationSettings() {
               setFormOpen(true);
             }}
           >
-            <Plus size={15} /> Add credential
+            <Plus size={15} aria-hidden="true" /> Add credential
           </Button>
         </div>
         <Show
           when={!credentials.isPending}
-          fallback={<p class="surface-note">Loading credentials...</p>}
+          fallback={
+            <p class="surface-note" role="status">
+              Loading credentials...
+            </p>
+          }
         >
           <Show
             when={(credentials.data?.length ?? 0) > 0}
@@ -350,7 +379,7 @@ export function AutomationSettings() {
             <div class="automation-credentials">
               <For each={credentials.data}>
                 {(credential) => (
-                  <article class="automation-credential">
+                  <article class="record-card automation-credential">
                     <div class="automation-credential__copy">
                       <strong>{credential.name}</strong>
                       <span>{credential.github_host}</span>
@@ -369,9 +398,19 @@ export function AutomationSettings() {
                       <Button
                         variant="outline"
                         size="sm"
+                        disabled={probing() === credential.id}
                         onClick={() => void probeCredential(credential)}
                       >
-                        <CheckCircle2 size={14} /> Probe
+                        <Show
+                          when={probing() === credential.id}
+                          fallback={
+                            <>
+                              <CheckCircle2 size={14} aria-hidden="true" /> Probe
+                            </>
+                          }
+                        >
+                          <Loader2 size={14} class="ui-spinner" aria-hidden="true" /> Probing…
+                        </Show>
                       </Button>
                       <Button
                         variant="ghost"
@@ -384,7 +423,7 @@ export function AutomationSettings() {
                           setFormOpen(true);
                         }}
                       >
-                        <Pencil size={16} />
+                        <Pencil size={16} aria-hidden="true" />
                       </Button>
                       <Button
                         variant="ghost"
@@ -392,9 +431,9 @@ export function AutomationSettings() {
                         iconOnly
                         aria-label={`Delete ${credential.name}`}
                         title="Delete credential"
-                        onClick={() => void removeCredential(credential)}
+                        onClick={() => setPendingDelete(credential)}
                       >
-                        <Trash2 size={16} />
+                        <Trash2 size={16} aria-hidden="true" />
                       </Button>
                     </div>
                   </article>
@@ -404,6 +443,29 @@ export function AutomationSettings() {
           </Show>
         </Show>
       </section>
+
+      <Show when={pendingDelete()}>
+        {(credential) => (
+          <Dialog
+            title="Delete GitHub credential"
+            description={`"${credential().name}" and its encrypted PAT are removed. Projects and automations using it lose push access. This cannot be undone.`}
+            close={() => setPendingDelete(null)}
+          >
+            <div class="dialog-footer">
+              <Button variant="outline" onClick={() => setPendingDelete(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={deleting()}
+                onClick={() => void removeCredential(credential())}
+              >
+                {deleting() ? "Deleting..." : "Delete credential"}
+              </Button>
+            </div>
+          </Dialog>
+        )}
+      </Show>
 
       <Show when={formOpen()}>
         <GithubCredentialForm
@@ -423,7 +485,7 @@ function AutomationRunCard(props: { run: AutomationRunView }) {
   const run = () => props.run;
   const status = () => run().operation.status;
   return (
-    <article class="automation-run">
+    <article class="record-card automation-run">
       <div class="automation-run__main">
         <div class="automation-run__title">
           <strong>{run().workflow}</strong>
@@ -440,7 +502,7 @@ function AutomationRunCard(props: { run: AutomationRunView }) {
           <Show when={run().pull_request_url}>
             {(url) => (
               <a href={url()} target="_blank" rel="noreferrer">
-                PR <ExternalLink size={13} />
+                PR <ExternalLink size={13} aria-hidden="true" />
               </a>
             )}
           </Show>
@@ -471,7 +533,7 @@ function AutomationRunCard(props: { run: AutomationRunView }) {
                   <div class="automation-run__repository">
                     <a href={repository.repository_url} target="_blank" rel="noreferrer">
                       {repository.repository_url.replace(/^https?:\/\//, "")}
-                      <ExternalLink size={13} />
+                      <ExternalLink size={13} aria-hidden="true" />
                     </a>
                     <span class={`automation-status automation-status--${repository.status}`}>
                       {repository.status}
@@ -571,32 +633,44 @@ function GithubCredentialForm(props: GithubCredentialFormProps) {
       <form class="dialog-form" onSubmit={submit}>
         <div class="dialog-form-grid">
           <div>
-            <span class="field-label">Name</span>
+            <label class="field-label" for="credential-name">
+              Name
+            </label>
             <input
+              id="credential-name"
               class="ui-input"
               value={name()}
               onInput={(event) => setName(event.currentTarget.value)}
+              aria-invalid={error() && !name().trim() ? "true" : undefined}
               required
             />
           </div>
           <div>
-            <span class="field-label">GitHub host</span>
+            <label class="field-label" for="credential-host">
+              GitHub host
+            </label>
             <input
+              id="credential-host"
               class="ui-input"
               value={host()}
               onInput={(event) => setHost(event.currentTarget.value)}
+              aria-invalid={error() && !host().trim() ? "true" : undefined}
               required
             />
           </div>
           <div class="full-field">
-            <span class="field-label">Classic PAT</span>
+            <label class="field-label" for="credential-pat">
+              Classic PAT
+            </label>
             <input
+              id="credential-pat"
               class="ui-input"
               type="password"
               value={pat()}
               onInput={(event) => setPat(event.currentTarget.value)}
               placeholder={editing() ? "Leave blank to keep the stored PAT" : "ghp_..."}
               autocomplete="new-password"
+              aria-invalid={error() && !editing() && !pat().trim() ? "true" : undefined}
               required={!editing()}
             />
           </div>
@@ -615,7 +689,9 @@ function GithubCredentialForm(props: GithubCredentialFormProps) {
           </label>
         </div>
         <Show when={error()}>
-          <p class="form-error">{error()}</p>
+          <p class="form-error" role="alert">
+            {error()}
+          </p>
         </Show>
         <div class="dialog-footer">
           <Button variant="outline" type="button" onClick={props.close}>
@@ -623,7 +699,7 @@ function GithubCredentialForm(props: GithubCredentialFormProps) {
           </Button>
           <Button variant="primary" type="submit" disabled={submitting()}>
             <Show when={submitting()} fallback={editing() ? "Save changes" : "Add credential"}>
-              <Loader2 size={15} class="ui-spinner" /> Saving...
+              <Loader2 size={15} class="ui-spinner" aria-hidden="true" /> Saving…
             </Show>
           </Button>
         </div>

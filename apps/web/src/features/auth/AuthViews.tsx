@@ -1,4 +1,5 @@
 import { useQueryClient } from "@tanstack/solid-query";
+import Copy from "lucide-solid/icons/copy";
 import KeyRound from "lucide-solid/icons/key-round";
 import LockKeyhole from "lucide-solid/icons/lock-keyhole";
 import ShieldCheck from "lucide-solid/icons/shield-check";
@@ -18,6 +19,26 @@ import {
 } from "../../lib/api";
 import { authenticationOptions, credentialPayload, registrationOptions } from "../../lib/webauthn";
 import "./auth.css";
+
+const passkeysSupported = "PublicKeyCredential" in window && "credentials" in navigator;
+
+// Browser WebAuthn failures surface as DOMExceptions whose messages read as spec
+// prose; map the ones an owner can act on.
+const WEBAUTHN_MESSAGES: Record<string, string> = {
+  NotAllowedError: "The passkey prompt was dismissed or timed out. Try again.",
+  InvalidStateError: "This device already holds a passkey for Janus. Sign in with it instead.",
+  NotSupportedError: "This browser cannot create the requested passkey.",
+  SecurityError: "Passkeys need Janus served over HTTPS or on localhost.",
+  AbortError: "The passkey request was cancelled.",
+};
+
+function authErrorMessage(value: unknown, fallback: string): string {
+  if (value instanceof DOMException) {
+    const message = WEBAUTHN_MESSAGES[value.name];
+    if (message) return message;
+  }
+  return getErrorMessage(value, fallback);
+}
 
 export function SetupView() {
   const queryClient = useQueryClient();
@@ -43,7 +64,7 @@ export function SetupView() {
       await queryClient.invalidateQueries({ queryKey: ["bootstrap"] });
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(getErrorMessage(value, "Initialization failed."));
+      setError(authErrorMessage(value, "Initialization failed."));
     } finally {
       setBusy(false);
     }
@@ -81,9 +102,19 @@ export function SetupView() {
               required
             />
           </label>
+          <Show when={!passkeysSupported}>
+            <p class="auth-note" role="alert">
+              This browser cannot use passkeys. Try a current browser over HTTPS or on localhost.
+            </p>
+          </Show>
           <NotificationEvent message={error()} variant="danger" />
-          <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
-            <KeyRound size={17} />
+          <Button
+            variant="primary"
+            class="auth-submit"
+            type="submit"
+            disabled={busy() || !passkeysSupported}
+          >
+            <KeyRound size={17} aria-hidden="true" />
             {busy() ? "Waiting for passkey..." : "Create owner passkey"}
           </Button>
         </form>
@@ -111,7 +142,7 @@ export function LoginView() {
       await loginComplete(options.ceremony_id, credentialPayload(credential));
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(getErrorMessage(value, "Login failed."));
+      setError(authErrorMessage(value, "Login failed."));
     } finally {
       setBusy(false);
     }
@@ -131,7 +162,7 @@ export function LoginView() {
       await recoveryComplete(options.ceremony_id, credentialPayload(credential));
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(getErrorMessage(value, "Recovery failed."));
+      setError(authErrorMessage(value, "Recovery failed."));
     } finally {
       setBusy(false);
     }
@@ -144,19 +175,24 @@ export function LoginView() {
     >
       <div class="auth-form">
         <NotificationEvent message={error()} variant="danger" />
+        <Show when={!passkeysSupported}>
+          <p class="auth-note" role="alert">
+            This browser cannot use passkeys. Try a current browser over HTTPS or on localhost.
+          </p>
+        </Show>
         <Button
           variant="primary"
           class="auth-submit"
           type="button"
           onClick={() => void login()}
-          disabled={busy()}
+          disabled={busy() || !passkeysSupported}
         >
-          <KeyRound size={17} />
+          <KeyRound size={17} aria-hidden="true" />
           {busy() ? "Waiting for passkey..." : "Continue with passkey"}
         </Button>
-        <button class="text-button" type="button" onClick={() => setRecovery(!recovery())}>
+        <Button variant="ghost" type="button" onClick={() => setRecovery(!recovery())}>
           {recovery() ? "Use a passkey" : "Lost your passkey? Use a recovery code"}
-        </button>
+        </Button>
         <Show when={recovery()}>
           <form class="auth-form" onSubmit={recover}>
             <label>
@@ -169,8 +205,13 @@ export function LoginView() {
                 required
               />
             </label>
-            <Button variant="outline" class="auth-submit" type="submit" disabled={busy()}>
-              <KeyRound size={16} />
+            <Button
+              variant="outline"
+              class="auth-submit"
+              type="submit"
+              disabled={busy() || !passkeysSupported}
+            >
+              <KeyRound size={16} aria-hidden="true" />
               Bind a new passkey
             </Button>
           </form>
@@ -206,10 +247,21 @@ function AuthSurface(props: {
 }
 
 function RecoveryCodes(props: { codes: string[]; done: () => void }) {
+  const [copyState, setCopyState] = createSignal("");
+
+  async function copyCodes() {
+    try {
+      await navigator.clipboard.writeText(props.codes.join("\n"));
+      setCopyState("Recovery codes copied to your clipboard.");
+    } catch {
+      setCopyState("Copy failed. Select the codes and copy them manually.");
+    }
+  }
+
   return (
     <div class="recovery-codes">
       <div class="recovery-heading">
-        <ShieldCheck size={20} />
+        <ShieldCheck size={20} aria-hidden="true" />
         <div>
           <h2>Recovery codes</h2>
           <p>Store these now. Each code works once and will not be shown again.</p>
@@ -224,9 +276,20 @@ function RecoveryCodes(props: { codes: string[]; done: () => void }) {
           )}
         </For>
       </ol>
-      <Button variant="primary" class="auth-submit" type="button" onClick={props.done}>
-        I saved these codes
-      </Button>
+      <Show when={copyState()}>
+        <p class="auth-note" role="status">
+          {copyState()}
+        </p>
+      </Show>
+      <div class="recovery-actions">
+        <Button variant="outline" type="button" onClick={() => void copyCodes()}>
+          <Copy size={16} aria-hidden="true" />
+          Copy codes
+        </Button>
+        <Button variant="primary" type="button" onClick={props.done}>
+          I saved these codes
+        </Button>
+      </div>
     </div>
   );
 }

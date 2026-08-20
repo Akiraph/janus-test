@@ -357,6 +357,21 @@ export function SessionTabView(props: SessionTabViewProps) {
     if (asyncTaskCount() > 0) views.push("async");
     return views;
   });
+  // Ids are session-scoped because several session documents stay mounted at
+  // once, and duplicate ids would break the tab/panel pairing.
+  const tabId = (view: SessionSubView) => `session-tab-${props.sessionId()}-${view}`;
+  const panelId = (view: SessionSubView) => `session-panel-${props.sessionId()}-${view}`;
+
+  function onTabKeyDown(event: KeyboardEvent) {
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    const views = subViews();
+    if (step === 0 || views.length < 2) return;
+    event.preventDefault();
+    const next = views[(views.indexOf(props.subView()) + step + views.length) % views.length];
+    if (!next) return;
+    props.onSubViewChange(next);
+    document.getElementById(tabId(next))?.focus();
+  }
   // If the active sub view is no longer offered (its data vanished), fall back.
   createEffect(() => {
     const turnId = currentTurnId();
@@ -502,23 +517,38 @@ export function SessionTabView(props: SessionTabViewProps) {
   return (
     <div class="session-doc">
       <header class="session-doc__toolbar">
-        <nav class="session-subtabs" aria-label="Session views">
+        <div
+          class="session-subtabs"
+          role="tablist"
+          aria-label="Session views"
+          onKeyDown={onTabKeyDown}
+        >
           <For each={subViews()}>
             {(view) => (
               <button
                 type="button"
+                id={tabId(view)}
+                role="tab"
                 class={`session-subtabs__item${props.subView() === view ? " session-subtabs__item--active" : ""}`}
-                aria-pressed={props.subView() === view}
+                aria-selected={props.subView() === view}
+                aria-controls={panelId(view)}
+                tabIndex={props.subView() === view ? 0 : -1}
                 onClick={() => props.onSubViewChange(view)}
               >
                 <span class="session-subtabs__label">{view === "main" ? "Main" : "Async"}</span>
               </button>
             )}
           </For>
-        </nav>
+        </div>
       </header>
 
-      <div class="session-doc__view" hidden={props.subView() !== "main"}>
+      <div
+        class="session-doc__view"
+        role="tabpanel"
+        id={panelId("main")}
+        aria-labelledby={tabId("main")}
+        hidden={props.subView() !== "main"}
+      >
         <SessionConversation
           items={conversationItems()}
           loading={
@@ -559,7 +589,13 @@ export function SessionTabView(props: SessionTabViewProps) {
         />
       </div>
 
-      <div class="session-doc__view" hidden={props.subView() !== "async"}>
+      <div
+        class="session-doc__view"
+        role="tabpanel"
+        id={panelId("async")}
+        aria-labelledby={tabId("async")}
+        hidden={props.subView() !== "async"}
+      >
         <div class="session-async">
           <p class="session-async__title">Async tasks</p>
           <AsyncTasksView

@@ -1,5 +1,7 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { Alt } from "../../components/ui/Alt";
+import { Button } from "../../components/ui/Button";
+import { getErrorMessage } from "../../lib/api";
 import { useGitLog } from "../../lib/queries";
 import { CommitAltContent, formatCommitTime } from "./commitMeta";
 
@@ -21,56 +23,80 @@ export function ScmGraphList(props: ScmGraphListProps) {
 
   return (
     <section class="scm-graph-list" aria-label="Source control commit graph">
-      <Show when={!log.isPending} fallback={<p class="surface-note">Loading...</p>}>
-        <Show when={entries().length > 0} fallback={<p class="surface-note">No commits yet</p>}>
-          <ol class="scm-graph-rows">
-            <For each={entries()}>
-              {(commit, index) => {
-                const latest = () => index() === 0;
-                const isSelected = () => selected() === commit.sha;
-                return (
-                  <li>
-                    <Alt content={<CommitAltContent commit={commit} />} class="alt-bubble--commit">
-                      <button
-                        type="button"
-                        class="scm-graph-row"
-                        classList={{ "scm-graph-row--selected": isSelected() }}
-                        aria-pressed={isSelected()}
-                        onClick={() => setSelected(commit.sha)}
+      <Show
+        when={!log.isError}
+        fallback={
+          <div class="scm-graph-error">
+            <p class="surface-note" role="alert">
+              Could not load commit history: {getErrorMessage(log.error, "the request failed")}
+            </p>
+            <Button variant="outline" size="sm" onClick={() => void log.refetch()}>
+              Retry
+            </Button>
+          </div>
+        }
+      >
+        <Show
+          when={!log.isPending}
+          fallback={
+            <p class="surface-note" role="status">
+              Loading…
+            </p>
+          }
+        >
+          <Show when={entries().length > 0} fallback={<p class="surface-note">No commits yet</p>}>
+            <ol class="scm-graph-rows">
+              <For each={entries()}>
+                {(commit, index) => {
+                  const latest = () => index() === 0;
+                  const isSelected = () => selected() === commit.sha;
+                  return (
+                    <li>
+                      <Alt
+                        content={<CommitAltContent commit={commit} />}
+                        class="alt-bubble--commit"
                       >
-                        <span
-                          class="scm-graph-rail"
-                          classList={{
-                            "scm-graph-rail--first": latest(),
-                            "scm-graph-rail--last": index() === entries().length - 1,
-                          }}
-                          aria-hidden="true"
+                        <button
+                          type="button"
+                          class="scm-graph-row"
+                          classList={{ "scm-graph-row--selected": isSelected() }}
+                          aria-pressed={isSelected()}
+                          onClick={() => setSelected(commit.sha)}
                         >
                           <span
-                            class="scm-graph-dot"
-                            classList={{ "scm-graph-dot--hollow": latest() }}
-                          />
-                        </span>
-                        <span class="scm-graph-content">
-                          <span class="scm-graph-message-row">
-                            <span class="scm-graph-message">{commit.message}</span>
-                            <Show when={latest() && props.branch?.()}>
-                              <span class="scm-graph-ref">{props.branch?.()}</span>
-                            </Show>
+                            class="scm-graph-rail"
+                            classList={{
+                              "scm-graph-rail--first": latest(),
+                              "scm-graph-rail--last": index() === entries().length - 1,
+                            }}
+                            aria-hidden="true"
+                          >
+                            <span
+                              class="scm-graph-dot"
+                              classList={{ "scm-graph-dot--hollow": latest() }}
+                            />
                           </span>
-                          <span class="scm-graph-meta">
-                            <code>{commit.sha.slice(0, 7)}</code>
-                            <span>{commit.author}</span>
-                            <span>{formatCommitTime(commit.committed_at)}</span>
+                          <span class="scm-graph-content">
+                            <span class="scm-graph-message-row">
+                              <span class="scm-graph-message">{commit.message}</span>
+                              <Show when={latest() && props.branch?.()}>
+                                <span class="scm-graph-ref">{props.branch?.()}</span>
+                              </Show>
+                            </span>
+                            <span class="scm-graph-meta">
+                              <code>{commit.sha.slice(0, 7)}</code>
+                              <span>{commit.author}</span>
+                              <span>{formatCommitTime(commit.committed_at)}</span>
+                            </span>
                           </span>
-                        </span>
-                      </button>
-                    </Alt>
-                  </li>
-                );
-              }}
-            </For>
-          </ol>
+                        </button>
+                      </Alt>
+                    </li>
+                  );
+                }}
+              </For>
+            </ol>
+          </Show>
         </Show>
       </Show>
     </section>

@@ -26,11 +26,36 @@ interface WorkspaceDocumentsProps {
   onFileSaved: (projectId: string) => void | Promise<void>;
 }
 
+function unavailableCopy(state: string): { title: string; description: string } {
+  switch (state) {
+    case "creating":
+      return {
+        title: "Cloning repository…",
+        description: "Files, Git, and Sessions unlock when the clone finishes.",
+      };
+    case "error":
+      return {
+        title: "Clone failed",
+        description: "Retry the clone from the Projects list to use workspace tools.",
+      };
+    case "deleting":
+      return {
+        title: "Deleting project…",
+        description: "This workspace is being removed.",
+      };
+    default:
+      return {
+        title: "Workspace unavailable",
+        description: "This project is not ready for workspace tools yet.",
+      };
+  }
+}
+
 export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
   const activeReadyDocument = () => (props.ready() ? props.workspace.activeDocument() : undefined);
 
   return (
-    <main class="ide-main">
+    <section class="ide-main" aria-label="Documents">
       <Show when={props.workspace.documents.length > 0 || !props.workspace.navigationOpen()}>
         <div class="ide-main-tabs">
           <Show when={!props.workspace.navigationOpen()}>
@@ -38,10 +63,11 @@ export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
               type="button"
               class="workspace-navigation-button"
               aria-label="Open workspace navigation"
+              aria-expanded={false}
               title="Open workspace navigation"
               onClick={props.workspace.openNavigation}
             >
-              <PanelLeftOpen size={16} />
+              <PanelLeftOpen size={16} aria-hidden="true" />
             </button>
           </Show>
           <div class="ide-tabs" role="tablist" aria-label="Open documents">
@@ -79,12 +105,8 @@ export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
                   {(project) => (
                     <EmptyState
                       icon={Files}
-                      title={`Project is ${project().state}`}
-                      description={
-                        project().state === "creating"
-                          ? "Clone is still running. Files and Git unlock when the project is ready."
-                          : "This project is not ready for workspace tools yet."
-                      }
+                      title={unavailableCopy(project().state).title}
+                      description={unavailableCopy(project().state).description}
                     />
                   )}
                 </Show>
@@ -101,8 +123,9 @@ export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
           {(document) => (
             <Suspense
               fallback={
-                <div class="ide-shell-scaffold-loading" role="status" aria-label="Loading">
-                  <Loader2 size={22} class="ui-spinner" />
+                <div class="ide-shell-scaffold-loading" role="status">
+                  <Loader2 size={22} class="ui-spinner" aria-hidden="true" />
+                  <span class="sr-only">Loading document</span>
                 </div>
               }
             >
@@ -138,7 +161,7 @@ export function WorkspaceDocuments(props: WorkspaceDocumentsProps) {
           )}
         </Show>
       </div>
-    </main>
+    </section>
   );
 }
 
@@ -162,6 +185,7 @@ function DocumentTab(props: {
   return (
     <div
       class="ide-tab"
+      role="presentation"
       classList={{
         "ide-tab--active": props.active,
         "ide-tab--dirty": dirty(),
@@ -178,7 +202,7 @@ function DocumentTab(props: {
         onClick={props.onActivate}
       >
         <Show when={props.document.kind === "session"}>
-          <MessageSquare size={12} class="ide-tab-kind-icon" />
+          <MessageSquare size={12} class="ide-tab-kind-icon" aria-hidden="true" />
         </Show>
         <Show when={dirty()}>
           <span class="ide-tab-dirty" aria-hidden="true" title="Unsaved changes" />
@@ -194,7 +218,7 @@ function DocumentTab(props: {
           props.onClose();
         }}
       >
-        <X size={12} />
+        <X size={12} aria-hidden="true" />
       </button>
     </div>
   );

@@ -70,8 +70,6 @@
 .ui-button[data-variant="ghost"]:focus-visible {
   color: var(--text);
   background: var(--surface-muted);
-  box-shadow: none;
-  outline: none;
 }
 
 .ui-button[data-variant="destructive"] {
