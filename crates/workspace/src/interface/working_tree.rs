@@ -23,7 +23,7 @@ impl WorkspaceInterface {
         let abs = self.workspace_root(handle).await?.join(&rel);
         let meta = tokio::fs::metadata(&abs)
             .await
-            .map_err(|_| WorkspaceError::PathNotFound(raw_path.to_owned()))?;
+            .map_err(|error| read_error(raw_path, error))?;
         let revision = self
             .current_revision(handle)
             .await
@@ -46,9 +46,15 @@ impl WorkspaceInterface {
         let rel = validate_workspace_path(raw_path)?;
         let _lock = self.acquire_mutation_lock(handle).await?;
         let abs = self.workspace_root(handle).await?.join(rel);
+        let meta = tokio::fs::metadata(&abs)
+            .await
+            .map_err(|error| read_error(raw_path, error))?;
+        if meta.is_dir() {
+            return Err(WorkspaceError::NotEditable(raw_path.to_owned()));
+        }
         tokio::fs::read(&abs)
             .await
-            .map_err(|_| WorkspaceError::PathNotFound(raw_path.to_owned()))
+            .map_err(|error| read_error(raw_path, error))
     }
 
     pub async fn file_tree(
@@ -65,7 +71,7 @@ impl WorkspaceInterface {
         let abs = self.workspace_root(handle).await?.join(&rel);
         let mut entries = tokio::fs::read_dir(&abs)
             .await
-            .map_err(|_| WorkspaceError::PathNotFound(raw_path.to_owned()))?;
+            .map_err(|error| read_error(raw_path, error))?;
         let mut out = Vec::new();
         while let Some(entry) = entries
             .next_entry()
@@ -524,5 +530,38 @@ impl WorkspaceInterface {
             )));
         }
         Ok(())
+    }
+}
+
+/// Separate the filesystem refusals a user can act on from a genuinely missing
+/// path. Reporting every read failure as `PathNotFound` tells a user that a file
+/// they are looking at in the tree does not exist, and hides the real cause.
+fn read_error(raw_path: &str, error: std::io::Error) -> WorkspaceError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => WorkspaceError::PathNotFound(raw_path.to_owned()),
+        std::io::ErrorKind::PermissionDenied => {
+            WorkspaceError::PermissionDenied(raw_path.to_owned())
+        }
+        _ => WorkspaceError::Internal(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_error;
+    use crate::interface::WorkspaceError;
+
+    #[test]
+    fn read_failures_keep_their_cause() {
+        let missing = read_error("src/main.rs", std::io::ErrorKind::NotFound.into());
+        assert!(matches!(missing, WorkspaceError::PathNotFound(_)));
+        assert_eq!(missing.to_string(), "path not found: src/main.rs");
+
+        let denied = read_error("src/main.rs", std::io::ErrorKind::PermissionDenied.into());
+        assert!(matches!(denied, WorkspaceError::PermissionDenied(_)));
+        assert_eq!(
+            denied.to_string(),
+            "permission denied by the filesystem: src/main.rs"
+        );
     }
 }
