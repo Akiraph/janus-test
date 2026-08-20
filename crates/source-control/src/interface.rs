@@ -49,6 +49,21 @@ pub enum GitError {
     CheckoutConflict,
     #[error("git update produced a three-way content conflict: {paths:?}")]
     UpdateConflict { paths: Vec<String> },
+    /// The named remote is absent from the repository configuration.
+    #[error("the git remote is not configured for this project")]
+    RemoteNotFound,
+    /// The remote answered, but the repository itself does not exist there.
+    #[error("the remote repository does not exist or is not visible to this credential")]
+    RepositoryNotFound,
+    /// The requested branch / ref does not exist locally or on the remote.
+    #[error("the requested git branch does not exist")]
+    RefNotFound,
+    #[error("there is nothing staged to commit")]
+    NothingToCommit,
+    #[error("git has no author identity configured (user.name and user.email)")]
+    IdentityUnset,
+    #[error("another git process is holding the repository lock; retry in a moment")]
+    RepositoryLocked,
     #[error("git process failed: {0}")]
     CommandFailed(String),
     #[error("git output was not valid UTF-8 or unexpected: {0}")]
@@ -65,6 +80,12 @@ impl GitError {
             Self::Diverged => "GIT_DIVERGED",
             Self::CheckoutConflict => "GIT_CHECKOUT_CONFLICT",
             Self::UpdateConflict { .. } => "GIT_UPDATE_CONFLICT",
+            Self::RemoteNotFound => "GIT_REMOTE_NOT_FOUND",
+            Self::RepositoryNotFound => "GIT_REPOSITORY_NOT_FOUND",
+            Self::RefNotFound => "GIT_REF_NOT_FOUND",
+            Self::NothingToCommit => "GIT_NOTHING_TO_COMMIT",
+            Self::IdentityUnset => "GIT_IDENTITY_UNSET",
+            Self::RepositoryLocked => "GIT_REPOSITORY_LOCKED",
             Self::CommandFailed(_) | Self::BadOutput(_) => "INTERNAL_ERROR",
         }
     }
@@ -404,6 +425,19 @@ fn sha2_hash(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// The problem payload recorded on a durable git Operation. A classified
+/// failure carries its user-facing message so the SCM panel can say what went
+/// wrong; an unclassified one stays opaque, matching how the transport scrubs
+/// the detail of an `INTERNAL_ERROR`.
+fn operation_problem(error: &GitError) -> serde_json::Value {
+    let detail = if error.code() == "INTERNAL_ERROR" {
+        "The git operation could not be completed.".to_owned()
+    } else {
+        error.to_string()
+    };
+    serde_json::json!({"code": error.code(), "detail": detail})
+}
+
 /// The git capability: drives the `GitRunner` over a Project's Main repo and
 /// owns the git state/conflict tables. Reads the Project's repo config and
 /// GitHub credential from `projects` (read-only) so orchestration stays here;
@@ -724,7 +758,7 @@ impl SourceControlInterface {
                     &created.operation.id,
                     OperationStatus::Failed,
                     None,
-                    Some(serde_json::json!({"code": error.code()})),
+                    Some(operation_problem(&error)),
                     correlation_id,
                 )
                 .await?;
@@ -788,6 +822,11 @@ impl SourceControlInterface {
         correlation_id: CorrelationId,
     ) -> Result<String, SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
+        if message.trim().is_empty() {
+            return Err(SourceControlError::Validation(
+                "a commit message is required".into(),
+            ));
+        }
         let _lock = self
             .workspace
             .acquire_project_mutation_lock(project_id)
@@ -840,7 +879,7 @@ impl SourceControlInterface {
                     &created.operation.id,
                     OperationStatus::Failed,
                     None,
-                    Some(serde_json::json!({"code": error.code()})),
+                    Some(operation_problem(&error)),
                     correlation_id,
                 )
                 .await?;
@@ -932,9 +971,7 @@ impl SourceControlInterface {
                         &created.operation.id,
                         OperationStatus::Failed,
                         None,
-                        Some(
-                            serde_json::json!({"code": error.code(), "detail": error.to_string()}),
-                        ),
+                        Some(operation_problem(&error)),
                         correlation_id,
                     )
                     .await?;
@@ -1052,7 +1089,9 @@ impl SourceControlInterface {
             )));
         }
 
-        // Save each path choice.
+        // Save each path choice. A path that is not part of this conflict has to
+        // be rejected: accepting it silently leaves the conflict open with no
+        // reason the user can see.
         let now = now_utc_str();
         for path in &input.paths {
             if !matches!(
@@ -1072,7 +1111,7 @@ impl SourceControlInterface {
             } else {
                 None
             };
-            sqlx::query(
+            let changed = sqlx::query(
                 "UPDATE git_update_conflict_paths SET choice = ?, edited_blob_sha = ?, version = ? WHERE conflict_id = ? AND path = ?",
             )
             .bind(&path.choice)
@@ -1081,20 +1120,19 @@ impl SourceControlInterface {
             .bind(conflict_id)
             .bind(&path.path)
             .execute(&self.pool)
-            .await?;
+            .await?
+            .rows_affected();
+            if changed == 0 {
+                return Err(SourceControlError::Validation(format!(
+                    "path is not part of this conflict: {}",
+                    path.path
+                )));
+            }
             if path.choice == "edited_text"
                 && let Some(text) = &path.edited_text
             {
-                let staging = self
-                    .workspaces_root
-                    .join("main")
-                    .join(project_id)
-                    .join(".janus-conflict-edits");
-                tokio::fs::create_dir_all(&staging).await.ok();
-                let safe = path.path.replace('/', "__");
-                tokio::fs::write(staging.join(safe), text.as_bytes())
-                    .await
-                    .map_err(|e| SourceControlError::Internal(anyhow::anyhow!(e)))?;
+                self.stage_conflict_edit(project_id, &path.path, text.as_bytes())
+                    .await?;
             }
         }
 
@@ -1140,14 +1178,15 @@ impl SourceControlInterface {
         for path_row in &path_rows {
             let choice = path_row.choice.as_deref().unwrap_or("main");
             let edited_bytes = if choice == "edited_text" {
-                let safe = path_row.path.replace('/', "__");
-                let staging = self
-                    .workspaces_root
-                    .join("main")
-                    .join(project_id)
-                    .join(".janus-conflict-edits")
-                    .join(safe);
-                Some(tokio::fs::read(&staging).await.unwrap_or_default())
+                let staged = self.conflict_edit_path(project_id, &path_row.path);
+                // Writing an empty file here would destroy the resolution the
+                // user typed, so a missing staged body has to fail the apply.
+                Some(tokio::fs::read(&staged).await.map_err(|_| {
+                    SourceControlError::Validation(format!(
+                        "the edited text for {} is no longer staged; resubmit the resolution",
+                        path_row.path
+                    ))
+                })?)
             } else {
                 None
             };
@@ -1208,6 +1247,32 @@ impl SourceControlInterface {
             .await;
         self.get_update_conflict(owner_id, project_id, conflict_id)
             .await
+    }
+
+    /// Where a resolved `edited_text` body waits between the partial save that
+    /// carried it and the apply step. The file name is a hash of the path so a
+    /// client-supplied path can neither collide with another path nor escape the
+    /// staging directory.
+    fn conflict_edit_path(&self, project_id: &str, path: &str) -> PathBuf {
+        self.workspaces_root
+            .join("main")
+            .join(project_id)
+            .join(".janus-conflict-edits")
+            .join(sha2_hash(path.as_bytes()))
+    }
+
+    async fn stage_conflict_edit(
+        &self,
+        project_id: &str,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<(), SourceControlError> {
+        let staged = self.conflict_edit_path(project_id, path);
+        if let Some(parent) = staged.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&staged, bytes).await?;
+        Ok(())
     }
 
     async fn refresh_git_state(
@@ -1363,12 +1428,37 @@ mod tests {
                 GitError::UpdateConflict { paths: Vec::new() },
                 "GIT_UPDATE_CONFLICT",
             ),
+            (GitError::RemoteNotFound, "GIT_REMOTE_NOT_FOUND"),
+            (GitError::RepositoryNotFound, "GIT_REPOSITORY_NOT_FOUND"),
+            (GitError::RefNotFound, "GIT_REF_NOT_FOUND"),
+            (GitError::NothingToCommit, "GIT_NOTHING_TO_COMMIT"),
+            (GitError::IdentityUnset, "GIT_IDENTITY_UNSET"),
+            (GitError::RepositoryLocked, "GIT_REPOSITORY_LOCKED"),
             (GitError::CommandFailed("exit 1".into()), "INTERNAL_ERROR"),
             (GitError::BadOutput("invalid".into()), "INTERNAL_ERROR"),
         ];
 
         for (error, code) in cases {
             assert_eq!(error.code(), code);
+        }
+    }
+
+    /// Every user-actionable git failure must carry a code of its own: the
+    /// transport replaces the detail of an `INTERNAL_ERROR` with a fixed
+    /// sentence, so anything mapped there reaches the user with no reason at all.
+    #[test]
+    fn user_actionable_git_failures_are_not_internal_errors() {
+        let actionable = [
+            GitError::RemoteNotFound,
+            GitError::RepositoryNotFound,
+            GitError::RefNotFound,
+            GitError::NothingToCommit,
+            GitError::IdentityUnset,
+            GitError::RepositoryLocked,
+        ];
+
+        for error in actionable {
+            assert_ne!(error.code(), "INTERNAL_ERROR", "{error}");
         }
     }
 
