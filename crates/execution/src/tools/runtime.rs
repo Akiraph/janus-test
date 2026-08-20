@@ -1,6 +1,9 @@
 //! Bash/runtime and process-control tools (bash, read_output, stop).
 use super::*;
 
+/// Bytes of an async task's log stream one `read_output` call pulls.
+const READ_OUTPUT_WINDOW_BYTES: usize = 256 * 1024;
+
 fn default_limits(timeout_ms: u64) -> janus_runtime::interface::ResourceLimits {
     janus_runtime::interface::ResourceLimits {
         timeout_ms,
@@ -379,7 +382,11 @@ pub(super) async fn tool_read_output(
         })?;
     let range = ctx
         .runtime
-        .log_range(async_task.log_stream_id, LogCursor::ZERO, 256 * 1024)
+        .log_range(
+            async_task.log_stream_id,
+            LogCursor::ZERO,
+            READ_OUTPUT_WINDOW_BYTES,
+        )
         .await
         .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("read_output log: {e}")))?;
 
@@ -393,17 +400,35 @@ pub(super) async fn tool_read_output(
     }
     let stdout = sanitize_secret(&stdout, ctx.git_token);
     let stderr = sanitize_secret(&stderr, ctx.git_token);
+    // The read window and the per-channel display caps both drop output. Say so
+    // in the summary: without it the caller cannot tell a task that printed
+    // nothing more from one whose remaining output was never fetched.
+    let window_reached_end = range
+        .chunks
+        .last()
+        .is_none_or(|chunk| chunk.end_cursor >= range.stream.next_cursor);
+    let (stdout_out, stdout_truncated) = truncate_tool_text(&stdout, 8_000);
+    let (stderr_out, stderr_truncated) = truncate_tool_text(&stderr, 4_000);
+    let truncated =
+        !window_reached_end || range.stream.truncated || stdout_truncated || stderr_truncated;
     let status = format!("{:?}", async_task.status).to_ascii_lowercase();
+    let exit_code = async_task.exit.as_ref().and_then(|exit| exit.exit_code);
     let summary = json!({
         "task_id": raw_id,
+        "command": async_task.command_summary,
         "status": status,
+        "exit_code": exit_code,
+        "stdout": stdout_out,
+        "stderr": stderr_out,
         "stdout_bytes": stdout.len(),
         "stderr_bytes": stderr.len(),
+        "truncated": truncated,
+        "next_cursor": range.stream.next_cursor.value(),
         "done": async_task.status.is_terminal(),
     });
     let text = format!(
-        "task {} (status={})\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        raw_id, status, stdout, stderr
+        "task {} (status={}, exit={:?}, truncated={})\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        raw_id, status, exit_code, truncated, stdout_out, stderr_out
     );
     Ok(ToolOutcome {
         disposition: ToolExecutionDisposition::Succeeded,

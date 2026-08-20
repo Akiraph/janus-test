@@ -74,7 +74,31 @@ fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolD
         }
         "read" => {
             let path = input_string("path");
-            (format!("Read {path}"), ToolDisplayBody::None)
+            let offset = summary
+                .and_then(|value| value.get("offset"))
+                .and_then(Value::as_i64);
+            let limit = summary
+                .and_then(|value| value.get("limit"))
+                .and_then(Value::as_i64);
+            let total_lines = summary
+                .and_then(|value| value.get("total_lines"))
+                .and_then(Value::as_i64);
+            // A sliced read has to say so in the row the user sees; a bare
+            // "Read path" reads as the whole file.
+            let sliced = match (limit, total_lines) {
+                (Some(limit), Some(total)) => limit < total,
+                _ => false,
+            };
+            let title = if sliced {
+                let first = offset.unwrap_or(1);
+                let count = limit.unwrap_or(0);
+                let last = first.saturating_add(count).saturating_sub(1).max(first);
+                let total = total_lines.unwrap_or(count);
+                format!("Read {path} (lines {first}-{last} of {total})")
+            } else {
+                format!("Read {path}")
+            };
+            (title, ToolDisplayBody::None)
         }
         "write" => {
             let path = input_string("path");
@@ -95,10 +119,24 @@ fn build_tool_display(name: &str, input: &Value, outcome: &ToolOutcome) -> ToolD
         }
         "read_output" => {
             let async_task_id = input_string("task_id");
+            let exit_code = summary
+                .and_then(|value| value.get("exit_code"))
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok());
+            let truncated = summary
+                .and_then(|value| value.get("truncated"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // The captured output is the point of this tool; a structured dump
+            // of byte counts showed the user everything except the output.
             (
                 format!("Read output for {async_task_id}"),
-                ToolDisplayBody::Structured {
-                    value: outcome.summary.clone(),
+                ToolDisplayBody::CommandOutput {
+                    command: string("command"),
+                    stdout: string("stdout"),
+                    stderr: string("stderr"),
+                    exit_code,
+                    truncated,
                 },
             )
         }
