@@ -142,7 +142,9 @@ fn apply_read_range(text: String, input: &Value) -> ReadRange {
         };
     }
     let offset = requested_offset.unwrap_or(1);
-    let start = usize::try_from(offset).unwrap_or(usize::MAX).saturating_sub(1);
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total = lines.len();
     if start >= total {
