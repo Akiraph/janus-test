@@ -23,7 +23,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
   const [errors, setErrors] = createSignal<Record<string, string>>({});
   const [scrollHost, setScrollHost] = createSignal<HTMLElement | null>(null);
   const [focusedPath, setFocusedPath] = createSignal<string | null>(null);
-  let treeEl: HTMLUListElement | undefined;
+  let treeEl: HTMLDivElement | undefined;
   let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function loadPath(path: string, force = false) {
@@ -226,7 +226,10 @@ export function FileTreePanel(props: FileTreePanelProps) {
               when={(children()[""]?.length ?? 0) > 0}
               fallback={<p class="surface-note">Empty repository</p>}
             >
-              <ul
+              {/* Plain divs rather than a list: an ARIA tree replaces list
+                  semantics, so a list element's implicit role only conflicts
+                  with role="tree". Depth is carried by aria-level per row. */}
+              <div
                 ref={treeEl}
                 class="ide-tree-list"
                 role="tree"
@@ -252,7 +255,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
                     />
                   )}
                 </For>
-              </ul>
+              </div>
             </Show>
           </Show>
         </div>
@@ -285,7 +288,7 @@ function TreeNode(props: {
     props.loading.has(props.entry.path) || (isOpen() && childEntries() === undefined);
 
   return (
-    <li
+    <div
       class="ide-tree-node"
       role="treeitem"
       data-tree-path={props.entry.path}
@@ -366,7 +369,7 @@ function TreeNode(props: {
                     </div>
                   }
                 >
-                  <ul class="ide-tree-list" role="group">
+                  <div class="ide-tree-list">
                     <For each={childEntries() ?? []}>
                       {(child) => (
                         <TreeNode
@@ -385,13 +388,13 @@ function TreeNode(props: {
                         />
                       )}
                     </For>
-                  </ul>
+                  </div>
                 </Show>
               </Show>
             </Show>
           </div>
         </div>
       </Show>
-    </li>
+    </div>
   );
 }

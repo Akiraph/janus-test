@@ -5,7 +5,16 @@ import Paperclip from "lucide-solid/icons/paperclip";
 import Send from "lucide-solid/icons/send";
 import Square from "lucide-solid/icons/square";
 import X from "lucide-solid/icons/x";
-import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  onCleanup,
+  onMount,
+  Show,
+  untrack,
+} from "solid-js";
 import { Button } from "../../components/ui/Button";
 import { useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
@@ -72,6 +81,7 @@ export function SessionComposer(props: SessionComposerProps) {
   const [goalMode, setGoalMode] = createSignal(false);
   const [contextOpen, setContextOpen] = createSignal(false);
   let contextCloseTimer: number | undefined;
+  let contextAnchorEl: HTMLDivElement | undefined;
   // Escape has to dismiss the hover/focus popover and keep it dismissed while
   // the pointer or focus still rests on the trigger (WCAG 1.4.13).
   let contextDismissed = false;
@@ -103,6 +113,30 @@ export function SessionComposer(props: SessionComposerProps) {
     cancelContextClose();
     setContextOpen(false);
   }
+
+  function onContextAnchorFocusOut(event: FocusEvent) {
+    const anchor = contextAnchorEl;
+    if (!anchor) return;
+    const next = event.relatedTarget;
+    if (!(next instanceof Node) || !anchor.contains(next)) scheduleContextClose();
+  }
+
+  function onContextAnchorKeyDown(event: KeyboardEvent) {
+    if (event.key === "Escape") dismissContext();
+  }
+
+  // The anchor is a bare layout wrapper with no role of its own, so its pointer
+  // and focus listeners are bound imperatively rather than as JSX props — same
+  // pattern as the Alt tooltip trigger.
+  onMount(() => {
+    const anchor = contextAnchorEl;
+    if (!anchor) return;
+    anchor.addEventListener("pointerenter", openContext);
+    anchor.addEventListener("pointerleave", scheduleContextClose);
+    anchor.addEventListener("focusin", openContext);
+    anchor.addEventListener("focusout", onContextAnchorFocusOut);
+    anchor.addEventListener("keydown", onContextAnchorKeyDown);
+  });
   onCleanup(cancelContextClose);
   const [canceling, setCanceling] = createSignal(false);
   let textarea: HTMLTextAreaElement | undefined;
@@ -429,21 +463,7 @@ export function SessionComposer(props: SessionComposerProps) {
             <Flag size={15} />
             <span>Goal mode</span>
           </Button>
-          <div
-            class="session-composer__context-anchor"
-            onPointerEnter={openContext}
-            onPointerLeave={scheduleContextClose}
-            onFocusIn={openContext}
-            onFocusOut={(event) => {
-              const next = event.relatedTarget;
-              if (!(next instanceof Node) || !event.currentTarget.contains(next)) {
-                scheduleContextClose();
-              }
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") dismissContext();
-            }}
-          >
+          <div class="session-composer__context-anchor" ref={contextAnchorEl}>
             <button
               type="button"
               class="session-composer__context"
