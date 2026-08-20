@@ -362,7 +362,7 @@ impl RuntimeInterface {
         .bind(spec.session_id.to_string())
         .bind(spec.initiated_by_tool_call_id.to_string())
         .bind(spec.controlling_turn_id.to_string())
-        .bind(command_summary())
+        .bind(command_summary(&spec))
         .bind(&runtime_nonce)
         .bind(log.id.to_string())
         .bind(serde_json::to_string(&ResourceUsage::default()).map_err(storage_error)?)
@@ -1508,6 +1508,7 @@ const PROJECT_LOG_STREAMS: &str = "SELECT id FROM log_streams WHERE \
 const TICKET_TTL: chrono::TimeDelta = chrono::Duration::seconds(30);
 const ASYNC_TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const ASYNC_TASK_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const COMMAND_SUMMARY_MAX_CHARS: usize = 120;
 
 fn terminal_projection(row: TerminalRow) -> Result<TerminalProjection, RuntimeError> {
     if row.owner_kind != "project" {
@@ -1667,8 +1668,34 @@ const fn async_task_status_str(value: AsyncTaskStatus) -> &'static str {
     }
 }
 
-fn command_summary() -> &'static str {
-    "Shell command"
+/// One-line, length-bounded rendering of an async task's own command.
+///
+/// This string is the only thing the task list and the model's task inventory
+/// have to tell two concurrent background tasks apart, so it carries the real
+/// command. Any secret the caller injected as an environment variable is
+/// replaced first: the summary is durable and is read back into prompts.
+fn command_summary(spec: &AsyncTaskSpec) -> String {
+    let secrets = spec
+        .execution
+        .environment()
+        .secrets()
+        .iter()
+        .map(|secret| secret.value().expose())
+        .collect::<Vec<_>>();
+    redacted_one_line(spec.execution.command().input(), &secrets)
+}
+
+fn redacted_one_line(command: &str, secrets: &[&str]) -> String {
+    let mut command = command.to_owned();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        command = command.replace(*secret, "[secret redacted]");
+    }
+    let one_line = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut summary: String = one_line.chars().take(COMMAND_SUMMARY_MAX_CHARS).collect();
+    if one_line.chars().count() > COMMAND_SUMMARY_MAX_CHARS {
+        summary.push('…');
+    }
+    summary
 }
 
 fn new_version() -> String {
@@ -1677,4 +1704,32 @@ fn new_version() -> String {
 
 fn storage_error(_error: impl Into<anyhow::Error>) -> RuntimeError {
     RuntimeError::RuntimeUnavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMAND_SUMMARY_MAX_CHARS, redacted_one_line};
+
+    #[test]
+    fn a_task_summary_carries_its_own_command_on_one_line() {
+        assert_eq!(
+            redacted_one_line("cargo test\n  --workspace", &[]),
+            "cargo test --workspace"
+        );
+    }
+
+    #[test]
+    fn an_injected_secret_never_reaches_the_durable_summary() {
+        let summary = redacted_one_line("gh auth login --with-token ghp_example", &["ghp_example"]);
+        assert_eq!(summary, "gh auth login --with-token [secret redacted]");
+        assert!(!summary.contains("ghp_example"));
+    }
+
+    #[test]
+    fn a_long_command_is_marked_as_shortened() {
+        let command = "echo ".repeat(200);
+        let summary = redacted_one_line(&command, &[]);
+        assert!(summary.ends_with('…'));
+        assert_eq!(summary.chars().count(), COMMAND_SUMMARY_MAX_CHARS + 1);
+    }
 }
