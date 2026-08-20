@@ -1,5 +1,7 @@
 # Janus
 
+English | [简体中文](./README.zh-CN.md)
+
 Janus is a local-first control plane for AI-assisted software work. A single
 Rust process owns projects, workspaces, sessions, turns, terminals, and durable
 background operations on top of one SQLite database, and publishes them over a
@@ -203,7 +205,8 @@ Transport conventions:
 
 - Success bodies are wrapped as `{ "data": ... }`.
 - Errors are `application/problem+json` with `type`, `title`, `status`, `code`,
-  `detail`, and the `request_id`.
+  `detail`, and the `request_id`. This holds for requests that never reach a
+  handler too — see [Error codes](#error-codes).
 - Commands with side effects that are not safely repeatable require a
   client-generated `Idempotency-Key`; mutating single-resource requests carry
   the resource version in `If-Match`.
@@ -289,6 +292,53 @@ Transport conventions:
 When `JANUS_WEB_DIST` is set, unmatched paths fall back to the built web client
 so one origin serves the API, the health probes, and the SPA.
 
+## Error codes
+
+`code` is the stable part of a failure and the field clients switch on; `status`
+and `title` follow from it through the shared map in
+`apps/server/src/transport/http/problem.rs`. `detail` is human-readable and is
+scrubbed for `INTERNAL_ERROR`, so a classified failure keeps its reason while an
+unclassified one stays opaque.
+
+| Group | Codes |
+| --- | --- |
+| shared | `RESOURCE_NOT_FOUND` (404), `RESOURCE_VERSION_MISMATCH` (412), `PRECONDITION_REQUIRED` (428), `IDEMPOTENCY_KEY_REUSED` (409), `OPERATION_IN_PROGRESS` (409), `VALIDATION_FAILED` (422), `INTERNAL_ERROR` (500) |
+| sessions and turns | `SESSION_NOT_FOUND` (404), `ACTIVE_TURN_EXISTS`, `SESSION_DELETING`, `TURN_NOT_INTERACTIVE`, `TURN_TERMINAL` (409), `TIMELINE_CURSOR_INVALID` (422) |
+| models and providers | `PROVIDER_AUTH_FAILED`, `PROVIDER_STREAM_FAILED` (502), `MODEL_NOT_CONFIGURED`, `MODEL_CONFIGURATION_FAULT` (422), `MODEL_CONTEXT_EXCEEDED`, `MODEL_CAPABILITY_MISMATCH` (409), `MODEL_UNAVAILABLE` (503), `RATE_LIMITED` (429) |
+| tools and media | `TOOL_NOT_ALLOWED`, `TOOL_PATH_INVALID`, `IMAGE_TOO_LARGE`, `UNSUPPORTED_IMAGE` (422) |
+| runtimes and terminals | `RESOURCE_BUSY`, `TERMINAL_NOT_WRITABLE` (409), `RUNTIME_UNAVAILABLE`, `ASYNC_TASK_LOST` (503), `TERMINAL_TICKET_INVALID` (401), `TERMINAL_SCROLLBACK_EXPIRED` (410) |
+| framework rejections | `METHOD_NOT_ALLOWED` (405), `PAYLOAD_TOO_LARGE` (413), `UNSUPPORTED_MEDIA_TYPE` (415), `REQUEST_REJECTED` (any other 4xx) |
+
+A request rejected before any handler ran — unparsable body, missing query
+parameter, wrong method, oversized payload — would otherwise answer with the
+framework's plain-text rejection and no code at all. `client_error_envelope`
+rebuilds every non-Problem 4xx into the same envelope, keeping the original
+status, keeping the framework's text as `detail` because it names the field at
+fault, and re-inserting the router's `Allow` header on a 405. A 400 or 422
+becomes `VALIDATION_FAILED` and a 404 becomes `RESOURCE_NOT_FOUND`, so those
+paths look the same whether or not a handler produced them.
+
+Git commands and Git-backed Operations carry their own codes from
+`GitError::code`, mapped to 409 unless the shared map says otherwise:
+`GIT_AUTH_FAILED`, `GIT_REMOTE_UNAVAILABLE`, `GIT_REMOTE_NOT_FOUND`,
+`GIT_REPOSITORY_NOT_FOUND`, `GIT_REF_NOT_FOUND`, `GIT_NOTHING_TO_COMMIT`,
+`GIT_IDENTITY_UNSET`, `GIT_REPOSITORY_LOCKED`, `GIT_NON_FAST_FORWARD`,
+`GIT_DIVERGED`, `GIT_INDEX_NOT_EMPTY`, `GIT_CHECKOUT_CONFLICT`, and
+`GIT_UPDATE_CONFLICT`, which also writes the conflict records exposed under
+`/git/update-conflicts`. Classification reads stdout as well as stderr, because
+`git commit` reports the most common failure — nothing staged — on stdout.
+
+Durable work reports `OPERATION_INTERRUPTED` after a restart, and automation
+adds `PROJECT_CLONE_FAILED`, `AUTOMATION_TIMED_OUT`, `OPERATION_LEASE_STALE`,
+and `FORK_SYNC_PARTIAL_FAILURE` so a clone that never finished is
+distinguishable from a pull request the remote rejected.
+
+Tool calls fail inside the timeline rather than over HTTP, and their outcomes
+carry their own codes — `TOOL_ARGUMENTS_INVALID` when a streamed call arrived
+truncated (the tool is not run), `TOOL_EXECUTION_FAILED`,
+`TOOL_SKIPPED_AFTER_BLOCK`, and the `TOOL_EDIT_*` and `TOOL_ATTACHMENT_*`
+families from `crates/execution/src/tools/`.
+
 ## Generated contract
 
 ```text
@@ -371,6 +421,64 @@ domain state machines are not reimplemented in the client.
 | `generate:types` | `openapi-typescript ../../generated/openapi.json -o src/generated/api.ts` |
 | `test:e2e` | `playwright test` |
 | `test:e2e:live` | build `janus-server` + `janus-test`, then run `live-execution.spec.ts` |
+
+## Accessibility
+
+The client is meant to be usable with a keyboard and a screen reader, not only
+with a pointer. The conventions below are contracts: new UI is expected to
+follow them rather than reintroduce the patterns they replaced.
+
+**Focus is always visible.** Every interactive surface — inputs, select
+triggers, both textareas, tree rows, buttons, links — carries a real `outline`
+on `:focus-visible`, coloured `var(--text)`. `--shadow-focus` still exists but
+is elevation, not an indicator: its 8–18% alpha is far below the 3:1 contrast
+WCAG 1.4.11 asks for, and `--accent-strong` measures roughly 1.6:1 against
+`--surface`, so neither can carry focus alone. Inputs use
+`outline-offset: 1px`; textareas and tree rows use a negative offset so the ring
+reads inside a borderless surface or a scroll container. Two `outline: none`
+declarations remain in the client, each paired with a `:focus-visible` ring
+immediately below it.
+
+**Dialogs trap and restore focus.** `components/ui/Dialog.tsx` moves focus into
+the dialog on mount and back to the opener on cleanup, wraps Tab and Shift-Tab
+inside it, closes on Escape, and wires `aria-labelledby`/`aria-describedby` with
+`createUniqueId`. `description` is a required prop, so no dialog can ship
+without stating its consequence. Destructive and irreversible actions —
+deleting a provider or channel, regenerating recovery codes, pushing to a
+remote — go through a dialog that says what will happen and whether Janus can
+undo it, never through native `confirm()`.
+
+**Composite widgets have a keyboard model.** The file explorer is a
+`role="tree"` with a roving tabindex: ArrowDown and ArrowUp walk the flattened
+list of *visible* rows, ArrowRight expands or descends, ArrowLeft collapses or
+climbs to the parent, Home and End jump, Enter and Space activate. Depth is
+carried by `aria-level` on each row, and collapsing the branch that held focus
+falls back to the first row instead of leaving the tree with no tab stop. The
+session tab strip and the workspace document tabs are
+`role="tablist"`/`tab`/`tabpanel`, also with a roving tabindex. Every
+collapsible trigger declares `aria-expanded` and `aria-controls`.
+
+**Status is announced, and never colour alone.** Errors are `role="alert"`,
+progress is `role="status"`, and the notification container is
+`aria-live="polite"`. Ahead/behind counts, queued messages, and async-task rows
+carry a text equivalent next to the glyph. Decorative icons and spinners are
+`aria-hidden="true"` so a screen reader reads "Saving" once rather than "Saving
+image". The streamed transcript is deliberately `aria-live="off"`:
+per-delta announcements would flood a screen reader during a turn.
+
+**In-flight and failed states are legible.** Long-running rows show which
+operation is running rather than only looking disabled, triggers are disabled
+while their request is open, load failures offer Retry, unsaved buffers save
+with Ctrl+S / Cmd+S and warn on `beforeunload`, and a save that lost an
+optimistic-concurrency race (`RESOURCE_VERSION_MISMATCH`) says to reopen the
+file and redo the edit instead of reporting a generic failure.
+
+`cargo xtask check` covers this only as far as Biome's accessibility rules,
+`tsc`, and `vite build` reach; the Playwright suite is not part of the gate and
+there is no component test for focus behaviour. Whether focus lands where
+intended and whether a screen reader reads what we think it reads is verified by
+review and by hand. Note also that `styles/tokens.css` defines a light palette
+only — there is no dark theme to contrast-check.
 
 ## Verification
 
