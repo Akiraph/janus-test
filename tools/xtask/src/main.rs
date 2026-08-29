@@ -186,6 +186,15 @@ fn dev(root: &Path) -> anyhow::Result<()> {
 
 fn check(root: &Path) -> anyhow::Result<()> {
     check_architecture(root)?;
+    // Type/borrow gate before the codegen steps: `cargo check` skips LLVM
+    // lowering and --keep-going makes rustc continue past independent crate
+    // errors, so one run reports every break instead of stopping at the first
+    // crate that fails.
+    run(
+        root,
+        "cargo",
+        &["check", "--workspace", "--all-targets", "--keep-going"],
+    )?;
     generate(root)?;
     run(root, "cargo", &["fmt", "--all", "--", "--check"])?;
     run(
@@ -195,12 +204,13 @@ fn check(root: &Path) -> anyhow::Result<()> {
             "clippy",
             "--workspace",
             "--all-targets",
+            "--keep-going",
             "--",
             "-D",
             "warnings",
         ],
     )?;
-    run(root, "cargo", &["test", "--workspace"])?;
+    run(root, "cargo", &["test", "--workspace", "--keep-going"])?;
     run(root, "bun", &["run", "--cwd", "apps/web", "typecheck"])?;
     run(root, "bun", &["run", "--cwd", "apps/web", "lint"])?;
     run(root, "bun", &["run", "--cwd", "apps/web", "build"])

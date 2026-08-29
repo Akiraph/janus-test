@@ -7,9 +7,9 @@
 //! comments here in sync with each module's `module.toml`.
 
 use mongodb::{
+    IndexModel,
     bson::{Document, doc},
     options::IndexOptions,
-    IndexModel,
 };
 
 /// Highest applied schema shape. The old SQLite migrator recorded version 4
