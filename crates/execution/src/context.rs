@@ -95,6 +95,7 @@ pub async fn record_context_version(
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_context_version_in_tx(
     database: &mongodb::Database,
     session: &mut ClientSession,
