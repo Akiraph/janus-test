@@ -125,8 +125,8 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         if let Some(document) = existing {
-            let stored_project_id = read_str(document, "project_id")?;
-            let version = read_str(document, "version")?;
+            let stored_project_id = read_str(&document, "project_id")?;
+            let version = read_str(&document, "version")?;
             if stored_project_id != project_id.to_string() {
                 return Err(SessionsError::Internal(anyhow::anyhow!(
                     "session id already belongs to another project"
@@ -220,7 +220,7 @@ impl SessionsInterface {
             .await?;
         let mut ids = Vec::new();
         while let Some(document) = rows.try_next().await? {
-            let id = read_str(document, "_id")?;
+            let id = read_str(&document, "_id")?;
             ids.push(
                 id.parse::<SessionId>()
                     .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
@@ -238,7 +238,7 @@ impl SessionsInterface {
             .sort(doc! {"last_activity_at": 1})
             .await?;
         while let Some(document) = rows.try_next().await? {
-            candidates.push(read_str(document, "_id")?);
+            candidates.push(read_str(&document, "_id")?);
         }
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -250,7 +250,7 @@ impl SessionsInterface {
             .find(doc! {"status": "queued"})
             .await?;
         while let Some(document) = turns.try_next().await? {
-            queued.insert(read_str(document, "session_id")?);
+            queued.insert(read_str(&document, "session_id")?);
         }
         candidates.retain(|id| !queued.contains(id));
         candidates
@@ -585,11 +585,11 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?
             .ok_or(SessionsError::NotFound)?;
-        let project_id = read_str(document, "project_id")?
+        let project_id = read_str(&document, "project_id")?
             .parse::<ProjectId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-        let state = read_str(document, "state")?;
-        let current_version = read_str(document, "version")?;
+        let state = read_str(&document, "state")?;
+        let current_version = read_str(&document, "version")?;
         if state == "deleting" {
             return Ok(DeletingSession {
                 changed: false,
@@ -640,10 +640,10 @@ impl SessionsInterface {
         let Some(document) = document else {
             return Ok(None);
         };
-        let project_id = read_str(document, "project_id")?
+        let project_id = read_str(&document, "project_id")?
             .parse::<ProjectId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-        let version = read_str(document, "version")?;
+        let version = read_str(&document, "version")?;
         let mut turns = self
             .pool
             .collection::<Document>("turns")
@@ -653,7 +653,7 @@ impl SessionsInterface {
             .await?;
         let mut turn_ids = Vec::new();
         while let Some(document) = turns.next(&mut *tx).await.transpose()? {
-            let id = read_str(document, "_id")?;
+            let id = read_str(&document, "_id")?;
             turn_ids.push(
                 id.parse::<TurnId>()
                     .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
@@ -966,23 +966,23 @@ impl SessionsInterface {
             .find_one(doc! {"_id": turn_id.to_string(), "session_id": session_id.to_string()})
             .await?
             .ok_or(SessionsError::NotFound)?;
-        let model_snapshot_json = read_str(document, "model_snapshot_json")?;
+        let model_snapshot_json = read_str(&document, "model_snapshot_json")?;
         Ok(TurnSummary {
-            id: read_str(document, "_id")?,
-            session_id: read_str(document, "session_id")?,
-            sequence: read_i64(document, "sequence")?,
-            status: read_str(document, "status")?,
+            id: read_str(&document, "_id")?,
+            session_id: read_str(&document, "session_id")?,
+            sequence: read_i64(&document, "sequence")?,
+            status: read_str(&document, "status")?,
             input_message_id: opt_str(&document, "input_message_id"),
-            goal_mode: read_i64(document, "goal_mode")? != 0,
+            goal_mode: read_i64(&document, "goal_mode")? != 0,
             model_snapshot: TurnModelSnapshot::parse(&model_snapshot_json)?,
             predecessor_turn_id: opt_str(&document, "predecessor_turn_id"),
             cancellation_reason: opt_str(&document, "cancellation_reason"),
             completion_reason: opt_str(&document, "completion_reason"),
             model_attempt: None,
             token_exchange: None,
-            version: read_str(document, "version")?,
-            created_at: read_str(document, "created_at")?,
-            updated_at: read_str(document, "updated_at")?,
+            version: read_str(&document, "version")?,
+            created_at: read_str(&document, "created_at")?,
+            updated_at: read_str(&document, "updated_at")?,
         })
     }
 

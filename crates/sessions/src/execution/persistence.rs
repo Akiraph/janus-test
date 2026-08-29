@@ -879,8 +879,12 @@ impl SessionsInterface {
             let body_json = read_str(&document, "body_json")?;
             let resource_tool_call_id = serde_json::from_str::<Value>(&body_json)
                 .ok()
-                .and_then(|value| value.get("resource_tool_call_id").and_then(Value::as_str))
-                .map(str::to_owned);
+                .and_then(|value| {
+                    value
+                        .get("resource_tool_call_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
             if resource_tool_call_id.as_deref() == Some(tool_call_id) {
                 matched_ids.push(read_str(&document, "_id")?);
             }

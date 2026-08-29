@@ -600,10 +600,15 @@ impl ModelsInterface {
         let provider_name: std::collections::HashMap<String, String> =
             provider_names.into_iter().collect();
         let provider_ids: Vec<&str> = provider_name.keys().map(String::as_str).collect();
+        let mut filter = doc! {
+            "provider_id": {"$in": provider_ids},
+            "enabled": true,
+        };
+        filter.extend(model_filter);
         let mut model_cursor = self
             .pool
             .collection::<Document>("models")
-            .find(doc! {"provider_id": {"$in": provider_ids}, "enabled": true, ...model_filter})
+            .find(filter)
             .session(&mut *session)
             .await?;
         let mut documents = Vec::new();
