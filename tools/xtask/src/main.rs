@@ -777,7 +777,9 @@ fn cfg_expression_is_test_only(expression: &syn::Meta) -> bool {
             ) else {
                 return false;
             };
-            !expressions.is_empty() && expressions.iter().all(cfg_expression_is_test_only)
+            // `all(test, feature = "testing")` still only compiles under test,
+            // so a single test-only conjunct is enough to treat it as test-only.
+            !expressions.is_empty() && expressions.iter().any(cfg_expression_is_test_only)
         }
         _ => false,
     }
