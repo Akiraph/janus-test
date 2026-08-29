@@ -6,9 +6,14 @@ use std::{fmt, str::FromStr, sync::Arc};
 
 use crate::clock::now_utc_str;
 use anyhow::Context;
+use futures_util::TryStreamExt;
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+    options::{FindOneAndUpdateOptions, ReturnDocument, UpdateOptions},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{FromRow, SqlitePool};
 use tokio::sync::broadcast;
 use utoipa::ToSchema;
 
@@ -165,37 +170,31 @@ pub struct EventBounds {
     pub max: u64,
 }
 
-#[derive(Debug, Clone, FromRow)]
-struct EventRow {
-    cursor: i64,
-    event_id: String,
-    event_type: String,
-    schema_version: i64,
-    actor_json: String,
-    resource_json: Option<String>,
-    correlation_id: String,
-    causation_id: Option<String>,
-    payload_json: String,
-    occurred_at: String,
-}
-
 #[derive(Clone)]
 pub struct EventStore {
     inner: Arc<EventStoreInner>,
 }
 
 struct EventStoreInner {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     // Broadcast delivery is only a wake-up hint. Slow consumers may miss it and
     // must use the cursor query to catch up.
     notifier: broadcast::Sender<()>,
+    // Serializes event-cursor allocation against overlapping transactions; see
+    // unit_of_work.rs. Owned by `Arc` so `lock_owned` yields an
+    // `OwnedMutexGuard` that can sit next to a `ClientSession`.
+    append_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl EventStore {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: mongodb::Database) -> Self {
         let (notifier, _) = broadcast::channel(64);
         Self {
-            inner: Arc::new(EventStoreInner { pool, notifier }),
+            inner: Arc::new(EventStoreInner {
+                pool,
+                notifier,
+                append_serial: Arc::new(tokio::sync::Mutex::new(())),
+            }),
         }
     }
 
@@ -203,10 +202,18 @@ impl EventStore {
         self.inner.notifier.subscribe()
     }
 
+    /// Owned guard that serializes the event-cursor `$inc`. Held for the whole
+    /// lifetime of a `UnitOfWorkTransaction`, or for a standalone `append`.
+    pub async fn append_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.append_serial.clone().lock_owned().await
+    }
+
     pub async fn append(&self, event: NewEvent) -> anyhow::Result<EventEnvelope> {
-        let mut transaction = self.inner.pool.begin().await?;
-        let envelope = self.append_in_tx(&mut transaction, event).await?;
-        transaction.commit().await?;
+        let _guard = self.append_lock().await;
+        let mut session = self.inner.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let envelope = self.append_in_tx(&mut session, event).await?;
+        session.commit_transaction().await?;
         // Standalone append path: same commit-then-notify rule as `UnitOfWork`.
         self.notify_committed();
         Ok(envelope)
@@ -214,26 +221,59 @@ impl EventStore {
 
     pub(crate) async fn append_in_tx(
         &self,
-        transaction: &mut sqlx::SqliteConnection,
+        session: &mut ClientSession,
         event: NewEvent,
     ) -> anyhow::Result<EventEnvelope> {
         let event_id = EventId::new().to_string();
         let occurred_at = now_utc_str();
-        let result = sqlx::query(
-            "INSERT INTO public_events (event_id, event_type, schema_version, actor_json, resource_json, correlation_id, causation_id, payload_json, occurred_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&event_id)
-        .bind(event.event_type.as_str())
-        .bind(serde_json::to_string(&event.actor)?)
-        .bind(event.resource.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(&event.correlation_id)
-        .bind(&event.causation_id)
-        .bind(serde_json::to_string(&event.payload)?)
-        .bind(&occurred_at)
-        .execute(&mut *transaction)
-        .await
-        .context("append public event")?;
-        let cursor = u64::try_from(result.last_insert_rowid())?;
+        // Allocate the cursor inside the same transaction as the insert. A
+        // rollback returns the counter to its previous value, so a committed
+        // event can never leave a hole behind itself, and the per-process
+        // append lock keeps two overlapping transactions from conflicting on
+        // the counter document.
+        let next = self
+            .inner
+            .pool
+            .collection::<Document>("event_seq")
+            .find_one_and_update(
+                doc! {"_id": "global"},
+                doc! {"$inc": {"value": 1i64}},
+                FindOneAndUpdateOptions::builder()
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .build(),
+            )
+            .session(&mut *session)
+            .await
+            .context("allocate event cursor")?
+            .ok_or_else(|| anyhow::anyhow!("event cursor did not materialize"))?;
+        let cursor = next.get_i64("value").context("event cursor missing value")?;
+
+        let actor_json = serde_json::to_string(&event.actor)?;
+        let payload_json = serde_json::to_string(&event.payload)?;
+        let mut document = doc! {
+            "_id": cursor,
+            "event_id": &event_id,
+            "event_type": event.event_type.as_str(),
+            "schema_version": 1i64,
+            "actor_json": &actor_json,
+            "correlation_id": &event.correlation_id,
+            "payload_json": &payload_json,
+            "occurred_at": &occurred_at,
+        };
+        if let Some(resource) = &event.resource {
+            document.insert("resource_json", serde_json::to_string(resource)?);
+        }
+        if let Some(causation_id) = &event.causation_id {
+            document.insert("causation_id", causation_id);
+        }
+        self.inner
+            .pool
+            .collection::<Document>("public_events")
+            .insert_one(document)
+            .session(&mut *session)
+            .await
+            .context("append public event")?;
 
         Ok(EventEnvelope {
             schema_version: 1,
@@ -254,75 +294,111 @@ impl EventStore {
     }
 
     pub async fn bounds(&self) -> anyhow::Result<EventBounds> {
-        let row = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
-            "SELECT MIN(cursor), MAX(cursor) FROM public_events",
-        )
-        .fetch_one(&self.inner.pool)
-        .await?;
+        let collection = self.inner.pool.collection::<Document>("public_events");
+        let max = collection
+            .find_one(doc! {})
+            .sort(doc! {"_id": -1})
+            .await?;
+        let min = collection.find_one(doc! {}).sort(doc! {"_id": 1}).await?;
+        let min = min
+            .and_then(|document| document.get_i64("_id").ok())
+            .unwrap_or(0);
+        let max = max
+            .and_then(|document| document.get_i64("_id").ok())
+            .unwrap_or(0);
         Ok(EventBounds {
-            min: u64::try_from(row.0.unwrap_or(0))?,
-            max: u64::try_from(row.1.unwrap_or(0))?,
+            min: u64::try_from(min)?,
+            max: u64::try_from(max)?,
         })
     }
 
+    /// Read events strictly after `cursor`, in cursor order.
+    ///
+    /// Returns only the contiguous prefix: if the first row is not `cursor + 1`,
+    /// an event below it is still inside an uncommitted transaction, so an empty
+    /// result stalls the reader until that transaction lands. The projection
+    /// engine relies on never being handed a gap, so it can never skip an event.
     pub async fn after(&self, cursor: u64, limit: u32) -> anyhow::Result<Vec<EventEnvelope>> {
         let cursor = i64::try_from(cursor)?;
         let limit = i64::from(limit.min(1000));
-        let rows = sqlx::query_as::<_, EventRow>(
-            "SELECT cursor, event_id, event_type, schema_version, actor_json, resource_json, correlation_id, causation_id, payload_json, occurred_at FROM public_events WHERE cursor > ? ORDER BY cursor ASC LIMIT ?",
-        )
-        .bind(cursor)
-        .bind(limit)
-        .fetch_all(&self.inner.pool)
-        .await?;
-
-        rows.into_iter().map(EventEnvelope::try_from).collect()
+        let mut rows = self
+            .inner
+            .pool
+            .collection::<Document>("public_events")
+            .find(doc! {"_id": {"$gt": cursor}})
+            .sort(doc! {"_id": 1})
+            .limit(limit)
+            .await?;
+        let mut documents = Vec::new();
+        while let Some(document) = rows.try_next().await? {
+            documents.push(document);
+        }
+        let mut envelopes = Vec::new();
+        let mut expected = cursor + 1;
+        for document in documents {
+            if document.get_i64("_id")? != expected {
+                break;
+            }
+            envelopes.push(EventEnvelope::try_from(document)?);
+            expected += 1;
+        }
+        Ok(envelopes)
     }
 
     /// Last cursor the projection engine has processed. 0 means it has not
     /// persisted a position yet.
     pub async fn projection_cursor(&self) -> anyhow::Result<u64> {
-        let row = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT cursor FROM projection_cursor WHERE id = 1",
-        )
-        .fetch_optional(&self.inner.pool)
-        .await?;
-        Ok(u64::try_from(row.flatten().unwrap_or(0))?)
+        let document = self
+            .inner
+            .pool
+            .collection::<Document>("projection_cursor")
+            .find_one(doc! {"_id": "1"})
+            .await?;
+        let cursor = document
+            .and_then(|document| document.get_i64("cursor").ok())
+            .unwrap_or(0);
+        Ok(u64::try_from(cursor)?)
     }
 
     /// Persist the projection engine's processed cursor. Called after each
     /// batch so a restart can resume from exactly this position.
     pub async fn set_projection_cursor(&self, cursor: u64) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO projection_cursor (id, cursor) VALUES (1, ?) \
-             ON CONFLICT(id) DO UPDATE SET cursor = excluded.cursor",
-        )
-        .bind(i64::try_from(cursor)?)
-        .execute(&self.inner.pool)
-        .await?;
+        let cursor = i64::try_from(cursor)?;
+        self.inner
+            .pool
+            .collection::<Document>("projection_cursor")
+            .update_one(
+                doc! {"_id": "1"},
+                doc! {"$set": {"cursor": cursor}},
+                UpdateOptions::builder().upsert(true).build(),
+            )
+            .await?;
         Ok(())
     }
 }
 
-impl TryFrom<EventRow> for EventEnvelope {
+impl TryFrom<Document> for EventEnvelope {
     type Error = anyhow::Error;
 
-    fn try_from(row: EventRow) -> Result<Self, Self::Error> {
+    fn try_from(document: Document) -> Result<Self, Self::Error> {
         Ok(Self {
-            schema_version: u16::try_from(row.schema_version)?,
-            event_id: row.event_id,
-            cursor: u64::try_from(row.cursor)?.to_string(),
-            event_type: row.event_type,
-            occurred_at: row.occurred_at,
-            actor: serde_json::from_str(&row.actor_json)?,
-            resource: row
-                .resource_json
-                .as_deref()
+            schema_version: u16::try_from(document.get_i64("schema_version")?)?,
+            event_id: document.get_str("event_id")?.to_owned(),
+            cursor: u64::try_from(document.get_i64("_id")?)?.to_string(),
+            event_type: document.get_str("event_type")?.to_owned(),
+            occurred_at: document.get_str("occurred_at")?.to_owned(),
+            actor: serde_json::from_str(document.get_str("actor_json")?)?,
+            resource: document
+                .get("resource_json")
+                .and_then(Bson::as_str)
                 .map(serde_json::from_str)
                 .transpose()?,
-            correlation_id: row.correlation_id,
-            causation_id: row.causation_id,
-            payload: serde_json::from_str(&row.payload_json)?,
+            correlation_id: document.get_str("correlation_id")?.to_owned(),
+            causation_id: document
+                .get("causation_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            payload: serde_json::from_str(document.get_str("payload_json")?)?,
         })
     }
 }

@@ -4,9 +4,14 @@
 //! make retries and process restarts idempotent. Work kinds and handlers live in
 //! server/application - not here.
 
+use futures_util::TryStreamExt;
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+    options::{FindOneAndUpdateOptions, ReturnDocument},
+};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::{SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 
 use super::{
@@ -85,7 +90,7 @@ pub enum OperationError {
     #[error("work claim is stale")]
     StaleWorkClaim,
     #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("internal error: {0}")]
@@ -104,12 +109,12 @@ pub enum IdempotencyOutcome {
 
 #[derive(Clone)]
 pub struct OperationInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     unit_of_work: UnitOfWork,
 }
 
 impl OperationInterface {
-    pub fn new(pool: SqlitePool, events: EventStore) -> Self {
+    pub fn new(pool: mongodb::Database, events: EventStore) -> Self {
         Self {
             pool: pool.clone(),
             unit_of_work: UnitOfWork::new(pool, events),
@@ -132,7 +137,7 @@ impl OperationInterface {
 
     pub async fn create_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         request: CreateOperation<'_>,
         work_item: Option<CreateWork<'_>>,
     ) -> Result<CreatedOperation, OperationError> {
@@ -160,29 +165,42 @@ impl OperationInterface {
         let now = now_utc_str();
         let version = format!("v_{}", OperationId::new());
         let operation_id = id.to_string();
-        sqlx::query("INSERT INTO operations (id, kind, actor_json, target_kind, target_id, status, current_step, conditions_json, result_json, problem_json, correlation_id, lease_nonce, lease_expires_at, progress_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', NULL, ?, NULL, NULL, ?, NULL, NULL, NULL, ?, ?, ?)")
-            .bind(&operation_id)
-            .bind(kind)
-            .bind(serde_json::to_string(&request.actor)?)
-            .bind(request.target_kind)
-            .bind(request.target_id)
-            .bind(serde_json::to_string(&request.conditions)?)
-            .bind(request.correlation_id.to_string())
-            .bind(&version)
-            .bind(&now)
-            .bind(&now)
-            .execute(work.connection())
+        let actor_json = serde_json::to_string(&request.actor)?;
+        let conditions_json = serde_json::to_string(&request.conditions)?;
+        let mut operation = doc! {
+            "_id": &operation_id,
+            "kind": kind,
+            "actor_json": &actor_json,
+            "target_kind": request.target_kind,
+            "status": "queued",
+            "conditions_json": &conditions_json,
+            "correlation_id": request.correlation_id.to_string(),
+            "version": &version,
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if let Some(target_id) = request.target_id {
+            operation.insert("target_id", target_id);
+        }
+        self.pool
+            .collection::<Document>("operations")
+            .insert_one(operation)
+            .session(&mut *work.connection())
             .await?;
         if let Some(idem) = &request.idempotency {
-            sqlx::query("INSERT INTO idempotency_records (key, owner_id, method, normalized_route, request_digest, status, response_ref, operation_id, expires_at) VALUES (?, ?, ?, ?, ?, 'running', NULL, ?, ?)")
-                .bind(&idem.key)
-                .bind(&idem.owner_id)
-                .bind(&idem.method)
-                .bind(&idem.normalized_route)
-                .bind(&idem.digest)
-                .bind(&operation_id)
-                .bind(&idem.expires_at)
-                .execute(work.connection())
+            self.pool
+                .collection::<Document>("idempotency_records")
+                .insert_one(doc! {
+                    "_id": &idem.key,
+                    "owner_id": &idem.owner_id,
+                    "method": &idem.method,
+                    "normalized_route": &idem.normalized_route,
+                    "request_digest": &idem.digest,
+                    "status": "running",
+                    "operation_id": &operation_id,
+                    "expires_at": &idem.expires_at,
+                })
+                .session(&mut *work.connection())
                 .await?;
         }
         if let Some(work_item) = work_item {
@@ -195,13 +213,19 @@ impl OperationInterface {
                 "operation_id".into(),
                 serde_json::Value::String(operation_id.clone()),
             );
-            sqlx::query("INSERT INTO work_items (id, handler_kind, payload_json, not_before, lease_nonce, lease_expires_at, attempts, dead, created_at) VALUES (?, ?, ?, ?, NULL, NULL, 0, 0, ?)")
-                .bind(work_id.to_string())
-                .bind(work_item.handler_kind)
-                .bind(serde_json::to_string(&payload)?)
-                .bind(&now)
-                .bind(&now)
-                .execute(work.connection())
+            let payload_json = serde_json::to_string(&payload)?;
+            self.pool
+                .collection::<Document>("work_items")
+                .insert_one(doc! {
+                    "_id": work_id.to_string(),
+                    "handler_kind": work_item.handler_kind,
+                    "payload_json": &payload_json,
+                    "not_before": &now,
+                    "attempts": 0i64,
+                    "dead": false,
+                    "created_at": &now,
+                })
+                .session(&mut *work.connection())
                 .await?;
         }
         self.emit_operation_changed(
@@ -228,25 +252,26 @@ impl OperationInterface {
     /// their payload semantics remain owned by the application control plane.
     pub async fn enqueue_work_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         handler_kind: &str,
         payload: Value,
     ) -> Result<WorkItemId, OperationError> {
         let work_id = WorkItemId::new();
         let now = now_utc_str();
-        sqlx::query(
-            "INSERT INTO work_items \
-             (id, handler_kind, payload_json, not_before, lease_nonce, lease_expires_at, \
-              attempts, dead, created_at) \
-             VALUES (?, ?, ?, ?, NULL, NULL, 0, 0, ?)",
-        )
-        .bind(work_id.to_string())
-        .bind(handler_kind)
-        .bind(serde_json::to_string(&payload)?)
-        .bind(&now)
-        .bind(&now)
-        .execute(work.connection())
-        .await?;
+        let payload_json = serde_json::to_string(&payload)?;
+        self.pool
+            .collection::<Document>("work_items")
+            .insert_one(doc! {
+                "_id": work_id.to_string(),
+                "handler_kind": handler_kind,
+                "payload_json": &payload_json,
+                "not_before": &now,
+                "attempts": 0i64,
+                "dead": false,
+                "created_at": &now,
+            })
+            .session(&mut *work.connection())
+            .await?;
         Ok(work_id)
     }
 
@@ -266,57 +291,55 @@ impl OperationInterface {
 
         // A worker can die without calling fail_work. Reclaiming an expired
         // lease must still obey the same attempt bound as an explicit failure.
-        sqlx::query(
-            "UPDATE work_items SET dead = 1 \
-             WHERE dead = 0 AND attempts >= ? \
-               AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
-        )
-        .bind(MAX_WORK_ATTEMPTS)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        self.pool
+            .collection::<Document>("work_items")
+            .update_many(
+                doc! {
+                    "dead": false,
+                    "attempts": {"$gte": MAX_WORK_ATTEMPTS},
+                    // BSON sorts nulls before strings, so `$lt` would match a
+                    // missing lease; an unleased item cannot be dead-lettered.
+                    "lease_expires_at": {"$ne": null, "$lt": &now},
+                },
+                doc! {"$set": {"dead": true}},
+            )
+            .await?;
 
-        // The conditional update is the ownership check. Keep it even if the
-        // candidate query changes: another worker may claim the row in between.
-        let candidate: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, payload_json FROM work_items
-             WHERE handler_kind = ? AND dead = 0
-               AND attempts < ?
-               AND not_before <= ?
-               AND (lease_expires_at IS NULL OR lease_expires_at < ?)
-             ORDER BY created_at ASC
-             LIMIT 1",
-        )
-        .bind(handler_kind)
-        .bind(MAX_WORK_ATTEMPTS)
-        .bind(&now)
-        .bind(&now)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((id, payload_json)) = candidate else {
+        // The find-and-update is the ownership check, replacing the SQL
+        // SELECT-then-UPDATE two-step with a single atomic claim.
+        let claimed = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one_and_update(
+                doc! {
+                    "handler_kind": handler_kind,
+                    "dead": false,
+                    "attempts": {"$lt": MAX_WORK_ATTEMPTS},
+                    "not_before": {"$lte": &now},
+                    "$or": [
+                        {"lease_expires_at": null},
+                        {"lease_expires_at": {"$lt": &now}},
+                    ],
+                },
+                doc! {
+                    "$set": {"lease_nonce": &nonce, "lease_expires_at": &lease_expires},
+                    "$inc": {"attempts": 1i64},
+                },
+                FindOneAndUpdateOptions::builder()
+                    .sort(doc! {"created_at": 1})
+                    .return_document(ReturnDocument::After)
+                    .build(),
+            )
+            .await?;
+        let Some(claimed) = claimed else {
             return Ok(None);
         };
-        let changed = sqlx::query(
-            "UPDATE work_items
-             SET lease_nonce = ?, lease_expires_at = ?, attempts = attempts + 1
-             WHERE id = ?
-               AND dead = 0
-               AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
-        )
-        .bind(&nonce)
-        .bind(&lease_expires)
-        .bind(&id)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if changed == 0 {
-            return Ok(None);
-        }
+        let id = claimed.get_str("_id")?.to_owned();
+        let payload_json = claimed.get_str("payload_json")?;
         Ok(Some(ClaimedWork {
             id,
             nonce,
-            payload: serde_json::from_str(&payload_json)?,
+            payload: serde_json::from_str(payload_json)?,
         }))
     }
 
@@ -324,17 +347,17 @@ impl OperationInterface {
     /// Only the current lease holder (matching nonce) may complete.
     pub async fn complete_work(&self, work_id: &str, nonce: &str) -> Result<bool, OperationError> {
         let now = now_utc_str();
-        let changed = sqlx::query(
-            "DELETE FROM work_items \
-             WHERE id = ? AND lease_nonce = ? AND lease_expires_at >= ?",
-        )
-        .bind(work_id)
-        .bind(nonce)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(changed > 0)
+        let deleted = self
+            .pool
+            .collection::<Document>("work_items")
+            .delete_one(doc! {
+                "_id": work_id,
+                "lease_nonce": nonce,
+                "lease_expires_at": {"$gte": &now},
+            })
+            .await?
+            .deleted_count;
+        Ok(deleted > 0)
     }
 
     /// Extend a live work lease without changing its attempt. Long-running
@@ -350,18 +373,20 @@ impl OperationInterface {
         let now = now_utc_str();
         let lease_expires =
             format_utc(now_dt + chrono::Duration::seconds(lease_ttl_seconds.max(1)));
-        let changed = sqlx::query(
-            "UPDATE work_items SET lease_expires_at = ? \
-             WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-               AND lease_expires_at >= ?",
-        )
-        .bind(&lease_expires)
-        .bind(work_id)
-        .bind(nonce)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let changed = self
+            .pool
+            .collection::<Document>("work_items")
+            .update_one(
+                doc! {
+                    "_id": work_id,
+                    "lease_nonce": nonce,
+                    "dead": false,
+                    "lease_expires_at": {"$gte": &now},
+                },
+                doc! {"$set": {"lease_expires_at": &lease_expires}},
+            )
+            .await?
+            .matched_count;
         Ok(changed > 0)
     }
 
@@ -376,16 +401,15 @@ impl OperationInterface {
         nonce: &str,
         disposition: WorkFailureDisposition,
     ) -> Result<bool, OperationError> {
-        let Some((attempts,)) = sqlx::query_as::<_, (i64,)>(
-            "SELECT attempts FROM work_items WHERE id = ? AND lease_nonce = ?",
-        )
-        .bind(work_id)
-        .bind(nonce)
-        .fetch_optional(&self.pool)
-        .await?
+        let Some(document) = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {"_id": work_id, "lease_nonce": nonce})
+            .await?
         else {
             return Ok(false);
         };
+        let attempts = document.get_i64("attempts")?;
         let now = now_utc_str();
         let exhausted = matches!(disposition, WorkFailureDisposition::DeadLetter)
             || attempts >= MAX_WORK_ATTEMPTS;
@@ -407,19 +431,26 @@ impl OperationInterface {
         let delay_seconds = (base_delay_seconds + jitter_seconds).min(MAX_WORK_RETRY_DELAY_SECONDS);
         let not_before =
             format_utc(crate::clock::now_utc() + chrono::Duration::seconds(delay_seconds));
-        let changed = sqlx::query(
-            "UPDATE work_items SET not_before = ?, dead = ?, lease_nonce = NULL, \
-             lease_expires_at = NULL WHERE id = ? AND lease_nonce = ? \
-             AND lease_expires_at >= ?",
-        )
-        .bind(&not_before)
-        .bind(exhausted)
-        .bind(work_id)
-        .bind(nonce)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let changed = self
+            .pool
+            .collection::<Document>("work_items")
+            .update_one(
+                doc! {
+                    "_id": work_id,
+                    "lease_nonce": nonce,
+                    "lease_expires_at": {"$gte": &now},
+                },
+                doc! {
+                    "$set": {
+                        "not_before": &not_before,
+                        "dead": exhausted,
+                        "lease_nonce": null,
+                        "lease_expires_at": null,
+                    }
+                },
+            )
+            .await?
+            .matched_count;
         Ok(changed > 0)
     }
 
@@ -429,19 +460,20 @@ impl OperationInterface {
         nonce: &str,
         disposition: WorkFailureDisposition,
     ) -> Result<bool, OperationError> {
-        let Some((attempts,)) = sqlx::query_as::<_, (i64,)>(
-            "SELECT attempts FROM work_items \
-             WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-               AND lease_expires_at >= ?",
-        )
-        .bind(work_id)
-        .bind(nonce)
-        .bind(now_utc_str())
-        .fetch_optional(&self.pool)
-        .await?
+        let Some(document) = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {
+                "_id": work_id,
+                "lease_nonce": nonce,
+                "dead": false,
+                "lease_expires_at": {"$gte": now_utc_str()},
+            })
+            .await?
         else {
             return Ok(false);
         };
+        let attempts = document.get_i64("attempts")?;
         Ok(matches!(disposition, WorkFailureDisposition::DeadLetter)
             || attempts >= MAX_WORK_ATTEMPTS)
     }
@@ -459,54 +491,72 @@ impl OperationInterface {
     ) -> Result<StepState, OperationError> {
         let now = now_utc_str();
         let mut tx = self.unit_of_work.begin().await?;
-        let owned: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1 FROM work_items \
-             WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-               AND lease_expires_at >= ?",
-        )
-        .bind(claim.id)
-        .bind(claim.nonce)
-        .bind(&now)
-        .fetch_optional(tx.connection())
-        .await?;
+        let owned = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {
+                "_id": claim.id,
+                "lease_nonce": claim.nonce,
+                "dead": false,
+                "lease_expires_at": {"$gte": &now},
+            })
+            .session(&mut *tx.connection())
+            .await?;
         if owned.is_none() {
             tx.rollback().await?;
             return Err(OperationError::StaleWorkClaim);
         }
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM operation_steps WHERE operation_id = ? AND step_key = ?",
-        )
-        .bind(operation_id)
-        .bind(step_key)
-        .fetch_optional(tx.connection())
-        .await?;
+        let existing = self
+            .pool
+            .collection::<Document>("operation_steps")
+            .find_one(doc! {"operation_id": operation_id, "step_key": step_key})
+            .session(&mut *tx.connection())
+            .await?;
         let state = match existing {
-            Some((status,)) if status == "succeeded" => StepState::AlreadySucceeded,
+            Some(document) if document.get_str("status")? == "succeeded" => {
+                StepState::AlreadySucceeded
+            }
             // A process can die after the external effect but before this
             // row is completed. Re-running a non-idempotent effect here would
             // be the most dangerous possible recovery policy, so leave the
             // step for an explicit reconciliation decision.
-            Some((status,)) if status == "running" => StepState::NeedsReconciliation,
+            Some(document) if document.get_str("status")? == "running" => {
+                StepState::NeedsReconciliation
+            }
             Some(_) => StepState::Running,
             None => {
-                sqlx::query("INSERT INTO operation_steps (operation_id, step_key, attempts, status, input_summary, external_ref, compensation_json, created_at, updated_at) VALUES (?, ?, 1, 'running', ?, NULL, NULL, ?, ?)")
-                    .bind(operation_id)
-                    .bind(step_key)
-                    .bind(serde_json::to_string(&input_summary)?)
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(tx.connection())
+                let input_summary_json = serde_json::to_string(&input_summary)?;
+                self.pool
+                    .collection::<Document>("operation_steps")
+                    .insert_one(doc! {
+                        "operation_id": operation_id,
+                        "step_key": step_key,
+                        "attempts": 1i64,
+                        "status": "running",
+                        "input_summary": &input_summary_json,
+                        "created_at": &now,
+                        "updated_at": &now,
+                    })
+                    .session(&mut *tx.connection())
                     .await?;
                 StepState::Running
             }
         };
         let version = format!("v_{}", OperationId::new());
-        sqlx::query("UPDATE operations SET status = 'running', current_step = ?, version = ?, updated_at = ? WHERE id = ? AND status = 'queued'")
-            .bind(step_key)
-            .bind(&version)
-            .bind(&now)
-            .bind(operation_id)
-            .execute(tx.connection())
+        self.pool
+            .collection::<Document>("operations")
+            .update_one(
+                doc! {"_id": operation_id, "status": "queued"},
+                doc! {
+                    "$set": {
+                        "status": "running",
+                        "current_step": step_key,
+                        "version": &version,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .session(&mut *tx.connection())
             .await?;
         tx.commit().await?;
         Ok(state)
@@ -523,27 +573,44 @@ impl OperationInterface {
         external_ref: Option<&str>,
     ) -> Result<(), OperationError> {
         let now = now_utc_str();
-        let changed = sqlx::query(
-            "UPDATE operation_steps SET status = 'succeeded', \
-                    external_ref = COALESCE(?, external_ref), updated_at = ? \
-             WHERE operation_id = ? AND step_key = ? \
-               AND EXISTS(SELECT 1 FROM work_items \
-                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-                            AND lease_expires_at >= ?)",
-        )
-        .bind(external_ref)
-        .bind(&now)
-        .bind(operation_id)
-        .bind(step_key)
-        .bind(claim.id)
-        .bind(claim.nonce)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if changed == 0 {
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let owned = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {
+                "_id": claim.id,
+                "lease_nonce": claim.nonce,
+                "dead": false,
+                "lease_expires_at": {"$gte": &now},
+            })
+            .session(&mut session)
+            .await?;
+        if owned.is_none() {
+            session.abort_transaction().await?;
             return Err(OperationError::StaleWorkClaim);
         }
+        // `external_ref` semantics mirror SQL `COALESCE(?, external_ref)`:
+        // only a caller-supplied ref overwrites a recorded one.
+        let mut set = doc! {"status": "succeeded", "updated_at": &now};
+        if let Some(reference) = external_ref {
+            set.insert("external_ref", reference);
+        }
+        let changed = self
+            .pool
+            .collection::<Document>("operation_steps")
+            .update_one(
+                doc! {"operation_id": operation_id, "step_key": step_key},
+                doc! {"$set": set},
+            )
+            .session(&mut session)
+            .await?
+            .matched_count;
+        if changed == 0 {
+            session.abort_transaction().await?;
+            return Err(OperationError::StaleWorkClaim);
+        }
+        session.commit_transaction().await?;
         Ok(())
     }
 
@@ -560,43 +627,63 @@ impl OperationInterface {
         let now = now_utc_str();
         let version = format!("v_{}", OperationId::new());
         let mut work = self.unit_of_work.begin().await?;
-        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM operations WHERE id = ?")
-            .bind(operation_id)
-            .fetch_optional(work.connection())
+        let kind_document = self
+            .pool
+            .collection::<Document>("operations")
+            .find_one(doc! {"_id": operation_id})
+            .session(&mut *work.connection())
             .await?;
-        let Some(kind) = kind else {
+        let Some(kind_document) = kind_document else {
             work.rollback().await?;
             return Err(OperationError::NotFound);
         };
-        let changed = sqlx::query("UPDATE operations SET status = ?, result_json = ?, problem_json = ?, current_step = NULL, version = ?, updated_at = ? WHERE id = ?")
-            .bind(status.as_str())
-            .bind(result.as_ref().map(serde_json::to_string).transpose()?)
-            .bind(problem.as_ref().map(serde_json::to_string).transpose()?)
-            .bind(&version)
-            .bind(&now)
-            .bind(operation_id)
-            .execute(work.connection())
+        let kind = kind_document.get_str("kind")?.to_owned();
+        let mut set = doc! {
+            "status": status.as_str(),
+            "current_step": null,
+            "version": &version,
+            "updated_at": &now,
+        };
+        if let Some(result) = result.as_ref() {
+            set.insert("result_json", serde_json::to_string(result)?);
+        }
+        if let Some(problem) = problem.as_ref() {
+            set.insert("problem_json", serde_json::to_string(problem)?);
+        }
+        let changed = self
+            .pool
+            .collection::<Document>("operations")
+            .update_one(doc! {"_id": operation_id}, doc! {"$set": set})
+            .session(&mut *work.connection())
             .await?
-            .rows_affected();
+            .matched_count;
         if changed == 0 {
             return Err(OperationError::NotFound);
         }
         if status == OperationStatus::NeedsAttention {
-            sqlx::query(
-                "UPDATE operation_steps SET status = 'failed', compensation_json = ?, updated_at = ? \
-                 WHERE operation_id = ? AND status = 'running'",
-            )
-            .bind(reconciliation_problem())
-            .bind(&now)
-            .bind(operation_id)
-            .execute(work.connection())
-            .await?;
+            self.pool
+                .collection::<Document>("operation_steps")
+                .update_many(
+                    doc! {"operation_id": operation_id, "status": "running"},
+                    doc! {
+                        "$set": {
+                            "status": "failed",
+                            "compensation_json": reconciliation_problem(),
+                            "updated_at": &now,
+                        }
+                    },
+                )
+                .session(&mut *work.connection())
+                .await?;
         }
         // Keep idempotency record in step with the terminal outcome.
-        sqlx::query("UPDATE idempotency_records SET status = ? WHERE operation_id = ?")
-            .bind(status.as_str())
-            .bind(operation_id)
-            .execute(work.connection())
+        self.pool
+            .collection::<Document>("idempotency_records")
+            .update_many(
+                doc! {"operation_id": operation_id},
+                doc! {"$set": {"status": status.as_str()}},
+            )
+            .session(&mut *work.connection())
             .await?;
         self.emit_operation_changed(
             &mut work,
@@ -624,74 +711,81 @@ impl OperationInterface {
         let now = now_utc_str();
         let version = format!("v_{}", OperationId::new());
         let mut work = self.unit_of_work.begin().await?;
-        let kind: Option<(String,)> = sqlx::query_as(
-            "SELECT kind FROM operations \
-             WHERE id = ? AND status IN ('queued', 'running') \
-               AND EXISTS(SELECT 1 FROM work_items \
-                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-                            AND lease_expires_at >= ?)",
-        )
-        .bind(operation_id)
-        .bind(work_id)
-        .bind(work_nonce)
-        .bind(&now)
-        .fetch_optional(work.connection())
-        .await?;
-        let Some((kind,)) = kind else {
+        let kind_document = self
+            .pool
+            .collection::<Document>("operations")
+            .find_one(doc! {"_id": operation_id, "status": {"$in": ["queued", "running"]}})
+            .session(&mut *work.connection())
+            .await?;
+        let Some(kind_document) = kind_document else {
             work.rollback().await?;
             return Ok(false);
         };
-        let changed = sqlx::query(
-            "UPDATE operations SET status = ?, result_json = ?, problem_json = ?, \
-             current_step = NULL, version = ?, updated_at = ? \
-             WHERE id = ? AND status IN ('queued', 'running') \
-               AND EXISTS(SELECT 1 FROM work_items \
-                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-                            AND lease_expires_at >= ?)",
-        )
-        .bind(completion.status.as_str())
-        .bind(
-            completion
-                .result
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
-        )
-        .bind(
-            completion
-                .problem
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
-        )
-        .bind(&version)
-        .bind(&now)
-        .bind(operation_id)
-        .bind(work_id)
-        .bind(work_nonce)
-        .bind(&now)
-        .execute(work.connection())
-        .await?
-        .rows_affected();
+        let kind = kind_document.get_str("kind")?.to_owned();
+        let owned = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {
+                "_id": work_id,
+                "lease_nonce": work_nonce,
+                "dead": false,
+                "lease_expires_at": {"$gte": &now},
+            })
+            .session(&mut *work.connection())
+            .await?;
+        if owned.is_none() {
+            work.rollback().await?;
+            return Ok(false);
+        }
+        let mut set = doc! {
+            "status": completion.status.as_str(),
+            "current_step": null,
+            "version": &version,
+            "updated_at": &now,
+        };
+        if let Some(result) = completion.result.as_ref() {
+            set.insert("result_json", serde_json::to_string(result)?);
+        }
+        if let Some(problem) = completion.problem.as_ref() {
+            set.insert("problem_json", serde_json::to_string(problem)?);
+        }
+        let changed = self
+            .pool
+            .collection::<Document>("operations")
+            .update_one(
+                doc! {"_id": operation_id, "status": {"$in": ["queued", "running"]}},
+                doc! {"$set": set},
+            )
+            .session(&mut *work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Ok(false);
         }
         if completion.status == OperationStatus::NeedsAttention {
-            sqlx::query(
-                "UPDATE operation_steps SET status = 'failed', compensation_json = ?, updated_at = ? \
-                 WHERE operation_id = ? AND status = 'running'",
-            )
-            .bind(reconciliation_problem())
-            .bind(&now)
-            .bind(operation_id)
-            .execute(work.connection())
-            .await?;
+            self.pool
+                .collection::<Document>("operation_steps")
+                .update_many(
+                    doc! {"operation_id": operation_id, "status": "running"},
+                    doc! {
+                        "$set": {
+                            "status": "failed",
+                            "compensation_json": reconciliation_problem(),
+                            "updated_at": &now,
+                        }
+                    },
+                )
+                .session(&mut *work.connection())
+                .await?;
         }
-        sqlx::query("UPDATE idempotency_records SET status = ? WHERE operation_id = ?")
-            .bind(completion.status.as_str())
-            .bind(operation_id)
-            .execute(work.connection())
+        self.pool
+            .collection::<Document>("idempotency_records")
+            .update_many(
+                doc! {"operation_id": operation_id},
+                doc! {"$set": {"status": completion.status.as_str()}},
+            )
+            .session(&mut *work.connection())
             .await?;
         self.emit_operation_changed(
             &mut work,
@@ -711,16 +805,16 @@ impl OperationInterface {
     /// effect, so a lease expiring during the effect becomes reconciliation work
     /// instead of an invisible overwrite.
     pub async fn assert_claimed(&self, claim: WorkClaim<'_>) -> Result<(), OperationError> {
-        let owned: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1 FROM work_items \
-             WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-               AND lease_expires_at >= ?",
-        )
-        .bind(claim.id)
-        .bind(claim.nonce)
-        .bind(now_utc_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let owned = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {
+                "_id": claim.id,
+                "lease_nonce": claim.nonce,
+                "dead": false,
+                "lease_expires_at": {"$gte": now_utc_str()},
+            })
+            .await?;
         if owned.is_none() {
             return Err(OperationError::StaleWorkClaim);
         }
@@ -728,13 +822,12 @@ impl OperationInterface {
     }
 
     pub async fn get(&self, operation_id: &str) -> Result<Option<OperationView>, OperationError> {
-        let row = sqlx::query_as::<_, OperationRow>(
-            "SELECT id, kind, status, target_kind, target_id, current_step, progress_json, result_json, problem_json, correlation_id, version, created_at, updated_at FROM operations WHERE id = ?",
-        )
-        .bind(operation_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(view_from_row).transpose()
+        let document = self
+            .pool
+            .collection::<Document>("operations")
+            .find_one(doc! {"_id": operation_id})
+            .await?;
+        document.map(view_from_document).transpose()
     }
 
     /// List operations owned by an authenticated caller. The owner is carried
@@ -748,21 +841,34 @@ impl OperationInterface {
         limit: i64,
     ) -> Result<Vec<OperationView>, OperationError> {
         let limit = limit.clamp(1, 200);
-        let rows = sqlx::query_as::<_, OperationRow>(
-            "SELECT o.id, o.kind, o.status, o.target_kind, o.target_id, o.current_step, \
-                    o.progress_json, o.result_json, o.problem_json, o.correlation_id, \
-                    o.version, o.created_at, o.updated_at \
-             FROM operations o \
-             INNER JOIN idempotency_records i ON i.operation_id = o.id \
-             WHERE o.kind = ? AND i.owner_id = ? \
-             ORDER BY o.created_at DESC, o.id DESC LIMIT ?",
-        )
-        .bind(kind)
-        .bind(owner_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(view_from_row).collect()
+        // The SQL `INNER JOIN` becomes two sequential queries: the owner's
+        // operation ids from the idempotency records, then the operations.
+        let mut ids = self
+            .pool
+            .collection::<Document>("idempotency_records")
+            .find(doc! {"owner_id": owner_id})
+            .await?;
+        let mut operation_ids = Vec::new();
+        while let Some(document) = ids.try_next().await? {
+            if let Some(operation_id) = document.get_str("operation_id").ok() {
+                operation_ids.push(operation_id.to_owned());
+            }
+        }
+        if operation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut operations = self
+            .pool
+            .collection::<Document>("operations")
+            .find(doc! {"kind": kind, "_id": {"$in": operation_ids}})
+            .sort(doc! {"created_at": -1, "_id": -1})
+            .limit(limit)
+            .await?;
+        let mut views = Vec::new();
+        while let Some(document) = operations.try_next().await? {
+            views.push(view_from_document(document)?);
+        }
+        Ok(views)
     }
 
     /// Publish durable workflow progress while fencing the update to the
@@ -779,42 +885,51 @@ impl OperationInterface {
         let now = now_utc_str();
         let version = format!("v_{}", OperationId::new());
         let mut work = self.unit_of_work.begin().await?;
-        let kind: Option<(String,)> = sqlx::query_as(
-            "SELECT kind FROM operations \
-             WHERE id = ? AND status IN ('queued', 'running') \
-               AND EXISTS(SELECT 1 FROM work_items \
-                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-                            AND lease_expires_at >= ?)",
-        )
-        .bind(operation_id)
-        .bind(claim.id)
-        .bind(claim.nonce)
-        .bind(&now)
-        .fetch_optional(work.connection())
-        .await?;
-        let Some((kind,)) = kind else {
+        let kind_document = self
+            .pool
+            .collection::<Document>("operations")
+            .find_one(doc! {"_id": operation_id, "status": {"$in": ["queued", "running"]}})
+            .session(&mut *work.connection())
+            .await?;
+        let Some(kind_document) = kind_document else {
             work.rollback().await?;
             return Ok(false);
         };
-        let changed = sqlx::query(
-            "UPDATE operations SET status = 'running', current_step = ?, \
-                    progress_json = ?, version = ?, updated_at = ? \
-             WHERE id = ? AND status IN ('queued', 'running') \
-               AND EXISTS(SELECT 1 FROM work_items \
-                          WHERE id = ? AND lease_nonce = ? AND dead = 0 \
-                            AND lease_expires_at >= ?)",
-        )
-        .bind(current_step)
-        .bind(serde_json::to_string(&progress)?)
-        .bind(&version)
-        .bind(&now)
-        .bind(operation_id)
-        .bind(claim.id)
-        .bind(claim.nonce)
-        .bind(&now)
-        .execute(work.connection())
-        .await?
-        .rows_affected();
+        let kind = kind_document.get_str("kind")?.to_owned();
+        let owned = self
+            .pool
+            .collection::<Document>("work_items")
+            .find_one(doc! {
+                "_id": claim.id,
+                "lease_nonce": claim.nonce,
+                "dead": false,
+                "lease_expires_at": {"$gte": &now},
+            })
+            .session(&mut *work.connection())
+            .await?;
+        if owned.is_none() {
+            work.rollback().await?;
+            return Ok(false);
+        }
+        let progress_json = serde_json::to_string(&progress)?;
+        let changed = self
+            .pool
+            .collection::<Document>("operations")
+            .update_one(
+                doc! {"_id": operation_id, "status": {"$in": ["queued", "running"]}},
+                doc! {
+                    "$set": {
+                        "status": "running",
+                        "current_step": current_step,
+                        "progress_json": &progress_json,
+                        "version": &version,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Ok(false);
@@ -834,16 +949,16 @@ impl OperationInterface {
 
     async fn get_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         operation_id: &str,
     ) -> Result<Option<OperationView>, OperationError> {
-        let row = sqlx::query_as::<_, OperationRow>(
-            "SELECT id, kind, status, target_kind, target_id, current_step, progress_json, result_json, problem_json, correlation_id, version, created_at, updated_at FROM operations WHERE id = ?",
-        )
-        .bind(operation_id)
-        .fetch_optional(tx)
-        .await?;
-        row.map(view_from_row).transpose()
+        let document = self
+            .pool
+            .collection::<Document>("operations")
+            .find_one(doc! {"_id": operation_id})
+            .session(&mut *session)
+            .await?;
+        document.map(view_from_document).transpose()
     }
 
     pub async fn in_flight_for_target(
@@ -852,60 +967,74 @@ impl OperationInterface {
         target_kind: &str,
         target_id: &str,
     ) -> Result<Option<String>, OperationError> {
-        sqlx::query_scalar(
-            "SELECT id FROM operations \
-             WHERE kind = ? AND target_kind = ? AND target_id = ? \
-               AND status IN ('queued', 'running') \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(kind)
-        .bind(target_kind)
-        .bind(target_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(OperationError::from)
+        let document = self
+            .pool
+            .collection::<Document>("operations")
+            .find_one(doc! {
+                "kind": kind,
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "status": {"$in": ["queued", "running"]},
+            })
+            .sort(doc! {"updated_at": -1})
+            .await?;
+        Ok(document.and_then(|document| {
+            document
+                .get_str("_id")
+                .ok()
+                .map(str::to_owned)
+        }))
     }
 
     /// Operations stuck in `running` with an expired lease - startup recovery must
     /// resume or terminalize them.
     pub async fn stale_running(&self) -> Result<Vec<String>, OperationError> {
         let now = now_utc_str();
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM operations WHERE status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
-        )
-        .bind(&now)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
+        let mut cursor = self
+            .pool
+            .collection::<Document>("operations")
+            .find(doc! {
+                "status": "running",
+                "$or": [
+                    {"lease_expires_at": null},
+                    {"lease_expires_at": {"$lt": &now}},
+                ],
+            })
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            ids.push(document.get_str("_id")?.to_owned());
+        }
+        Ok(ids)
     }
 
     async fn lookup_idempotency_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         idem: &IdempotencyRequest,
     ) -> Result<Option<OperationView>, OperationError> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT request_digest, operation_id FROM idempotency_records WHERE key = ?",
-        )
-        .bind(&idem.key)
-        .fetch_optional(&mut *tx)
-        .await?;
-        match row {
-            None => Ok(None),
-            Some((stored_digest, operation_id)) => {
-                if stored_digest != idem.digest {
-                    return Err(OperationError::Internal(anyhow::anyhow!(
-                        "IDEMPOTENCY_KEY_REUSED"
-                    )));
-                }
-                self.get_in_tx(tx, &operation_id).await
-            }
+        let document = self
+            .pool
+            .collection::<Document>("idempotency_records")
+            .find_one(doc! {"_id": &idem.key})
+            .session(&mut *session)
+            .await?;
+        let Some(document) = document else {
+            return Ok(None);
+        };
+        let stored_digest = document.get_str("request_digest")?;
+        let operation_id = document.get_str("operation_id")?;
+        if stored_digest != idem.digest {
+            return Err(OperationError::Internal(anyhow::anyhow!(
+                "IDEMPOTENCY_KEY_REUSED"
+            )));
         }
+        self.get_in_tx(session, operation_id).await
     }
 
     async fn emit_operation_changed(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         operation_id: &str,
         kind: &str,
         status: &str,
@@ -977,59 +1106,33 @@ pub struct IdempotencyRequest {
     pub expires_at: String,
 }
 
-#[derive(sqlx::FromRow)]
-struct OperationRow {
-    id: String,
-    kind: String,
-    status: String,
-    target_kind: String,
-    target_id: Option<String>,
-    current_step: Option<String>,
-    progress_json: Option<String>,
-    result_json: Option<String>,
-    problem_json: Option<String>,
-    correlation_id: String,
-    version: String,
-    created_at: String,
-    updated_at: String,
-}
-
-fn view_from_row(row: OperationRow) -> Result<OperationView, OperationError> {
-    let OperationRow {
-        id,
-        kind,
-        status,
-        target_kind,
-        target_id,
-        current_step,
-        progress_json,
-        result_json,
-        problem_json,
-        correlation_id,
-        version,
-        created_at,
-        updated_at,
-    } = row;
+fn view_from_document(document: Document) -> Result<OperationView, OperationError> {
     Ok(OperationView {
-        id,
-        kind,
-        status,
-        target_kind,
-        target_id,
-        current_step,
-        progress: parse_json_opt(progress_json)?,
-        result: parse_json_opt(result_json)?,
-        problem: parse_json_opt(problem_json)?,
-        correlation_id,
-        version,
-        created_at,
-        updated_at,
+        id: document.get_str("_id")?.to_owned(),
+        kind: document.get_str("kind")?.to_owned(),
+        status: document.get_str("status")?.to_owned(),
+        target_kind: document.get_str("target_kind")?.to_owned(),
+        target_id: document
+            .get("target_id")
+            .and_then(Bson::as_str)
+            .map(str::to_owned),
+        current_step: document
+            .get("current_step")
+            .and_then(Bson::as_str)
+            .map(str::to_owned),
+        progress: parse_json_opt(document.get("progress_json").and_then(Bson::as_str))?,
+        result: parse_json_opt(document.get("result_json").and_then(Bson::as_str))?,
+        problem: parse_json_opt(document.get("problem_json").and_then(Bson::as_str))?,
+        correlation_id: document.get_str("correlation_id")?.to_owned(),
+        version: document.get_str("version")?.to_owned(),
+        created_at: document.get_str("created_at")?.to_owned(),
+        updated_at: document.get_str("updated_at")?.to_owned(),
     })
 }
 
-fn parse_json_opt(stored: Option<String>) -> Result<Option<Value>, serde_json::Error> {
+fn parse_json_opt(stored: Option<&str>) -> Result<Option<Value>, serde_json::Error> {
     match stored {
-        Some(s) => serde_json::from_str(&s).map(Some),
+        Some(s) => serde_json::from_str(s).map(Some),
         None => Ok(None),
     }
 }
@@ -1056,43 +1159,35 @@ pub struct WorkClaim<'a> {
     pub nonce: &'a str,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::{
         clock::{format_utc, now_utc, now_utc_str},
         id::OwnerId,
+        testing::TestDb,
     };
     use chrono::Duration;
+    use mongodb::bson::{doc, Document};
     use serde_json::json;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
 
-    /// In-memory SQLite with the real server migration, an owner row (for the
-    /// idempotency FK), and a bare OperationInterface.
-    async fn test_harness() -> (SqlitePool, OperationInterface, String) {
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::migrate!("../../apps/server/migrations")
-            .run(&pool)
-            .await
-            .unwrap();
+    /// A configured throwaway database with an owner row and a bare
+    /// OperationInterface.
+    async fn test_harness() -> (TestDb, OperationInterface, String) {
+        let db = TestDb::open().await.unwrap();
         let owner_id = OwnerId::new();
-        sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, 'test', ?)")
-            .bind(owner_id.to_string())
-            .bind(now_utc_str())
-            .execute(&pool)
+        db.database()
+            .collection::<Document>("owners")
+            .insert_one(doc! {
+                "_id": owner_id.to_string(),
+                "display_name": "test",
+                "created_at": now_utc_str(),
+            })
             .await
             .unwrap();
-        let ops = OperationInterface::new(pool.clone(), EventStore::new(pool.clone()));
-        (pool, ops, owner_id.to_string())
+        let ops = OperationInterface::new(db.database().clone(), db.events());
+        (db, ops, owner_id.to_string())
     }
 
     fn create_request<'a>(idem: Option<IdempotencyRequest>) -> CreateOperation<'a> {
@@ -1116,7 +1211,7 @@ mod tests {
 
     #[tokio::test]
     async fn lease_renewal_and_expiry() {
-        let (pool, ops, _owner_id) = test_harness().await;
+        let (db, ops, _owner_id) = test_harness().await;
         ops.create(create_request(None), Some(create_work()))
             .await
             .unwrap();
@@ -1138,10 +1233,12 @@ mod tests {
                 .unwrap()
         );
         // Force the lease into the past.
-        sqlx::query("UPDATE work_items SET lease_expires_at = ? WHERE id = ?")
-            .bind(format_utc(now_utc() - Duration::seconds(10)))
-            .bind(&claimed.id)
-            .execute(&pool)
+        db.database()
+            .collection::<Document>("work_items")
+            .update_one(
+                doc! {"_id": &claimed.id},
+                doc! {"$set": {"lease_expires_at": format_utc(now_utc() - Duration::seconds(10))}},
+            )
             .await
             .unwrap();
         // Renewing an expired lease fails.
@@ -1173,7 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn idempotency_key_dedup() {
-        let (_pool, ops, owner_id) = test_harness().await;
+        let (_db, ops, owner_id) = test_harness().await;
         let key = "clone-project-p_1".to_owned();
         let digest = "sha256:same".to_owned();
         let make_idem = |digest: &str| IdempotencyRequest {
@@ -1224,7 +1321,7 @@ mod tests {
 
     #[tokio::test]
     async fn work_dead_letters_after_attempt_cap() {
-        let (pool, ops, _owner_id) = test_harness().await;
+        let (db, ops, _owner_id) = test_harness().await;
         ops.create(create_request(None), Some(create_work()))
             .await
             .unwrap();
@@ -1245,10 +1342,12 @@ mod tests {
                     .unwrap()
             );
             // Make the item immediately eligible for the next claim.
-            sqlx::query("UPDATE work_items SET not_before = ? WHERE id = ?")
-                .bind(format_utc(now_utc() - Duration::seconds(30)))
-                .bind(&claimed.id)
-                .execute(&pool)
+            db.database()
+                .collection::<Document>("work_items")
+                .update_one(
+                    doc! {"_id": &claimed.id},
+                    doc! {"$set": {"not_before": format_utc(now_utc() - Duration::seconds(30))}},
+                )
                 .await
                 .unwrap();
         }
@@ -1258,28 +1357,35 @@ mod tests {
 
     #[tokio::test]
     async fn stale_running_reports_expired_leases() {
-        let (pool, ops, _owner_id) = test_harness().await;
+        let (db, ops, _owner_id) = test_harness().await;
         let created = ops
             .create(create_request(None), Some(create_work()))
             .await
             .unwrap();
         let op_id = created.operation.id.clone();
         // Running with a live lease is not stale.
-        sqlx::query(
-            "UPDATE operations SET status = 'running', lease_nonce = 'x', lease_expires_at = ? \
-             WHERE id = ?",
-        )
-        .bind(format_utc(now_utc() + Duration::seconds(60)))
-        .bind(&op_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        db.database()
+            .collection::<Document>("operations")
+            .update_one(
+                doc! {"_id": &op_id},
+                doc! {
+                    "$set": {
+                        "status": "running",
+                        "lease_nonce": "x",
+                        "lease_expires_at": format_utc(now_utc() + Duration::seconds(60)),
+                    }
+                },
+            )
+            .await
+            .unwrap();
         assert!(ops.stale_running().await.unwrap().is_empty());
         // Expiring the lease makes it stale.
-        sqlx::query("UPDATE operations SET lease_expires_at = ? WHERE id = ?")
-            .bind(format_utc(now_utc() - Duration::seconds(10)))
-            .bind(&op_id)
-            .execute(&pool)
+        db.database()
+            .collection::<Document>("operations")
+            .update_one(
+                doc! {"_id": &op_id},
+                doc! {"$set": {"lease_expires_at": format_utc(now_utc() - Duration::seconds(10))}},
+            )
             .await
             .unwrap();
         let stale = ops.stale_running().await.unwrap();
@@ -1288,7 +1394,7 @@ mod tests {
 
     #[tokio::test]
     async fn step_replay_is_idempotent() {
-        let (_pool, ops, _owner_id) = test_harness().await;
+        let (_db, ops, _owner_id) = test_harness().await;
         let created = ops
             .create(create_request(None), Some(create_work()))
             .await

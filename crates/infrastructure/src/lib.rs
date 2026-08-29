@@ -10,10 +10,14 @@ pub mod events;
 pub mod id;
 pub mod managed_storage;
 pub mod operations;
+pub mod schema;
 pub mod secrets;
 pub mod shell;
 pub mod state_broadcaster;
 pub mod unit_of_work;
+
+#[cfg(feature = "testing")]
+pub mod testing;
 
 /// Lease and step tokens are opaque capabilities, not domain IDs; UUID v7 keeps
 /// them unique and gives recovery logs a useful time order.
