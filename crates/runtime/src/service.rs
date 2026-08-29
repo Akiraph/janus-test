@@ -329,7 +329,7 @@ impl RuntimeInterface {
             .map_err(storage_error)?;
         let mut projections = Vec::new();
         while let Some(document) = rows.try_next().await.map_err(storage_error)? {
-            projections.push(async_task_projection(&AsyncTaskRow::from_document(
+            projections.push(async_task_projection(AsyncTaskRow::from_document(
                 &document,
             )?)?);
         }
@@ -352,7 +352,7 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?;
         let mut count: i64 = 0;
-        while rows.try_next().await.map_err(storage_error)?.is_some() {
+        while rows.next(&mut *tx).await.transpose().map_err(storage_error)?.is_some() {
             count += 1;
         }
         Ok(count)
@@ -402,8 +402,8 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?;
         let mut projections = Vec::new();
-        while let Some(document) = rows.try_next().await.map_err(storage_error)? {
-            projections.push(async_task_projection(&AsyncTaskRow::from_document(
+        while let Some(document) = rows.next(&mut *tx).await.transpose().map_err(storage_error)? {
+            projections.push(async_task_projection(AsyncTaskRow::from_document(
                 &document,
             )?)?);
         }
@@ -773,7 +773,7 @@ impl RuntimeInterface {
             })
             .await
             .map_err(storage_error)?;
-        row.as_deref()
+        row.as_ref()
             .map(RuntimeRow::from_document)
             .transpose()?
             .map(runtime_projection)
@@ -834,7 +834,12 @@ impl RuntimeInterface {
             .session(&mut *work.connection())
             .await
             .map_err(storage_error)?;
-        while let Some(document) = runtimes.try_next().await.map_err(storage_error)? {
+        while let Some(document) = runtimes
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             runtime_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
         }
         if !runtime_ids.is_empty() {
@@ -905,7 +910,7 @@ impl RuntimeInterface {
             .map_err(storage_error)?;
         let mut projections = Vec::new();
         while let Some(document) = rows.try_next().await.map_err(storage_error)? {
-            projections.push(async_task_projection(&AsyncTaskRow::from_document(
+            projections.push(async_task_projection(AsyncTaskRow::from_document(
                 &document,
             )?)?);
         }
@@ -1438,7 +1443,12 @@ impl RuntimeInterface {
             .session(&mut *work.connection())
             .await
             .map_err(storage_error)?;
-        while let Some(document) = runtimes.try_next().await.map_err(storage_error)? {
+        while let Some(document) = runtimes
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             let id = document.get_str("_id").map_err(storage_error)?.to_owned();
             runtime_ids.push(id.parse::<RuntimeId>().map_err(storage_error)?);
         }
@@ -1451,7 +1461,12 @@ impl RuntimeInterface {
             .session(&mut *work.connection())
             .await
             .map_err(storage_error)?;
-        while let Some(document) = tasks.try_next().await.map_err(storage_error)? {
+        while let Some(document) = tasks
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             let id = document.get_str("_id").map_err(storage_error)?.to_owned();
             async_task_ids.push(id.parse::<AsyncTaskId>().map_err(storage_error)?);
         }
@@ -1464,7 +1479,12 @@ impl RuntimeInterface {
             .session(&mut *work.connection())
             .await
             .map_err(storage_error)?;
-        while let Some(document) = terminals.try_next().await.map_err(storage_error)? {
+        while let Some(document) = terminals
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             let id = document.get_str("_id").map_err(storage_error)?.to_owned();
             terminal_ids.push(id.parse::<TerminalId>().map_err(storage_error)?);
         }
@@ -1891,7 +1911,7 @@ impl RuntimeInterface {
             .session(&mut *tx)
             .await
             .map_err(storage_error)?;
-        while let Some(document) = tasks.try_next().await.map_err(storage_error)? {
+        while let Some(document) = tasks.next(&mut *tx).await.transpose().map_err(storage_error)? {
             async_task_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
         }
         if async_task_ids.is_empty() {
@@ -1905,7 +1925,12 @@ impl RuntimeInterface {
             .session(&mut *tx)
             .await
             .map_err(storage_error)?;
-        while let Some(document) = streams.try_next().await.map_err(storage_error)? {
+        while let Some(document) = streams
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             log_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
         }
         Ok(log_ids)

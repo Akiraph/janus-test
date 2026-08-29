@@ -875,7 +875,7 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         let mut matched_ids = Vec::new();
-        while let Some(document) = candidates.try_next().await? {
+        while let Some(document) = candidates.next(&mut *tx).await.transpose()? {
             let body_json = read_str(&document, "body_json")?;
             let resource_tool_call_id = serde_json::from_str::<Value>(&body_json)
                 .ok()

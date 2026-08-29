@@ -79,7 +79,7 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         let mut ids = HashSet::new();
-        while let Some(document) = rows.try_next().await? {
+        while let Some(document) = rows.next(&mut *tx).await.transpose()? {
             let id = read_str(&document, "_id")?;
             ids.insert(
                 id.parse::<TurnId>()
@@ -103,7 +103,7 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         let mut recovered = Vec::new();
-        while let Some(row) = rows.try_next().await? {
+        while let Some(row) = rows.next(&mut *tx).await.transpose()? {
             let turn_id = read_str(&row, "_id")?
                 .parse::<TurnId>()
                 .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;

@@ -538,7 +538,7 @@ impl ModelsInterface {
             .session(&mut *session)
             .await?;
         let mut candidate_ids = Vec::new();
-        while let Some(document) = cursor.try_next().await? {
+        while let Some(document) = cursor.next(&mut *session).await.transpose()? {
             candidate_ids.push(document.get_str("candidate_model_id")?.to_owned());
         }
         let mut candidates = Vec::with_capacity(candidate_ids.len());
@@ -587,7 +587,7 @@ impl ModelsInterface {
             .session(&mut *session)
             .await?;
         let mut provider_names = Vec::new();
-        while let Some(document) = provider_cursor.try_next().await? {
+        while let Some(document) = provider_cursor.next(&mut *session).await.transpose()? {
             let id = document.get_str("_id")?.to_owned();
             let display_name = document.get_str("display_name")?.to_owned();
             provider_names.push((id, display_name));
@@ -605,7 +605,7 @@ impl ModelsInterface {
             .session(&mut *session)
             .await?;
         let mut documents = Vec::new();
-        while let Some(document) = model_cursor.try_next().await? {
+        while let Some(document) = model_cursor.next(&mut *session).await.transpose()? {
             documents.push(document);
         }
         documents.sort_by(|a, b| {
@@ -1320,7 +1320,7 @@ impl ModelsInterface {
             .session(&mut *session)
             .await?;
         let mut existing = Vec::new();
-        while let Some(document) = existing_cursor.try_next().await? {
+        while let Some(document) = existing_cursor.next(&mut *session).await.transpose()? {
             let id = document.get_str("_id")?.to_owned();
             let display_name = document.get_str("display_name")?.to_owned();
             let upstream_model_id = document.get_str("upstream_model_id")?.to_owned();

@@ -1174,7 +1174,7 @@ impl ExecutionInterface {
             .session(&mut *work.connection())
             .await?;
         let mut already = None;
-        while let Some(document) = timeline.try_next().await? {
+        while let Some(document) = timeline.next(&mut *work.connection()).await.transpose()? {
             let projection: Value = document
                 .get("projection_json")
                 .and_then(Bson::as_str)
@@ -1700,7 +1700,7 @@ impl ExecutionInterface {
             .await?;
         let mut input_tokens = 0i64;
         let mut output_tokens = 0i64;
-        while let Some(document) = sum_cursor.try_next().await? {
+        while let Some(document) = sum_cursor.next(&mut *work.connection()).await.transpose()? {
             input_tokens =
                 input_tokens.saturating_add(document.get_i64("input_tokens").unwrap_or(0));
             output_tokens =

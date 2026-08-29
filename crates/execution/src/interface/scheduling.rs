@@ -147,7 +147,7 @@ impl ExecutionInterface {
                 .sort(doc! {"sequence": 1})
                 .session(&mut *tx)
                 .await?;
-            while let Some(document) = cursor.try_next().await? {
+            while let Some(document) = cursor.next(&mut *tx).await.transpose()? {
                 let id = document
                     .get_str("_id")?
                     .parse::<RoundId>()

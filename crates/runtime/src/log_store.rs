@@ -158,7 +158,7 @@ impl LogStore {
         }
         let _guard = self.gate.lock().await;
         let row = self.row(id).await?;
-        if row.closed != 0 {
+        if row.closed {
             return Err(RuntimeError::ResourceBusy);
         }
         let text = redact(&String::from_utf8_lossy(input), secret_values);

@@ -652,7 +652,7 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         let mut turn_ids = Vec::new();
-        while let Some(document) = turns.try_next().await? {
+        while let Some(document) = turns.next(&mut *tx).await.transpose()? {
             let id = read_str(document, "_id")?;
             turn_ids.push(
                 id.parse::<TurnId>()
