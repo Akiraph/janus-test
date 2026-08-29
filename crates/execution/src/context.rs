@@ -162,7 +162,7 @@ pub async fn schedule_compact(
         &mut session,
         ScheduleCompactInput {
             session_id,
-            compact_summary_id: id,
+            compact_summary_id: id.clone(),
             source_first: source_first.map(ToOwned::to_owned),
             source_last: source_last.to_owned(),
             summary,
