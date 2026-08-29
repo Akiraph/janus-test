@@ -13,10 +13,13 @@ use janus_server::{
     AppState,
     config::{Config, RunMode},
 };
+use mongodb::bson::{Bson, Document, doc};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use tempfile::TempDir;
 
 const NOW: &str = "2026-08-19T00:00:00.000Z";
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -32,6 +35,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -44,49 +54,60 @@ async fn seed_project_with_active_session(
     let project_id = ProjectId::new();
     let session_id = SessionId::new();
     let turn_id = TurnId::new();
-    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Owner', ?)")
-        .bind(format!("owner-{label}"))
-        .bind(NOW)
-        .execute(pool)
+    let owner_id = format!("owner-{label}");
+    pool.collection::<Document>("owners")
+        .insert_one(doc! {
+            "_id": &owner_id,
+            "display_name": "Owner",
+            "created_at": NOW,
+        })
         .await?;
-    sqlx::query(
-        "INSERT INTO projects \
-         (id, owner_id, name, state, repo_access, repo_url, version, \
-          created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, ?, 'ready', 'public_https', 'https://example.com/repo.git', 'v1', ?, ?, ?)",
-    )
-    .bind(project_id.to_string())
-    .bind(format!("owner-{label}"))
-    .bind(label)
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO sessions \
-         (id, project_id, state, active_turn_id, version, created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, 'active', ?, 'v_session', ?, ?, ?)",
-    )
-    .bind(session_id.to_string())
-    .bind(project_id.to_string())
-    .bind(turn_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO turns \
-         (id, session_id, sequence, status, model_snapshot_json, version, created_at, updated_at) \
-         VALUES (?, ?, 1, 'running', '{}', 'v_turn', ?, ?)",
-    )
-    .bind(turn_id.to_string())
-    .bind(session_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
+    pool.collection::<Document>("projects")
+        .insert_one(doc! {
+            "_id": project_id.to_string(),
+            "owner_id": &owner_id,
+            "name": label,
+            "state": "ready",
+            "repo_access": "public_https",
+            "repo_url": "https://example.com/repo.git",
+            "repo_branch": null,
+            "github_credential_id": null,
+            "default_model_id": null,
+            "main_workspace_handle": null,
+            "clone_error": null,
+            "version": "v1",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
+    pool.collection::<Document>("sessions")
+        .insert_one(doc! {
+            "_id": session_id.to_string(),
+            "project_id": project_id.to_string(),
+            "title": Bson::Null,
+            "state": "active",
+            "next_model_ref": Bson::Null,
+            "active_turn_id": turn_id.to_string(),
+            "version": "v_session",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
+    pool.collection::<Document>("turns")
+        .insert_one(doc! {
+            "_id": turn_id.to_string(),
+            "session_id": session_id.to_string(),
+            "sequence": 1i64,
+            "status": "running",
+            "goal_mode": 0i64,
+            "model_snapshot_json": "{}",
+            "version": "v_turn",
+            "created_at": NOW,
+            "updated_at": NOW,
+        })
+        .await?;
     Ok((project_id, session_id))
 }
 
@@ -116,18 +137,22 @@ async fn idle_sessions_stay_excluded_from_active_sessions() -> anyhow::Result<()
 
     // A same-project session without an active turn must not appear.
     let idle = SessionId::new();
-    sqlx::query(
-        "INSERT INTO sessions \
-         (id, project_id, state, active_turn_id, version, created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, 'active', NULL, 'v_idle', ?, ?, ?)",
-    )
-    .bind(idle.to_string())
-    .bind(project_a.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(state.pool())
-    .await?;
+    state
+        .pool()
+        .collection::<Document>("sessions")
+        .insert_one(doc! {
+            "_id": idle.to_string(),
+            "project_id": project_a.to_string(),
+            "title": Bson::Null,
+            "state": "active",
+            "next_model_ref": Bson::Null,
+            "active_turn_id": Bson::Null,
+            "version": "v_idle",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
 
     let sessions = state.sessions().active_sessions(project_a, 100).await?;
     assert_eq!(sessions.len(), 1);

@@ -11,3 +11,4 @@
 *.db-wal
 *.log
 .DS_Store
+verified-methodology.md

@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn test_config(data_root: PathBuf) -> Config {
     Config {
         bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -28,6 +30,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
