@@ -24,6 +24,10 @@ impl UnitOfWork {
         Self { pool, events }
     }
 
+    pub fn pool(&self) -> &Database {
+        &self.pool
+    }
+
     pub async fn begin(&self) -> Result<UnitOfWorkTransaction, mongodb::error::Error> {
         for attempt in 0_u32..=4 {
             let mut session = self.pool.client().start_session().await?;

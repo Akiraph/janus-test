@@ -216,7 +216,7 @@ impl ExecutionCoordinator {
 
     async fn enqueue_turn_wake_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         turn_id: TurnId,
     ) -> Result<(), TurnExecutionError> {
         self.operations
