@@ -433,6 +433,9 @@ fn parse_schema_catalog(root: &Path) -> anyhow::Result<SchemaCatalog> {
             continue;
         };
         let ident = const_item.ident.to_string();
+        if ident != "COLLECTIONS" && ident != "INDEXLESS_COLLECTIONS" {
+            continue;
+        }
         let array = match &*const_item.expr {
             Expr::Reference(reference) => match &*reference.expr {
                 Expr::Array(array) => array,
