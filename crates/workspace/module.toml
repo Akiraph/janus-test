@@ -1,6 +1,6 @@
 name = "workspace"
 public_root = "interface/mod.rs"
-owned_tables = [
+owned_collections = [
   "workspace_copies",
   "content_revisions",
   "workspace_snapshots",

@@ -1,6 +1,8 @@
 //! Working-tree file operations and the controlled file-mutation
 //! pipeline (write/patch/delete/move) against a workspace copy.
 use super::*;
+use futures_util::TryStreamExt;
+use mongodb::ClientSession;
 
 impl WorkspaceInterface {
     pub async fn workspace_root(
@@ -125,11 +127,12 @@ impl WorkspaceInterface {
             )
             .await?;
         let applied = self.apply_prepared_file_mutation(&lock, &prepared).await?;
-        let mut tx = self.pool.begin().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
         let revision = self
-            .finalize_file_mutation_in_tx(&lock, &mut tx, &prepared, &applied)
+            .finalize_file_mutation_in_tx(&lock, &mut session, &prepared, &applied)
             .await?;
-        tx.commit().await?;
+        session.commit_transaction().await?;
         Ok(revision)
     }
 
@@ -146,17 +149,19 @@ impl WorkspaceInterface {
         let pre_manifest = hash_working_tree(&root)
             .await
             .map_err(WorkspaceError::Internal)?;
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM workspace_mutation_intents \
-             WHERE workspace_handle = ? AND state IN ('pending', 'applied', 'awaiting_event') \
-             ORDER BY created_at, id LIMIT 1",
-        )
-        .bind(request.handle.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .find_one(doc! {
+                "workspace_handle": request.handle.as_str(),
+                "state": {"$in": ["pending", "applied", "awaiting_event"]},
+            })
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .await?;
         if let Some(existing) = existing {
             return Err(WorkspaceError::Internal(anyhow!(
-                "workspace mutation {existing} requires reconciliation"
+                "workspace mutation {} requires reconciliation",
+                existing.get_str("_id")?
             )));
         }
         let intent = StoredFileMutationIntent {
@@ -171,44 +176,47 @@ impl WorkspaceInterface {
             event: request.event,
         };
         let now = now_utc_str();
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mutation_json = serde_json::to_string(&intent.mutation)?;
+        let actor_json = serde_json::to_string(&intent.actor)?;
+        let pre_manifest_json = serde_json::to_string(&intent.pre_manifest)?;
+        let event_json = intent
+            .event
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        // The project lock replaces the SQLite `BEGIN IMMEDIATE` write lock.
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
         self.check_expected_revision_in_tx(
-            &mut tx,
+            &mut session,
             &intent.handle,
             intent.expected_revision.as_ref(),
         )
         .await?;
-        sqlx::query(
-            "INSERT INTO workspace_mutation_intents \
-             (id, workspace_handle, project_id, mutation_json, expected_revision_id, cause, \
-              actor_json, pre_manifest_json, event_json, state, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-        )
-        .bind(&intent.id)
-        .bind(intent.handle.as_str())
-        .bind(&intent.project_id)
-        .bind(serde_json::to_string(&intent.mutation)?)
-        .bind(
-            intent
-                .expected_revision
-                .as_ref()
-                .map(|revision| &revision.0),
-        )
-        .bind(&intent.cause)
-        .bind(serde_json::to_string(&intent.actor)?)
-        .bind(serde_json::to_string(&intent.pre_manifest)?)
-        .bind(
-            intent
-                .event
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?,
-        )
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        let mut document = doc! {
+            "_id": &intent.id,
+            "workspace_handle": intent.handle.as_str(),
+            "project_id": &intent.project_id,
+            "mutation_json": &mutation_json,
+            "cause": &intent.cause,
+            "actor_json": &actor_json,
+            "pre_manifest_json": &pre_manifest_json,
+            "state": "pending",
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if let Some(expected) = &intent.expected_revision {
+            document.insert("expected_revision_id", &expected.0);
+        }
+        if let Some(event) = &event_json {
+            document.insert("event_json", event);
+        }
+        self.pool
+            .collection::<Document>("workspace_mutation_intents")
+            .insert_one(document)
+            .session(&mut session)
+            .await?;
+        session.commit_transaction().await?;
         Ok(PreparedFileMutation { intent })
     }
 
@@ -226,18 +234,22 @@ impl WorkspaceInterface {
         let manifest = hash_working_tree(&root)
             .await
             .map_err(WorkspaceError::Internal)?;
-        let changed = sqlx::query(
-            "UPDATE workspace_mutation_intents SET state = 'applied', \
-             observed_manifest_root_hash = ?, updated_at = ? \
-             WHERE id = ? AND state = 'pending'",
-        )
-        .bind(&manifest.root_hash)
-        .bind(now_utc_str())
-        .bind(&prepared.intent.id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        if changed == 0 {
+        let updated_at = now_utc_str();
+        let changed = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .update_one(
+                doc! {"_id": &prepared.intent.id, "state": "pending"},
+                doc! {
+                    "$set": {
+                        "state": "applied",
+                        "observed_manifest_root_hash": &manifest.root_hash,
+                        "updated_at": &updated_at,
+                    }
+                },
+            )
+            .await?;
+        if changed.matched_count == 0 {
             return Err(WorkspaceError::Internal(anyhow!(
                 "workspace mutation {} is no longer pending",
                 prepared.intent.id
@@ -253,7 +265,7 @@ impl WorkspaceInterface {
     pub async fn finalize_file_mutation_in_tx(
         &self,
         lock: &WorkspaceMutationGuard,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         prepared: &PreparedFileMutation,
         applied: &AppliedFileMutation,
     ) -> Result<RevisionRef, WorkspaceError> {
@@ -264,11 +276,16 @@ impl WorkspaceInterface {
                 "workspace mutation intent mismatch"
             )));
         }
-        let state: Option<String> =
-            sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
-                .bind(&prepared.intent.id)
-                .fetch_optional(&mut *tx)
-                .await?;
+        let document = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .find_one(doc! {"_id": &prepared.intent.id})
+            .session(&mut *tx)
+            .await?;
+        let state = document
+            .as_ref()
+            .and_then(|document| document.get_str("state").ok())
+            .map(str::to_owned);
         if !matches!(state.as_deref(), Some("applied")) {
             return Err(WorkspaceError::Internal(anyhow!(
                 "workspace mutation {} is not applied",
@@ -290,36 +307,45 @@ impl WorkspaceInterface {
         } else {
             "completed"
         };
-        sqlx::query(
-            "UPDATE workspace_mutation_intents SET state = ?, revision_id = ?, updated_at = ? \
-             WHERE id = ? AND state = 'applied'",
-        )
-        .bind(state)
-        .bind(&revision.0)
-        .bind(now_utc_str())
-        .bind(&prepared.intent.id)
-        .execute(&mut *tx)
-        .await?;
+        let updated_at = now_utc_str();
+        self.pool
+            .collection::<Document>("workspace_mutation_intents")
+            .update_one(
+                doc! {"_id": &prepared.intent.id, "state": "applied"},
+                doc! {
+                    "$set": {
+                        "state": state,
+                        "revision_id": &revision.0,
+                        "updated_at": &updated_at,
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
         Ok(revision)
     }
 
     pub async fn acknowledge_file_mutation_event_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         intent_id: &str,
         revision: &RevisionRef,
     ) -> Result<(), WorkspaceError> {
-        let changed = sqlx::query(
-            "UPDATE workspace_mutation_intents SET state = 'completed', updated_at = ? \
-             WHERE id = ? AND state = 'awaiting_event' AND revision_id = ?",
-        )
-        .bind(now_utc_str())
-        .bind(intent_id)
-        .bind(&revision.0)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if changed == 0 {
+        let updated_at = now_utc_str();
+        let changed = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .update_one(
+                doc! {
+                    "_id": intent_id,
+                    "state": "awaiting_event",
+                    "revision_id": &revision.0,
+                },
+                doc! {"$set": {"state": "completed", "updated_at": &updated_at}},
+            )
+            .session(&mut *tx)
+            .await?;
+        if changed.matched_count == 0 {
             return Err(WorkspaceError::Internal(anyhow!(
                 "workspace mutation event acknowledgement lost for {intent_id}"
             )));
@@ -332,15 +358,18 @@ impl WorkspaceInterface {
     pub async fn recover_uncertain_file_mutations(
         &self,
     ) -> Result<Vec<RecoveredFileMutation>, WorkspaceError> {
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM workspace_mutation_intents \
-             WHERE state IN ('pending', 'applied', 'awaiting_event') \
-             ORDER BY updated_at, id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .find(doc! {"state": {"$in": ["pending", "applied", "awaiting_event"]}})
+            .sort(doc! {"updated_at": 1, "_id": 1})
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            ids.push(document.get_str("_id")?.to_owned());
+        }
         let mut recovered = Vec::new();
-        for id in rows {
+        for id in ids {
             let intent = self.load_file_mutation_intent(&id).await?;
             let lock = self.lock_project(&intent.project_id).await;
             if let Some(event) = self.reconcile_file_mutation_locked(&lock, &intent).await? {
@@ -396,21 +425,26 @@ impl WorkspaceInterface {
             intent_id: intent.id.clone(),
             manifest_root_hash: observed.root_hash,
         };
-        sqlx::query(
-            "UPDATE workspace_mutation_intents SET state = 'applied', \
-             observed_manifest_root_hash = ?, updated_at = ? \
-             WHERE id = ? AND state IN ('pending', 'applied')",
-        )
-        .bind(&applied.manifest_root_hash)
-        .bind(now_utc_str())
-        .bind(&intent.id)
-        .execute(&self.pool)
-        .await?;
-        let mut tx = self.pool.begin().await?;
-        let revision = self
-            .finalize_file_mutation_in_tx(lock, &mut tx, &prepared, &applied)
+        let updated_at = now_utc_str();
+        self.pool
+            .collection::<Document>("workspace_mutation_intents")
+            .update_one(
+                doc! {"_id": &intent.id, "state": {"$in": ["pending", "applied"]}},
+                doc! {
+                    "$set": {
+                        "state": "applied",
+                        "observed_manifest_root_hash": &applied.manifest_root_hash,
+                        "updated_at": &updated_at,
+                    }
+                },
+            )
             .await?;
-        tx.commit().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let revision = self
+            .finalize_file_mutation_in_tx(lock, &mut session, &prepared, &applied)
+            .await?;
+        session.commit_transaction().await?;
         Ok(intent.event.clone().map(|event| RecoveredFileMutation {
             intent_id: intent.id.clone(),
             revision,
@@ -422,59 +456,65 @@ impl WorkspaceInterface {
         &self,
         id: &str,
     ) -> Result<StoredFileMutationIntent, WorkspaceError> {
-        let row: Option<StoredFileMutationIntentRow> = sqlx::query_as(
-            "SELECT id, workspace_handle, project_id, mutation_json, expected_revision_id, \
-             cause, actor_json, pre_manifest_json, event_json \
-             FROM workspace_mutation_intents WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((
-            id,
-            handle,
-            project_id,
-            mutation_json,
-            expected_revision_id,
-            cause,
-            actor_json,
-            pre_manifest_json,
-            event_json,
-        )) = row
-        else {
+        let document = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .find_one(doc! {"_id": id})
+            .await?;
+        let Some(document) = document else {
             return Err(WorkspaceError::NotFound);
         };
+        let id = document.get_str("_id")?.to_owned();
+        let handle = document.get_str("workspace_handle")?.to_owned();
+        let project_id = document.get_str("project_id")?.to_owned();
+        let mutation = serde_json::from_str(document.get_str("mutation_json")?)?;
+        let expected_revision = document
+            .get("expected_revision_id")
+            .and_then(Bson::as_str)
+            .map(|revision| RevisionRef(revision.to_owned()));
+        let cause = document.get_str("cause")?.to_owned();
+        let actor = serde_json::from_str(document.get_str("actor_json")?)?;
+        let pre_manifest = serde_json::from_str(document.get_str("pre_manifest_json")?)?;
+        let event = document
+            .get("event_json")
+            .and_then(Bson::as_str)
+            .map(serde_json::from_str)
+            .transpose()?;
         Ok(StoredFileMutationIntent {
             id,
             handle: WorkspaceHandle(handle),
             project_id,
-            mutation: serde_json::from_str(&mutation_json)?,
-            expected_revision: expected_revision_id.map(RevisionRef),
+            mutation,
+            expected_revision,
             cause,
-            actor: serde_json::from_str(&actor_json)?,
-            pre_manifest: serde_json::from_str(&pre_manifest_json)?,
-            event: event_json
-                .map(|json| serde_json::from_str(&json))
-                .transpose()?,
+            actor,
+            pre_manifest,
+            event,
         })
     }
 
     async fn intent_state(&self, id: &str) -> Result<Option<String>, WorkspaceError> {
-        Ok(
-            sqlx::query_scalar("SELECT state FROM workspace_mutation_intents WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        let document = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .find_one(doc! {"_id": id})
+            .await?;
+        Ok(document
+            .as_ref()
+            .and_then(|document| document.get_str("state").ok())
+            .map(str::to_owned))
     }
 
     async fn intent_revision(&self, id: &str) -> Result<Option<String>, WorkspaceError> {
-        Ok(
-            sqlx::query_scalar("SELECT revision_id FROM workspace_mutation_intents WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        let document = self
+            .pool
+            .collection::<Document>("workspace_mutation_intents")
+            .find_one(doc! {"_id": id})
+            .await?;
+        Ok(document
+            .as_ref()
+            .and_then(|document| document.get("revision_id").and_then(Bson::as_str))
+            .map(str::to_owned))
     }
 
     async fn mark_file_mutation_attention(
@@ -482,14 +522,20 @@ impl WorkspaceInterface {
         id: &str,
         error: &str,
     ) -> Result<(), WorkspaceError> {
-        sqlx::query(
-            "UPDATE workspace_mutation_intents SET state = 'needs_attention', error = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(error)
-        .bind(now_utc_str())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let updated_at = now_utc_str();
+        self.pool
+            .collection::<Document>("workspace_mutation_intents")
+            .update_one(
+                doc! {"_id": id},
+                doc! {
+                    "$set": {
+                        "state": "needs_attention",
+                        "error": error,
+                        "updated_at": &updated_at,
+                    }
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -498,11 +544,15 @@ impl WorkspaceInterface {
         lock: &WorkspaceMutationGuard,
         handle: &WorkspaceHandle,
     ) -> Result<(), WorkspaceError> {
-        let project_id: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .await?;
+        let project_id = document
+            .as_ref()
+            .and_then(|document| document.get_str("project_id").ok())
+            .map(str::to_owned);
         if project_id.as_deref() != Some(lock.project_id.as_str()) {
             return Err(WorkspaceError::Internal(anyhow!(
                 "mutation guard does not own workspace handle {}",
@@ -515,14 +565,19 @@ impl WorkspaceInterface {
     async fn assert_guard_handle_in_tx(
         &self,
         lock: &WorkspaceMutationGuard,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         handle: &WorkspaceHandle,
     ) -> Result<(), WorkspaceError> {
-        let project_id: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .session(&mut *tx)
+            .await?;
+        let project_id = document
+            .as_ref()
+            .and_then(|document| document.get_str("project_id").ok())
+            .map(str::to_owned);
         if project_id.as_deref() != Some(lock.project_id.as_str()) {
             return Err(WorkspaceError::Internal(anyhow!(
                 "mutation guard does not own workspace handle {}",

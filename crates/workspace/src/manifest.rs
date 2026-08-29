@@ -451,11 +451,14 @@ mod tests {
             );
         }
 
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+        let db = janus_infrastructure::testing::TestDb::open()
             .await
-            .expect("sqlite");
-        let blobs = janus_infrastructure::managed_storage::BlobStore::new(pool, root.path())
-            .expect("blob store");
+            .expect("test database");
+        let blobs = janus_infrastructure::managed_storage::BlobStore::new(
+            db.database().clone(),
+            root.path(),
+        )
+        .expect("blob store");
         let manifest = collect_manifest(root.path(), &blobs, "manifest-test")
             .await
             .expect("collect manifest");

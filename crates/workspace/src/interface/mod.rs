@@ -21,8 +21,8 @@ use std::{
 
 use anyhow::anyhow;
 use janus_infrastructure::clock::now_utc_str;
+use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -101,18 +101,6 @@ pub struct FileMetaView {
     pub mime: Option<String>,
     pub main_revision: Option<String>,
 }
-
-type StoredFileMutationIntentRow = (
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-    String,
-    Option<String>,
-);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMutationEventContext {
@@ -229,7 +217,7 @@ pub enum WorkspaceError {
     #[error("file is not editable: {0}")]
     NotEditable(String),
     #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("internal error: {0}")]
@@ -238,13 +226,13 @@ pub enum WorkspaceError {
 
 #[derive(Clone)]
 pub struct WorkspaceInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     data_root: PathBuf,
     blobs: BlobStore,
 }
 
 impl WorkspaceInterface {
-    pub fn new(pool: SqlitePool, data_root: &Path, blobs: BlobStore) -> Self {
+    pub fn new(pool: mongodb::Database, data_root: &Path, blobs: BlobStore) -> Self {
         Self {
             pool,
             data_root: data_root.to_path_buf(),
@@ -259,12 +247,15 @@ impl WorkspaceInterface {
         &self,
         handle: &WorkspaceHandle,
     ) -> Result<WorkspaceMutationGuard, WorkspaceError> {
-        let project_id: Option<String> =
-            sqlx::query_scalar("SELECT project_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        let project_id = project_id.ok_or(WorkspaceError::NotFound)?;
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .await?;
+        let project_id = document
+            .as_ref()
+            .and_then(|document| document.get_str("project_id").ok().map(str::to_owned))
+            .ok_or(WorkspaceError::NotFound)?;
         Ok(self.lock_project(&project_id).await)
     }
 
