@@ -623,14 +623,14 @@ fn validate_production_collection_access(
         let mut collector = CollectionAccessCollector::default();
         collector.visit_file(&parsed);
         if source_owner != Some("platform") {
-            if let Some(span) = collector.non_literal_spans.iter().next() {
+            if let Some(span) = collector.non_literal_spans.first() {
                 bail!(
                     "{}:{} collection() must take an inline string literal",
                     file.display(),
                     span.start().line
                 );
             }
-            if let Some(span) = collector.bound_collection_spans.iter().next() {
+            if let Some(span) = collector.bound_collection_spans.first() {
                 bail!(
                     "{}:{} bind a collection handle to a variable; call .collection(\"...\") inline",
                     file.display(),

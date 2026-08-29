@@ -87,10 +87,10 @@ impl WorkspaceInterface {
             .await?;
         let mut registered = BTreeSet::new();
         while let Some(document) = cursor.try_next().await? {
-            if let Ok(managed_dir) = document.get_str("managed_dir") {
-                if let Some(name) = Path::new(managed_dir).parent().and_then(Path::file_name) {
-                    registered.insert(name.to_string_lossy().to_string());
-                }
+            if let Ok(managed_dir) = document.get_str("managed_dir")
+                && let Some(name) = Path::new(managed_dir).parent().and_then(Path::file_name)
+            {
+                registered.insert(name.to_string_lossy().to_string());
             }
         }
         let main_root = self.data_root.join("workspaces").join("main");
