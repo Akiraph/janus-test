@@ -98,7 +98,7 @@ pub(crate) enum AutomationError {
     #[error(transparent)]
     SourceControl(#[from] SourceControlError),
     #[error(transparent)]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("automation serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
 }

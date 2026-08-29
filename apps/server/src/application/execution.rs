@@ -38,7 +38,7 @@ pub(crate) enum TurnExecutionError {
     #[error("stored model preference is invalid")]
     InvalidModelPreference,
     #[error("execution transaction failed: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("execution event failed: {0}")]
     Event(#[from] anyhow::Error),
 }
@@ -236,7 +236,7 @@ impl ExecutionCoordinator {
 
     pub(crate) async fn resolve_model_snapshot_in_tx(
         &self,
-        tx: &mut sqlx::SqliteConnection,
+        tx: &mut mongodb::ClientSession,
         project_id: janus_infrastructure::id::ProjectId,
         expected_owner_id: Option<&str>,
         preference: Option<&SessionModelPreference>,
