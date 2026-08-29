@@ -1157,6 +1157,8 @@ pub struct WorkClaim<'a> {
 #[cfg(all(test, feature = "testing"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
         clock::{format_utc, now_utc, now_utc_str},
@@ -1169,7 +1171,7 @@ mod tests {
 
     /// A configured throwaway database with an owner row and a bare
     /// OperationInterface.
-    async fn test_harness() -> (TestDb, OperationInterface, String) {
+    async fn test_harness() -> (Arc<TestDb>, OperationInterface, String) {
         let db = TestDb::open().await.unwrap();
         let owner_id = OwnerId::new();
         db.database()

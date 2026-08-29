@@ -867,6 +867,8 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
 mod tests {
     use std::{collections::BTreeSet, path::Path};
 
+    use syn::visit::Visit;
+
     use super::{
         CollectionAccessCollector, collection_in_receiver_spine, validate_dependency,
         validate_module_reference,
