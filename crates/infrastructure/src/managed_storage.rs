@@ -14,7 +14,6 @@ use anyhow::Context;
 use futures_util::TryStreamExt;
 use mongodb::{
     bson::{Document, doc},
-    options::UpdateOptions,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -153,8 +152,8 @@ impl BlobStore {
                                 "first_written_at": &now,
                             }
                         },
-                        UpdateOptions::builder().upsert(true).build(),
                     )
+                    .upsert(true)
                     .await?;
                 Ok(())
             }
@@ -182,8 +181,8 @@ impl BlobStore {
                         "first_written_at": &now,
                     }
                 },
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .session(&mut session)
             .await?;
         self.pool
@@ -196,8 +195,8 @@ impl BlobStore {
                     "purpose": reference.purpose,
                 },
                 doc! {"$setOnInsert": {"blob_sha": sha, "created_at": &now}},
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .session(&mut session)
             .await?;
         session.commit_transaction().await?;
@@ -400,8 +399,8 @@ impl BlobStore {
                         "created_at": &now,
                     }
                 },
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .await?;
         Ok(())
     }

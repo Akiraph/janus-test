@@ -14,7 +14,6 @@ use janus_infrastructure::clock::now_utc_str;
 use futures_util::TryStreamExt;
 use mongodb::{
     bson::{Bson, Document, doc},
-    options::UpdateOptions,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -415,8 +414,8 @@ impl ProjectsInterface {
                     "$set": {"content": content, "version": &version, "updated_at": &now},
                     "$setOnInsert": {"created_at": &now},
                 },
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .await?;
         Ok(MemoryView {
             key: key.to_owned(),

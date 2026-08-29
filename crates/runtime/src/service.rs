@@ -211,13 +211,10 @@ impl RuntimeInterface {
         let count = self
             .pool
             .collection::<Document>("async_tasks")
-            .count_documents(
-                doc! {
-                    "controlling_turn_id": turn_id.to_string(),
-                    "status": {"$in": ["queued", "running"]},
-                },
-                None,
-            )
+            .count_documents(doc! {
+                "controlling_turn_id": turn_id.to_string(),
+                "status": {"$in": ["queued", "running"]},
+            })
             .await
             .map_err(storage_error)?;
         i64::try_from(count).map_err(storage_error)

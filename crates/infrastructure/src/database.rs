@@ -4,7 +4,6 @@ use anyhow::{Context, bail};
 use fs2::FileExt;
 use mongodb::{
     bson::{doc, Document},
-    options::UpdateOptions,
 };
 
 use crate::schema::{COLLECTIONS, INDEXLESS_COLLECTIONS, SCHEMA_VERSION, index_specs};
@@ -68,8 +67,8 @@ impl Database {
             .update_one(
                 doc! {"_id": "global"},
                 doc! {"$setOnInsert": {"value": 0i64}},
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .await
             .context("seed event cursor counter")?;
 

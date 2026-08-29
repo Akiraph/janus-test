@@ -1,7 +1,6 @@
 //! Main workspace copy lifecycle.
 use super::*;
 use futures_util::TryStreamExt;
-use mongodb::options::UpdateOptions;
 
 impl WorkspaceInterface {
     /// Create the Main workspace copy for a project and its first Content
@@ -56,8 +55,8 @@ impl WorkspaceInterface {
                         "updated_at": &now,
                     }
                 },
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .session(&mut session)
             .await?;
         self.pool

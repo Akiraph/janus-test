@@ -7,7 +7,6 @@ use janus_infrastructure::clock::now_utc_str;
 use mongodb::{
     ClientSession,
     bson::{Bson, Document, doc},
-    options::UpdateOptions,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -461,8 +460,8 @@ impl ModelsInterface {
             .update_one(
                 doc! {"_id": owner_id},
                 doc! {"$set": set},
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .await?;
         Ok(())
     }
@@ -1365,8 +1364,8 @@ impl ModelsInterface {
                             "created_at": now,
                         }
                     },
-                    UpdateOptions::builder().upsert(true).build(),
                 )
+                .upsert(true)
                 .session(&mut *session)
                 .await?;
         }

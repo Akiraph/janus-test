@@ -10,7 +10,7 @@ use futures_util::TryStreamExt;
 use mongodb::{
     ClientSession,
     bson::{Bson, Document, doc},
-    options::{FindOneAndUpdateOptions, ReturnDocument, UpdateOptions},
+    options::ReturnDocument,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -238,11 +238,9 @@ impl EventStore {
             .find_one_and_update(
                 doc! {"_id": "global"},
                 doc! {"$inc": {"value": 1i64}},
-                FindOneAndUpdateOptions::builder()
-                    .upsert(true)
-                    .return_document(ReturnDocument::After)
-                    .build(),
             )
+            .upsert(true)
+            .return_document(ReturnDocument::After)
             .session(&mut *session)
             .await
             .context("allocate event cursor")?
@@ -370,8 +368,8 @@ impl EventStore {
             .update_one(
                 doc! {"_id": "1"},
                 doc! {"$set": {"cursor": cursor}},
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .await?;
         Ok(())
     }

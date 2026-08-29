@@ -6,7 +6,7 @@ use futures_util::TryStreamExt;
 use mongodb::{
     ClientSession,
     bson::{Bson, Document, doc, oid::ObjectId},
-    options::{FindOneAndUpdateOptions, ReturnDocument},
+    options::ReturnDocument,
 };
 use serde_json::Value;
 
@@ -848,10 +848,8 @@ impl SessionsInterface {
                         "updated_at": now,
                     }
                 },
-                FindOneAndUpdateOptions::builder()
-                    .return_document(ReturnDocument::After)
-                    .build(),
             )
+            .return_document(ReturnDocument::After)
             .session(&mut *tx)
             .await?;
         let timeline_item_id = timeline_item

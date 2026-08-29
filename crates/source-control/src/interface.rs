@@ -27,7 +27,6 @@ use janus_infrastructure::{
 use janus_workspace::interface::{WorkspaceError, WorkspaceHandle, WorkspaceInterface};
 use mongodb::{
     bson::{Bson, Document, doc},
-    options::UpdateOptions,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1385,8 +1384,8 @@ impl SourceControlInterface {
                     "version": &version,
                     "updated_at": &now,
                 }},
-                UpdateOptions::builder().upsert(true).build(),
             )
+            .upsert(true)
             .session(&mut *work.connection())
             .await?;
         work.append_event(NewEvent {

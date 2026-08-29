@@ -8,7 +8,7 @@ use futures_util::TryStreamExt;
 use mongodb::{
     ClientSession,
     bson::{Bson, Document, doc},
-    options::{FindOneAndUpdateOptions, ReturnDocument},
+    options::ReturnDocument,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -325,11 +325,9 @@ impl OperationInterface {
                     "$set": {"lease_nonce": &nonce, "lease_expires_at": &lease_expires},
                     "$inc": {"attempts": 1i64},
                 },
-                FindOneAndUpdateOptions::builder()
-                    .sort(doc! {"created_at": 1})
-                    .return_document(ReturnDocument::After)
-                    .build(),
             )
+            .sort(doc! {"created_at": 1})
+            .return_document(ReturnDocument::After)
             .await?;
         let Some(claimed) = claimed else {
             return Ok(None);

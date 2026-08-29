@@ -882,10 +882,10 @@ impl SessionsInterface {
             let count: u64 = self
                 .pool
                 .collection::<Document>("timeline_items")
-                .count_documents(
-                    doc! {"session_id": session_id.to_string(), "display_order": {"$lt": o}},
-                    None,
-                )
+                .count_documents(doc! {
+                    "session_id": session_id.to_string(),
+                    "display_order": {"$lt": o},
+                })
                 .await?;
             count > 0
         } else {
@@ -895,10 +895,10 @@ impl SessionsInterface {
             let count: u64 = self
                 .pool
                 .collection::<Document>("timeline_items")
-                .count_documents(
-                    doc! {"session_id": session_id.to_string(), "display_order": {"$gt": n}},
-                    None,
-                )
+                .count_documents(doc! {
+                    "session_id": session_id.to_string(),
+                    "display_order": {"$gt": n},
+                })
                 .await?;
             count > 0
         } else {
@@ -945,7 +945,7 @@ impl SessionsInterface {
         let count = i64::try_from(
             self.pool
                 .collection::<Document>("timeline_items")
-                .count_documents(doc! {"session_id": session_id.to_string()}, None)
+                .count_documents(doc! {"session_id": session_id.to_string()})
                 .await?,
         )
         .map_err(|error| SessionsError::Internal(error.into()))?;
