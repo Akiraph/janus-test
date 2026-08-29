@@ -1100,7 +1100,7 @@ async fn insert_passkey(
             "credential_json": &credential_json,
             "created_at": &created_at,
         })
-        .session(session)
+        .session(&mut *session)
         .await?;
     Ok(id)
 }
@@ -1134,7 +1134,7 @@ async fn insert_recovery_codes(
             "owner_id": owner_id,
             "created_at": &created_at,
         })
-        .session(session)
+        .session(&mut *session)
         .await?;
     for code in codes {
         let id = Uuid::now_v7().to_string();
@@ -1145,7 +1145,7 @@ async fn insert_recovery_codes(
                 "batch_id": &batch_id,
                 "code_hash": &code_hash,
             })
-            .session(session)
+            .session(&mut *session)
             .await?;
     }
     Ok(())
@@ -1174,7 +1174,7 @@ async fn insert_session(
             "last_seen_at": &last_seen_at,
             "expires_at": &expires_at,
         })
-        .session(session)
+        .session(&mut *session)
         .await?;
     Ok(())
 }
