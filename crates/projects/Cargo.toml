@@ -6,13 +6,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+futures-util.workspace = true
 janus-infrastructure = { path = "../infrastructure" }
 janus-runtime = { path = "../runtime" }
 janus-workspace = { path = "../workspace" }
+mongodb.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 utoipa.workspace = true
