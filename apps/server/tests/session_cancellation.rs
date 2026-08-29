@@ -174,13 +174,14 @@ async fn seed_session(
 #[tokio::test]
 async fn restart_persists_wake_for_unstarted_turn() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
+    let config = test_config(directory.path().into());
     let active_turn_id;
     {
-        let state = AppState::initialize(test_config(directory.path().into())).await?;
+        let state = AppState::initialize(config.clone()).await?;
         active_turn_id = seed_session(&state, false).await?.active_turn_id;
     }
 
-    let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let state = AppState::initialize(config).await?;
     let db = state.pool();
     let turn = db
         .collection::<Document>("turns")
