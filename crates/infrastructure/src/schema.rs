@@ -97,6 +97,7 @@ pub const INDEXLESS_COLLECTIONS: &[&str] = &[
     "project_git_state",
     "projection_cursor",
     "event_seq",
+    "command_idempotency_records",
 ];
 
 fn index(name: &str, keys: Document) -> IndexModel {
