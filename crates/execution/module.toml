@@ -1,6 +1,6 @@
 name = "execution"
 public_root = "interface/mod.rs"
-owned_tables = [
+owned_collections = [
   "rounds",
   "tool_calls",
   "plan_versions",

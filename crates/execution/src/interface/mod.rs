@@ -24,9 +24,9 @@ use janus_sessions::interface::{
     ModelAttemptStatus, SessionsInterface, TurnModelAttempt, TurnStatus, TurnTokenExchange,
 };
 use janus_workspace::interface::WorkspaceInterface;
+use mongodb::ClientSession;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::{SqliteConnection, SqlitePool};
 
 use super::context::SYSTEM_PROMPT;
 pub use super::context::{
@@ -110,7 +110,7 @@ struct ExecutedToolCall {
 /// coordinator. Keeping this as a named bundle makes the capability boundary
 /// explicit without turning the constructor into an unreviewable argument list.
 pub struct ExecutionDependencies {
-    pub pool: SqlitePool,
+    pub pool: mongodb::Database,
     pub events: EventStore,
     pub state_broadcaster: StateBroadcaster,
     pub models: ModelsInterface,
@@ -123,7 +123,7 @@ pub struct ExecutionDependencies {
 
 #[derive(Clone)]
 pub struct ExecutionInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     events: EventStore,
     state_broadcaster: StateBroadcaster,
     unit_of_work: UnitOfWork,

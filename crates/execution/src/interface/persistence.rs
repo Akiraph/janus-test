@@ -1,60 +1,66 @@
 //! Turn and async-task persistence: loading queries and transactional writes.
 use super::*;
 
+use futures_util::TryStreamExt;
+use mongodb::bson::{Bson, Document, doc};
+
 impl ExecutionInterface {
     pub async fn context_compact_in_progress(
         &self,
         session_id: SessionId,
     ) -> Result<bool, ExecutionError> {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM context_versions \
-             WHERE session_id = ? AND compact_status IN ('scheduled', 'running'))",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(exists != 0)
+        let count = self
+            .pool
+            .collection::<Document>("context_versions")
+            .count_documents(doc! {
+                "session_id": session_id.to_string(),
+                "compact_status": {"$in": ["scheduled", "running"]},
+            })
+            .await?;
+        Ok(count != 0)
     }
 
     pub async fn context_compact_in_progress_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
     ) -> Result<bool, ExecutionError> {
-        let exists: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM context_versions \
-             WHERE session_id = ? AND compact_status IN ('scheduled', 'running'))",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-        Ok(exists != 0)
+        let count = self
+            .pool
+            .collection::<Document>("context_versions")
+            .count_documents(doc! {
+                "session_id": session_id.to_string(),
+                "compact_status": {"$in": ["scheduled", "running"]},
+            })
+            .session(&mut *tx)
+            .await?;
+        Ok(count != 0)
     }
 
     pub async fn schedule_context_compact_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: ScheduleCompactInput,
     ) -> Result<String, ExecutionError> {
-        super::super::context::schedule_compact_in_tx(tx, input)
+        super::super::context::schedule_compact_in_tx(&self.pool, tx, input)
             .await
             .map_err(ExecutionError::Internal)
     }
 
     pub async fn begin_context_compact_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
         compact_summary_id: &str,
     ) -> Result<bool, ExecutionError> {
-        super::super::context::begin_compact_in_tx(tx, session_id, compact_summary_id)
+        super::super::context::begin_compact_in_tx(&self.pool, tx, session_id, compact_summary_id)
             .await
             .map_err(ExecutionError::Internal)
     }
 
     pub async fn finalize_compact_summary_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         compact_summary_id: &str,
         summary: Value,
         model_attempt_id: Option<&str>,
@@ -62,6 +68,7 @@ impl ExecutionInterface {
         output_tokens: i64,
     ) -> Result<(), ExecutionError> {
         super::super::context::finalize_compact_summary_in_tx(
+            &self.pool,
             tx,
             compact_summary_id,
             summary,
@@ -75,12 +82,13 @@ impl ExecutionInterface {
 
     pub async fn complete_context_compact_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
         compact_summary_id: &str,
         estimated_input_tokens: i64,
     ) -> Result<bool, ExecutionError> {
         super::super::context::complete_compact_in_tx(
+            &self.pool,
             tx,
             session_id,
             compact_summary_id,
@@ -94,13 +102,19 @@ impl ExecutionInterface {
         &self,
         turn_id: TurnId,
     ) -> Result<TurnTokenExchange, ExecutionError> {
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT input_tokens, output_tokens FROM model_usage_ledger \
-             WHERE turn_id = ? ORDER BY occurred_at, id",
-        )
-        .bind(turn_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("model_usage_ledger")
+            .find(doc! {"turn_id": turn_id.to_string()})
+            .sort(doc! {"occurred_at": 1, "_id": 1})
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push((
+                document.get_i64("input_tokens")?,
+                document.get_i64("output_tokens")?,
+            ));
+        }
         Ok(aggregate_turn_token_exchange(
             &rows,
             estimated_system_prompt_tokens(),
@@ -111,39 +125,42 @@ impl ExecutionInterface {
         &self,
         session_id: SessionId,
     ) -> Result<Option<ContextUsageView>, ExecutionError> {
-        let row: Option<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT estimated_input_tokens, context_limit, compact_status, created_at \
-             FROM context_versions WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
-        )
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(
-            |(estimated_input_tokens, context_limit, compact_status, created_at)| {
-                ContextUsageView {
-                    estimated_input_tokens,
-                    context_limit,
-                    compact_status,
-                    created_at,
-                }
-            },
-        ))
+        let document = self
+            .pool
+            .collection::<Document>("context_versions")
+            .find_one(doc! {"session_id": session_id.to_string()})
+            .sort(doc! {"sequence": -1})
+            .await?;
+        let view = match document {
+            Some(doc) => Some(ContextUsageView {
+                estimated_input_tokens: doc.get_i64("estimated_input_tokens")?,
+                context_limit: doc.get_i64("context_limit")?,
+                compact_status: doc.get_str("compact_status")?.to_owned(),
+                created_at: doc.get_str("created_at")?.to_owned(),
+            }),
+            None => None,
+        };
+        Ok(view)
     }
 
     pub async fn latest_model_attempt_for_turn(
         &self,
         turn_id: TurnId,
     ) -> Result<Option<TurnModelAttempt>, ExecutionError> {
-        let round_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM rounds WHERE turn_id = ? ORDER BY sequence",
-        )
-        .bind(turn_id.to_string())
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|id| id.parse::<RoundId>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("rounds")
+            .find(doc! {"turn_id": turn_id.to_string()})
+            .sort(doc! {"sequence": 1})
+            .await?;
+        let mut round_ids = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            let id = document
+                .get_str("_id")?
+                .parse::<RoundId>()
+                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?;
+            round_ids.push(id);
+        }
         let Some(attempt) = self.models.latest_attempt_for_rounds(&round_ids).await? else {
             return Ok(None);
         };
@@ -314,20 +331,21 @@ impl ExecutionInterface {
 
     pub(crate) async fn persist_tool_effects_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_id: TurnId,
         tool_call_id: ToolCallId,
         summary: &mut Value,
         now: &str,
     ) -> Result<(), ExecutionError> {
         if let Some(async_task_id) = summary.get("task_id").and_then(Value::as_str) {
-            sqlx::query(
-                "UPDATE tool_calls SET async_task_id = ? WHERE id = ? AND status = 'running'",
-            )
-            .bind(async_task_id)
-            .bind(tool_call_id.to_string())
-            .execute(&mut *tx)
-            .await?;
+            self.pool
+                .collection::<Document>("tool_calls")
+                .update_one(
+                    doc! {"_id": tool_call_id.to_string(), "status": "running"},
+                    doc! {"$set": {"async_task_id": async_task_id}},
+                )
+                .session(&mut *tx)
+                .await?;
         }
 
         let Some(plan) = summary.get("plan").cloned() else {
@@ -339,25 +357,37 @@ impl ExecutionInterface {
             .ok_or_else(|| anyhow::anyhow!("plan id is missing"))?;
         let todos = plan.get("todos").cloned().unwrap_or_else(|| json!([]));
         let evidence = plan.get("evidence").cloned().unwrap_or_else(|| json!([]));
-        let sequence: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM plan_versions WHERE turn_id = ?",
-        )
-        .bind(turn_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO plan_versions \
-             (id, turn_id, sequence, plan_json, evidence_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(plan_id)
-        .bind(turn_id.to_string())
-        .bind(sequence)
-        .bind(todos.to_string())
-        .bind(evidence.to_string())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        let latest = self
+            .pool
+            .collection::<Document>("plan_versions")
+            .find_one(doc! {"turn_id": turn_id.to_string()})
+            .sort(doc! {"sequence": -1})
+            .session(&mut *tx)
+            .await?;
+        let sequence = latest
+            .and_then(|doc| doc.get("sequence").and_then(Bson::as_i64))
+            .unwrap_or(0)
+            .saturating_add(1);
+        let plan_json = todos.to_string();
+        let evidence_json = evidence.to_string();
+        let inserted = self
+            .pool
+            .collection::<Document>("plan_versions")
+            .insert_one(doc! {
+                "_id": plan_id,
+                "turn_id": turn_id.to_string(),
+                "sequence": sequence,
+                "plan_json": &plan_json,
+                "evidence_json": &evidence_json,
+                "created_at": now,
+            })
+            .session(&mut *tx)
+            .await;
+        if let Err(error) = inserted
+            && !is_duplicate_key(&error)
+        {
+            return Err(error.into());
+        }
         if let Some(object) = summary.as_object_mut() {
             object.insert("plan_version_id".into(), Value::String(plan_id.into()));
             object.insert("sequence".into(), Value::from(sequence));
@@ -367,30 +397,42 @@ impl ExecutionInterface {
 
     pub async fn delete_session_execution_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
         turn_ids: &[TurnId],
     ) -> Result<(), ExecutionError> {
         for turn_id in turn_ids {
-            sqlx::query("DELETE FROM plan_versions WHERE turn_id = ?")
-                .bind(turn_id.to_string())
-                .execute(&mut *tx)
+            self.pool
+                .collection::<Document>("plan_versions")
+                .delete_many(doc! {"turn_id": turn_id.to_string()})
+                .session(&mut *tx)
                 .await?;
-            sqlx::query("DELETE FROM rounds WHERE turn_id = ?")
-                .bind(turn_id.to_string())
-                .execute(&mut *tx)
+            self.pool
+                .collection::<Document>("rounds")
+                .delete_many(doc! {"turn_id": turn_id.to_string()})
+                .session(&mut *tx)
                 .await?;
         }
-        sqlx::query("DELETE FROM context_versions WHERE session_id = ?")
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
+        self.pool
+            .collection::<Document>("context_versions")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM compact_summaries WHERE session_id = ?")
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
+        self.pool
+            .collection::<Document>("compact_summaries")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
             .await?;
         Ok(())
     }
+}
+
+fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write))
+            if write.code == 11000
+    )
 }
 
 /// Translate a stored 0-based ledger retry index into the 1-based reconnect

@@ -41,7 +41,7 @@ pub enum ExecutionError {
     #[error("path error: {0}")]
     Path(#[from] PathError),
     #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("internal error: {0}")]

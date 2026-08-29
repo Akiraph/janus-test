@@ -1,36 +1,60 @@
 //! Round scheduling and Turn interruption/cancel transactions.
 use super::*;
 
+use futures_util::TryStreamExt;
+use mongodb::bson::{Document, doc};
+
 impl ExecutionInterface {
     pub async fn interrupt_execution_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         now: &str,
     ) -> Result<(), ExecutionError> {
-        sqlx::query(
-            "UPDATE rounds SET status = 'interrupted', stop_reason = 'control_plane_restart', \
-                    version = ?, updated_at = ? WHERE status = 'running'",
-        )
-        .bind(format!("v_{}", RoundId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE tool_calls SET status = 'canceled', error_code = 'CONTROL_PLANE_RESTART', \
-                    ended_at = ?, version = ? WHERE status = 'requested'",
-        )
-        .bind(now)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE tool_calls SET status = 'lost', error_code = 'CONTROL_PLANE_RESTART', \
-                    ended_at = ?, version = ? WHERE status = 'running'",
-        )
-        .bind(now)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("rounds")
+            .update_many(
+                doc! {"status": "running"},
+                doc! {
+                    "$set": {
+                        "status": "interrupted",
+                        "stop_reason": "control_plane_restart",
+                        "version": format!("v_{}", RoundId::new()),
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
+        self.pool
+            .collection::<Document>("tool_calls")
+            .update_many(
+                doc! {"status": "requested"},
+                doc! {
+                    "$set": {
+                        "status": "canceled",
+                        "error_code": "CONTROL_PLANE_RESTART",
+                        "ended_at": now,
+                        "version": format!("v_{}", ToolCallId::new()),
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
+        self.pool
+            .collection::<Document>("tool_calls")
+            .update_many(
+                doc! {"status": "running"},
+                doc! {
+                    "$set": {
+                        "status": "lost",
+                        "error_code": "CONTROL_PLANE_RESTART",
+                        "ended_at": now,
+                        "version": format!("v_{}", ToolCallId::new()),
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
         Ok(())
     }
 
@@ -40,19 +64,21 @@ impl ExecutionInterface {
     ///
     /// Recovery uses this query to distinguish a crash before execution began
     /// from a crash in an already materialized Round. The Sessions capability
-    /// receives the result instead of reading the `rounds` table itself.
+    /// receives the result instead of reading the `rounds` collection itself.
     pub async fn unstarted_active_turn_ids_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         candidate_turn_ids: &HashSet<TurnId>,
     ) -> Result<HashSet<TurnId>, ExecutionError> {
         let mut unstarted = HashSet::new();
         for turn_id in candidate_turn_ids {
-            let has_round: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM rounds WHERE turn_id = ?)")
-                    .bind(turn_id.to_string())
-                    .fetch_one(&mut *tx)
-                    .await?;
+            let has_round = self
+                .pool
+                .collection::<Document>("rounds")
+                .find_one(doc! {"turn_id": turn_id.to_string()})
+                .session(&mut *tx)
+                .await?
+                .is_some();
             if !has_round {
                 unstarted.insert(*turn_id);
             }
@@ -62,52 +88,71 @@ impl ExecutionInterface {
 
     pub async fn cancel_execution_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_id: TurnId,
         now: &str,
     ) -> Result<Vec<RoundId>, ExecutionError> {
         let round_ids = self.round_ids_for_turns_in_tx(tx, &[turn_id]).await?;
-        sqlx::query(
-            "UPDATE tool_calls SET status = 'canceled', error_code = 'USER_CANCEL', \
-                    ended_at = ?, version = ? \
-             WHERE status IN ('requested', 'running') \
-               AND round_id IN (SELECT id FROM rounds WHERE turn_id = ?)",
-        )
-        .bind(now)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .bind(turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE rounds SET status = 'canceled', stop_reason = 'user_cancel', \
-                    version = ?, updated_at = ? WHERE turn_id = ? AND status = 'running'",
-        )
-        .bind(format!("v_{}", RoundId::new()))
-        .bind(now)
-        .bind(turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        let round_ids_str = round_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        self.pool
+            .collection::<Document>("tool_calls")
+            .update_many(
+                doc! {
+                    "status": {"$in": ["requested", "running"]},
+                    "round_id": {"$in": round_ids_str},
+                },
+                doc! {
+                    "$set": {
+                        "status": "canceled",
+                        "error_code": "USER_CANCEL",
+                        "ended_at": now,
+                        "version": format!("v_{}", ToolCallId::new()),
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
+        self.pool
+            .collection::<Document>("rounds")
+            .update_many(
+                doc! {"turn_id": turn_id.to_string(), "status": "running"},
+                doc! {
+                    "$set": {
+                        "status": "canceled",
+                        "stop_reason": "user_cancel",
+                        "version": format!("v_{}", RoundId::new()),
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
         Ok(round_ids)
     }
 
     pub async fn round_ids_for_turns_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_ids: &[TurnId],
     ) -> Result<Vec<RoundId>, ExecutionError> {
         let mut rounds = Vec::new();
         for turn_id in turn_ids {
-            let rows = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM rounds WHERE turn_id = ? ORDER BY sequence",
-            )
-            .bind(turn_id.to_string())
-            .fetch_all(&mut *tx)
-            .await?;
-            for id in rows {
-                rounds.push(
-                    id.parse::<RoundId>()
-                        .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?,
-                );
+            let mut cursor = self
+                .pool
+                .collection::<Document>("rounds")
+                .find(doc! {"turn_id": turn_id.to_string()})
+                .sort(doc! {"sequence": 1})
+                .session(&mut *tx)
+                .await?;
+            while let Some(document) = cursor.try_next().await? {
+                let id = document
+                    .get_str("_id")?
+                    .parse::<RoundId>()
+                    .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?;
+                rounds.push(id);
             }
         }
         Ok(rounds)
@@ -127,6 +172,7 @@ mod tests {
         operations::OperationInterface,
         secrets::SecretCipher,
         state_broadcaster::StateBroadcaster,
+        testing::TestDb,
     };
     use janus_models::interface::ModelsInterface;
     use janus_projects::interface::ProjectsInterface;
@@ -137,8 +183,8 @@ mod tests {
     };
     use janus_sessions::interface::SessionsInterface;
     use janus_workspace::interface::WorkspaceInterface;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::{collections::HashSet, str::FromStr, sync::Arc};
+    use mongodb::bson::{Bson, Document, doc};
+    use std::{collections::HashSet, sync::Arc};
     use tempfile::TempDir;
 
     /// Stub executor: scheduling transactions never invoke the runtime, so every
@@ -242,23 +288,13 @@ mod tests {
         }
     }
 
-    /// In-memory SQLite with the real server migration and the full
-    /// ExecutionInterface dependency bundle wired around a stub executor.
-    async fn test_execution() -> (sqlx::SqlitePool, ExecutionInterface, TempDir) {
+    /// Test replica-set database and the full ExecutionInterface dependency
+    /// bundle wired around a stub executor.
+    async fn test_execution() -> (Arc<TestDb>, ExecutionInterface, TempDir) {
+        let db = TestDb::open().await.unwrap();
         let temp = TempDir::new().unwrap();
         let data_root = temp.path();
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::migrate!("../../apps/server/migrations")
-            .run(&pool)
-            .await
-            .unwrap();
+        let pool = db.database().clone();
 
         let events = EventStore::new(pool.clone());
         let state_broadcaster = StateBroadcaster::new();
@@ -294,101 +330,126 @@ mod tests {
             blobs,
             runtime,
         });
-        (pool, execution, temp)
+        (db, execution, temp)
     }
 
     async fn seed_round(
-        pool: &sqlx::SqlitePool,
+        pool: &mongodb::Database,
         id: &RoundId,
         turn_id: TurnId,
         sequence: i64,
         status: &str,
         now: &str,
     ) {
-        sqlx::query(
-            "INSERT INTO rounds (id, turn_id, sequence, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, 'v1', ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(turn_id.to_string())
-        .bind(sequence)
-        .bind(status)
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .unwrap();
+        pool.collection::<Document>("rounds")
+            .insert_one(doc! {
+                "_id": id.to_string(),
+                "turn_id": turn_id.to_string(),
+                "sequence": sequence,
+                "status": status,
+                "version": "v1",
+                "created_at": now,
+                "updated_at": now,
+            })
+            .await
+            .unwrap();
     }
 
     async fn seed_tool_call(
-        pool: &sqlx::SqlitePool,
+        pool: &mongodb::Database,
         id: &ToolCallId,
         round_id: &RoundId,
         ord: i64,
         status: &str,
         now: &str,
     ) {
-        sqlx::query(
-            "INSERT INTO tool_calls \
-             (id, round_id, ord, tool_name, schema_version, input_json, status, actor_json, version, started_at) \
-             VALUES (?, ?, ?, 'bash', 1, '{}', ?, '{\"kind\":\"model\"}', 'v1', ?)",
+        pool.collection::<Document>("tool_calls")
+            .insert_one(doc! {
+                "_id": id.to_string(),
+                "round_id": round_id.to_string(),
+                "ord": ord,
+                "tool_name": "bash",
+                "schema_version": 1,
+                "input_json": "{}",
+                "status": status,
+                "actor_json": "{\"kind\":\"model\"}",
+                "version": "v1",
+                "started_at": now,
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn round_status_and_stop(
+        pool: &mongodb::Database,
+        id: &RoundId,
+    ) -> (String, Option<String>) {
+        let document = pool
+            .collection::<Document>("rounds")
+            .find_one(doc! {"_id": id.to_string()})
+            .await
+            .unwrap()
+            .unwrap();
+        (
+            document.get_str("status").unwrap().to_owned(),
+            document
+                .get("stop_reason")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
         )
-        .bind(id.to_string())
-        .bind(round_id.to_string())
-        .bind(ord)
-        .bind(status)
-        .bind(now)
-        .execute(pool)
-        .await
-        .unwrap();
     }
 
     async fn tool_call_status_and_error(
-        pool: &sqlx::SqlitePool,
+        pool: &mongodb::Database,
         id: &ToolCallId,
     ) -> (String, Option<String>) {
-        sqlx::query_as("SELECT status, error_code FROM tool_calls WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_one(pool)
+        let document = pool
+            .collection::<Document>("tool_calls")
+            .find_one(doc! {"_id": id.to_string()})
             .await
             .unwrap()
+            .unwrap();
+        (
+            document.get_str("status").unwrap().to_owned(),
+            document
+                .get("error_code")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+        )
     }
 
     #[tokio::test]
     async fn interrupt_marks_running_rounds_and_loses_live_tool_calls() {
-        let (pool, execution, _temp) = test_execution().await;
+        let (db, execution, _temp) = test_execution().await;
+        let pool = db.database();
         let now = now_utc_str();
         let turn = TurnId::new();
         let round = RoundId::new();
-        seed_round(&pool, &round, turn, 1, "running", &now).await;
+        seed_round(pool, &round, turn, 1, "running", &now).await;
         let requested = ToolCallId::new();
         let running = ToolCallId::new();
         let second_running = ToolCallId::new();
-        seed_tool_call(&pool, &requested, &round, 1, "requested", &now).await;
-        seed_tool_call(&pool, &running, &round, 2, "running", &now).await;
-        seed_tool_call(&pool, &second_running, &round, 3, "running", &now).await;
+        seed_tool_call(pool, &requested, &round, 1, "requested", &now).await;
+        seed_tool_call(pool, &running, &round, 2, "running", &now).await;
+        seed_tool_call(pool, &second_running, &round, 3, "running", &now).await;
 
-        let mut tx = pool.begin().await.unwrap();
+        let mut session = db.client().start_session().await.unwrap();
+        session.start_transaction().await.unwrap();
         execution
-            .interrupt_execution_in_tx(&mut tx, &now)
+            .interrupt_execution_in_tx(&mut session, &now)
             .await
             .unwrap();
-        tx.commit().await.unwrap();
+        session.commit_transaction().await.unwrap();
 
-        let (status, stop): (String, Option<String>) =
-            sqlx::query_as("SELECT status, stop_reason FROM rounds WHERE id = ?")
-                .bind(round.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (status, stop) = round_status_and_stop(pool, &round).await;
         assert_eq!(status, "interrupted");
         assert_eq!(stop.as_deref(), Some("control_plane_restart"));
 
-        let (status, error) = tool_call_status_and_error(&pool, &requested).await;
+        let (status, error) = tool_call_status_and_error(pool, &requested).await;
         assert_eq!(status, "canceled");
         assert_eq!(error.as_deref(), Some("CONTROL_PLANE_RESTART"));
         for id in [running, second_running] {
-            let (status, error) = tool_call_status_and_error(&pool, &id).await;
+            let (status, error) = tool_call_status_and_error(pool, &id).await;
             assert_eq!(status, "lost");
             assert_eq!(error.as_deref(), Some("CONTROL_PLANE_RESTART"));
         }
@@ -396,73 +457,67 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_marks_turn_tool_calls_and_rounds_only() {
-        let (pool, execution, _temp) = test_execution().await;
+        let (db, execution, _temp) = test_execution().await;
+        let pool = db.database();
         let now = now_utc_str();
         let turn = TurnId::new();
         let round_a = RoundId::new();
         let round_b = RoundId::new();
-        seed_round(&pool, &round_a, turn, 1, "running", &now).await;
-        seed_round(&pool, &round_b, turn, 2, "running", &now).await;
+        seed_round(pool, &round_a, turn, 1, "running", &now).await;
+        seed_round(pool, &round_b, turn, 2, "running", &now).await;
         let tc_a = ToolCallId::new();
         let tc_b = ToolCallId::new();
-        seed_tool_call(&pool, &tc_a, &round_a, 1, "running", &now).await;
-        seed_tool_call(&pool, &tc_b, &round_b, 1, "running", &now).await;
+        seed_tool_call(pool, &tc_a, &round_a, 1, "running", &now).await;
+        seed_tool_call(pool, &tc_b, &round_b, 1, "running", &now).await;
         // Another turn stays untouched.
         let other_turn = TurnId::new();
         let other_round = RoundId::new();
         let other_tc = ToolCallId::new();
-        seed_round(&pool, &other_round, other_turn, 1, "running", &now).await;
-        seed_tool_call(&pool, &other_tc, &other_round, 1, "running", &now).await;
+        seed_round(pool, &other_round, other_turn, 1, "running", &now).await;
+        seed_tool_call(pool, &other_tc, &other_round, 1, "running", &now).await;
 
-        let mut tx = pool.begin().await.unwrap();
+        let mut session = db.client().start_session().await.unwrap();
+        session.start_transaction().await.unwrap();
         let round_ids = execution
-            .cancel_execution_in_tx(&mut tx, turn, &now)
+            .cancel_execution_in_tx(&mut session, turn, &now)
             .await
             .unwrap();
-        tx.commit().await.unwrap();
+        session.commit_transaction().await.unwrap();
 
         assert_eq!(round_ids.len(), 2);
         for id in [tc_a, tc_b] {
-            let (status, error) = tool_call_status_and_error(&pool, &id).await;
+            let (status, error) = tool_call_status_and_error(pool, &id).await;
             assert_eq!(status, "canceled");
             assert_eq!(error.as_deref(), Some("USER_CANCEL"));
         }
-        let (status, stop): (String, Option<String>) =
-            sqlx::query_as("SELECT status, stop_reason FROM rounds WHERE id = ?")
-                .bind(round_a.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (status, stop) = round_status_and_stop(pool, &round_a).await;
         assert_eq!(status, "canceled");
         assert_eq!(stop.as_deref(), Some("user_cancel"));
         // The unrelated turn is untouched.
-        let (status, _): (String, Option<String>) =
-            sqlx::query_as("SELECT status, stop_reason FROM rounds WHERE id = ?")
-                .bind(other_round.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (status, _) = round_status_and_stop(pool, &other_round).await;
         assert_eq!(status, "running");
-        let (status, error) = tool_call_status_and_error(&pool, &other_tc).await;
+        let (status, error) = tool_call_status_and_error(pool, &other_tc).await;
         assert_eq!(status, "running");
         assert_eq!(error, None);
     }
 
     #[tokio::test]
     async fn unstarted_turns_are_those_without_any_round() {
-        let (pool, execution, _temp) = test_execution().await;
+        let (db, execution, _temp) = test_execution().await;
+        let pool = db.database();
         let now = now_utc_str();
         let started = TurnId::new();
         let unstarted = TurnId::new();
-        seed_round(&pool, &RoundId::new(), started, 1, "running", &now).await;
+        seed_round(pool, &RoundId::new(), started, 1, "running", &now).await;
 
         let candidates = HashSet::from([started, unstarted]);
-        let mut tx = pool.begin().await.unwrap();
+        let mut session = db.client().start_session().await.unwrap();
+        session.start_transaction().await.unwrap();
         let result = execution
-            .unstarted_active_turn_ids_in_tx(&mut tx, &candidates)
+            .unstarted_active_turn_ids_in_tx(&mut session, &candidates)
             .await
             .unwrap();
-        tx.commit().await.unwrap();
+        session.commit_transaction().await.unwrap();
 
         assert!(result.contains(&unstarted));
         assert!(!result.contains(&started));
