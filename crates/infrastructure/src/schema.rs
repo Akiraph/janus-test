@@ -150,11 +150,9 @@ fn unique_partial_index(name: &str, keys: Document, filter: Document) -> IndexMo
 /// was only accepted from 7.0.
 fn status_in(statuses: &[&str]) -> Document {
     doc! {
-        "status": {
-            "$or": statuses.iter().map(|status| {
-                doc! {"status": {"$eq": status}}
-            }).collect::<Vec<_>>()
-        }
+        "$or": statuses.iter().map(|status| {
+            doc! {"status": {"$eq": status}}
+        }).collect::<Vec<_>>()
     }
 }
 
