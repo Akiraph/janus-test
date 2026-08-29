@@ -43,7 +43,7 @@ impl Database {
                 .any(|existing| existing == name);
             if !exists {
                 database
-                    .create_collection(name)
+                    .create_collection(*name)
                     .await
                     .with_context(|| format!("create collection {name}"))?;
             }

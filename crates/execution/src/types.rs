@@ -46,6 +46,8 @@ pub enum ExecutionError {
     Serde(#[from] serde_json::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

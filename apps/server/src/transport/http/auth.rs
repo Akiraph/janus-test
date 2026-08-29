@@ -366,7 +366,10 @@ fn problem(error: IdentityError) -> Problem {
             "Recovery failed",
             error.to_string(),
         ),
-        IdentityError::Storage(_) | IdentityError::Data(_) | IdentityError::Internal(_) => {
+        IdentityError::Storage(_)
+        | IdentityError::Data(_)
+        | IdentityError::Internal(_)
+        | IdentityError::ValueAccess(_) => {
             Problem::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "INTERNAL_ERROR",

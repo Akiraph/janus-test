@@ -114,6 +114,8 @@ pub enum IdentityError {
     Data(#[from] serde_json::Error),
     #[error("identity operation failed")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
 }
 
 #[derive(Clone)]

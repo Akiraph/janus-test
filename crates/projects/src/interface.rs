@@ -199,6 +199,8 @@ pub enum ProjectsError {
     Io(#[from] std::io::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
 }
 
 impl From<PathError> for ProjectsError {
@@ -244,7 +246,8 @@ impl ProjectsError {
             | Self::Storage(_)
             | Self::Serde(_)
             | Self::Io(_)
-            | Self::Internal(_) => "INTERNAL_ERROR",
+            | Self::Internal(_)
+            | Self::ValueAccess(_) => "INTERNAL_ERROR",
         }
     }
 }

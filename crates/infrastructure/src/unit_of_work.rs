@@ -97,7 +97,7 @@ impl UnitOfWorkTransaction {
         }
     }
 
-    pub async fn rollback(self) -> Result<(), mongodb::error::Error> {
+    pub async fn rollback(mut self) -> Result<(), mongodb::error::Error> {
         self.session.abort_transaction().await
     }
 }

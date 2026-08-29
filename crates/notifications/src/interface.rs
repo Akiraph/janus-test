@@ -109,6 +109,8 @@ pub enum NotificationsError {
     Data(#[from] serde_json::Error),
     #[error("notification operation failed")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
     #[error("notification delivery failed: {0}")]
     Delivery(String),
 }
