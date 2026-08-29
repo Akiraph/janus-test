@@ -221,7 +221,7 @@ impl NotificationsInterface {
             document.insert(
                 "secret_ciphertext",
                 Bson::Binary(mongodb::bson::Binary {
-                    subtype: mongodb::bson::BinarySubtype::Generic,
+                    subtype: mongodb::bson::spec::BinarySubtype::Generic,
                     bytes: bytes.clone(),
                 }),
             );
@@ -268,7 +268,7 @@ impl NotificationsInterface {
                 set.insert(
                     "secret_ciphertext",
                     Bson::Binary(mongodb::bson::Binary {
-                        subtype: mongodb::bson::BinarySubtype::Generic,
+                        subtype: mongodb::bson::spec::BinarySubtype::Generic,
                         bytes: bytes.clone(),
                     }),
                 );

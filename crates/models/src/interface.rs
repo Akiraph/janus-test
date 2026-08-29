@@ -807,7 +807,7 @@ impl ModelsInterface {
             document.insert(
                 "api_key_ciphertext",
                 Bson::Binary(mongodb::bson::Binary {
-                    subtype: mongodb::bson::BinarySubtype::Generic,
+                    subtype: mongodb::bson::spec::BinarySubtype::Generic,
                     bytes: bytes.clone(),
                 }),
             );
@@ -882,7 +882,7 @@ impl ModelsInterface {
                 set.insert(
                     "api_key_ciphertext",
                     Bson::Binary(mongodb::bson::Binary {
-                        subtype: mongodb::bson::BinarySubtype::Generic,
+                        subtype: mongodb::bson::spec::BinarySubtype::Generic,
                         bytes: bytes.clone(),
                     }),
                 );

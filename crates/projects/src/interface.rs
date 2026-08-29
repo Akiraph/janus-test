@@ -1066,7 +1066,7 @@ impl ProjectsInterface {
             document.insert(
                 "pat_ciphertext",
                 Bson::Binary(mongodb::bson::Binary {
-                    subtype: mongodb::bson::BinarySubtype::Generic,
+                    subtype: mongodb::bson::spec::BinarySubtype::Generic,
                     bytes: ciphertext,
                 }),
             );
@@ -1259,7 +1259,7 @@ impl ProjectsInterface {
                 set.insert(
                     "pat_ciphertext",
                     Bson::Binary(mongodb::bson::Binary {
-                        subtype: mongodb::bson::BinarySubtype::Generic,
+                        subtype: mongodb::bson::spec::BinarySubtype::Generic,
                         bytes: bytes.clone(),
                     }),
                 );
