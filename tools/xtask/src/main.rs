@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
-use syn::{Expr, punctuated::Punctuated, visit::Visit};
+use syn::{Expr, punctuated::Punctuated, spanned::Spanned, visit::Visit};
 
 const MODULES: &[&str] = &[
     "identity",
@@ -433,7 +433,7 @@ fn parse_schema_catalog(root: &Path) -> anyhow::Result<SchemaCatalog> {
             continue;
         };
         let ident = const_item.ident.to_string();
-        let array = match &const_item.expr {
+        let array = match &*const_item.expr {
             Expr::Reference(reference) => match &*reference.expr {
                 Expr::Array(array) => array,
                 _ => bail!("{}: {ident} must be an array reference", path.display()),
@@ -648,9 +648,9 @@ struct CollectionAccessCollector {
     /// `(collection, is_write)` pairs detected from `.collection(...)` chains.
     accesses: BTreeSet<(String, bool)>,
     /// Spans of `.collection(` calls whose argument is not a string literal.
-    non_literal_spans: Vec<syn::Span>,
+    non_literal_spans: Vec<proc_macro2::Span>,
     /// Spans of `let name = ...collection("...")` bindings of a bare handle.
-    bound_collection_spans: Vec<syn::Span>,
+    bound_collection_spans: Vec<proc_macro2::Span>,
 }
 
 impl<'ast> Visit<'ast> for CollectionAccessCollector {
@@ -671,8 +671,8 @@ impl<'ast> Visit<'ast> for CollectionAccessCollector {
     fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
         if let syn::Stmt::Local(local) = stmt
             && !matches!(local.pat, syn::Pat::Wild(_))
-            && let Some((init, _)) = &local.init
-            && is_bare_collection_call(init)
+            && let Some(init) = &local.init
+            && is_bare_collection_call(&*init.expr)
         {
             self.bound_collection_spans.push(local.pat.span());
         }
@@ -705,7 +705,7 @@ fn is_bare_collection_call(expr: &Expr) -> bool {
         Expr::Paren(paren) => is_bare_collection_call(&paren.expr),
         Expr::Reference(reference) => is_bare_collection_call(&reference.expr),
         Expr::MethodCall(call) => {
-            matches!(&call.method, syn::Member::Named(name) if name == "collection")
+            matches!(&call.method, syn::Member::Named(name) if name.to_string() == "collection")
         }
         _ => false,
     }
@@ -716,7 +716,7 @@ fn is_bare_collection_call(expr: &Expr) -> bool {
 fn collection_in_receiver_spine(expr: &Expr) -> Option<String> {
     match expr {
         Expr::MethodCall(call) => {
-            if matches!(&call.method, syn::Member::Named(name) if name == "collection") {
+            if matches!(&call.method, syn::Member::Named(name) if name.to_string() == "collection") {
                 return literal_string_arg(&call.args);
             }
             collection_in_receiver_spine(&call.receiver)
