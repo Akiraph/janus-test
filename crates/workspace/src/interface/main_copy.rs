@@ -87,7 +87,7 @@ impl WorkspaceInterface {
             .await?;
         let mut registered = BTreeSet::new();
         while let Some(document) = cursor.try_next().await? {
-            if let Some(managed_dir) = document.get_str("managed_dir").ok() {
+            if let Ok(managed_dir) = document.get_str("managed_dir") {
                 if let Some(name) = Path::new(managed_dir).parent().and_then(Path::file_name) {
                     registered.insert(name.to_string_lossy().to_string());
                 }

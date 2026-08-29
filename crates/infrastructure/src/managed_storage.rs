@@ -308,7 +308,7 @@ impl BlobStore {
             .await?;
         let mut referenced = HashSet::new();
         while let Some(document) = references.try_next().await? {
-            if let Some(sha) = document.get_str("blob_sha").ok() {
+            if let Ok(sha) = document.get_str("blob_sha") {
                 referenced.insert(sha.to_owned());
             }
         }

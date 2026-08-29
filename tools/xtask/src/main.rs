@@ -623,14 +623,14 @@ fn validate_production_collection_access(
         let mut collector = CollectionAccessCollector::default();
         collector.visit_file(&parsed);
         if source_owner != Some("platform") {
-            for span in &collector.non_literal_spans {
+            if let Some(span) = collector.non_literal_spans.iter().next() {
                 bail!(
                     "{}:{} collection() must take an inline string literal",
                     file.display(),
                     span.start().line
                 );
             }
-            for span in &collector.bound_collection_spans {
+            if let Some(span) = collector.bound_collection_spans.iter().next() {
                 bail!(
                     "{}:{} bind a collection handle to a variable; call .collection(\"...\") inline",
                     file.display(),
@@ -685,7 +685,7 @@ impl<'ast> Visit<'ast> for CollectionAccessCollector {
         if let syn::Stmt::Local(local) = stmt
             && !matches!(local.pat, syn::Pat::Wild(_))
             && let Some(init) = &local.init
-            && is_bare_collection_call(&*init.expr)
+            && is_bare_collection_call(&init.expr)
         {
             self.bound_collection_spans.push(local.pat.span());
         }
@@ -717,7 +717,7 @@ fn is_bare_collection_call(expr: &Expr) -> bool {
         Expr::Await(await_) => is_bare_collection_call(&await_.base),
         Expr::Paren(paren) => is_bare_collection_call(&paren.expr),
         Expr::Reference(reference) => is_bare_collection_call(&reference.expr),
-        Expr::MethodCall(call) => call.method.to_string() == "collection",
+        Expr::MethodCall(call) => call.method == "collection",
         _ => false,
     }
 }
@@ -727,7 +727,7 @@ fn is_bare_collection_call(expr: &Expr) -> bool {
 fn collection_in_receiver_spine(expr: &Expr) -> Option<String> {
     match expr {
         Expr::MethodCall(call) => {
-            if call.method.to_string() == "collection" {
+            if call.method == "collection" {
                 return literal_string_arg(&call.args);
             }
             collection_in_receiver_spine(&call.receiver)

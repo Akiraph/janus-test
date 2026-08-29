@@ -328,13 +328,11 @@ impl EventStore {
             documents.push(document);
         }
         let mut envelopes = Vec::new();
-        let mut expected = cursor + 1;
-        for document in documents {
+        for (expected, document) in (cursor + 1..).zip(documents) {
             if document.get_i64("_id")? != expected {
                 break;
             }
             envelopes.push(EventEnvelope::try_from(document)?);
-            expected += 1;
         }
         Ok(envelopes)
     }

@@ -850,7 +850,7 @@ impl OperationInterface {
             .await?;
         let mut operation_ids = Vec::new();
         while let Some(document) = ids.try_next().await? {
-            if let Some(operation_id) = document.get_str("operation_id").ok() {
+            if let Ok(operation_id) = document.get_str("operation_id") {
                 operation_ids.push(operation_id.to_owned());
             }
         }
