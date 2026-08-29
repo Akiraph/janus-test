@@ -1,10 +1,15 @@
 //! Public identity capability boundary.
 
 use chrono::{DateTime, Duration, Utc};
+use futures_util::TryStreamExt;
 use janus_infrastructure::clock::{format_utc, now_utc_str};
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+    Database,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -105,7 +110,7 @@ pub enum IdentityError {
     #[error("the CSRF token is invalid")]
     CsrfRejected,
     #[error("identity storage failed")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("identity data is invalid")]
     Data(#[from] serde_json::Error),
     #[error("identity operation failed")]
@@ -114,7 +119,7 @@ pub enum IdentityError {
 
 #[derive(Clone)]
 pub struct IdentityInterface {
-    pool: SqlitePool,
+    pool: Database,
     webauthn: Webauthn,
     origin: String,
     development_auth: bool,
@@ -135,24 +140,23 @@ struct AuthenticationState {
     state: PasskeyAuthentication,
 }
 
-#[derive(FromRow)]
 struct OwnerRow {
     id: String,
     display_name: String,
 }
 
-#[derive(FromRow)]
-struct SessionRow {
-    id: String,
-    owner_id: String,
-    display_name: String,
-    csrf_token: String,
-    expires_at: String,
+impl OwnerRow {
+    fn from_doc(doc: &Document) -> Result<Self, IdentityError> {
+        Ok(Self {
+            id: doc.get_str("_id")?.to_owned(),
+            display_name: doc.get_str("display_name")?.to_owned(),
+        })
+    }
 }
 
 impl IdentityInterface {
     pub fn new(
-        pool: SqlitePool,
+        pool: Database,
         webauthn_rp_id: &str,
         public_origin: &url::Url,
         webauthn_rp_name: &str,
@@ -171,8 +175,10 @@ impl IdentityInterface {
     }
 
     pub async fn initialization_state(&self) -> Result<InitializationState, IdentityError> {
-        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM owners")
-            .fetch_one(&self.pool)
+        let count = self
+            .pool
+            .collection::<Document>("owners")
+            .count_documents(doc! {})
             .await?;
         Ok(if count == 0 {
             InitializationState::Uninitialized
@@ -187,18 +193,28 @@ impl IdentityInterface {
         }
         let token = random_token(32);
         let now = Utc::now();
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("DELETE FROM initialization_tokens WHERE used_at IS NULL")
-            .execute(&mut *transaction)
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        self.pool
+            .collection::<Document>("initialization_tokens")
+            .delete_many(doc! {"used_at": null})
+            .session(&mut session)
             .await?;
-        sqlx::query("INSERT INTO initialization_tokens (id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)")
-            .bind(Uuid::now_v7().to_string())
-            .bind(purpose_hash("initialization-token", &token))
-            .bind(format_utc(now + Duration::minutes(30)))
-            .bind(format_utc(now))
-            .execute(&mut *transaction)
+        let id = Uuid::now_v7().to_string();
+        let token_hash = purpose_hash("initialization-token", &token);
+        let expires_at = format_utc(now + Duration::minutes(30));
+        let created_at = format_utc(now);
+        self.pool
+            .collection::<Document>("initialization_tokens")
+            .insert_one(doc! {
+                "_id": &id,
+                "token_hash": &token_hash,
+                "expires_at": &expires_at,
+                "created_at": &created_at,
+            })
+            .session(&mut session)
             .await?;
-        transaction.commit().await?;
+        session.commit_transaction().await?;
         Ok(token)
     }
 
@@ -206,8 +222,18 @@ impl IdentityInterface {
         let owner = self.owner().await?;
         let token = random_token(32);
         let now = Utc::now();
-        sqlx::query("INSERT INTO recovery_states (id, owner_id, token_hash, expires_at) VALUES (?, ?, ?, ?)")
-            .bind(Uuid::now_v7().to_string()).bind(owner.id).bind(purpose_hash("recovery-state", &token)).bind(format_utc(now + RECOVERY_TTL)).execute(&self.pool).await?;
+        let id = Uuid::now_v7().to_string();
+        let token_hash = purpose_hash("recovery-state", &token);
+        let expires_at = format_utc(now + RECOVERY_TTL);
+        self.pool
+            .collection::<Document>("recovery_states")
+            .insert_one(doc! {
+                "_id": &id,
+                "owner_id": &owner.id,
+                "token_hash": &token_hash,
+                "expires_at": &expires_at,
+            })
+            .await?;
         Ok(token)
     }
 
@@ -220,13 +246,16 @@ impl IdentityInterface {
             return Err(IdentityError::AlreadyInitialized);
         }
         let token_hash = purpose_hash("initialization-token", token);
-        let valid = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM initialization_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
-        )
-        .bind(&token_hash)
-        .bind(now_utc_str())
-        .fetch_one(&self.pool)
-        .await?;
+        let now = now_utc_str();
+        let valid = self
+            .pool
+            .collection::<Document>("initialization_tokens")
+            .count_documents(doc! {
+                "token_hash": &token_hash,
+                "used_at": null,
+                "expires_at": {"$gt": &now},
+            })
+            .await?;
         if valid != 1 {
             return Err(IdentityError::InvalidInitializationToken);
         }
@@ -261,50 +290,68 @@ impl IdentityInterface {
         let session_token = random_token(32);
         let csrf_token = random_token(24);
         let recovery_codes = (0..10).map(|_| random_token(16)).collect::<Vec<_>>();
-        let mut transaction = self.pool.begin().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
         let token_hash = state
             .token_hash
             .as_deref()
             .ok_or(IdentityError::InvalidInitializationToken)?;
-        let consumed = sqlx::query("UPDATE initialization_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?")
-            .bind(format_utc(now))
-            .bind(token_hash)
-            .bind(format_utc(now))
-            .execute(&mut *transaction)
+        let used_at = format_utc(now);
+        let consumed = self
+            .pool
+            .collection::<Document>("initialization_tokens")
+            .update_one(
+                doc! {
+                    "token_hash": token_hash,
+                    "used_at": null,
+                    "expires_at": {"$gt": &used_at},
+                },
+                doc! {"$set": {"used_at": &used_at}},
+            )
+            .session(&mut session)
             .await?
-            .rows_affected();
-        if consumed != 1
-            || sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM owners")
-                .fetch_one(&mut *transaction)
-                .await?
-                != 0
-        {
+            .matched_count;
+        let owner_count = self
+            .pool
+            .collection::<Document>("owners")
+            .count_documents(doc! {})
+            .session(&mut session)
+            .await?;
+        if consumed != 1 || owner_count != 0 {
+            session.abort_transaction().await?;
             return Err(IdentityError::InvalidInitializationToken);
         }
-        sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
-            .bind(&state.owner_id)
-            .bind(&state.display_name)
-            .bind(format_utc(now))
-            .execute(&mut *transaction)
+        let created_at = format_utc(now);
+        self.pool
+            .collection::<Document>("owners")
+            .insert_one(doc! {
+                "_id": &state.owner_id,
+                "display_name": &state.display_name,
+                "created_at": &created_at,
+            })
+            .session(&mut session)
             .await?;
         insert_passkey(
-            &mut transaction,
+            &self.pool,
+            &mut session,
             &state.owner_id,
             &state.passkey_name,
             &passkey,
             now,
         )
         .await?;
-        insert_recovery_codes(&mut transaction, &state.owner_id, &recovery_codes, now).await?;
+        insert_recovery_codes(&self.pool, &mut session, &state.owner_id, &recovery_codes, now)
+            .await?;
         insert_session(
-            &mut transaction,
+            &self.pool,
+            &mut session,
             &state.owner_id,
             &session_token,
             &csrf_token,
             now,
         )
         .await?;
-        transaction.commit().await?;
+        session.commit_transaction().await?;
         Ok(AuthenticationGrant {
             owner: owner_view(
                 &state.owner_id,
@@ -318,17 +365,22 @@ impl IdentityInterface {
     }
 
     pub async fn login_options(&self) -> Result<CeremonyOptions, IdentityError> {
-        let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT credential_json FROM passkeys WHERE revoked_at IS NULL ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        if rows.is_empty() {
+        let mut cursor = self
+            .pool
+            .collection::<Document>("passkeys")
+            .find(doc! {"revoked_at": null})
+            .sort(doc! {"created_at": 1})
+            .await?;
+        let mut credential_json = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            credential_json.push(document.get_str("credential_json")?.to_owned());
+        }
+        if credential_json.is_empty() {
             return Err(IdentityError::AuthRequired);
         }
-        let passkeys = rows
+        let passkeys = credential_json
             .into_iter()
-            .map(|row| serde_json::from_str::<Passkey>(&row.0))
+            .map(|raw| serde_json::from_str::<Passkey>(&raw))
             .collect::<Result<Vec<_>, _>>()?;
         let (options, state) = self
             .webauthn
@@ -357,15 +409,15 @@ impl IdentityInterface {
             .map_err(|_| IdentityError::InvalidCredential)?;
         let owner = self.owner().await?;
         let now = Utc::now();
-        let rows = sqlx::query_as::<_, (String, String)>(
-            "SELECT id, credential_json FROM passkeys WHERE owner_id = ? AND revoked_at IS NULL",
-        )
-        .bind(&owner.id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("passkeys")
+            .find(doc! {"owner_id": &owner.id, "revoked_at": null})
+            .await?;
         let mut matched = None;
-        for (id, credential_json) in rows {
-            let mut passkey: Passkey = serde_json::from_str(&credential_json)?;
+        while let Some(document) = cursor.try_next().await? {
+            let id = document.get_str("_id")?.to_owned();
+            let mut passkey: Passkey = serde_json::from_str(document.get_str("credential_json")?)?;
             if passkey.cred_id() == result.cred_id() {
                 let _ = passkey.update_credential(&result);
                 matched = Some((id, serde_json::to_string(&passkey)?));
@@ -375,22 +427,27 @@ impl IdentityInterface {
         let (passkey_id, passkey_json) = matched.ok_or(IdentityError::InvalidCredential)?;
         let session_token = random_token(32);
         let csrf_token = random_token(24);
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("UPDATE passkeys SET credential_json = ?, last_used_at = ? WHERE id = ?")
-            .bind(passkey_json)
-            .bind(format_utc(now))
-            .bind(passkey_id)
-            .execute(&mut *transaction)
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let last_used_at = format_utc(now);
+        self.pool
+            .collection::<Document>("passkeys")
+            .update_one(
+                doc! {"_id": &passkey_id},
+                doc! {"$set": {"credential_json": &passkey_json, "last_used_at": &last_used_at}},
+            )
+            .session(&mut session)
             .await?;
         insert_session(
-            &mut transaction,
+            &self.pool,
+            &mut session,
             &owner.id,
             &session_token,
             &csrf_token,
             now,
         )
         .await?;
-        transaction.commit().await?;
+        session.commit_transaction().await?;
         Ok(AuthenticationGrant {
             owner: owner_view(&owner.id, &owner.display_name, csrf_token, false),
             session_token,
@@ -414,21 +471,28 @@ impl IdentityInterface {
             });
         }
         let token = session_token.ok_or(IdentityError::AuthRequired)?;
-        let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT s.id, s.owner_id, o.display_name, s.csrf_token, s.expires_at FROM login_sessions s JOIN owners o ON o.id = s.owner_id WHERE s.token_hash = ? AND s.revoked_at IS NULL",
-        )
-        .bind(purpose_hash("login-session", token))
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(IdentityError::AuthRequired)?;
-        if parse_time(&row.expires_at)? <= Utc::now() {
+        let token_hash = purpose_hash("login-session", token);
+        let login = self
+            .pool
+            .collection::<Document>("login_sessions")
+            .find_one(doc! {"token_hash": &token_hash, "revoked_at": null})
+            .await?
+            .ok_or(IdentityError::AuthRequired)?;
+        let owner = self
+            .pool
+            .collection::<Document>("owners")
+            .find_one(doc! {"_id": login.get_str("owner_id")?})
+            .await?
+            .ok_or(IdentityError::AuthRequired)?;
+        let expires_at = login.get_str("expires_at")?;
+        if parse_time(expires_at)? <= Utc::now() {
             return Err(IdentityError::AuthRequired);
         }
         Ok(AuthContext {
-            owner_id: row.owner_id,
-            display_name: row.display_name,
-            session_id: Some(row.id),
-            csrf_token: row.csrf_token,
+            owner_id: login.get_str("owner_id")?.to_owned(),
+            display_name: owner.get_str("display_name")?.to_owned(),
+            session_id: Some(login.get_str("_id")?.to_owned()),
+            csrf_token: login.get_str("csrf_token")?.to_owned(),
             development: false,
         })
     }
@@ -474,31 +538,38 @@ impl IdentityInterface {
 
     pub async fn logout(&self, auth: &AuthContext) -> Result<(), IdentityError> {
         if let Some(session_id) = &auth.session_id {
-            sqlx::query("UPDATE login_sessions SET revoked_at = ? WHERE id = ?")
-                .bind(now_utc_str())
-                .bind(session_id)
-                .execute(&self.pool)
+            let revoked_at = now_utc_str();
+            self.pool
+                .collection::<Document>("login_sessions")
+                .update_one(
+                    doc! {"_id": session_id},
+                    doc! {"$set": {"revoked_at": &revoked_at}},
+                )
                 .await?;
         }
         Ok(())
     }
 
     pub async fn passkeys(&self, auth: &AuthContext) -> Result<Vec<PasskeyView>, IdentityError> {
-        let rows = sqlx::query_as::<_, (String, String, String, Option<String>)>(
-            "SELECT id, name, created_at, last_used_at FROM passkeys WHERE owner_id = ? AND revoked_at IS NULL ORDER BY created_at",
-        )
-        .bind(&auth.owner_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| PasskeyView {
-                id: row.0,
-                name: row.1,
-                created_at: row.2,
-                last_used_at: row.3,
-            })
-            .collect())
+        let mut cursor = self
+            .pool
+            .collection::<Document>("passkeys")
+            .find(doc! {"owner_id": &auth.owner_id, "revoked_at": null})
+            .sort(doc! {"created_at": 1})
+            .await?;
+        let mut views = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            views.push(PasskeyView {
+                id: document.get_str("_id")?.to_owned(),
+                name: document.get_str("name")?.to_owned(),
+                created_at: document.get_str("created_at")?.to_owned(),
+                last_used_at: document
+                    .get("last_used_at")
+                    .and_then(Bson::as_str)
+                    .map(str::to_owned),
+            });
+        }
+        Ok(views)
     }
 
     pub async fn add_passkey_options(
@@ -506,16 +577,7 @@ impl IdentityInterface {
         auth: &AuthContext,
         name: &str,
     ) -> Result<CeremonyOptions, IdentityError> {
-        let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT credential_json FROM passkeys WHERE owner_id = ? AND revoked_at IS NULL",
-        )
-        .bind(&auth.owner_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let credentials = rows
-            .into_iter()
-            .map(|row| serde_json::from_str::<Passkey>(&row.0).map(|key| key.cred_id().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let credentials = self.credential_ids(&auth.owner_id).await?;
         self.registration_options(RegistrationStateSeed {
             token_hash: None,
             owner_id: auth.owner_id.clone(),
@@ -569,15 +631,16 @@ impl IdentityInterface {
         id: &str,
         name: &str,
     ) -> Result<(), IdentityError> {
-        let changed = sqlx::query(
-            "UPDATE passkeys SET name = ? WHERE id = ? AND owner_id = ? AND revoked_at IS NULL",
-        )
-        .bind(normalize_name(name, "Passkey")?)
-        .bind(id)
-        .bind(&auth.owner_id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let name = normalize_name(name, "Passkey")?;
+        let changed = self
+            .pool
+            .collection::<Document>("passkeys")
+            .update_one(
+                doc! {"_id": id, "owner_id": &auth.owner_id, "revoked_at": null},
+                doc! {"$set": {"name": &name}},
+            )
+            .await?
+            .matched_count;
         if changed == 0 {
             Err(IdentityError::PasskeyNotFound)
         } else {
@@ -586,27 +649,34 @@ impl IdentityInterface {
     }
 
     pub async fn revoke_passkey(&self, auth: &AuthContext, id: &str) -> Result<(), IdentityError> {
-        let mut transaction = self.pool.begin().await?;
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM passkeys WHERE owner_id = ? AND revoked_at IS NULL",
-        )
-        .bind(&auth.owner_id)
-        .fetch_one(&mut *transaction)
-        .await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let count = self
+            .pool
+            .collection::<Document>("passkeys")
+            .count_documents(doc! {"owner_id": &auth.owner_id, "revoked_at": null})
+            .session(&mut session)
+            .await?;
         if count <= 1 {
+            session.abort_transaction().await?;
             return Err(IdentityError::LastPasskey);
         }
-        let changed = sqlx::query("UPDATE passkeys SET revoked_at = ? WHERE id = ? AND owner_id = ? AND revoked_at IS NULL")
-            .bind(now_utc_str())
-            .bind(id)
-            .bind(&auth.owner_id)
-            .execute(&mut *transaction)
+        let revoked_at = now_utc_str();
+        let changed = self
+            .pool
+            .collection::<Document>("passkeys")
+            .update_one(
+                doc! {"_id": id, "owner_id": &auth.owner_id, "revoked_at": null},
+                doc! {"$set": {"revoked_at": &revoked_at}},
+            )
+            .session(&mut session)
             .await?
-            .rows_affected();
+            .matched_count;
         if changed == 0 {
+            session.abort_transaction().await?;
             return Err(IdentityError::PasskeyNotFound);
         }
-        transaction.commit().await?;
+        session.commit_transaction().await?;
         Ok(())
     }
 
@@ -616,16 +686,19 @@ impl IdentityInterface {
     ) -> Result<Vec<String>, IdentityError> {
         let codes = (0..10).map(|_| random_token(16)).collect::<Vec<_>>();
         let now = Utc::now();
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE recovery_batches SET revoked_at = ? WHERE owner_id = ? AND revoked_at IS NULL",
-        )
-        .bind(format_utc(now))
-        .bind(&auth.owner_id)
-        .execute(&mut *transaction)
-        .await?;
-        insert_recovery_codes(&mut transaction, &auth.owner_id, &codes, now).await?;
-        transaction.commit().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let revoked_at = format_utc(now);
+        self.pool
+            .collection::<Document>("recovery_batches")
+            .update_many(
+                doc! {"owner_id": &auth.owner_id, "revoked_at": null},
+                doc! {"$set": {"revoked_at": &revoked_at}},
+            )
+            .session(&mut session)
+            .await?;
+        insert_recovery_codes(&self.pool, &mut session, &auth.owner_id, &codes, now).await?;
+        session.commit_transaction().await?;
         Ok(codes)
     }
 
@@ -634,32 +707,73 @@ impl IdentityInterface {
         code_or_token: &str,
     ) -> Result<RecoveryGrant, IdentityError> {
         let now = Utc::now();
-        let existing = sqlx::query_as::<_, (String, String)>("SELECT id, expires_at FROM recovery_states WHERE token_hash=? AND used_at IS NULL AND expires_at>?")
-            .bind(purpose_hash("recovery-state", code_or_token)).bind(format_utc(now)).fetch_optional(&self.pool).await?;
-        if let Some((_id, expires_at)) = existing {
+        let token_hash = purpose_hash("recovery-state", code_or_token);
+        let now_str = format_utc(now);
+        let existing = self
+            .pool
+            .collection::<Document>("recovery_states")
+            .find_one(doc! {
+                "token_hash": &token_hash,
+                "used_at": null,
+                "expires_at": {"$gt": &now_str},
+            })
+            .await?;
+        if let Some(document) = existing {
             return Ok(RecoveryGrant {
                 token: code_or_token.into(),
-                expires_at,
+                expires_at: document.get_str("expires_at")?.to_owned(),
             });
         }
         let code_hash = purpose_hash("recovery-code", code_or_token);
-        let mut transaction = self.pool.begin().await?;
-        let row = sqlx::query_as::<_, (String, String)>("SELECT c.id, b.owner_id FROM recovery_codes c JOIN recovery_batches b ON b.id=c.batch_id WHERE c.code_hash=? AND c.used_at IS NULL AND b.revoked_at IS NULL")
-            .bind(code_hash).fetch_optional(&mut *transaction).await?.ok_or(IdentityError::InvalidRecoveryCode)?;
-        if sqlx::query("UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL")
-            .bind(format_utc(now))
-            .bind(&row.0)
-            .execute(&mut *transaction)
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let code = self
+            .pool
+            .collection::<Document>("recovery_codes")
+            .find_one(doc! {"code_hash": &code_hash, "used_at": null})
+            .session(&mut session)
             .await?
-            .rows_affected()
-            != 1
-        {
+            .ok_or(IdentityError::InvalidRecoveryCode)?;
+        let code_id = code.get_str("_id")?.to_owned();
+        let batch_id = code.get_str("batch_id")?.to_owned();
+        let batch = self
+            .pool
+            .collection::<Document>("recovery_batches")
+            .find_one(doc! {"_id": &batch_id, "revoked_at": null})
+            .session(&mut session)
+            .await?
+            .ok_or(IdentityError::InvalidRecoveryCode)?;
+        let owner_id = batch.get_str("owner_id")?.to_owned();
+        let used_at = format_utc(now);
+        let consumed = self
+            .pool
+            .collection::<Document>("recovery_codes")
+            .update_one(
+                doc! {"_id": &code_id, "used_at": null},
+                doc! {"$set": {"used_at": &used_at}},
+            )
+            .session(&mut session)
+            .await?
+            .matched_count;
+        if consumed != 1 {
+            session.abort_transaction().await?;
             return Err(IdentityError::InvalidRecoveryCode);
         }
         let token = random_token(32);
+        let id = Uuid::now_v7().to_string();
+        let token_hash = purpose_hash("recovery-state", &token);
         let expires_at = format_utc(now + RECOVERY_TTL);
-        sqlx::query("INSERT INTO recovery_states (id, owner_id, token_hash, expires_at) VALUES (?, ?, ?, ?)").bind(Uuid::now_v7().to_string()).bind(row.1).bind(purpose_hash("recovery-state",&token)).bind(&expires_at).execute(&mut *transaction).await?;
-        transaction.commit().await?;
+        self.pool
+            .collection::<Document>("recovery_states")
+            .insert_one(doc! {
+                "_id": &id,
+                "owner_id": &owner_id,
+                "token_hash": &token_hash,
+                "expires_at": &expires_at,
+            })
+            .session(&mut session)
+            .await?;
+        session.commit_transaction().await?;
         Ok(RecoveryGrant { token, expires_at })
     }
 
@@ -668,23 +782,34 @@ impl IdentityInterface {
         recovery_token: &str,
         name: &str,
     ) -> Result<CeremonyOptions, IdentityError> {
-        let row=sqlx::query_as::<_,(String,String,String)>("SELECT r.id,o.id,o.display_name FROM recovery_states r JOIN owners o ON o.id=r.owner_id WHERE r.token_hash=? AND r.used_at IS NULL AND r.expires_at>?")
-            .bind(purpose_hash("recovery-state",recovery_token)).bind(now_utc_str()).fetch_optional(&self.pool).await?.ok_or(IdentityError::InvalidRecoveryCode)?;
-        let credentials = sqlx::query_as::<_, (String,)>(
-            "SELECT credential_json FROM passkeys WHERE owner_id=? AND revoked_at IS NULL",
-        )
-        .bind(&row.1)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|item| serde_json::from_str::<Passkey>(&item.0).map(|key| key.cred_id().clone()))
-        .collect::<Result<Vec<_>, _>>()?;
+        let token_hash = purpose_hash("recovery-state", recovery_token);
+        let now = now_utc_str();
+        let recovery = self
+            .pool
+            .collection::<Document>("recovery_states")
+            .find_one(doc! {
+                "token_hash": &token_hash,
+                "used_at": null,
+                "expires_at": {"$gt": &now},
+            })
+            .await?
+            .ok_or(IdentityError::InvalidRecoveryCode)?;
+        let owner_id = recovery.get_str("owner_id")?.to_owned();
+        let display_name = self
+            .pool
+            .collection::<Document>("owners")
+            .find_one(doc! {"_id": &owner_id})
+            .await?
+            .map(|document| document.get_str("display_name").map(str::to_owned))
+            .transpose()?
+            .unwrap_or_else(|| "Owner".to_owned());
+        let credentials = self.credential_ids(&owner_id).await?;
         self.registration_options(RegistrationStateSeed {
             token_hash: None,
-            owner_id: row.1,
-            display_name: row.2,
+            owner_id,
+            display_name,
             passkey_name: normalize_name(name, "Recovered passkey")?,
-            recovery_state_id: Some(row.0),
+            recovery_state_id: Some(recovery.get_str("_id")?.to_owned()),
             kind: "recovery_passkey",
             exclude: Some(credentials),
         })
@@ -714,10 +839,33 @@ impl IdentityInterface {
         let session_token = random_token(32);
         let csrf_token = random_token(24);
         let owner = self.owner().await?;
-        let mut transaction = self.pool.begin().await?;
-        if sqlx::query("UPDATE recovery_states SET used_at=? WHERE id=? AND owner_id=? AND token_hash=? AND used_at IS NULL AND expires_at>?").bind(format_utc(now)).bind(recovery_id).bind(&state.owner_id).bind(purpose_hash("recovery-state",recovery_token)).bind(format_utc(now)).execute(&mut *transaction).await?.rows_affected()!=1{return Err(IdentityError::InvalidRecoveryCode);}
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let token_hash = purpose_hash("recovery-state", recovery_token);
+        let used_at = format_utc(now);
+        let consumed = self
+            .pool
+            .collection::<Document>("recovery_states")
+            .update_one(
+                doc! {
+                    "_id": recovery_id,
+                    "owner_id": &state.owner_id,
+                    "token_hash": &token_hash,
+                    "used_at": null,
+                    "expires_at": {"$gt": &used_at},
+                },
+                doc! {"$set": {"used_at": &used_at}},
+            )
+            .session(&mut session)
+            .await?
+            .matched_count;
+        if consumed != 1 {
+            session.abort_transaction().await?;
+            return Err(IdentityError::InvalidRecoveryCode);
+        }
         insert_passkey(
-            &mut transaction,
+            &self.pool,
+            &mut session,
             &state.owner_id,
             &state.passkey_name,
             &passkey,
@@ -725,14 +873,15 @@ impl IdentityInterface {
         )
         .await?;
         insert_session(
-            &mut transaction,
+            &self.pool,
+            &mut session,
             &state.owner_id,
             &session_token,
             &csrf_token,
             now,
         )
         .await?;
-        transaction.commit().await?;
+        session.commit_transaction().await?;
         Ok(AuthenticationGrant {
             owner: owner_view(&owner.id, &owner.display_name, csrf_token, false),
             session_token,
@@ -779,13 +928,17 @@ impl IdentityInterface {
     ) -> Result<CeremonyOptions, IdentityError> {
         let id = Uuid::now_v7().to_string();
         let now = Utc::now();
-        sqlx::query("INSERT INTO ceremonies (id, kind, state_json, expires_at, created_at) VALUES (?, ?, ?, ?, ?)")
-            .bind(&id)
-            .bind(kind)
-            .bind(state_json)
-            .bind(format_utc(now + CEREMONY_TTL))
-            .bind(format_utc(now))
-            .execute(&self.pool)
+        let expires_at = format_utc(now + CEREMONY_TTL);
+        let created_at = format_utc(now);
+        self.pool
+            .collection::<Document>("ceremonies")
+            .insert_one(doc! {
+                "_id": &id,
+                "kind": kind,
+                "state_json": &state_json,
+                "expires_at": &expires_at,
+                "created_at": &created_at,
+            })
             .await?;
         Ok(CeremonyOptions {
             ceremony_id: id,
@@ -803,36 +956,62 @@ impl IdentityInterface {
 
     async fn take_ceremony(&self, id: &str, kind: &str) -> Result<String, IdentityError> {
         let now = now_utc_str();
-        let mut transaction = self.pool.begin().await?;
-        let state = sqlx::query_scalar::<_, String>(
-            "SELECT state_json FROM ceremonies WHERE id = ? AND kind = ? AND consumed_at IS NULL AND expires_at > ?",
-        )
-        .bind(id)
-        .bind(kind)
-        .bind(&now)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or(IdentityError::InvalidCeremony)?;
-        let changed = sqlx::query(
-            "UPDATE ceremonies SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
-        )
-        .bind(&now)
-        .bind(id)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected();
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let state = self
+            .pool
+            .collection::<Document>("ceremonies")
+            .find_one(doc! {
+                "_id": id,
+                "kind": kind,
+                "consumed_at": null,
+                "expires_at": {"$gt": &now},
+            })
+            .session(&mut session)
+            .await?
+            .ok_or(IdentityError::InvalidCeremony)?
+            .get_str("state_json")?
+            .to_owned();
+        let changed = self
+            .pool
+            .collection::<Document>("ceremonies")
+            .update_one(
+                doc! {"_id": id, "consumed_at": null},
+                doc! {"$set": {"consumed_at": &now}},
+            )
+            .session(&mut session)
+            .await?
+            .matched_count;
         if changed != 1 {
+            session.abort_transaction().await?;
             return Err(IdentityError::InvalidCeremony);
         }
-        transaction.commit().await?;
+        session.commit_transaction().await?;
         Ok(state)
     }
 
     async fn owner(&self) -> Result<OwnerRow, IdentityError> {
-        sqlx::query_as::<_, OwnerRow>("SELECT id, display_name FROM owners LIMIT 1")
-            .fetch_optional(&self.pool)
+        self.pool
+            .collection::<Document>("owners")
+            .find_one(doc! {})
             .await?
+            .map(|document| OwnerRow::from_doc(&document))
+            .transpose()?
             .ok_or(IdentityError::AuthRequired)
+    }
+
+    async fn credential_ids(&self, owner_id: &str) -> Result<Vec<webauthn_rs::prelude::CredentialID>, IdentityError> {
+        let mut cursor = self
+            .pool
+            .collection::<Document>("passkeys")
+            .find(doc! {"owner_id": owner_id, "revoked_at": null})
+            .await?;
+        let mut credentials = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            let passkey: Passkey = serde_json::from_str(document.get_str("credential_json")?)?;
+            credentials.push(passkey.cred_id().clone());
+        }
+        Ok(credentials)
     }
 
     async fn ensure_development_owner(&self) -> Result<(), IdentityError> {
@@ -841,15 +1020,18 @@ impl IdentityInterface {
         }
         let now = now_utc_str();
         let owner_id = OwnerId::new().to_string();
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO owners (id, display_name, created_at) VALUES (?, 'Development Owner', ?)",
-        )
-        .bind(owner_id)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        self.pool
+            .collection::<Document>("owners")
+            .insert_one(doc! {
+                "_id": &owner_id,
+                "display_name": "Development Owner",
+                "created_at": &now,
+            })
+            .session(&mut session)
+            .await?;
+        session.commit_transaction().await?;
         Ok(())
     }
 }
@@ -890,65 +1072,100 @@ fn owner_view(id: &str, display_name: &str, csrf_token: String, development: boo
 }
 
 async fn insert_passkey(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool: &Database,
+    session: &mut ClientSession,
     owner_id: &str,
     name: &str,
     passkey: &Passkey,
     now: DateTime<Utc>,
 ) -> Result<String, IdentityError> {
     let id = PasskeyId::new().to_string();
-    sqlx::query("INSERT INTO passkeys (id, owner_id, name, credential_json, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(&id).bind(owner_id).bind(name).bind(serde_json::to_string(passkey)?).bind(format_utc(now))
-        .execute(&mut **transaction).await?;
+    let credential_json = serde_json::to_string(passkey)?;
+    let created_at = format_utc(now);
+    pool.collection::<Document>("passkeys")
+        .insert_one(doc! {
+            "_id": &id,
+            "owner_id": owner_id,
+            "name": name,
+            "credential_json": &credential_json,
+            "created_at": &created_at,
+        })
+        .session(session)
+        .await?;
     Ok(id)
 }
 
 async fn insert_passkey_pool(
-    pool: &SqlitePool,
+    pool: &Database,
     owner_id: &str,
     name: &str,
     passkey: &Passkey,
     now: DateTime<Utc>,
 ) -> Result<String, IdentityError> {
-    let mut transaction = pool.begin().await?;
-    let id = insert_passkey(&mut transaction, owner_id, name, passkey, now).await?;
-    transaction.commit().await?;
+    let mut session = pool.client().start_session().await?;
+    session.start_transaction().await?;
+    let id = insert_passkey(pool, &mut session, owner_id, name, passkey, now).await?;
+    session.commit_transaction().await?;
     Ok(id)
 }
 
 async fn insert_recovery_codes(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool: &Database,
+    session: &mut ClientSession,
     owner_id: &str,
     codes: &[String],
     now: DateTime<Utc>,
 ) -> Result<(), IdentityError> {
     let batch_id = Uuid::now_v7().to_string();
-    sqlx::query("INSERT INTO recovery_batches (id, owner_id, created_at) VALUES (?, ?, ?)")
-        .bind(&batch_id)
-        .bind(owner_id)
-        .bind(format_utc(now))
-        .execute(&mut **transaction)
+    let created_at = format_utc(now);
+    pool.collection::<Document>("recovery_batches")
+        .insert_one(doc! {
+            "_id": &batch_id,
+            "owner_id": owner_id,
+            "created_at": &created_at,
+        })
+        .session(session)
         .await?;
     for code in codes {
-        sqlx::query("INSERT INTO recovery_codes (id, batch_id, code_hash) VALUES (?, ?, ?)")
-            .bind(Uuid::now_v7().to_string())
-            .bind(&batch_id)
-            .bind(purpose_hash("recovery-code", code))
-            .execute(&mut **transaction)
+        let id = Uuid::now_v7().to_string();
+        let code_hash = purpose_hash("recovery-code", code);
+        pool.collection::<Document>("recovery_codes")
+            .insert_one(doc! {
+                "_id": &id,
+                "batch_id": &batch_id,
+                "code_hash": &code_hash,
+            })
+            .session(session)
             .await?;
     }
     Ok(())
 }
 
 async fn insert_session(
-    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool: &Database,
+    session: &mut ClientSession,
     owner_id: &str,
     token: &str,
     csrf: &str,
     now: DateTime<Utc>,
 ) -> Result<(), IdentityError> {
-    sqlx::query("INSERT INTO login_sessions (id, owner_id, token_hash, csrf_token, created_at, last_seen_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-        .bind(Uuid::now_v7().to_string()).bind(owner_id).bind(purpose_hash("login-session", token)).bind(csrf).bind(format_utc(now)).bind(format_utc(now)).bind(format_utc(now + SESSION_IDLE_TTL)).execute(&mut **transaction).await?;
+    let id = Uuid::now_v7().to_string();
+    let token_hash = purpose_hash("login-session", token);
+    let created_at = format_utc(now);
+    let last_seen_at = format_utc(now);
+    let expires_at = format_utc(now + SESSION_IDLE_TTL);
+    pool.collection::<Document>("login_sessions")
+        .insert_one(doc! {
+            "_id": &id,
+            "owner_id": owner_id,
+            "token_hash": &token_hash,
+            "csrf_token": csrf,
+            "created_at": &created_at,
+            "last_seen_at": &last_seen_at,
+            "expires_at": &expires_at,
+        })
+        .session(session)
+        .await?;
     Ok(())
 }
 
