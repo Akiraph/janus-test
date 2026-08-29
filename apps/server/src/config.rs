@@ -1,4 +1,4 @@
-﻿use std::{env, net::IpAddr, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, net::IpAddr, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use thiserror::Error;
 
@@ -110,8 +110,7 @@ impl Config {
             data_root,
             mongodb_uri: env::var("JANUS_MONGODB_URI")
                 .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
-            mongodb_database: env::var("JANUS_MONGODB_DATABASE")
-                .unwrap_or_else(|_| "janus".into()),
+            mongodb_database: env::var("JANUS_MONGODB_DATABASE").unwrap_or_else(|_| "janus".into()),
             web_dist: env::var_os("JANUS_WEB_DIST")
                 .map(PathBuf::from)
                 .filter(|path| !path.as_os_str().is_empty()),

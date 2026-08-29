@@ -12,9 +12,7 @@ use std::{
 use crate::clock::{format_utc, now_utc, now_utc_str};
 use anyhow::Context;
 use futures_util::TryStreamExt;
-use mongodb::{
-    bson::{Document, doc},
-};
+use mongodb::bson::{Document, doc};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
@@ -279,9 +277,7 @@ impl BlobStore {
                             },
                         )
                         .await?;
-                    return Err(anyhow::anyhow!(
-                        "blob cleanup intent {id} failed: {error}"
-                    ));
+                    return Err(anyhow::anyhow!("blob cleanup intent {id} failed: {error}"));
                 }
             }
         }
@@ -324,7 +320,10 @@ impl BlobStore {
             if referenced.contains(&sha) {
                 self.pool
                     .collection::<Document>("blob_objects")
-                    .update_one(doc! {"_id": &sha}, doc! {"$set": {"storage_state": "present"}})
+                    .update_one(
+                        doc! {"_id": &sha},
+                        doc! {"$set": {"storage_state": "present"}},
+                    )
                     .await?;
                 continue;
             }
@@ -354,7 +353,10 @@ impl BlobStore {
             if still_referenced.is_some() {
                 self.pool
                     .collection::<Document>("blob_objects")
-                    .update_one(doc! {"_id": &sha}, doc! {"$set": {"storage_state": "present"}})
+                    .update_one(
+                        doc! {"_id": &sha},
+                        doc! {"$set": {"storage_state": "present"}},
+                    )
                     .await?;
                 continue;
             }
@@ -369,7 +371,10 @@ impl BlobStore {
             } else {
                 self.pool
                     .collection::<Document>("blob_objects")
-                    .update_one(doc! {"_id": &sha}, doc! {"$set": {"storage_state": "present"}})
+                    .update_one(
+                        doc! {"_id": &sha},
+                        doc! {"$set": {"storage_state": "present"}},
+                    )
                     .await?;
             }
         }

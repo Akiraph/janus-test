@@ -13,7 +13,7 @@ use janus_server::{
     AppState,
     config::{Config, RunMode},
 };
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use tempfile::TempDir;
 
 static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -1183,7 +1183,10 @@ impl ExecutionInterface {
                 .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?
                 .unwrap_or(json!({}));
             if projection.get("round_id").and_then(Value::as_str) == Some(round_id_str.as_str()) {
-                already = document.get_str("source_resource_id").ok().map(str::to_owned);
+                already = document
+                    .get_str("source_resource_id")
+                    .ok()
+                    .map(str::to_owned);
                 break;
             }
         }
@@ -1327,7 +1330,9 @@ impl ExecutionInterface {
         attach_tool_display(&accepted.request.name, &input, &mut outcome);
         let summary = outcome.summary;
         let mut work = self.unit_of_work.begin().await?;
-        let round_ids = self.round_ids_for_turns_in_tx(work.connection(), &[turn_id]).await?;
+        let round_ids = self
+            .round_ids_for_turns_in_tx(work.connection(), &[turn_id])
+            .await?;
         let round_ids_str = round_ids
             .iter()
             .map(|id| id.to_string())
@@ -1467,7 +1472,9 @@ impl ExecutionInterface {
             work.rollback().await?;
             return Ok(None);
         }
-        let round_ids = self.round_ids_for_turns_in_tx(work.connection(), &[turn_id]).await?;
+        let round_ids = self
+            .round_ids_for_turns_in_tx(work.connection(), &[turn_id])
+            .await?;
         let round_ids_str = round_ids
             .iter()
             .map(|id| id.to_string())
@@ -1664,7 +1671,9 @@ impl ExecutionInterface {
         let now = now_utc_str();
         let summary_value = serde_json::to_value(&summary)?;
         let mut work = self.unit_of_work.begin().await?;
-        let round_ids = self.round_ids_for_turns_in_tx(work.connection(), &[turn_id]).await?;
+        let round_ids = self
+            .round_ids_for_turns_in_tx(work.connection(), &[turn_id])
+            .await?;
         let round_ids_str = round_ids
             .iter()
             .map(|id| id.to_string())
@@ -1692,12 +1701,10 @@ impl ExecutionInterface {
         let mut input_tokens = 0i64;
         let mut output_tokens = 0i64;
         while let Some(document) = sum_cursor.try_next().await? {
-            input_tokens = input_tokens.saturating_add(
-                document.get_i64("input_tokens").unwrap_or(0),
-            );
-            output_tokens = output_tokens.saturating_add(
-                document.get_i64("output_tokens").unwrap_or(0),
-            );
+            input_tokens =
+                input_tokens.saturating_add(document.get_i64("input_tokens").unwrap_or(0));
+            output_tokens =
+                output_tokens.saturating_add(document.get_i64("output_tokens").unwrap_or(0));
         }
         let transition = self
             .sessions

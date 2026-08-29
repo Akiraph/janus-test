@@ -297,7 +297,10 @@ impl ModelRow {
             provider_id: doc.get_str("provider_id")?.to_owned(),
             display_name: doc.get_str("display_name")?.to_owned(),
             upstream_model_id: doc.get_str("upstream_model_id")?.to_owned(),
-            context_limit: doc.get("context_limit").and_then(Bson::as_i64).unwrap_or_default(),
+            context_limit: doc
+                .get("context_limit")
+                .and_then(Bson::as_i64)
+                .unwrap_or_default(),
             supports_images: doc
                 .get("supports_images")
                 .and_then(Bson::as_bool)
@@ -457,10 +460,7 @@ impl ModelsInterface {
         }
         self.pool
             .collection::<Document>("automation_settings")
-            .update_one(
-                doc! {"_id": owner_id},
-                doc! {"$set": set},
-            )
+            .update_one(doc! {"_id": owner_id}, doc! {"$set": set})
             .upsert(true)
             .await?;
         Ok(())
@@ -489,30 +489,29 @@ impl ModelsInterface {
         owner_id: &str,
         preference: ModelPreference<'_>,
     ) -> Result<Option<ResolvedModel>, ModelsError> {
-        let (provider_filter, model_filter) =
-            if let (Some(provider_id), Some(upstream_model_id)) =
-                (preference.provider_id, preference.upstream_model_id)
-            {
-                (
-                    doc! {
-                        "_id": provider_id,
-                        "owner_id": owner_id,
-                        "client": "supervisor",
-                        "enabled": true,
-                    },
-                    doc! {"upstream_model_id": upstream_model_id},
-                )
-            } else if let Some(model_id) = preference.model_id {
-                (
-                    doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
-                    doc! {"_id": model_id},
-                )
-            } else {
-                (
-                    doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
-                    doc! {},
-                )
-            };
+        let (provider_filter, model_filter) = if let (Some(provider_id), Some(upstream_model_id)) =
+            (preference.provider_id, preference.upstream_model_id)
+        {
+            (
+                doc! {
+                    "_id": provider_id,
+                    "owner_id": owner_id,
+                    "client": "supervisor",
+                    "enabled": true,
+                },
+                doc! {"upstream_model_id": upstream_model_id},
+            )
+        } else if let Some(model_id) = preference.model_id {
+            (
+                doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
+                doc! {"_id": model_id},
+            )
+        } else {
+            (
+                doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
+                doc! {},
+            )
+        };
         Ok(self
             .resolve_models_in_tx(session, provider_filter, model_filter)
             .await?
@@ -891,10 +890,7 @@ impl ModelsInterface {
         let changed = self
             .pool
             .collection::<Document>("model_providers")
-            .update_one(
-                doc! {"_id": id, "owner_id": owner_id},
-                doc! {"$set": set},
-            )
+            .update_one(doc! {"_id": id, "owner_id": owner_id}, doc! {"$set": set})
             .session(work.connection())
             .await?
             .matched_count;
@@ -1343,7 +1339,11 @@ impl ModelsInterface {
                 .map(|(id, _, _)| id.clone());
             let id = existing_id.unwrap_or_else(|| ModelId::new().to_string());
             retained.insert(id.clone());
-            let context_limit = if input.supports_1m { 1_000_000i64 } else { 200_000i64 };
+            let context_limit = if input.supports_1m {
+                1_000_000i64
+            } else {
+                200_000i64
+            };
             self.pool
                 .collection::<Document>("models")
                 .update_one(

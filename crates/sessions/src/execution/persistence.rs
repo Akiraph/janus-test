@@ -326,9 +326,8 @@ impl SessionsInterface {
                     "attachment is missing or belongs to another session".into(),
                 ));
             };
-            let byte_size =
-                u64::try_from(read_i64(&attachment, "byte_size")?)
-                    .map_err(|error| SessionsError::Internal(error.into()))?;
+            let byte_size = u64::try_from(read_i64(&attachment, "byte_size")?)
+                .map_err(|error| SessionsError::Internal(error.into()))?;
             message_bytes = message_bytes
                 .checked_add(byte_size)
                 .ok_or_else(|| SessionsError::Validation("message is too large".into()))?;
@@ -425,8 +424,8 @@ impl SessionsInterface {
             .await?;
 
         for (ordinal, attachment) in attachments.iter().enumerate() {
-            let ord = i64::try_from(ordinal)
-                .map_err(|error| SessionsError::Internal(error.into()))?;
+            let ord =
+                i64::try_from(ordinal).map_err(|error| SessionsError::Internal(error.into()))?;
             self.pool
                 .collection::<Document>("message_attachments")
                 .insert_one(doc! {

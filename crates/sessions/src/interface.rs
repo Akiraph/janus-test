@@ -221,9 +221,10 @@ impl SessionsInterface {
         let mut ids = Vec::new();
         while let Some(document) = rows.try_next().await? {
             let id = read_str(document, "_id")?;
-            ids.push(id.parse::<SessionId>().map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!(error))
-            })?);
+            ids.push(
+                id.parse::<SessionId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+            );
         }
         Ok(ids)
     }
@@ -350,7 +351,8 @@ impl SessionsInterface {
         }
         let now = now_utc_str();
         let version = format!("v_{attachment_id}");
-        let byte_size = i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?;
+        let byte_size =
+            i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?;
         let mut work = self.unit_of_work.begin().await?;
         self.pool
             .collection::<Document>("uploads")
@@ -652,9 +654,10 @@ impl SessionsInterface {
         let mut turn_ids = Vec::new();
         while let Some(document) = turns.try_next().await? {
             let id = read_str(document, "_id")?;
-            turn_ids.push(id.parse::<TurnId>().map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!(error))
-            })?);
+            turn_ids.push(
+                id.parse::<TurnId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+            );
         }
         Ok(Some(SessionDeletionPlan {
             project_id,
@@ -1073,10 +1076,7 @@ impl SessionsInterface {
         String::new()
     }
 
-    async fn row_to_summary(
-        &self,
-        document: &Document,
-    ) -> Result<SessionSummary, SessionsError> {
+    async fn row_to_summary(&self, document: &Document) -> Result<SessionSummary, SessionsError> {
         Self::summary_from_row(document)
     }
 
@@ -1132,9 +1132,7 @@ fn timeline_row(
     })
 }
 
-fn attachment_resource(
-    document: &Document,
-) -> Result<AttachmentResource, SessionsError> {
+fn attachment_resource(document: &Document) -> Result<AttachmentResource, SessionsError> {
     let id = read_str(document, "_id")?
         .parse::<AttachmentId>()
         .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;

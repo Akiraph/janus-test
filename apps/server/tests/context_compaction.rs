@@ -9,7 +9,7 @@ use janus_execution::interface::{
     latest_compact_summary, record_context_version, schedule_compact,
 };
 use janus_infrastructure::{database::Database, id::SessionId};
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use serde_json::json;
 use tempfile::TempDir;
 

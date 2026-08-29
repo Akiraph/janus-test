@@ -50,10 +50,7 @@ impl WorkspaceInterface {
         let mut revisions = HashMap::new();
         while let Some(document) = cursor.try_next().await? {
             let handle = document.get_str("_id")?.to_owned();
-            if let Some(revision) = document
-                .get("current_revision_id")
-                .and_then(Bson::as_str)
-            {
+            if let Some(revision) = document.get("current_revision_id").and_then(Bson::as_str) {
                 revisions.insert(handle, RevisionRef(revision.to_owned()));
             }
         }

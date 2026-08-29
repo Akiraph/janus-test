@@ -11,8 +11,8 @@ use janus_infrastructure::{
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 use mongodb::{
-    bson::{Bson, Document, doc},
     Database,
+    bson::{Bson, Document, doc},
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

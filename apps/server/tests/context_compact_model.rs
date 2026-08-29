@@ -25,7 +25,7 @@ use janus_server::{
     AppState,
     config::{Config, RunMode},
 };
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -250,7 +250,10 @@ async fn compact_generates_a_model_summary_with_real_tokens() -> anyhow::Result<
     state
         .pool()
         .collection::<Document>("projects")
-        .update_one(doc! {"owner_id": "owner"}, doc! {"$set": {"default_model_id": &model_id}})
+        .update_one(
+            doc! {"owner_id": "owner"},
+            doc! {"$set": {"default_model_id": &model_id}},
+        )
         .await?;
 
     request_compact(&state, session_id).await?;

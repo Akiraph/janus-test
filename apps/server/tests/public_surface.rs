@@ -12,7 +12,7 @@ use janus_server::{
     config::{Config, RunMode},
     router,
 };
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -362,7 +362,11 @@ async fn data_root_lock_is_exclusive_and_reusable_after_close() -> anyhow::Resul
         TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let first = Database::open(directory.path(), &uri, &db_name).await?;
-    assert!(Database::open(directory.path(), &uri, &db_name).await.is_err());
+    assert!(
+        Database::open(directory.path(), &uri, &db_name)
+            .await
+            .is_err()
+    );
     drop(first);
     let reopened = Database::open(directory.path(), &uri, &db_name).await?;
     assert!(reopened.ready().await);

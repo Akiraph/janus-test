@@ -81,9 +81,10 @@ impl SessionsInterface {
         let mut ids = HashSet::new();
         while let Some(document) = rows.try_next().await? {
             let id = read_str(&document, "_id")?;
-            ids.insert(id.parse::<TurnId>().map_err(|error| {
-                SessionsError::Internal(anyhow::anyhow!(error))
-            })?);
+            ids.insert(
+                id.parse::<TurnId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+            );
         }
         Ok(ids)
     }

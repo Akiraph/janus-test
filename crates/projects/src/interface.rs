@@ -10,11 +10,9 @@
 //! application layer) executes them through the Operation interface so a
 //! process restart cannot silently drop a half-done clone.
 
-use janus_infrastructure::clock::now_utc_str;
 use futures_util::TryStreamExt;
-use mongodb::{
-    bson::{Bson, Document, doc},
-};
+use janus_infrastructure::clock::now_utc_str;
+use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -285,7 +283,10 @@ impl ProjectRow {
             state: document.get_str("state")?.to_owned(),
             repo_access: document.get_str("repo_access")?.to_owned(),
             repo_url: document.get_str("repo_url")?.to_owned(),
-            repo_branch: document.get("repo_branch").and_then(Bson::as_str).map(str::to_owned),
+            repo_branch: document
+                .get("repo_branch")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
             github_credential_id: document
                 .get("github_credential_id")
                 .and_then(Bson::as_str)
@@ -298,7 +299,10 @@ impl ProjectRow {
                 .get("main_workspace_handle")
                 .and_then(Bson::as_str)
                 .map(str::to_owned),
-            clone_error: document.get("clone_error").and_then(Bson::as_str).map(str::to_owned),
+            clone_error: document
+                .get("clone_error")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
             version: document.get_str("version")?.to_owned(),
             created_at: document.get_str("created_at")?.to_owned(),
             updated_at: document.get_str("updated_at")?.to_owned(),
@@ -698,7 +702,10 @@ impl ProjectsInterface {
             .flatten();
         match document {
             Some(document) => (
-                document.get("branch").and_then(Bson::as_str).map(str::to_owned),
+                document
+                    .get("branch")
+                    .and_then(Bson::as_str)
+                    .map(str::to_owned),
                 document
                     .get("git_state_version")
                     .and_then(Bson::as_str)

@@ -25,9 +25,7 @@ use janus_infrastructure::{
     unit_of_work::UnitOfWork,
 };
 use janus_workspace::interface::{WorkspaceError, WorkspaceHandle, WorkspaceInterface};
-use mongodb::{
-    bson::{Bson, Document, doc},
-};
+use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -476,7 +474,10 @@ impl ConflictPathRow {
                 .get("main_hash")
                 .and_then(Bson::as_str)
                 .map(str::to_owned),
-            choice: document.get("choice").and_then(Bson::as_str).map(str::to_owned),
+            choice: document
+                .get("choice")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
         })
     }
 }

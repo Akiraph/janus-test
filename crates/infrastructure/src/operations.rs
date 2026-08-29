@@ -976,12 +976,7 @@ impl OperationInterface {
             })
             .sort(doc! {"updated_at": -1})
             .await?;
-        Ok(document.and_then(|document| {
-            document
-                .get_str("_id")
-                .ok()
-                .map(str::to_owned)
-        }))
+        Ok(document.and_then(|document| document.get_str("_id").ok().map(str::to_owned)))
     }
 
     /// Operations stuck in `running` with an expired lease - startup recovery must
@@ -1167,7 +1162,7 @@ mod tests {
         testing::TestDb,
     };
     use chrono::Duration;
-    use mongodb::bson::{doc, Document};
+    use mongodb::bson::{Document, doc};
     use serde_json::json;
 
     /// A configured throwaway database with an owner row and a bare

@@ -2,9 +2,7 @@ use std::{fs::OpenOptions, path::Path};
 
 use anyhow::{Context, bail};
 use fs2::FileExt;
-use mongodb::{
-    bson::{doc, Document},
-};
+use mongodb::bson::{Document, doc};
 
 use crate::schema::{COLLECTIONS, INDEXLESS_COLLECTIONS, SCHEMA_VERSION, index_specs};
 
@@ -15,11 +13,7 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn open(
-        data_root: &Path,
-        uri: &str,
-        database_name: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn open(data_root: &Path, uri: &str, database_name: &str) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_root)
             .with_context(|| format!("create data root {}", data_root.display()))?;
         let lock_path = data_root.join("janus.lock");
@@ -106,9 +100,6 @@ impl Database {
     }
 
     pub async fn ready(&self) -> bool {
-        self.database
-            .run_command(doc! {"ping": 1})
-            .await
-            .is_ok()
+        self.database.run_command(doc! {"ping": 1}).await.is_ok()
     }
 }

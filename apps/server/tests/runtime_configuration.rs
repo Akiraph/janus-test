@@ -9,7 +9,7 @@ use janus_models::interface::{
 };
 use janus_projects::interface::ProjectsInterface;
 use janus_workspace::interface::WorkspaceInterface;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use tempfile::TempDir;
 
 const OWNER_ID: &str = "owner-test";

@@ -52,7 +52,12 @@ const READ_COLLECTION_METHODS: &[&str] = &[
 
 /// Helper call names inside `schema.rs::index_specs`. The first argument of
 /// each call is an index name; these must be globally unique.
-const INDEX_HELPERS: &[&str] = &["index", "unique_index", "partial_index", "unique_partial_index"];
+const INDEX_HELPERS: &[&str] = &[
+    "index",
+    "unique_index",
+    "partial_index",
+    "unique_partial_index",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "xtask")]
@@ -440,7 +445,10 @@ fn parse_schema_catalog(root: &Path) -> anyhow::Result<SchemaCatalog> {
             "COLLECTIONS" => {
                 for element in &array.elems {
                     let Expr::Tuple(tuple) = element else {
-                        bail!("{}: COLLECTIONS must be (name, owner) tuples", path.display());
+                        bail!(
+                            "{}: COLLECTIONS must be (name, owner) tuples",
+                            path.display()
+                        );
                     };
                     let name = string_value(&tuple.elems[0], &path)?;
                     let owner = string_value(&tuple.elems[1], &path)?;
@@ -456,13 +464,18 @@ fn parse_schema_catalog(root: &Path) -> anyhow::Result<SchemaCatalog> {
         }
     }
 
-    let Some(syn::Item::Fn(index_specs)) = file.items.iter().find(|item| {
-        matches!(item, syn::Item::Fn(func) if func.sig.ident == "index_specs")
-    }) else {
+    let Some(syn::Item::Fn(index_specs)) = file
+        .items
+        .iter()
+        .find(|item| matches!(item, syn::Item::Fn(func) if func.sig.ident == "index_specs"))
+    else {
         bail!("{}: missing index_specs()", path.display());
     };
     let Some(syn::Stmt::Expr(top, _)) = index_specs.block.stmts.last() else {
-        bail!("{}: index_specs() must end in an expression", path.display());
+        bail!(
+            "{}: index_specs() must end in an expression",
+            path.display()
+        );
     };
     let Expr::Macro(outer) = top else {
         bail!("{}: index_specs() must return a vec![...]", path.display());
@@ -473,11 +486,17 @@ fn parse_schema_catalog(root: &Path) -> anyhow::Result<SchemaCatalog> {
         .with_context(|| format!("{}: parse index_specs vec", path.display()))?;
     for tuple_expr in collection_tuples {
         let Expr::Tuple(tuple) = tuple_expr else {
-            bail!("{}: index_specs entries must be (collection, vec) tuples", path.display());
+            bail!(
+                "{}: index_specs entries must be (collection, vec) tuples",
+                path.display()
+            );
         };
         let collection = string_value(&tuple.elems[0], &path)?;
         let Expr::Macro(index_vec) = &tuple.elems[1] else {
-            bail!("{}: index_specs entry {collection} must map to vec![...]", path.display());
+            bail!(
+                "{}: index_specs entry {collection} must map to vec![...]",
+                path.display()
+            );
         };
         let index_exprs = index_vec
             .mac
@@ -549,9 +568,7 @@ fn validate_schema_declarations(
         let is_indexed = catalog.indexed.contains(collection);
         let is_indexless = catalog.indexless.contains(collection);
         if is_indexed == is_indexless {
-            bail!(
-                "schema.rs collection {collection} must be exactly one of indexed or indexless"
-            );
+            bail!("schema.rs collection {collection} must be exactly one of indexed or indexless");
         }
     }
     Ok(())
@@ -610,7 +627,10 @@ fn validate_production_collection_access(
         }
         for (collection, is_write) in collector.accesses {
             let owner = collection_owners.get(&collection).with_context(|| {
-                format!("{} accesses unregistered collection {collection}", file.display())
+                format!(
+                    "{} accesses unregistered collection {collection}",
+                    file.display()
+                )
             })?;
             if is_write && source_owner != Some(owner.as_str()) {
                 bail!(
@@ -835,8 +855,8 @@ mod tests {
     use std::{collections::BTreeSet, path::Path};
 
     use super::{
-        validate_dependency, validate_module_reference, CollectionAccessCollector,
-        collection_in_receiver_spine,
+        CollectionAccessCollector, collection_in_receiver_spine, validate_dependency,
+        validate_module_reference,
     };
 
     #[test]
@@ -924,7 +944,14 @@ mod tests {
 
     #[test]
     fn receiver_spine_finds_collection_through_chaining() {
-        let expr = syn::parse_quote!(pool.collection::<Document>("sessions").find(doc! {}).sort(doc! {}));
-        assert_eq!(collection_in_receiver_spine(&expr), Some("sessions".to_owned()));
+        let expr = syn::parse_quote!(
+            pool.collection::<Document>("sessions")
+                .find(doc! {})
+                .sort(doc! {})
+        );
+        assert_eq!(
+            collection_in_receiver_spine(&expr),
+            Some("sessions".to_owned())
+        );
     }
 }

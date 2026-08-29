@@ -53,14 +53,38 @@ impl RuntimeRow {
     fn from_document(document: &Document) -> Result<Self, RuntimeError> {
         Ok(Self {
             id: document.get_str("_id").map_err(storage_error)?.to_owned(),
-            scope_kind: document.get_str("scope_kind").map_err(storage_error)?.to_owned(),
-            scope_id: document.get_str("scope_id").map_err(storage_error)?.to_owned(),
-            executor_nonce: document.get_str("executor_nonce").map_err(storage_error)?.to_owned(),
-            limits_json: document.get_str("limits_json").map_err(storage_error)?.to_owned(),
-            status: document.get_str("status").map_err(storage_error)?.to_owned(),
-            version: document.get_str("version").map_err(storage_error)?.to_owned(),
-            created_at: document.get_str("created_at").map_err(storage_error)?.to_owned(),
-            updated_at: document.get_str("updated_at").map_err(storage_error)?.to_owned(),
+            scope_kind: document
+                .get_str("scope_kind")
+                .map_err(storage_error)?
+                .to_owned(),
+            scope_id: document
+                .get_str("scope_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            executor_nonce: document
+                .get_str("executor_nonce")
+                .map_err(storage_error)?
+                .to_owned(),
+            limits_json: document
+                .get_str("limits_json")
+                .map_err(storage_error)?
+                .to_owned(),
+            status: document
+                .get_str("status")
+                .map_err(storage_error)?
+                .to_owned(),
+            version: document
+                .get_str("version")
+                .map_err(storage_error)?
+                .to_owned(),
+            created_at: document
+                .get_str("created_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            updated_at: document
+                .get_str("updated_at")
+                .map_err(storage_error)?
+                .to_owned(),
             stopped_at: opt_str(document, "stopped_at"),
         })
     }
@@ -88,21 +112,51 @@ impl AsyncTaskRow {
     fn from_document(document: &Document) -> Result<Self, RuntimeError> {
         Ok(Self {
             id: document.get_str("_id").map_err(storage_error)?.to_owned(),
-            runtime_id: document.get_str("runtime_id").map_err(storage_error)?.to_owned(),
-            session_id: document.get_str("session_id").map_err(storage_error)?.to_owned(),
+            runtime_id: document
+                .get_str("runtime_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            session_id: document
+                .get_str("session_id")
+                .map_err(storage_error)?
+                .to_owned(),
             initiated_by_tool_call_id: document
                 .get_str("initiated_by_tool_call_id")
                 .map_err(storage_error)?
                 .to_owned(),
-            controlling_turn_id: document.get_str("controlling_turn_id").map_err(storage_error)?.to_owned(),
-            command_summary: document.get_str("command_summary").map_err(storage_error)?.to_owned(),
-            executor_nonce: document.get_str("executor_nonce").map_err(storage_error)?.to_owned(),
-            log_stream_id: document.get_str("log_stream_id").map_err(storage_error)?.to_owned(),
-            status: document.get_str("status").map_err(storage_error)?.to_owned(),
+            controlling_turn_id: document
+                .get_str("controlling_turn_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            command_summary: document
+                .get_str("command_summary")
+                .map_err(storage_error)?
+                .to_owned(),
+            executor_nonce: document
+                .get_str("executor_nonce")
+                .map_err(storage_error)?
+                .to_owned(),
+            log_stream_id: document
+                .get_str("log_stream_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            status: document
+                .get_str("status")
+                .map_err(storage_error)?
+                .to_owned(),
             exit_json: opt_str(document, "exit_json"),
-            usage_json: document.get_str("usage_json").map_err(storage_error)?.to_owned(),
-            version: document.get_str("version").map_err(storage_error)?.to_owned(),
-            created_at: document.get_str("created_at").map_err(storage_error)?.to_owned(),
+            usage_json: document
+                .get_str("usage_json")
+                .map_err(storage_error)?
+                .to_owned(),
+            version: document
+                .get_str("version")
+                .map_err(storage_error)?
+                .to_owned(),
+            created_at: document
+                .get_str("created_at")
+                .map_err(storage_error)?
+                .to_owned(),
             started_at: opt_str(document, "started_at"),
             ended_at: opt_str(document, "ended_at"),
         })
@@ -130,21 +184,45 @@ impl TerminalRow {
     fn from_document(document: &Document) -> Result<Self, RuntimeError> {
         Ok(Self {
             id: document.get_str("_id").map_err(storage_error)?.to_owned(),
-            runtime_id: document.get_str("runtime_id").map_err(storage_error)?.to_owned(),
-            owner_kind: document.get_str("owner_kind").map_err(storage_error)?.to_owned(),
-            owner_id: document.get_str("owner_id").map_err(storage_error)?.to_owned(),
-            executor_nonce: document.get_str("executor_nonce").map_err(storage_error)?.to_owned(),
+            runtime_id: document
+                .get_str("runtime_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            owner_kind: document
+                .get_str("owner_kind")
+                .map_err(storage_error)?
+                .to_owned(),
+            owner_id: document
+                .get_str("owner_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            executor_nonce: document
+                .get_str("executor_nonce")
+                .map_err(storage_error)?
+                .to_owned(),
             cols: document.get_i64("cols").map_err(storage_error)?,
             rows: document.get_i64("rows").map_err(storage_error)?,
             scrollback_stream_id: document
                 .get_str("scrollback_stream_id")
                 .map_err(storage_error)?
                 .to_owned(),
-            status: document.get_str("status").map_err(storage_error)?.to_owned(),
+            status: document
+                .get_str("status")
+                .map_err(storage_error)?
+                .to_owned(),
             exit_json: opt_str(document, "exit_json"),
-            version: document.get_str("version").map_err(storage_error)?.to_owned(),
-            created_at: document.get_str("created_at").map_err(storage_error)?.to_owned(),
-            updated_at: document.get_str("updated_at").map_err(storage_error)?.to_owned(),
+            version: document
+                .get_str("version")
+                .map_err(storage_error)?
+                .to_owned(),
+            created_at: document
+                .get_str("created_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            updated_at: document
+                .get_str("updated_at")
+                .map_err(storage_error)?
+                .to_owned(),
             ended_at: opt_str(document, "ended_at"),
         })
     }
@@ -162,10 +240,22 @@ struct TerminalTicketRow {
 impl TerminalTicketRow {
     fn from_document(document: &Document) -> Result<Self, RuntimeError> {
         Ok(Self {
-            terminal_id: document.get_str("terminal_id").map_err(storage_error)?.to_owned(),
-            actor_id: document.get_str("actor_id").map_err(storage_error)?.to_owned(),
-            origin: document.get_str("origin").map_err(storage_error)?.to_owned(),
-            expires_at: document.get_str("expires_at").map_err(storage_error)?.to_owned(),
+            terminal_id: document
+                .get_str("terminal_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            actor_id: document
+                .get_str("actor_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            origin: document
+                .get_str("origin")
+                .map_err(storage_error)?
+                .to_owned(),
+            expires_at: document
+                .get_str("expires_at")
+                .map_err(storage_error)?
+                .to_owned(),
             consumed_at: opt_str(document, "consumed_at"),
             revoked_at: opt_str(document, "revoked_at"),
         })
@@ -239,7 +329,9 @@ impl RuntimeInterface {
             .map_err(storage_error)?;
         let mut projections = Vec::new();
         while let Some(document) = rows.try_next().await.map_err(storage_error)? {
-            projections.push(async_task_projection(&AsyncTaskRow::from_document(&document)?)?);
+            projections.push(async_task_projection(&AsyncTaskRow::from_document(
+                &document,
+            )?)?);
         }
         Ok(projections)
     }
@@ -311,7 +403,9 @@ impl RuntimeInterface {
             .map_err(storage_error)?;
         let mut projections = Vec::new();
         while let Some(document) = rows.try_next().await.map_err(storage_error)? {
-            projections.push(async_task_projection(&AsyncTaskRow::from_document(&document)?)?);
+            projections.push(async_task_projection(&AsyncTaskRow::from_document(
+                &document,
+            )?)?);
         }
         Ok(projections)
     }
@@ -705,9 +799,7 @@ impl RuntimeInterface {
         &self,
         session_id: SessionId,
     ) -> Result<(), RuntimeError> {
-        let ids = self
-            .session_log_stream_ids(&session_id.to_string())
-            .await?;
+        let ids = self.session_log_stream_ids(&session_id.to_string()).await?;
         let ids = ids
             .into_iter()
             .map(|id| id.parse().map_err(storage_error))
@@ -719,9 +811,7 @@ impl RuntimeInterface {
         &self,
         project_id: ProjectId,
     ) -> Result<(), RuntimeError> {
-        let ids = self
-            .project_log_stream_ids(&project_id.to_string())
-            .await?;
+        let ids = self.project_log_stream_ids(&project_id.to_string()).await?;
         let ids = ids
             .into_iter()
             .map(|id| id.parse().map_err(storage_error))
@@ -815,7 +905,9 @@ impl RuntimeInterface {
             .map_err(storage_error)?;
         let mut projections = Vec::new();
         while let Some(document) = rows.try_next().await.map_err(storage_error)? {
-            projections.push(async_task_projection(&AsyncTaskRow::from_document(&document)?)?);
+            projections.push(async_task_projection(&AsyncTaskRow::from_document(
+                &document,
+            )?)?);
         }
         Ok(projections)
     }
@@ -1297,12 +1389,14 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?;
         if let Some(stream) = stream {
-            terminal.first_cursor =
-                LogCursor::new(u64::try_from(stream.get_i64("first_cursor").map_err(storage_error)?)
-                    .map_err(storage_error)?);
-            terminal.next_cursor =
-                LogCursor::new(u64::try_from(stream.get_i64("next_cursor").map_err(storage_error)?)
-                    .map_err(storage_error)?);
+            terminal.first_cursor = LogCursor::new(
+                u64::try_from(stream.get_i64("first_cursor").map_err(storage_error)?)
+                    .map_err(storage_error)?,
+            );
+            terminal.next_cursor = LogCursor::new(
+                u64::try_from(stream.get_i64("next_cursor").map_err(storage_error)?)
+                    .map_err(storage_error)?,
+            );
         }
         work.append_event(NewEvent {
             event_type: EventType::TerminalChanged,

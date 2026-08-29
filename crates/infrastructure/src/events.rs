@@ -235,17 +235,16 @@ impl EventStore {
             .inner
             .pool
             .collection::<Document>("event_seq")
-            .find_one_and_update(
-                doc! {"_id": "global"},
-                doc! {"$inc": {"value": 1i64}},
-            )
+            .find_one_and_update(doc! {"_id": "global"}, doc! {"$inc": {"value": 1i64}})
             .upsert(true)
             .return_document(ReturnDocument::After)
             .session(&mut *session)
             .await
             .context("allocate event cursor")?
             .ok_or_else(|| anyhow::anyhow!("event cursor did not materialize"))?;
-        let cursor = next.get_i64("value").context("event cursor missing value")?;
+        let cursor = next
+            .get_i64("value")
+            .context("event cursor missing value")?;
 
         let actor_json = serde_json::to_string(&event.actor)?;
         let payload_json = serde_json::to_string(&event.payload)?;
@@ -293,10 +292,7 @@ impl EventStore {
 
     pub async fn bounds(&self) -> anyhow::Result<EventBounds> {
         let collection = self.inner.pool.collection::<Document>("public_events");
-        let max = collection
-            .find_one(doc! {})
-            .sort(doc! {"_id": -1})
-            .await?;
+        let max = collection.find_one(doc! {}).sort(doc! {"_id": -1}).await?;
         let min = collection.find_one(doc! {}).sort(doc! {"_id": 1}).await?;
         let min = min
             .and_then(|document| document.get_i64("_id").ok())
@@ -365,10 +361,7 @@ impl EventStore {
         self.inner
             .pool
             .collection::<Document>("projection_cursor")
-            .update_one(
-                doc! {"_id": "1"},
-                doc! {"$set": {"cursor": cursor}},
-            )
+            .update_one(doc! {"_id": "1"}, doc! {"$set": {"cursor": cursor}})
             .upsert(true)
             .await?;
         Ok(())

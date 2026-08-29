@@ -8,7 +8,7 @@
 
 use mongodb::{
     bson::doc,
-    options::{IndexOptions, IndexModel},
+    options::{IndexModel, IndexOptions},
 };
 
 /// Highest applied schema shape. The old SQLite migrator recorded version 4
@@ -165,7 +165,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         (
             "public_events",
             vec![
-                index("public_events_type_cursor_idx", doc! {"event_type": 1, "_id": 1}),
+                index(
+                    "public_events_type_cursor_idx",
+                    doc! {"event_type": 1, "_id": 1},
+                ),
                 unique_index("public_events_event_id_idx", doc! {"event_id": 1}),
             ],
         ),
@@ -173,7 +176,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
             "operations",
             vec![
                 index("operations_status_idx", doc! {"status": 1}),
-                index("operations_target_idx", doc! {"target_kind": 1, "target_id": 1}),
+                index(
+                    "operations_target_idx",
+                    doc! {"target_kind": 1, "target_id": 1},
+                ),
             ],
         ),
         (
@@ -317,7 +323,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         (
             "projects",
             vec![
-                index("projects_owner_idx", doc! {"owner_id": 1, "last_activity_at": 1}),
+                index(
+                    "projects_owner_idx",
+                    doc! {"owner_id": 1, "last_activity_at": 1},
+                ),
                 index("projects_state_idx", doc! {"state": 1}),
             ],
         ),
@@ -367,7 +376,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         (
             "async_tasks",
             vec![
-                index("async_tasks_session_idx", doc! {"session_id": 1, "created_at": 1}),
+                index(
+                    "async_tasks_session_idx",
+                    doc! {"session_id": 1, "created_at": 1},
+                ),
                 index(
                     "async_tasks_turn_idx",
                     doc! {"controlling_turn_id": 1, "status": 1},
@@ -397,7 +409,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         (
             "sessions",
             vec![
-                index("sessions_project_idx", doc! {"project_id": 1, "last_activity_at": 1}),
+                index(
+                    "sessions_project_idx",
+                    doc! {"project_id": 1, "last_activity_at": 1},
+                ),
                 index("sessions_state_idx", doc! {"state": 1}),
             ],
         ),
@@ -420,7 +435,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         (
             "messages",
             vec![
-                index("messages_session_idx", doc! {"session_id": 1, "created_at": 1}),
+                index(
+                    "messages_session_idx",
+                    doc! {"session_id": 1, "created_at": 1},
+                ),
                 index("messages_turn_idx", doc! {"turn_id": 1}),
             ],
         ),
@@ -443,7 +461,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         ),
         (
             "uploads",
-            vec![index("uploads_owner_idx", doc! {"owner_id": 1, "created_at": 1})],
+            vec![index(
+                "uploads_owner_idx",
+                doc! {"owner_id": 1, "created_at": 1},
+            )],
         ),
         (
             "attachments",
@@ -503,7 +524,10 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
         ),
         (
             "workspace_copies",
-            vec![index("workspace_copies_project_idx", doc! {"project_id": 1})],
+            vec![index(
+                "workspace_copies_project_idx",
+                doc! {"project_id": 1},
+            )],
         ),
         (
             "content_revisions",

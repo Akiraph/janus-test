@@ -4,9 +4,8 @@ use chrono::{DateTime, Duration, Utc};
 use futures_util::TryStreamExt;
 use janus_infrastructure::clock::{format_utc, now_utc_str};
 use mongodb::{
-    ClientSession,
+    ClientSession, Database,
     bson::{Bson, Document, doc},
-    Database,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -340,8 +339,14 @@ impl IdentityInterface {
             now,
         )
         .await?;
-        insert_recovery_codes(&self.pool, &mut session, &state.owner_id, &recovery_codes, now)
-            .await?;
+        insert_recovery_codes(
+            &self.pool,
+            &mut session,
+            &state.owner_id,
+            &recovery_codes,
+            now,
+        )
+        .await?;
         insert_session(
             &self.pool,
             &mut session,
@@ -1000,7 +1005,10 @@ impl IdentityInterface {
             .ok_or(IdentityError::AuthRequired)
     }
 
-    async fn credential_ids(&self, owner_id: &str) -> Result<Vec<webauthn_rs::prelude::CredentialID>, IdentityError> {
+    async fn credential_ids(
+        &self,
+        owner_id: &str,
+    ) -> Result<Vec<webauthn_rs::prelude::CredentialID>, IdentityError> {
         let mut cursor = self
             .pool
             .collection::<Document>("passkeys")
