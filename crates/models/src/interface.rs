@@ -1229,7 +1229,7 @@ impl ModelsInterface {
         now: &str,
     ) -> Result<u64, ModelsError> {
         let error_json = serde_json::json!({"code": "USER_CANCEL"}).to_string();
-        let mut canceled = 0i64;
+        let mut canceled = 0u64;
         for round_id in round_ids {
             let updated = self
                 .pool
@@ -1248,9 +1248,7 @@ impl ModelsInterface {
                 .await?;
             canceled += updated.matched_count;
         }
-        Ok(u64::try_from(canceled).map_err(|_| {
-            ModelsError::Internal(anyhow::anyhow!("canceled attempt count overflow"))
-        })?)
+        Ok(canceled)
     }
 
     pub async fn delete_attempts_for_rounds_in_tx(
@@ -1258,7 +1256,7 @@ impl ModelsInterface {
         session: &mut ClientSession,
         round_ids: &[RoundId],
     ) -> Result<u64, ModelsError> {
-        let mut deleted = 0i64;
+        let mut deleted = 0u64;
         for round_id in round_ids {
             let result = self
                 .pool
@@ -1268,9 +1266,7 @@ impl ModelsInterface {
                 .await?;
             deleted += result.deleted_count;
         }
-        Ok(u64::try_from(deleted).map_err(|_| {
-            ModelsError::Internal(anyhow::anyhow!("deleted attempt count overflow"))
-        })?)
+        Ok(deleted)
     }
 
     pub async fn latest_attempt_for_rounds(
