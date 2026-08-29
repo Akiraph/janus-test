@@ -496,7 +496,11 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
                 unique_partial_index(
                     "tool_calls_provider_call_idx",
                     doc! {"round_id": 1, "provider_call_id": 1},
-                    doc! {"provider_call_id": {"$ne": null}},
+                    // MongoDB partial filters reject $ne (it desugars to $not);
+                    // $gt: null keeps the SQL `provider_call_id IS NOT NULL`
+                    // semantics — missing fields compare as null, and null is
+                    // below every real BSON value.
+                    doc! {"provider_call_id": {"$gt": null}},
                 ),
             ],
         ),
