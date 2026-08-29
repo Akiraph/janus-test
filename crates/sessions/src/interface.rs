@@ -1108,12 +1108,12 @@ fn timeline_row(
         .and_then(|id| turns.get(&id))
         .map(|turn| {
             Ok::<TimelineTurnStatus, SessionsError>(TimelineTurnStatus {
-                id: read_str(&turn, "_id")?,
-                status: read_str(&turn, "status")?,
+                id: read_str(turn, "_id")?,
+                status: read_str(turn, "status")?,
                 cancellation_reason: opt_str(turn, "cancellation_reason"),
                 completion_reason: opt_str(turn, "completion_reason"),
-                created_at: read_str(&turn, "created_at")?,
-                updated_at: read_str(&turn, "updated_at")?,
+                created_at: read_str(turn, "created_at")?,
+                updated_at: read_str(turn, "updated_at")?,
             })
         })
         .transpose()?;
