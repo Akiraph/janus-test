@@ -120,7 +120,10 @@ async fn provider_embeds_models_and_masks_key_without_leaking() -> anyhow::Resul
         .await?
         .expect("provider row")
         .get("api_key_ciphertext")
-        .and_then(Bson::as_binary)
+        .and_then(|value| match value {
+            Bson::Binary(binary) => Some(binary),
+            _ => None,
+        })
         .expect("api_key_ciphertext stored as BSON binary")
         .bytes
         .clone();

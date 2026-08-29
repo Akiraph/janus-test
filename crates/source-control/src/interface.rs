@@ -415,8 +415,10 @@ impl CredentialRow {
         Ok(Self {
             pat_ciphertext: document
                 .get("pat_ciphertext")
-                .and_then(Bson::as_binary)
-                .map(|binary| binary.bytes.clone()),
+                .and_then(|value| match value {
+                    Bson::Binary(binary) => Some(binary.bytes.clone()),
+                    _ => None,
+                }),
         })
     }
 }

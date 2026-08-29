@@ -1063,7 +1063,13 @@ impl ProjectsInterface {
             "updated_at": &now,
         };
         if let Some(ciphertext) = ciphertext {
-            document.insert("pat_ciphertext", ciphertext);
+            document.insert(
+                "pat_ciphertext",
+                Bson::Binary(mongodb::bson::Binary {
+                    subtype: mongodb::bson::BinarySubtype::Generic,
+                    bytes: ciphertext,
+                }),
+            );
         }
         let mut work = self.unit_of_work.begin().await?;
         self.pool
@@ -1240,21 +1246,35 @@ impl ProjectsInterface {
         let automation_enabled = input
             .automation_enabled
             .unwrap_or(existing.automation_enabled);
+        let mut set = doc! {
+            "name": name,
+            "github_host": host,
+            "pat_fingerprint": fingerprint,
+            "automation_enabled": automation_enabled,
+            "version": &new_version,
+            "updated_at": &now,
+        };
+        match &ciphertext {
+            Some(bytes) => {
+                set.insert(
+                    "pat_ciphertext",
+                    Bson::Binary(mongodb::bson::Binary {
+                        subtype: mongodb::bson::BinarySubtype::Generic,
+                        bytes: bytes.clone(),
+                    }),
+                );
+            }
+            None => {
+                set.insert("pat_ciphertext", Bson::Null);
+            }
+        }
         let mut work = self.unit_of_work.begin().await?;
         let changed = self
             .pool
             .collection::<Document>("github_credentials")
             .update_one(
                 doc! {"_id": id, "owner_id": owner_id, "version": expected_version},
-                doc! {"$set": {
-                    "name": name,
-                    "github_host": host,
-                    "pat_ciphertext": ciphertext,
-                    "pat_fingerprint": fingerprint,
-                    "automation_enabled": automation_enabled,
-                    "version": &new_version,
-                    "updated_at": &now,
-                }},
+                doc! {"$set": set},
             )
             .session(&mut *work.connection())
             .await?
@@ -1869,8 +1889,10 @@ impl CredentialRow {
             github_host: document.get_str("github_host")?.to_owned(),
             pat_ciphertext: document
                 .get("pat_ciphertext")
-                .and_then(Bson::as_binary)
-                .map(|binary| binary.bytes.clone()),
+                .and_then(|value| match value {
+                    Bson::Binary(binary) => Some(binary.bytes.clone()),
+                    _ => None,
+                }),
             pat_fingerprint: document
                 .get("pat_fingerprint")
                 .and_then(Bson::as_str)

@@ -260,8 +260,10 @@ impl ProviderRow {
             base_url: doc.get_str("base_url")?.to_owned(),
             api_key_ciphertext: doc
                 .get("api_key_ciphertext")
-                .and_then(Bson::as_binary)
-                .map(|binary| binary.bytes.clone()),
+                .and_then(|value| match value {
+                    Bson::Binary(binary) => Some(binary.bytes.clone()),
+                    _ => None,
+                }),
             api_key_fingerprint: doc
                 .get("api_key_fingerprint")
                 .and_then(Bson::as_str)

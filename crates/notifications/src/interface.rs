@@ -147,8 +147,10 @@ impl ChannelRow {
             endpoint_url: doc.get_str("endpoint_url")?.to_owned(),
             secret_ciphertext: doc
                 .get("secret_ciphertext")
-                .and_then(Bson::as_binary)
-                .map(|binary| binary.bytes.clone()),
+                .and_then(|value| match value {
+                    Bson::Binary(binary) => Some(binary.bytes.clone()),
+                    _ => None,
+                }),
             target_json: doc.get_str("target_json")?.to_owned(),
             events_json: doc.get_str("events_json")?.to_owned(),
             enabled: doc.get("enabled").and_then(Bson::as_bool).unwrap_or(false),
