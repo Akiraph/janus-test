@@ -1,8 +1,8 @@
 use std::{path::Path, sync::Arc};
 
 use janus_infrastructure::clock::now_utc_str;
+use mongodb::bson::{Document, doc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
 use tokio::sync::Mutex;
 
 use super::interface::{
@@ -42,12 +42,11 @@ impl LogRetention {
 
 #[derive(Clone)]
 pub struct LogStore {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     root: Arc<std::path::PathBuf>,
     gate: Arc<Mutex<()>>,
 }
 
-#[derive(FromRow)]
 struct StreamRow {
     id: String,
     relative_path: String,
@@ -55,8 +54,26 @@ struct StreamRow {
     next_cursor: i64,
     retained_bytes: i64,
     total_bytes: i64,
-    truncated: i64,
-    closed: i64,
+    truncated: bool,
+    closed: bool,
+}
+
+impl StreamRow {
+    fn from_document(document: &Document) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            id: document.get_str("_id").map_err(storage_error)?.to_owned(),
+            relative_path: document
+                .get_str("relative_path")
+                .map_err(storage_error)?
+                .to_owned(),
+            first_cursor: document.get_i64("first_cursor").map_err(storage_error)?,
+            next_cursor: document.get_i64("next_cursor").map_err(storage_error)?,
+            retained_bytes: document.get_i64("retained_bytes").map_err(storage_error)?,
+            total_bytes: document.get_i64("total_bytes").map_err(storage_error)?,
+            truncated: document.get_bool("truncated").map_err(storage_error)?,
+            closed: document.get_bool("closed").map_err(storage_error)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,7 +86,7 @@ struct DiskChunk {
 }
 
 impl LogStore {
-    pub fn new(pool: SqlitePool, data_root: &Path) -> Self {
+    pub fn new(pool: mongodb::Database, data_root: &Path) -> Self {
         Self {
             pool,
             root: Arc::new(data_root.join("runtime").join("logs")),
@@ -84,7 +101,8 @@ impl LogStore {
     ) -> Result<LogStreamProjection, RuntimeError> {
         let _guard = self.gate.lock().await;
         let id = LogStreamId::new();
-        let relative_path = id.to_string();
+        let id_string = id.to_string();
+        let relative_path = id_string.clone();
         tokio::fs::create_dir_all(self.root.join(&relative_path))
             .await
             .map_err(storage_error)?;
@@ -93,25 +111,28 @@ impl LogStore {
         // for every synchronous command, so it cannot satisfy the historical
         // owner uniqueness constraint.
         let stored_owner_id = if owner == LogOwnerKind::Sync {
-            id.to_string()
+            id_string.clone()
         } else {
             owner_id.to_owned()
         };
-        sqlx::query(
-            "INSERT INTO log_streams \
-             (id, owner_kind, owner_id, relative_path, first_cursor, next_cursor, retained_bytes, \
-              total_bytes, truncated, closed, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(owner.as_str())
-        .bind(stored_owner_id)
-        .bind(&relative_path)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        self.pool
+            .collection::<Document>("log_streams")
+            .insert_one(doc! {
+                "_id": &id_string,
+                "owner_kind": owner.as_str(),
+                "owner_id": &stored_owner_id,
+                "relative_path": &relative_path,
+                "first_cursor": 0i64,
+                "next_cursor": 0i64,
+                "retained_bytes": 0i64,
+                "total_bytes": 0i64,
+                "truncated": false,
+                "closed": false,
+                "created_at": &now,
+                "updated_at": &now,
+            })
+            .await
+            .map_err(storage_error)?;
         Ok(LogStreamProjection {
             id,
             first_cursor: LogCursor::new(0),
@@ -163,35 +184,43 @@ impl LogStore {
         let (first_cursor, retained_bytes, truncated) =
             enforce_retention(&directory, cursor, total_bytes, retention).await?;
         let now = now_utc_str();
-        sqlx::query(
-            "UPDATE log_streams SET first_cursor = ?, next_cursor = ?, retained_bytes = ?, \
-             total_bytes = ?, truncated = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(to_i64(first_cursor)?)
-        .bind(to_i64(cursor)?)
-        .bind(to_i64(retained_bytes)?)
-        .bind(to_i64(total_bytes)?)
-        .bind(truncated)
-        .bind(now)
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let first_cursor = to_i64(first_cursor)?;
+        let next_cursor = to_i64(cursor)?;
+        let retained_bytes = to_i64(retained_bytes)?;
+        let total_bytes = to_i64(total_bytes)?;
+        self.pool
+            .collection::<Document>("log_streams")
+            .update_one(
+                doc! {"_id": id.to_string()},
+                doc! {
+                    "$set": {
+                        "first_cursor": first_cursor,
+                        "next_cursor": next_cursor,
+                        "retained_bytes": retained_bytes,
+                        "total_bytes": total_bytes,
+                        "truncated": truncated,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .await
+            .map_err(storage_error)?;
         self.projection_unlocked(id).await
     }
 
     pub async fn close(&self, id: LogStreamId) -> Result<LogStreamProjection, RuntimeError> {
         let _guard = self.gate.lock().await;
         let now = now_utc_str();
-        if sqlx::query("UPDATE log_streams SET closed = 1, updated_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(id.to_string())
-            .execute(&self.pool)
+        let changed = self
+            .pool
+            .collection::<Document>("log_streams")
+            .update_one(
+                doc! {"_id": id.to_string()},
+                doc! {"$set": {"closed": true, "updated_at": &now}},
+            )
             .await
-            .map_err(storage_error)?
-            .rows_affected()
-            == 0
-        {
+            .map_err(storage_error)?;
+        if changed.matched_count == 0 {
             return Err(RuntimeError::unavailable(format!(
                 "log stream {id} does not exist"
             )));
@@ -286,15 +315,18 @@ impl LogStore {
     }
 
     async fn row(&self, id: LogStreamId) -> Result<StreamRow, RuntimeError> {
-        sqlx::query_as::<_, StreamRow>(
-            "SELECT id, relative_path, first_cursor, next_cursor, retained_bytes, total_bytes, \
-             truncated, closed FROM log_streams WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .ok_or_else(|| RuntimeError::unavailable(format!("log stream {id} does not exist")))
+        match self
+            .pool
+            .collection::<Document>("log_streams")
+            .find_one(doc! {"_id": id.to_string()})
+            .await
+            .map_err(storage_error)?
+        {
+            Some(document) => StreamRow::from_document(&document),
+            None => Err(RuntimeError::unavailable(format!(
+                "log stream {id} does not exist"
+            ))),
+        }
     }
 }
 
@@ -308,8 +340,8 @@ fn projection_from_row(row: &StreamRow) -> Result<LogStreamProjection, RuntimeEr
         next_cursor: LogCursor::new(to_u64(row.next_cursor, "next_cursor")?),
         retained_bytes: to_u64(row.retained_bytes, "retained_bytes")?,
         total_bytes: to_u64(row.total_bytes, "total_bytes")?,
-        truncated: row.truncated != 0,
-        closed: row.closed != 0,
+        truncated: row.truncated,
+        closed: row.closed,
     })
 }
 
@@ -551,49 +583,25 @@ fn storage_error(error: impl Into<anyhow::Error>) -> RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use janus_infrastructure::id::AsyncTaskId;
+    use janus_infrastructure::testing::TestDb;
     use tempfile::TempDir;
 
     use super::{LogRetention, LogStore};
     use crate::interface::{LogChannel, LogCursor, LogOwnerKind};
-    use janus_infrastructure::id::AsyncTaskId;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn test_store() -> anyhow::Result<(TempDir, LogStore)> {
+    async fn test_store() -> anyhow::Result<(TempDir, LogStore, Arc<TestDb>)> {
         let temp = TempDir::new()?;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await?;
-        sqlx::query(
-            "CREATE TABLE log_streams (
-                id TEXT PRIMARY KEY,
-                owner_kind TEXT NOT NULL,
-                owner_id TEXT NOT NULL,
-                relative_path TEXT NOT NULL,
-                first_cursor INTEGER NOT NULL,
-                next_cursor INTEGER NOT NULL,
-                retained_bytes INTEGER NOT NULL,
-                total_bytes INTEGER NOT NULL,
-                truncated INTEGER NOT NULL,
-                closed INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await?;
-        sqlx::query(
-            "CREATE UNIQUE INDEX log_streams_owner_idx ON log_streams (owner_kind, owner_id)",
-        )
-        .execute(&pool)
-        .await?;
-        let store = LogStore::new(pool, temp.path());
-        Ok((temp, store))
+        let test_db = TestDb::open().await?;
+        let store = LogStore::new(test_db.database().clone(), temp.path());
+        Ok((temp, store, test_db))
     }
 
     #[tokio::test]
     async fn sync_streams_are_unique_per_invocation() -> anyhow::Result<()> {
-        let (_temp, store) = test_store().await?;
+        let (_temp, store, _db) = test_store().await?;
         let first = store.create(LogOwnerKind::Sync, "runtime-1").await?;
         let second = store.create(LogOwnerKind::Sync, "runtime-1").await?;
         assert_ne!(first.id, second.id);
@@ -602,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn redacts_closes_and_retains_head_marker_and_tail() -> anyhow::Result<()> {
-        let (_temp, store) = test_store().await?;
+        let (_temp, store, _db) = test_store().await?;
         let stream = store
             .create(LogOwnerKind::AsyncTask, &AsyncTaskId::new().to_string())
             .await?;
@@ -664,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn unicode_retention_and_cursor_ranges_use_utf8_boundaries() -> anyhow::Result<()> {
-        let (_temp, store) = test_store().await?;
+        let (_temp, store, _db) = test_store().await?;
         let retention = LogRetention {
             raw_limit_bytes: 47,
             head_bytes: 5,

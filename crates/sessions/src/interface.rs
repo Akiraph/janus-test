@@ -6,9 +6,15 @@
 //! This crate persists Session-owned state only; the application layer decides
 //! when a newly active Turn is scheduled for execution.
 
+use std::collections::HashMap;
+
+use futures_util::TryStreamExt;
 use janus_infrastructure::clock::now_utc_str;
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+};
 use serde_json::{Value, json};
-use sqlx::{Row, SqliteConnection, SqlitePool};
 
 pub use super::types::{
     ActiveTurnOutcome, AppendAssistantMessage, AppendSteerInput, AppendToolResultInput,
@@ -30,7 +36,7 @@ use janus_infrastructure::{
 
 #[derive(Clone)]
 pub struct SessionsInterface {
-    pub(super) pool: SqlitePool,
+    pub(super) pool: mongodb::Database,
     pub(super) unit_of_work: UnitOfWork,
     pub(super) blobs: BlobStore,
 }
@@ -76,8 +82,27 @@ struct PersistUploadAttachment<'a> {
     blob_sha: &'a str,
 }
 
+pub(super) fn opt_str(document: &Document, key: &str) -> Option<String> {
+    document.get(key).and_then(Bson::as_str).map(str::to_owned)
+}
+
+pub(super) fn read_str(document: &Document, key: &str) -> Result<String, SessionsError> {
+    document
+        .get_str(key)
+        .map(str::to_owned)
+        .map_err(accessor_error)
+}
+
+pub(super) fn read_i64(document: &Document, key: &str) -> Result<i64, SessionsError> {
+    document.get_i64(key).map_err(accessor_error)
+}
+
+fn accessor_error(error: impl std::error::Error + Send + Sync + 'static) -> SessionsError {
+    SessionsError::Internal(anyhow::anyhow!(error))
+}
+
 impl SessionsInterface {
-    pub fn new(pool: SqlitePool, events: EventStore, blobs: BlobStore) -> Self {
+    pub fn new(pool: mongodb::Database, events: EventStore, blobs: BlobStore) -> Self {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Self {
             pool,
@@ -88,17 +113,20 @@ impl SessionsInterface {
 
     pub async fn create_session_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
         project_id: ProjectId,
         title: Option<String>,
     ) -> Result<CreatedSessionRecord, SessionsError> {
-        let existing: Option<(String, String)> =
-            sqlx::query_as("SELECT project_id, version FROM sessions WHERE id = ?")
-                .bind(session_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
-        if let Some((stored_project_id, version)) = existing {
+        let existing = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        if let Some(document) = existing {
+            let stored_project_id = read_str(document, "project_id")?;
+            let version = read_str(document, "version")?;
             if stored_project_id != project_id.to_string() {
                 return Err(SessionsError::Internal(anyhow::anyhow!(
                     "session id already belongs to another project"
@@ -113,22 +141,22 @@ impl SessionsInterface {
         let version = format!("v_{}", SessionId::new());
         let title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
 
-        sqlx::query(
-            "INSERT INTO sessions \
-             (id, project_id, title, state, next_model_ref, active_turn_id, \
-              version, created_at, updated_at, \
-              last_activity_at) \
-             VALUES (?, ?, ?, 'ready', NULL, NULL, ?, ?, ?, ?)",
-        )
-        .bind(session_id.to_string())
-        .bind(project_id.to_string())
-        .bind(&title)
-        .bind(&version)
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("sessions")
+            .insert_one(doc! {
+                "_id": session_id.to_string(),
+                "project_id": project_id.to_string(),
+                "title": title.map(Bson::String).unwrap_or(Bson::Null),
+                "state": "ready",
+                "next_model_ref": Bson::Null,
+                "active_turn_id": Bson::Null,
+                "version": &version,
+                "created_at": &now,
+                "updated_at": &now,
+                "last_activity_at": &now,
+            })
+            .session(&mut *tx)
+            .await?;
         Ok(CreatedSessionRecord {
             created: true,
             version,
@@ -141,22 +169,17 @@ impl SessionsInterface {
         limit: i64,
     ) -> Result<Vec<SessionSummary>, SessionsError> {
         let limit = limit.clamp(1, 100);
-        let rows = sqlx::query(
-            "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
-                    version, \
-                    created_at, updated_at, last_activity_at \
-             FROM sessions \
-             WHERE project_id = ? AND state != 'deleting' \
-             ORDER BY last_activity_at DESC LIMIT ?",
-        )
-        .bind(project_id.to_string())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut rows = self
+            .pool
+            .collection::<Document>("sessions")
+            .find(doc! {"project_id": project_id.to_string(), "state": {"$ne": "deleting"}})
+            .sort(doc! {"last_activity_at": -1})
+            .limit(limit)
+            .await?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            out.push(Self::summary_from_row(row)?);
+        let mut out = Vec::with_capacity(limit as usize);
+        while let Some(document) = rows.try_next().await? {
+            out.push(Self::summary_from_row(&document)?);
         }
         Ok(out)
     }
@@ -167,73 +190,88 @@ impl SessionsInterface {
         limit: i64,
     ) -> Result<Vec<SessionSummary>, SessionsError> {
         let limit = limit.clamp(1, 100);
-        let rows = sqlx::query(
-            "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
-                    version, created_at, updated_at, last_activity_at \
-             FROM sessions WHERE state != 'deleting' \
-               AND active_turn_id IS NOT NULL \
-               AND project_id = ? \
-             ORDER BY last_activity_at DESC LIMIT ?",
-        )
-        .bind(project_id.to_string())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(Self::summary_from_row).collect()
+        let mut rows = self
+            .pool
+            .collection::<Document>("sessions")
+            .find(doc! {
+                "state": {"$ne": "deleting"},
+                "active_turn_id": {"$ne": Bson::Null},
+                "project_id": project_id.to_string(),
+            })
+            .sort(doc! {"last_activity_at": -1})
+            .limit(limit)
+            .await?;
+        let mut out = Vec::with_capacity(limit as usize);
+        while let Some(document) = rows.try_next().await? {
+            out.push(Self::summary_from_row(&document)?);
+        }
+        Ok(out)
     }
 
     pub async fn project_session_ids(
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<SessionId>, SessionsError> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM sessions WHERE project_id = ? ORDER BY created_at",
-        )
-        .bind(project_id.to_string())
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|id| {
-            id.parse::<SessionId>()
-                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
-        })
-        .collect()
+        let mut rows = self
+            .pool
+            .collection::<Document>("sessions")
+            .find(doc! {"project_id": project_id.to_string()})
+            .sort(doc! {"created_at": 1})
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(document) = rows.try_next().await? {
+            let id = read_str(document, "_id")?;
+            ids.push(id.parse::<SessionId>().map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!(error))
+            })?);
+        }
+        Ok(ids)
     }
 
     pub async fn ready_session_ids(&self) -> Result<Vec<SessionId>, SessionsError> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM sessions \
-             WHERE state = 'ready' AND active_turn_id IS NULL \
-               AND NOT EXISTS(SELECT 1 FROM turns \
-                              WHERE turns.session_id = sessions.id \
-                                AND turns.status = 'queued') \
-             ORDER BY last_activity_at",
-        )
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|id| {
-            id.parse::<SessionId>()
-                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
-        })
-        .collect()
+        let mut candidates = Vec::new();
+        let mut rows = self
+            .pool
+            .collection::<Document>("sessions")
+            .find(doc! {"state": "ready", "active_turn_id": Bson::Null})
+            .sort(doc! {"last_activity_at": 1})
+            .await?;
+        while let Some(document) = rows.try_next().await? {
+            candidates.push(read_str(document, "_id")?);
+        }
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut queued: std::collections::HashSet<String> = Default::default();
+        let mut turns = self
+            .pool
+            .collection::<Document>("turns")
+            .find(doc! {"status": "queued"})
+            .await?;
+        while let Some(document) = turns.try_next().await? {
+            queued.insert(read_str(document, "session_id")?);
+        }
+        candidates.retain(|id| !queued.contains(id));
+        candidates
+            .into_iter()
+            .map(|id| {
+                id.parse::<SessionId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
+            })
+            .collect()
     }
 
     pub async fn get_session(
         &self,
         session_id: SessionId,
     ) -> Result<SessionSummary, SessionsError> {
-        let row = sqlx::query(
-            "SELECT id, project_id, title, state, active_turn_id, next_model_ref, \
-                    version, \
-                    created_at, updated_at, last_activity_at \
-             FROM sessions WHERE id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        self.row_to_summary(row).await
+        let document = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        self.row_to_summary(&document).await
     }
 
     pub async fn create_upload_attachment(
@@ -299,56 +337,60 @@ impl SessionsInterface {
             byte_size,
             blob_sha,
         } = input;
-        let available: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ? AND state != 'deleting')",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
-        .await?;
-        if available != 1 {
+        let available = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {
+                "_id": session_id.to_string(),
+                "state": {"$ne": "deleting"},
+            })
+            .await?;
+        if available.is_none() {
             return Err(SessionsError::NotFound);
         }
         let now = now_utc_str();
         let version = format!("v_{attachment_id}");
+        let byte_size = i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?;
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query(
-            "INSERT INTO uploads \
-             (id, owner_id, original_name, mime, byte_size, blob_sha, scan_status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?)",
-        )
-        .bind(upload_id.to_string())
-        .bind(owner_id)
-        .bind(name)
-        .bind(mime)
-        .bind(i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?)
-        .bind(blob_sha)
-        .bind(&now)
-        .execute(work.connection())
-        .await?;
-        sqlx::query(
-            "INSERT INTO attachments \
-             (id, session_id, source_kind, upload_id, name, mime, byte_size, blob_sha, \
-              lifecycle, version, created_at) \
-             VALUES (?, ?, 'upload', ?, ?, ?, ?, ?, 'draft', ?, ?)",
-        )
-        .bind(attachment_id.to_string())
-        .bind(session_id.to_string())
-        .bind(upload_id.to_string())
-        .bind(name)
-        .bind(mime)
-        .bind(i64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?)
-        .bind(blob_sha)
-        .bind(&version)
-        .bind(&now)
-        .execute(work.connection())
-        .await?;
+        self.pool
+            .collection::<Document>("uploads")
+            .insert_one(doc! {
+                "_id": upload_id.to_string(),
+                "owner_id": owner_id,
+                "original_name": name,
+                "mime": mime,
+                "byte_size": byte_size,
+                "blob_sha": blob_sha,
+                "scan_status": "accepted",
+                "created_at": &now,
+            })
+            .session(work.connection())
+            .await?;
+        self.pool
+            .collection::<Document>("attachments")
+            .insert_one(doc! {
+                "_id": attachment_id.to_string(),
+                "session_id": session_id.to_string(),
+                "source_kind": "upload",
+                "upload_id": upload_id.to_string(),
+                "name": name,
+                "mime": mime,
+                "byte_size": byte_size,
+                "blob_sha": blob_sha,
+                "lifecycle": "draft",
+                "version": &version,
+                "created_at": &now,
+            })
+            .session(work.connection())
+            .await?;
         work.commit().await?;
         Ok(AttachmentView {
             id: attachment_id.to_string(),
             session_id: session_id.to_string(),
             name: name.to_owned(),
             mime: mime.to_owned(),
-            byte_size,
+            byte_size: u64::try_from(byte_size)
+                .map_err(|error| SessionsError::Internal(error.into()))?,
             lifecycle: "draft".into(),
             version,
             created_at: now,
@@ -361,31 +403,45 @@ impl SessionsInterface {
         attachment_id: AttachmentId,
     ) -> Result<(), SessionsError> {
         let mut work = self.unit_of_work.begin().await?;
-        let row: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT attachment.upload_id FROM attachments AS attachment \
-             WHERE attachment.id = ? AND attachment.session_id = ? \
-               AND attachment.lifecycle = 'draft' \
-               AND NOT EXISTS (SELECT 1 FROM message_attachments AS message_attachment \
-                               WHERE message_attachment.attachment_id = attachment.id)",
-        )
-        .bind(attachment_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_optional(work.connection())
-        .await?;
-        let Some(upload_id) = row else {
+        let document = self
+            .pool
+            .collection::<Document>("attachments")
+            .find_one(doc! {
+                "_id": attachment_id.to_string(),
+                "session_id": session_id.to_string(),
+                "lifecycle": "draft",
+            })
+            .session(&mut *work.connection())
+            .await?;
+        let Some(document) = document else {
             work.rollback().await?;
             return Err(SessionsError::Validation(
                 "attachment is missing or is already referenced by a message".into(),
             ));
         };
-        sqlx::query("DELETE FROM attachments WHERE id = ?")
-            .bind(attachment_id.to_string())
-            .execute(work.connection())
+        let referenced = self
+            .pool
+            .collection::<Document>("message_attachments")
+            .find_one(doc! {"attachment_id": attachment_id.to_string()})
+            .session(&mut *work.connection())
+            .await?;
+        if referenced.is_some() {
+            work.rollback().await?;
+            return Err(SessionsError::Validation(
+                "attachment is missing or is already referenced by a message".into(),
+            ));
+        }
+        let upload_id = opt_str(&document, "upload_id");
+        self.pool
+            .collection::<Document>("attachments")
+            .delete_one(doc! {"_id": attachment_id.to_string()})
+            .session(&mut *work.connection())
             .await?;
         if let Some(upload_id) = upload_id {
-            sqlx::query("DELETE FROM uploads WHERE id = ?")
-                .bind(upload_id)
-                .execute(work.connection())
+            self.pool
+                .collection::<Document>("uploads")
+                .delete_one(doc! {"_id": upload_id})
+                .session(&mut *work.connection())
                 .await?;
         }
         work.commit().await?;
@@ -411,15 +467,20 @@ impl SessionsInterface {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<AttachmentResource>, SessionsError> {
-        let rows = sqlx::query(
-            "SELECT id, name, mime, byte_size, blob_sha FROM attachments \
-             WHERE session_id = ? AND lifecycle = 'attached' \
-             ORDER BY created_at, id",
-        )
-        .bind(session_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(attachment_resource).collect()
+        let mut rows = self
+            .pool
+            .collection::<Document>("attachments")
+            .find(doc! {
+                "session_id": session_id.to_string(),
+                "lifecycle": "attached",
+            })
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .await?;
+        let mut out = Vec::new();
+        while let Some(document) = rows.try_next().await? {
+            out.push(attachment_resource(&document)?);
+        }
+        Ok(out)
     }
 
     pub async fn get_attachment(
@@ -427,16 +488,17 @@ impl SessionsInterface {
         session_id: SessionId,
         attachment_id: AttachmentId,
     ) -> Result<AttachmentResource, SessionsError> {
-        let row = sqlx::query(
-            "SELECT id, name, mime, byte_size, blob_sha FROM attachments \
-             WHERE id = ? AND session_id = ? AND lifecycle = 'attached'",
-        )
-        .bind(attachment_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        attachment_resource(row)
+        let document = self
+            .pool
+            .collection::<Document>("attachments")
+            .find_one(doc! {
+                "_id": attachment_id.to_string(),
+                "session_id": session_id.to_string(),
+                "lifecycle": "attached",
+            })
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        attachment_resource(&document)
     }
 
     pub async fn patch_session(
@@ -465,19 +527,24 @@ impl SessionsInterface {
         let new_version = format!("v_{}", SessionId::new());
         let title = title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
 
+        let mut set = Document::new();
+        set.insert("updated_at", &now);
+        set.insert("version", &new_version);
+        if let Some(title) = &title {
+            set.insert("title", title.clone());
+        }
+
         let mut work = self.unit_of_work.begin().await?;
-        let result = sqlx::query(
-            "UPDATE sessions SET title = COALESCE(?, title), version = ?, updated_at = ? \
-             WHERE id = ? AND version = ?",
-        )
-        .bind(&title)
-        .bind(&new_version)
-        .bind(&now)
-        .bind(session_id.to_string())
-        .bind(expected_version)
-        .execute(work.connection())
-        .await?;
-        if result.rows_affected() == 0 {
+        let result = self
+            .pool
+            .collection::<Document>("sessions")
+            .update_one(
+                doc! {"_id": session_id.to_string(), "version": expected_version},
+                doc! {"$set": set},
+            )
+            .session(work.connection())
+            .await?;
+        if result.matched_count == 0 {
             work.rollback().await?;
             return Err(SessionsError::VersionMismatch {
                 expected: expected_version.into(),
@@ -505,19 +572,22 @@ impl SessionsInterface {
 
     pub async fn mark_session_deleting_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
         expected_version: &str,
     ) -> Result<DeletingSession, SessionsError> {
-        let row: Option<(String, String, String)> =
-            sqlx::query_as("SELECT project_id, state, version FROM sessions WHERE id = ?")
-                .bind(session_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let (project_id, state, current_version) = row.ok_or(SessionsError::NotFound)?;
-        let project_id = project_id
+        let document = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        let project_id = read_str(document, "project_id")?
             .parse::<ProjectId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
+        let state = read_str(document, "state")?;
+        let current_version = read_str(document, "version")?;
         if state == "deleting" {
             return Ok(DeletingSession {
                 changed: false,
@@ -533,14 +603,20 @@ impl SessionsInterface {
         }
         let now = now_utc_str();
         let version = format!("v_{}", SessionId::new());
-        sqlx::query(
-            "UPDATE sessions SET state = 'deleting', version = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&version)
-        .bind(&now)
-        .bind(session_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("sessions")
+            .update_one(
+                doc! {"_id": session_id.to_string()},
+                doc! {
+                    "$set": {
+                        "state": "deleting",
+                        "version": &version,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
         Ok(DeletingSession {
             changed: true,
             project_id,
@@ -550,32 +626,36 @@ impl SessionsInterface {
 
     pub async fn session_deletion_plan_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
     ) -> Result<Option<SessionDeletionPlan>, SessionsError> {
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT project_id, version FROM sessions WHERE id = ?")
-                .bind(session_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((project_id, version)) = row else {
+        let document = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        let Some(document) = document else {
             return Ok(None);
         };
-        let project_id = project_id
+        let project_id = read_str(document, "project_id")?
             .parse::<ProjectId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-        let turn_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM turns WHERE session_id = ? ORDER BY sequence",
-        )
-        .bind(session_id.to_string())
-        .fetch_all(&mut *tx)
-        .await?
-        .into_iter()
-        .map(|id| {
-            id.parse::<TurnId>()
-                .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        let version = read_str(document, "version")?;
+        let mut turns = self
+            .pool
+            .collection::<Document>("turns")
+            .find(doc! {"session_id": session_id.to_string()})
+            .sort(doc! {"sequence": 1})
+            .session(&mut *tx)
+            .await?;
+        let mut turn_ids = Vec::new();
+        while let Some(document) = turns.try_next().await? {
+            let id = read_str(document, "_id")?;
+            turn_ids.push(id.parse::<TurnId>().map_err(|error| {
+                SessionsError::Internal(anyhow::anyhow!(error))
+            })?);
+        }
         Ok(Some(SessionDeletionPlan {
             project_id,
             version,
@@ -585,15 +665,16 @@ impl SessionsInterface {
 
     pub async fn delete_session_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
     ) -> Result<bool, SessionsError> {
-        let deleted = sqlx::query("DELETE FROM sessions WHERE id = ? AND state = 'deleting'")
-            .bind(session_id.to_string())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        Ok(deleted > 0)
+        let deleted = self
+            .pool
+            .collection::<Document>("sessions")
+            .delete_one(doc! {"_id": session_id.to_string(), "state": "deleting"})
+            .session(&mut *tx)
+            .await?;
+        Ok(deleted.deleted_count > 0)
     }
 
     // ----------------------------------------------------------------------
@@ -715,9 +796,10 @@ impl SessionsInterface {
         after: Option<&str>,
         limit: i64,
     ) -> Result<TimelinePage, SessionsError> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE id = ?")
-            .bind(session_id.to_string())
-            .fetch_optional(&self.pool)
+        let exists = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
             .await?;
         if exists.is_none() {
             return Err(SessionsError::NotFound);
@@ -732,75 +814,64 @@ impl SessionsInterface {
                 .map_err(|_| SessionsError::TimelineCursorInvalid)
         };
 
-        let rows = if let Some(before) = before {
+        let mut rows = if let Some(before) = before {
             let order = parse_cursor(before)?;
-            sqlx::query(
-                "SELECT timeline_items.id, timeline_items.session_id, timeline_items.turn_id, \
-                        timeline_items.kind, timeline_items.source_resource_id, \
-                        timeline_items.display_order, timeline_items.projection_json, \
-                        timeline_items.status, timeline_items.version, timeline_items.created_at, \
-                        turns.id AS turn_status_id, turns.status AS turn_status, \
-                        turns.cancellation_reason AS turn_cancellation_reason, \
-                        turns.completion_reason AS turn_completion_reason, \
-                        turns.created_at AS turn_created_at, turns.updated_at AS turn_updated_at \
-                 FROM timeline_items \
-                 LEFT JOIN turns ON turns.id = timeline_items.turn_id \
-                    AND turns.session_id = timeline_items.session_id \
-                 WHERE timeline_items.session_id = ? AND timeline_items.display_order < ? \
-                 ORDER BY timeline_items.display_order DESC LIMIT ?",
-            )
-            .bind(session_id.to_string())
-            .bind(order)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+            self.pool
+                .collection::<Document>("timeline_items")
+                .find(doc! {
+                    "session_id": session_id.to_string(),
+                    "display_order": {"$lt": order},
+                })
+                .sort(doc! {"display_order": -1})
+                .limit(limit)
+                .await?
         } else if let Some(after) = after {
             let order = parse_cursor(after)?;
-            sqlx::query(
-                "SELECT timeline_items.id, timeline_items.session_id, timeline_items.turn_id, \
-                        timeline_items.kind, timeline_items.source_resource_id, \
-                        timeline_items.display_order, timeline_items.projection_json, \
-                        timeline_items.status, timeline_items.version, timeline_items.created_at, \
-                        turns.id AS turn_status_id, turns.status AS turn_status, \
-                        turns.cancellation_reason AS turn_cancellation_reason, \
-                        turns.completion_reason AS turn_completion_reason, \
-                        turns.created_at AS turn_created_at, turns.updated_at AS turn_updated_at \
-                 FROM timeline_items \
-                 LEFT JOIN turns ON turns.id = timeline_items.turn_id \
-                    AND turns.session_id = timeline_items.session_id \
-                 WHERE timeline_items.session_id = ? AND timeline_items.display_order > ? \
-                 ORDER BY timeline_items.display_order ASC LIMIT ?",
-            )
-            .bind(session_id.to_string())
-            .bind(order)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+            self.pool
+                .collection::<Document>("timeline_items")
+                .find(doc! {
+                    "session_id": session_id.to_string(),
+                    "display_order": {"$gt": order},
+                })
+                .sort(doc! {"display_order": 1})
+                .limit(limit)
+                .await?
         } else {
-            sqlx::query(
-                "SELECT timeline_items.id, timeline_items.session_id, timeline_items.turn_id, \
-                        timeline_items.kind, timeline_items.source_resource_id, \
-                        timeline_items.display_order, timeline_items.projection_json, \
-                        timeline_items.status, timeline_items.version, timeline_items.created_at, \
-                        turns.id AS turn_status_id, turns.status AS turn_status, \
-                        turns.cancellation_reason AS turn_cancellation_reason, \
-                        turns.completion_reason AS turn_completion_reason, \
-                        turns.created_at AS turn_created_at, turns.updated_at AS turn_updated_at \
-                 FROM timeline_items \
-                 LEFT JOIN turns ON turns.id = timeline_items.turn_id \
-                    AND turns.session_id = timeline_items.session_id \
-                 WHERE timeline_items.session_id = ? \
-                 ORDER BY timeline_items.display_order DESC LIMIT ?",
-            )
-            .bind(session_id.to_string())
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+            self.pool
+                .collection::<Document>("timeline_items")
+                .find(doc! {"session_id": session_id.to_string()})
+                .sort(doc! {"display_order": -1})
+                .limit(limit)
+                .await?
         };
 
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            items.push(timeline_row(row)?);
+        let mut documents = Vec::with_capacity(limit as usize);
+        let mut turn_ids = Vec::new();
+        while let Some(document) = rows.try_next().await? {
+            if let Some(turn_id) = opt_str(&document, "turn_id") {
+                turn_ids.push(turn_id);
+            }
+            documents.push(document);
+        }
+        let mut turns: HashMap<String, Document> = HashMap::new();
+        if !turn_ids.is_empty() {
+            let mut cursor = self
+                .pool
+                .collection::<Document>("turns")
+                .find(doc! {
+                    "_id": {"$in": &turn_ids},
+                    "session_id": session_id.to_string(),
+                })
+                .await?;
+            while let Some(turn) = cursor.try_next().await? {
+                if let Ok(id) = turn.get_str("_id") {
+                    turns.insert(id.to_owned(), turn);
+                }
+            }
+        }
+        let mut items = Vec::with_capacity(documents.len());
+        for document in documents {
+            items.push(timeline_row(&document, &turns)?);
         }
         items.sort_by_key(|i| i.display_order);
 
@@ -808,25 +879,27 @@ impl SessionsInterface {
         let newest = items.last().map(|i| i.display_order.to_string());
 
         let has_older = if let Some(o) = oldest.as_ref().and_then(|s| s.parse::<i64>().ok()) {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(1) FROM timeline_items WHERE session_id = ? AND display_order < ?",
-            )
-            .bind(session_id.to_string())
-            .bind(o)
-            .fetch_one(&self.pool)
-            .await?;
+            let count: u64 = self
+                .pool
+                .collection::<Document>("timeline_items")
+                .count_documents(
+                    doc! {"session_id": session_id.to_string(), "display_order": {"$lt": o}},
+                    None,
+                )
+                .await?;
             count > 0
         } else {
             false
         };
         let has_newer = if let Some(n) = newest.as_ref().and_then(|s| s.parse::<i64>().ok()) {
-            let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(1) FROM timeline_items WHERE session_id = ? AND display_order > ?",
-            )
-            .bind(session_id.to_string())
-            .bind(n)
-            .fetch_one(&self.pool)
-            .await?;
+            let count: u64 = self
+                .pool
+                .collection::<Document>("timeline_items")
+                .count_documents(
+                    doc! {"session_id": session_id.to_string(), "display_order": {"$gt": n}},
+                    None,
+                )
+                .await?;
             count > 0
         } else {
             false
@@ -845,26 +918,38 @@ impl SessionsInterface {
         &self,
         session_id: SessionId,
     ) -> Result<(Option<String>, Option<String>, i64), SessionsError> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE id = ?")
-            .bind(session_id.to_string())
-            .fetch_optional(&self.pool)
+        let exists = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
             .await?;
         if exists.is_none() {
             return Err(SessionsError::NotFound);
         }
-        sqlx::query_as(
-            "SELECT \
-                (SELECT id FROM timeline_items WHERE session_id = ? ORDER BY display_order ASC LIMIT 1), \
-                (SELECT id FROM timeline_items WHERE session_id = ? ORDER BY display_order DESC LIMIT 1), \
-                COUNT(1) \
-             FROM timeline_items WHERE session_id = ?",
+        let oldest = self
+            .pool
+            .collection::<Document>("timeline_items")
+            .find_one(doc! {"session_id": session_id.to_string()})
+            .sort(doc! {"display_order": 1})
+            .await?
+            .map(|document| read_str(&document, "_id"))
+            .transpose()?;
+        let newest = self
+            .pool
+            .collection::<Document>("timeline_items")
+            .find_one(doc! {"session_id": session_id.to_string()})
+            .sort(doc! {"display_order": -1})
+            .await?
+            .map(|document| read_str(&document, "_id"))
+            .transpose()?;
+        let count = i64::try_from(
+            self.pool
+                .collection::<Document>("timeline_items")
+                .count_documents(doc! {"session_id": session_id.to_string()}, None)
+                .await?,
         )
-        .bind(session_id.to_string())
-        .bind(session_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+        .map_err(|error| SessionsError::Internal(error.into()))?;
+        Ok((oldest, newest, count))
     }
 
     pub async fn get_turn(
@@ -872,34 +957,29 @@ impl SessionsInterface {
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Result<TurnSummary, SessionsError> {
-        let row = sqlx::query(
-            "SELECT id, session_id, sequence, status, input_message_id, goal_mode, model_snapshot_json, \
-                    predecessor_turn_id, \
-                    cancellation_reason, completion_reason, version, created_at, updated_at \
-             FROM turns WHERE id = ? AND session_id = ?",
-        )
-        .bind(turn_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        let model_snapshot_json: String = row.try_get("model_snapshot_json")?;
+        let document = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": turn_id.to_string(), "session_id": session_id.to_string()})
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        let model_snapshot_json = read_str(document, "model_snapshot_json")?;
         Ok(TurnSummary {
-            id: row.try_get("id")?,
-            session_id: row.try_get("session_id")?,
-            sequence: row.try_get("sequence")?,
-            status: row.try_get("status")?,
-            input_message_id: row.try_get("input_message_id")?,
-            goal_mode: row.try_get::<i64, _>("goal_mode")? != 0,
+            id: read_str(document, "_id")?,
+            session_id: read_str(document, "session_id")?,
+            sequence: read_i64(document, "sequence")?,
+            status: read_str(document, "status")?,
+            input_message_id: opt_str(&document, "input_message_id"),
+            goal_mode: read_i64(document, "goal_mode")? != 0,
             model_snapshot: TurnModelSnapshot::parse(&model_snapshot_json)?,
-            predecessor_turn_id: row.try_get("predecessor_turn_id")?,
-            cancellation_reason: row.try_get("cancellation_reason")?,
-            completion_reason: row.try_get("completion_reason")?,
+            predecessor_turn_id: opt_str(&document, "predecessor_turn_id"),
+            cancellation_reason: opt_str(&document, "cancellation_reason"),
+            completion_reason: opt_str(&document, "completion_reason"),
             model_attempt: None,
             token_exchange: None,
-            version: row.try_get("version")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
+            version: read_str(document, "version")?,
+            created_at: read_str(document, "created_at")?,
+            updated_at: read_str(document, "updated_at")?,
         })
     }
 
@@ -907,10 +987,13 @@ impl SessionsInterface {
     /// coordination. The caller still uses `get_session` to cross the
     /// Session-to-Project ownership boundary.
     pub async fn session_id_for_turn(&self, turn_id: TurnId) -> Result<SessionId, SessionsError> {
-        let id = sqlx::query_scalar::<_, String>("SELECT session_id FROM turns WHERE id = ?")
-            .bind(turn_id.to_string())
-            .fetch_optional(&self.pool)
+        let id = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": turn_id.to_string()})
             .await?
+            .map(|document| read_str(&document, "session_id"))
+            .transpose()?
             .ok_or(SessionsError::NotFound)?;
         id.parse::<SessionId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))
@@ -925,23 +1008,28 @@ impl SessionsInterface {
         session_id: SessionId,
     ) -> Result<Vec<QueuedTurnItem>, SessionsError> {
         let _ = self.get_session(session_id).await?;
-        let rows = sqlx::query(
-            "SELECT turn.id AS turn_id, turn.sequence, turn.version, \
-                    COALESCE(message.body_json, '') AS body_json \
-             FROM turns AS turn \
-             LEFT JOIN messages AS message ON message.id = turn.input_message_id \
-             WHERE turn.session_id = ? AND turn.status = 'queued' \
-             ORDER BY turn.sequence ASC",
-        )
-        .bind(session_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
-            let turn_id: String = row.try_get("turn_id")?;
-            let sequence: i64 = row.try_get("sequence")?;
-            let version: String = row.try_get("version")?;
-            let body_json: String = row.try_get("body_json")?;
+        let mut rows = self
+            .pool
+            .collection::<Document>("turns")
+            .find(doc! {"session_id": session_id.to_string(), "status": "queued"})
+            .sort(doc! {"sequence": 1})
+            .await?;
+        let mut items = Vec::new();
+        while let Some(turn) = rows.try_next().await? {
+            let turn_id = read_str(&turn, "_id")?;
+            let sequence = read_i64(&turn, "sequence")?;
+            let version = read_str(&turn, "version")?;
+            let body_json = if let Some(message_id) = opt_str(&turn, "input_message_id") {
+                self.pool
+                    .collection::<Document>("messages")
+                    .find_one(doc! {"_id": message_id})
+                    .await?
+                    .map(|message| read_str(&message, "body_json"))
+                    .transpose()?
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             items.push(QueuedTurnItem {
                 turn_id,
                 sequence,
@@ -987,73 +1075,76 @@ impl SessionsInterface {
 
     async fn row_to_summary(
         &self,
-        row: sqlx::sqlite::SqliteRow,
+        document: &Document,
     ) -> Result<SessionSummary, SessionsError> {
-        Self::summary_from_row(row)
+        Self::summary_from_row(document)
     }
 
-    fn summary_from_row(row: sqlx::sqlite::SqliteRow) -> Result<SessionSummary, SessionsError> {
+    fn summary_from_row(document: &Document) -> Result<SessionSummary, SessionsError> {
         Ok(SessionSummary {
-            id: row.try_get("id")?,
-            project_id: row.try_get("project_id")?,
-            title: row.try_get("title")?,
-            state: row.try_get("state")?,
-            active_turn_id: row.try_get("active_turn_id")?,
-            model_preference: row
-                .try_get::<Option<String>, _>("next_model_ref")?
+            id: read_str(document, "_id")?,
+            project_id: read_str(document, "project_id")?,
+            title: opt_str(document, "title"),
+            state: read_str(document, "state")?,
+            active_turn_id: opt_str(document, "active_turn_id"),
+            model_preference: opt_str(document, "next_model_ref")
                 .map(|raw| serde_json::from_str(&raw))
                 .transpose()?,
-            version: row.try_get("version")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-            last_activity_at: row.try_get("last_activity_at")?,
+            version: read_str(document, "version")?,
+            created_at: read_str(document, "created_at")?,
+            updated_at: read_str(document, "updated_at")?,
+            last_activity_at: read_str(document, "last_activity_at")?,
         })
     }
 }
 
-fn timeline_row(row: sqlx::sqlite::SqliteRow) -> Result<TimelineItemView, SessionsError> {
-    let projection_json: String = row.try_get("projection_json")?;
+fn timeline_row(
+    document: &Document,
+    turns: &HashMap<String, Document>,
+) -> Result<TimelineItemView, SessionsError> {
+    let projection_json = read_str(document, "projection_json")?;
     let projection: Value = serde_json::from_str(&projection_json)?;
-    let turn_status = row
-        .try_get::<Option<String>, _>("turn_status_id")?
-        .map(|id| {
+    let turn_status = opt_str(document, "turn_id")
+        .and_then(|id| turns.get(&id))
+        .map(|turn| {
             Ok::<TimelineTurnStatus, SessionsError>(TimelineTurnStatus {
-                id,
-                status: row.try_get("turn_status")?,
-                cancellation_reason: row.try_get("turn_cancellation_reason")?,
-                completion_reason: row.try_get("turn_completion_reason")?,
-                created_at: row.try_get("turn_created_at")?,
-                updated_at: row.try_get("turn_updated_at")?,
+                id: read_str(&turn, "_id")?,
+                status: read_str(&turn, "status")?,
+                cancellation_reason: opt_str(turn, "cancellation_reason"),
+                completion_reason: opt_str(turn, "completion_reason"),
+                created_at: read_str(&turn, "created_at")?,
+                updated_at: read_str(&turn, "updated_at")?,
             })
         })
         .transpose()?;
     Ok(TimelineItemView {
-        id: row.try_get("id")?,
-        session_id: row.try_get("session_id")?,
-        turn_id: row.try_get("turn_id")?,
-        kind: row.try_get("kind")?,
-        source_resource_id: row.try_get("source_resource_id")?,
-        display_order: row.try_get("display_order")?,
+        id: read_str(document, "_id")?,
+        session_id: read_str(document, "session_id")?,
+        turn_id: opt_str(document, "turn_id"),
+        kind: read_str(document, "kind")?,
+        source_resource_id: opt_str(document, "source_resource_id"),
+        display_order: read_i64(document, "display_order")?,
         projection,
-        status: row.try_get("status")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
+        status: read_str(document, "status")?,
+        version: read_str(document, "version")?,
+        created_at: read_str(document, "created_at")?,
         turn_status,
     })
 }
 
-fn attachment_resource(row: sqlx::sqlite::SqliteRow) -> Result<AttachmentResource, SessionsError> {
-    let id = row
-        .try_get::<String, _>("id")?
+fn attachment_resource(
+    document: &Document,
+) -> Result<AttachmentResource, SessionsError> {
+    let id = read_str(document, "_id")?
         .parse::<AttachmentId>()
         .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-    let byte_size = u64::try_from(row.try_get::<i64, _>("byte_size")?)
+    let byte_size = u64::try_from(read_i64(document, "byte_size")?)
         .map_err(|error| SessionsError::Internal(error.into()))?;
     Ok(AttachmentResource {
         id,
-        name: row.try_get("name")?,
-        mime: row.try_get("mime")?,
+        name: read_str(document, "name")?,
+        mime: read_str(document, "mime")?,
         byte_size,
-        blob_sha: row.try_get("blob_sha")?,
+        blob_sha: opt_str(document, "blob_sha"),
     })
 }

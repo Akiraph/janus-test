@@ -1,7 +1,13 @@
 //! Turn content persistence: read queries and transactional writes for turn inputs, messages, tool results, and checkpoints.
 
 use super::*;
-use crate::interface::ContextCompactedTimelineInput;
+use crate::interface::{ContextCompactedTimelineInput, opt_str, read_i64, read_str};
+use futures_util::TryStreamExt;
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc, oid::ObjectId},
+    options::{FindOneAndUpdateOptions, ReturnDocument},
+};
 use serde_json::Value;
 
 struct MessageAttachment {
@@ -22,42 +28,39 @@ struct CheckpointInput<'a> {
 
 impl SessionsInterface {
     pub async fn execution_turn(&self, turn_id: TurnId) -> Result<ExecutionTurn, SessionsError> {
-        let row = sqlx::query(
-            "SELECT turn.id, turn.session_id, session.project_id, \
-                    turn.status, turn.sequence, turn.goal_mode, turn.model_snapshot_json, session.active_turn_id \
-             FROM turns AS turn \
-             JOIN sessions AS session ON session.id = turn.session_id \
-             WHERE turn.id = ?",
-        )
-        .bind(turn_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        let id: TurnId = row
-            .try_get::<String, _>("id")?
+        let turn = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": turn_id.to_string()})
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        let session_id = read_str(&turn, "session_id")?;
+        let session = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": &session_id})
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        let id: TurnId = read_str(&turn, "_id")?
             .parse::<TurnId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
-        let active_turn_id: Option<String> = row.try_get("active_turn_id")?;
+        let active_turn_id = opt_str(&session, "active_turn_id");
         let active = active_turn_id.as_deref() == Some(id.to_string().as_str());
-        let status: String = row.try_get("status")?;
-        let model_snapshot_json: String = row.try_get("model_snapshot_json")?;
         Ok(ExecutionTurn {
             active,
             id,
-            session_id: row
-                .try_get::<String, _>("session_id")?
+            session_id: session_id
                 .parse::<SessionId>()
                 .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
-            project_id: row
-                .try_get::<String, _>("project_id")?
+            project_id: read_str(&session, "project_id")?
                 .parse::<ProjectId>()
                 .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
-            status: status
+            status: read_str(&turn, "status")?
                 .parse()
                 .map_err(|error: String| SessionsError::Internal(anyhow::anyhow!(error)))?,
-            sequence: row.try_get("sequence")?,
-            goal_mode: row.try_get::<i64, _>("goal_mode")? != 0,
-            model_snapshot: TurnModelSnapshot::parse(&model_snapshot_json)?,
+            sequence: read_i64(&turn, "sequence")?,
+            goal_mode: read_i64(&turn, "goal_mode")? != 0,
+            model_snapshot: TurnModelSnapshot::parse(&read_str(&turn, "model_snapshot_json")?)?,
         })
     }
 
@@ -85,45 +88,77 @@ impl SessionsInterface {
         turn_id: TurnId,
         after_timeline_id: Option<&str>,
     ) -> Result<Vec<ContextMessage>, SessionsError> {
-        let rows = sqlx::query(
-            "SELECT message.turn_id, message.kind, message.body_json, \
-                    COALESCE(message.timeline_sequence, 0) AS timeline_sequence \
-             FROM messages AS message \
-             LEFT JOIN turns AS source_turn ON source_turn.id = message.turn_id \
-             JOIN turns AS current_turn ON current_turn.id = ? \
-             WHERE message.session_id = ? AND current_turn.session_id = message.session_id \
-               AND message.status = 'active' \
-               AND (message.turn_id IS NULL OR message.turn_id = current_turn.id OR \
-                    (source_turn.sequence < current_turn.sequence AND \
-                     source_turn.status IN ('completed', 'failed', 'canceled', 'interrupted'))) \
-               AND (? IS NULL OR COALESCE(message.timeline_sequence, 0) > \
-                    COALESCE((SELECT display_order FROM timeline_items \
-                              WHERE id = ? AND session_id = ?), 0)) \
-             ORDER BY COALESCE(message.timeline_sequence, 0), message.created_at, message.id",
-        )
-        .bind(turn_id.to_string())
-        .bind(session_id.to_string())
-        .bind(after_timeline_id)
-        .bind(after_timeline_id)
-        .bind(session_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                let body_json: String = row.try_get("body_json")?;
-                Ok(ContextMessage {
-                    turn_id: row.try_get("turn_id")?,
-                    kind: row.try_get("kind")?,
-                    body: serde_json::from_str(&body_json)?,
-                    timeline_sequence: row.try_get("timeline_sequence")?,
-                })
+        let current_turn = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": turn_id.to_string()})
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        if read_str(&current_turn, "session_id")? != session_id.to_string() {
+            return Err(SessionsError::NotFound);
+        }
+        let current_sequence = read_i64(&current_turn, "sequence")?;
+        let mut terminal_ids = Vec::new();
+        let mut terminal_turns = self
+            .pool
+            .collection::<Document>("turns")
+            .find(doc! {
+                "session_id": session_id.to_string(),
+                "status": {"$in": ["completed", "failed", "canceled", "interrupted"]},
+                "sequence": {"$lt": current_sequence},
             })
-            .collect()
+            .await?;
+        while let Some(document) = terminal_turns.try_next().await? {
+            terminal_ids.push(read_str(&document, "_id")?);
+        }
+        let after_order = if let Some(after_timeline_id) = after_timeline_id {
+            self.pool
+                .collection::<Document>("timeline_items")
+                .find_one(doc! {
+                    "_id": after_timeline_id,
+                    "session_id": session_id.to_string(),
+                })
+                .await?
+                .map(|document| read_i64(&document, "display_order"))
+                .transpose()?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut filter = doc! {
+            "session_id": session_id.to_string(),
+            "status": "active",
+            "$or": [
+                {"turn_id": Bson::Null},
+                {"turn_id": turn_id.to_string()},
+                {"turn_id": {"$in": terminal_ids}},
+            ],
+        };
+        if after_timeline_id.is_some() {
+            filter.insert("timeline_sequence", doc! {"$gt": after_order});
+        }
+        let mut rows = self
+            .pool
+            .collection::<Document>("messages")
+            .find(filter)
+            .sort(doc! {"timeline_sequence": 1, "created_at": 1, "_id": 1})
+            .await?;
+        let mut out = Vec::new();
+        while let Some(document) = rows.try_next().await? {
+            let body_json = read_str(&document, "body_json")?;
+            out.push(ContextMessage {
+                turn_id: opt_str(&document, "turn_id"),
+                kind: read_str(&document, "kind")?,
+                body: serde_json::from_str(&body_json)?,
+                timeline_sequence: read_i64(&document, "timeline_sequence").unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     pub async fn append_context_compacted_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: ContextCompactedTimelineInput<'_>,
     ) -> Result<(String, bool), SessionsError> {
         let ContextCompactedTimelineInput {
@@ -134,16 +169,18 @@ impl SessionsInterface {
             summary,
             now,
         } = input;
-        if let Some(existing) = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM timeline_items \
-             WHERE session_id = ? AND kind = 'context_compacted' \
-               AND source_resource_id = ? LIMIT 1",
-        )
-        .bind(session_id.to_string())
-        .bind(compact_summary_id)
-        .fetch_optional(&mut *tx)
-        .await?
+        if let Some(existing) = self
+            .pool
+            .collection::<Document>("timeline_items")
+            .find_one(doc! {
+                "session_id": session_id.to_string(),
+                "kind": "context_compacted",
+                "source_resource_id": compact_summary_id,
+            })
+            .session(&mut *tx)
+            .await?
         {
+            let existing = read_str(&existing, "_id")?;
             return Ok((existing, false));
         }
 
@@ -159,22 +196,23 @@ impl SessionsInterface {
             "item_count": item_count,
             "summary": summary,
         });
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, NULL, 'context_compacted', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(&timeline_item_id)
-        .bind(session_id.to_string())
-        .bind(compact_summary_id)
-        .bind(display_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("timeline_items")
+            .insert_one(doc! {
+                "_id": &timeline_item_id,
+                "session_id": session_id.to_string(),
+                "turn_id": Bson::Null,
+                "kind": "context_compacted",
+                "source_resource_id": compact_summary_id,
+                "display_order": display_order,
+                "projection_json": projection.to_string(),
+                "status": "active",
+                "version": format!("v_{}", TimelineItemId::new()),
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
         Ok((timeline_item_id, true))
     }
 
@@ -183,39 +221,43 @@ impl SessionsInterface {
         turn_id: TurnId,
         after_sequence: i64,
     ) -> Result<Vec<ContextMessage>, SessionsError> {
-        let rows = sqlx::query(
-            "SELECT turn_id, kind, body_json, COALESCE(timeline_sequence, 0) AS timeline_sequence \
-             FROM messages \
-             WHERE turn_id = ? AND status = 'active' AND kind = 'user' \
-               AND COALESCE(timeline_sequence, 0) > ? \
-             ORDER BY COALESCE(timeline_sequence, 0), created_at, id",
-        )
-        .bind(turn_id.to_string())
-        .bind(after_sequence)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                let body_json: String = row.try_get("body_json")?;
-                Ok(ContextMessage {
-                    turn_id: row.try_get("turn_id")?,
-                    kind: row.try_get("kind")?,
-                    body: serde_json::from_str(&body_json)?,
-                    timeline_sequence: row.try_get("timeline_sequence")?,
-                })
+        let mut rows = self
+            .pool
+            .collection::<Document>("messages")
+            .find(doc! {
+                "turn_id": turn_id.to_string(),
+                "status": "active",
+                "kind": "user",
+                "timeline_sequence": {"$gt": after_sequence},
             })
-            .collect()
+            .sort(doc! {"timeline_sequence": 1, "created_at": 1, "_id": 1})
+            .await?;
+        let mut out = Vec::new();
+        while let Some(document) = rows.try_next().await? {
+            let body_json = read_str(&document, "body_json")?;
+            out.push(ContextMessage {
+                turn_id: opt_str(&document, "turn_id"),
+                kind: read_str(&document, "kind")?,
+                body: serde_json::from_str(&body_json)?,
+                timeline_sequence: read_i64(&document, "timeline_sequence").unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     pub async fn turn_status_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_id: &str,
     ) -> Result<Option<TurnStatus>, SessionsError> {
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM turns WHERE id = ?")
-            .bind(turn_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let status = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": turn_id})
+            .session(&mut *tx)
+            .await?
+            .map(|document| read_str(&document, "status"))
+            .transpose()?;
         status
             .map(|status| {
                 status
@@ -227,7 +269,7 @@ impl SessionsInterface {
 
     pub async fn create_turn_input_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: CreateTurnInput<'_>,
     ) -> Result<CreatedTurnInput, SessionsError> {
         let CreateTurnInput {
@@ -269,28 +311,31 @@ impl SessionsInterface {
                     "attachment ids must be unique".into(),
                 ));
             }
-            let row: Option<(String, String, i64)> = sqlx::query_as(
-                "SELECT name, mime, byte_size FROM attachments \
-                 WHERE id = ? AND session_id = ? AND lifecycle IN ('draft', 'attached')",
-            )
-            .bind(attachment_id.to_string())
-            .bind(session_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((name, mime, byte_size)) = row else {
+            let attachment = self
+                .pool
+                .collection::<Document>("attachments")
+                .find_one(doc! {
+                    "_id": attachment_id.to_string(),
+                    "session_id": session_id.to_string(),
+                    "lifecycle": {"$in": ["draft", "attached"]},
+                })
+                .session(&mut *tx)
+                .await?;
+            let Some(attachment) = attachment else {
                 return Err(SessionsError::Validation(
                     "attachment is missing or belongs to another session".into(),
                 ));
             };
             let byte_size =
-                u64::try_from(byte_size).map_err(|error| SessionsError::Internal(error.into()))?;
+                u64::try_from(read_i64(&attachment, "byte_size")?)
+                    .map_err(|error| SessionsError::Internal(error.into()))?;
             message_bytes = message_bytes
                 .checked_add(byte_size)
                 .ok_or_else(|| SessionsError::Validation("message is too large".into()))?;
             attachments.push(MessageAttachment {
                 id: *attachment_id,
-                name,
-                mime,
+                name: read_str(&attachment, "name")?,
+                mime: read_str(&attachment, "mime")?,
                 byte_size,
             });
         }
@@ -299,37 +344,49 @@ impl SessionsInterface {
                 "message content and attachments exceed {MAX_MESSAGE_BYTES} bytes"
             )));
         }
-        let next_sequence: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM turns WHERE session_id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
+        let next_sequence: i64 = {
+            let max_sequence = self
+                .pool
+                .collection::<Document>("turns")
+                .find_one(doc! {"session_id": session_id.to_string()})
+                .sort(doc! {"sequence": -1})
+                .session(&mut *tx)
+                .await?
+                .map(|document| read_i64(&document, "sequence"))
+                .transpose()?
+                .unwrap_or(0);
+            max_sequence + 1
+        };
         let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
         let turn_id = TurnId::new();
         let message_id = MessageId::new();
         let timeline_item_id = TimelineItemId::new();
         let model_snapshot_json = serde_json::to_string(&model_snapshot)?;
-        sqlx::query(
-            "INSERT INTO turns \
-             (id, session_id, sequence, status, input_message_id, model_snapshot_json, \
-              goal_mode, predecessor_turn_id, \
-              completion_summary_json, completion_reason, cancellation_reason, \
-              input_tokens, output_tokens, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, ?)",
-        )
-        .bind(turn_id.to_string())
-        .bind(session_id.to_string())
-        .bind(next_sequence)
-        .bind(message_id.to_string())
-        .bind(model_snapshot_json)
-        .bind(i64::from(goal_mode))
-        .bind(predecessor_turn_id)
-        .bind(format!("v_{}", TurnId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        let predecessor_turn_id = predecessor_turn_id
+            .map(|id| Bson::String(id.to_owned()))
+            .unwrap_or(Bson::Null);
+        self.pool
+            .collection::<Document>("turns")
+            .insert_one(doc! {
+                "_id": turn_id.to_string(),
+                "session_id": session_id.to_string(),
+                "sequence": next_sequence,
+                "status": "queued",
+                "input_message_id": message_id.to_string(),
+                "model_snapshot_json": &model_snapshot_json,
+                "goal_mode": i64::from(goal_mode),
+                "predecessor_turn_id": predecessor_turn_id,
+                "completion_summary_json": Bson::Null,
+                "completion_reason": Bson::Null,
+                "cancellation_reason": Bson::Null,
+                "input_tokens": 0i64,
+                "output_tokens": 0i64,
+                "version": format!("v_{}", TurnId::new()),
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
 
         let mut parts = Vec::with_capacity(attachments.len() + 1);
         if !content.is_empty() {
@@ -350,42 +407,52 @@ impl SessionsInterface {
         {
             body_object.extend(metadata.clone());
         }
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(message_kind)
-        .bind(body.to_string())
-        .bind(display_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("messages")
+            .insert_one(doc! {
+                "_id": message_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
+                "actor_json": actor.to_string(),
+                "kind": message_kind,
+                "body_json": body.to_string(),
+                "status": "active",
+                "timeline_sequence": display_order,
+                "version": format!("v_{}", MessageId::new()),
+                "created_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
 
         for (ordinal, attachment) in attachments.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO message_attachments (message_id, attachment_id, ord) \
-                 VALUES (?, ?, ?)",
-            )
-            .bind(message_id.to_string())
-            .bind(attachment.id.to_string())
-            .bind(i64::try_from(ordinal).map_err(|error| SessionsError::Internal(error.into()))?)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE attachments SET lifecycle = 'attached', version = ? \
-                 WHERE id = ? AND lifecycle = 'draft'",
-            )
-            .bind(format!("v_{}", AttachmentId::new()))
-            .bind(attachment.id.to_string())
-            .execute(&mut *tx)
-            .await?;
+            let ord = i64::try_from(ordinal)
+                .map_err(|error| SessionsError::Internal(error.into()))?;
+            self.pool
+                .collection::<Document>("message_attachments")
+                .insert_one(doc! {
+                    "_id": ObjectId::new(),
+                    "message_id": message_id.to_string(),
+                    "attachment_id": attachment.id.to_string(),
+                    "ord": ord,
+                })
+                .session(&mut *tx)
+                .await?;
+            self.pool
+                .collection::<Document>("attachments")
+                .update_one(
+                    doc! {
+                        "_id": attachment.id.to_string(),
+                        "lifecycle": "draft",
+                    },
+                    doc! {
+                        "$set": {
+                            "lifecycle": "attached",
+                            "version": format!("v_{}", AttachmentId::new()),
+                        }
+                    },
+                )
+                .session(&mut *tx)
+                .await?;
         }
 
         let mut projection = json!({
@@ -405,24 +472,23 @@ impl SessionsInterface {
         {
             projection_object.extend(metadata.clone());
         }
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_item_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(timeline_kind)
-        .bind(message_id.to_string())
-        .bind(display_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("timeline_items")
+            .insert_one(doc! {
+                "_id": timeline_item_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
+                "kind": timeline_kind,
+                "source_resource_id": message_id.to_string(),
+                "display_order": display_order,
+                "projection_json": projection.to_string(),
+                "status": "active",
+                "version": format!("v_{}", TimelineItemId::new()),
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
 
         let checkpoint_id = if let Some(workspace_revision) = checkpoint_revision {
             Some(
@@ -455,7 +521,7 @@ impl SessionsInterface {
 
     pub async fn append_steer_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: AppendSteerInput<'_>,
     ) -> Result<(crate::types::SteerResult, String), SessionsError> {
         let AppendSteerInput {
@@ -466,36 +532,39 @@ impl SessionsInterface {
             actor,
             now,
         } = input;
-        let row = sqlx::query(
-            "SELECT session.state, session.active_turn_id, session.version, turn.status \
-             FROM sessions AS session \
-             LEFT JOIN turns AS turn ON turn.id = session.active_turn_id \
-             WHERE session.id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        if row.try_get::<String, _>("state")? == "deleting" {
+        let session = self
+            .pool
+            .collection::<Document>("sessions")
+            .find_one(doc! {"_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        if read_str(&session, "state")? == "deleting" {
             return Err(SessionsError::SessionDeleting);
         }
-        let current_version: String = row.try_get("version")?;
+        let current_version = read_str(&session, "version")?;
         if current_version != expected_version {
             return Err(SessionsError::VersionMismatch {
                 expected: expected_version.to_owned(),
                 current: current_version,
             });
         }
-        let active_turn_id = row
-            .try_get::<Option<String>, _>("active_turn_id")?
+        let active_turn_id = opt_str(&session, "active_turn_id")
             .ok_or(SessionsError::TurnNotInteractive)?
             .parse::<TurnId>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
         if expected_turn_id.is_some_and(|expected| expected != active_turn_id) {
             return Err(SessionsError::TurnNotInteractive);
         }
-        let status = row
-            .try_get::<Option<String>, _>("status")?
+        let turn = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": active_turn_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        let status = turn
+            .map(|document| read_str(&document, "status"))
+            .transpose()?
             .ok_or(SessionsError::TurnNotInteractive)?
             .parse::<TurnStatus>()
             .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?;
@@ -507,22 +576,22 @@ impl SessionsInterface {
         let message_id = MessageId::new();
         let timeline_item_id = TimelineItemId::new();
         let body = json!({"parts": [{"type": "text", "text": content}], "steer": true});
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'user', ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(active_turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(body.to_string())
-        .bind(display_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("messages")
+            .insert_one(doc! {
+                "_id": message_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": active_turn_id.to_string(),
+                "actor_json": actor.to_string(),
+                "kind": "user",
+                "body_json": body.to_string(),
+                "status": "active",
+                "timeline_sequence": display_order,
+                "version": format!("v_{}", MessageId::new()),
+                "created_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
 
         let projection = json!({
             "kind": "steer",
@@ -530,37 +599,44 @@ impl SessionsInterface {
             "turn_id": active_turn_id.to_string(),
             "text": content,
         });
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'steer', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_item_id.to_string())
-        .bind(session_id.to_string())
-        .bind(active_turn_id.to_string())
-        .bind(message_id.to_string())
-        .bind(display_order)
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("timeline_items")
+            .insert_one(doc! {
+                "_id": timeline_item_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": active_turn_id.to_string(),
+                "kind": "steer",
+                "source_resource_id": message_id.to_string(),
+                "display_order": display_order,
+                "projection_json": projection.to_string(),
+                "status": "active",
+                "version": format!("v_{}", TimelineItemId::new()),
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
 
         let session_version = format!("v_{}", SessionId::new());
-        let changed = sqlx::query(
-            "UPDATE sessions SET version = ?, updated_at = ? \
-             WHERE id = ? AND version = ? AND active_turn_id = ?",
-        )
-        .bind(&session_version)
-        .bind(now)
-        .bind(session_id.to_string())
-        .bind(expected_version)
-        .bind(active_turn_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        if changed.rows_affected() != 1 {
+        let changed = self
+            .pool
+            .collection::<Document>("sessions")
+            .update_one(
+                doc! {
+                    "_id": session_id.to_string(),
+                    "version": expected_version,
+                    "active_turn_id": active_turn_id.to_string(),
+                },
+                doc! {
+                    "$set": {
+                        "version": &session_version,
+                        "updated_at": now,
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
+        if changed.matched_count != 1 {
             return Err(SessionsError::Internal(anyhow::anyhow!(
                 "Session changed while recording Steer"
             )));
@@ -577,7 +653,7 @@ impl SessionsInterface {
 
     pub async fn append_assistant_message_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: AppendAssistantMessage<'_>,
     ) -> Result<(String, Option<String>, i64), SessionsError> {
         let AppendAssistantMessage {
@@ -602,57 +678,55 @@ impl SessionsInterface {
         if let Some(raw) = reasoning_content {
             body["reasoning_content"] = json!(raw);
         }
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'assistant', ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(body.to_string())
-        .bind(display_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("messages")
+            .insert_one(doc! {
+                "_id": message_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
+                "actor_json": actor.to_string(),
+                "kind": "assistant",
+                "body_json": body.to_string(),
+                "status": "active",
+                "timeline_sequence": display_order,
+                "version": format!("v_{}", MessageId::new()),
+                "created_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
         if text.is_empty() && reasoning.is_empty() {
             return Ok((message_id.to_string(), None, display_order));
         }
         let timeline_item_id = TimelineItemId::new();
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'assistant_message', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_item_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(message_id.to_string())
-        .bind(display_order)
-        .bind({
-            let mut proj = json!({
+        let mut proj = json!({
+            "kind": "assistant_message",
+            "message_id": message_id.to_string(),
+            "round_id": round_id.to_string(),
+            "text": text,
+            "reasoning": reasoning,
+        });
+        if let Some(ms) = duration_ms {
+            proj.as_object_mut()
+                .expect("proj is object")
+                .insert("duration_ms".into(), json!(ms));
+        }
+        self.pool
+            .collection::<Document>("timeline_items")
+            .insert_one(doc! {
+                "_id": timeline_item_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
                 "kind": "assistant_message",
-                "message_id": message_id.to_string(),
-                "round_id": round_id.to_string(),
-                "text": text,
-                "reasoning": reasoning,
-            });
-            if let Some(ms) = duration_ms {
-                proj.as_object_mut()
-                    .expect("proj is object")
-                    .insert("duration_ms".into(), json!(ms));
-            }
-            proj.to_string()
-        })
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+                "source_resource_id": message_id.to_string(),
+                "display_order": display_order,
+                "projection_json": proj.to_string(),
+                "status": "active",
+                "version": format!("v_{}", TimelineItemId::new()),
+                "created_at": now,
+                "updated_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
         Ok((
             message_id.to_string(),
             Some(timeline_item_id.to_string()),
@@ -662,7 +736,7 @@ impl SessionsInterface {
 
     pub async fn append_tool_result_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: AppendToolResultInput<'_>,
     ) -> Result<(String, String, i64), SessionsError> {
         let AppendToolResultInput {
@@ -679,57 +753,53 @@ impl SessionsInterface {
         } = input;
         let display_order = self.next_timeline_position_in_tx(tx, session_id).await?;
         let timeline_item_id = TimelineItemId::new();
-        sqlx::query(
-            "INSERT INTO timeline_items \
-             (id, session_id, turn_id, kind, source_resource_id, display_order, \
-              projection_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'tool_call', ?, ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(timeline_item_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(tool_call_id)
-        .bind(display_order)
-        .bind(
-            json!({
+        self.pool
+            .collection::<Document>("timeline_items")
+            .insert_one(doc! {
+                "_id": timeline_item_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
                 "kind": "tool_call",
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "status": status,
-                "summary": summary,
+                "source_resource_id": tool_call_id,
+                "display_order": display_order,
+                "projection_json": json!({
+                    "kind": "tool_call",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "status": status,
+                    "summary": summary,
+                })
+                .to_string(),
+                "status": "active",
+                "version": format!("v_{}", TimelineItemId::new()),
+                "created_at": now,
+                "updated_at": now,
             })
-            .to_string(),
-        )
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+            .session(&mut *tx)
+            .await?;
 
         let message_id = MessageId::new();
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, ?, 'tool_result_ref', ?, 'active', ?, ?, ?)",
-        )
-        .bind(message_id.to_string())
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(actor.to_string())
-        .bind(
-            json!({
-                "parts": model_parts,
-                "tool_call_id": provider_call_id,
-                "resource_tool_call_id": tool_call_id,
+        self.pool
+            .collection::<Document>("messages")
+            .insert_one(doc! {
+                "_id": message_id.to_string(),
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
+                "actor_json": actor.to_string(),
+                "kind": "tool_result_ref",
+                "body_json": json!({
+                    "parts": model_parts,
+                    "tool_call_id": provider_call_id,
+                    "resource_tool_call_id": tool_call_id,
+                })
+                .to_string(),
+                "status": "active",
+                "timeline_sequence": display_order,
+                "version": format!("v_{}", MessageId::new()),
+                "created_at": now,
             })
-            .to_string(),
-        )
-        .bind(display_order)
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+            .session(&mut *tx)
+            .await?;
         Ok((
             message_id.to_string(),
             timeline_item_id.to_string(),
@@ -739,7 +809,7 @@ impl SessionsInterface {
 
     pub async fn replace_tool_result_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: ReplaceToolResultInput<'_>,
     ) -> Result<String, SessionsError> {
         let ReplaceToolResultInput {
@@ -760,71 +830,110 @@ impl SessionsInterface {
             "status": status,
             "summary": summary,
         });
-        let timeline_item_id: Option<String> = sqlx::query_scalar(
-            "UPDATE timeline_items SET projection_json = ?, version = ?, updated_at = ? \
-             WHERE session_id = ? AND turn_id = ? AND kind = 'tool_call' \
-               AND source_resource_id = ? AND status = 'active' \
-             RETURNING id",
-        )
-        .bind(projection.to_string())
-        .bind(format!("v_{}", TimelineItemId::new()))
-        .bind(now)
-        .bind(session_id.to_string())
-        .bind(source_turn_id.to_string())
-        .bind(tool_call_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let timeline_item_id = timeline_item_id.ok_or_else(|| {
-            SessionsError::Internal(anyhow::anyhow!("Tool Call timeline projection is missing"))
-        })?;
+        let timeline_item = self
+            .pool
+            .collection::<Document>("timeline_items")
+            .find_one_and_update(
+                doc! {
+                    "session_id": session_id.to_string(),
+                    "turn_id": source_turn_id.to_string(),
+                    "kind": "tool_call",
+                    "source_resource_id": tool_call_id,
+                    "status": "active",
+                },
+                doc! {
+                    "$set": {
+                        "projection_json": projection.to_string(),
+                        "version": format!("v_{}", TimelineItemId::new()),
+                        "updated_at": now,
+                    }
+                },
+                FindOneAndUpdateOptions::builder()
+                    .return_document(ReturnDocument::After)
+                    .build(),
+            )
+            .session(&mut *tx)
+            .await?;
+        let timeline_item_id = timeline_item
+            .map(|document| read_str(&document, "_id"))
+            .transpose()?
+            .ok_or_else(|| {
+                SessionsError::Internal(anyhow::anyhow!("Tool Call timeline projection is missing"))
+            })?;
 
         let message = json!({
             "parts": model_parts,
             "tool_call_id": provider_call_id,
             "resource_tool_call_id": tool_call_id,
         });
-        let updated = sqlx::query(
-            "UPDATE messages SET body_json = ?, version = ? \
-             WHERE session_id = ? AND turn_id = ? AND kind = 'tool_result_ref' \
-               AND status = 'active' \
-               AND json_extract(body_json, '$.resource_tool_call_id') = ?",
-        )
-        .bind(message.to_string())
-        .bind(format!("v_{}", MessageId::new()))
-        .bind(session_id.to_string())
-        .bind(source_turn_id.to_string())
-        .bind(tool_call_id)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() != 1 {
+        let mut candidates = self
+            .pool
+            .collection::<Document>("messages")
+            .find(doc! {
+                "session_id": session_id.to_string(),
+                "turn_id": source_turn_id.to_string(),
+                "kind": "tool_result_ref",
+                "status": "active",
+            })
+            .session(&mut *tx)
+            .await?;
+        let mut matched_ids = Vec::new();
+        while let Some(document) = candidates.try_next().await? {
+            let body_json = read_str(&document, "body_json")?;
+            let resource_tool_call_id = serde_json::from_str::<Value>(&body_json)
+                .ok()
+                .and_then(|value| value.get("resource_tool_call_id").and_then(Value::as_str))
+                .map(str::to_owned);
+            if resource_tool_call_id.as_deref() == Some(tool_call_id) {
+                matched_ids.push(read_str(&document, "_id")?);
+            }
+        }
+        if matched_ids.len() != 1 {
             return Err(SessionsError::Internal(anyhow::anyhow!(
                 "Tool Call protocol result is missing or duplicated"
             )));
         }
+        self.pool
+            .collection::<Document>("messages")
+            .update_one(
+                doc! {"_id": &matched_ids[0]},
+                doc! {
+                    "$set": {
+                        "body_json": message.to_string(),
+                        "version": format!("v_{}", MessageId::new()),
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
         Ok(timeline_item_id)
     }
 
     pub async fn insert_checkpoint_for_turn_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
         turn_id: TurnId,
         workspace_revision: &str,
         now: &str,
     ) -> Result<(), SessionsError> {
-        let row = sqlx::query(
-            "SELECT input_message_id, \
-                    COALESCE((SELECT timeline_sequence FROM messages WHERE id = turns.input_message_id), 0) \
-                        AS timeline_position \
-             FROM turns WHERE id = ? AND session_id = ?",
-        )
-        .bind(turn_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(SessionsError::NotFound)?;
-        let message_id: String = row.try_get("input_message_id")?;
-        let timeline_position: i64 = row.try_get("timeline_position")?;
+        let turn = self
+            .pool
+            .collection::<Document>("turns")
+            .find_one(doc! {"_id": turn_id.to_string(), "session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?
+            .ok_or(SessionsError::NotFound)?;
+        let message_id = opt_str(&turn, "input_message_id").ok_or(SessionsError::NotFound)?;
+        let timeline_position = self
+            .pool
+            .collection::<Document>("messages")
+            .find_one(doc! {"_id": &message_id})
+            .session(&mut *tx)
+            .await?
+            .map(|document| read_i64(&document, "timeline_sequence"))
+            .transpose()?
+            .unwrap_or(0);
         self.insert_checkpoint_in_tx(
             tx,
             CheckpointInput {
@@ -842,26 +951,38 @@ impl SessionsInterface {
 
     async fn next_timeline_position_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
     ) -> Result<i64, SessionsError> {
-        Ok(sqlx::query_scalar(
-            "SELECT COALESCE(MAX(position), 0) + 1 FROM (\
-                 SELECT display_order AS position FROM timeline_items WHERE session_id = ? \
-                 UNION ALL \
-                 SELECT timeline_sequence AS position FROM messages \
-                 WHERE session_id = ? AND timeline_sequence IS NOT NULL\
-             )",
-        )
-        .bind(session_id.to_string())
-        .bind(session_id.to_string())
-        .fetch_one(&mut *tx)
-        .await?)
+        let items_max = self
+            .pool
+            .collection::<Document>("timeline_items")
+            .find_one(doc! {"session_id": session_id.to_string()})
+            .sort(doc! {"display_order": -1})
+            .session(&mut *tx)
+            .await?
+            .map(|document| read_i64(&document, "display_order"))
+            .transpose()?
+            .unwrap_or(0);
+        let messages_max = self
+            .pool
+            .collection::<Document>("messages")
+            .find_one(doc! {
+                "session_id": session_id.to_string(),
+                "timeline_sequence": {"$ne": Bson::Null},
+            })
+            .sort(doc! {"timeline_sequence": -1})
+            .session(&mut *tx)
+            .await?
+            .map(|document| read_i64(&document, "timeline_sequence"))
+            .transpose()?
+            .unwrap_or(0);
+        Ok(items_max.max(messages_max) + 1)
     }
 
     async fn insert_checkpoint_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         input: CheckpointInput<'_>,
     ) -> Result<String, SessionsError> {
         let CheckpointInput {
@@ -873,21 +994,20 @@ impl SessionsInterface {
             now,
         } = input;
         let checkpoint_id = CheckpointId::new().to_string();
-        sqlx::query(
-            "INSERT INTO checkpoints \
-             (id, session_id, kind, timeline_position, workspace_revision_id, \
-              source_message_id, source_turn_id, created_at) \
-             VALUES (?, ?, 'pre_turn', ?, ?, ?, ?, ?)",
-        )
-        .bind(&checkpoint_id)
-        .bind(session_id.to_string())
-        .bind(timeline_position)
-        .bind(workspace_revision)
-        .bind(message_id)
-        .bind(turn_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("checkpoints")
+            .insert_one(doc! {
+                "_id": &checkpoint_id,
+                "session_id": session_id.to_string(),
+                "kind": "pre_turn",
+                "timeline_position": timeline_position,
+                "workspace_revision_id": workspace_revision,
+                "source_message_id": message_id,
+                "source_turn_id": turn_id,
+                "created_at": now,
+            })
+            .session(&mut *tx)
+            .await?;
         Ok(checkpoint_id)
     }
 }

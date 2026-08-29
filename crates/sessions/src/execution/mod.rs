@@ -8,7 +8,6 @@ use std::collections::HashSet;
 
 use janus_infrastructure::clock::now_utc_str;
 use serde_json::json;
-use sqlx::{Row, SqliteConnection};
 
 use super::interface::SessionsInterface;
 use super::types::{

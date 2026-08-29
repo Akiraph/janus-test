@@ -1,6 +1,6 @@
 name = "runtime"
 public_root = "interface.rs"
-owned_tables = [
+owned_collections = [
   "runtimes",
   "log_streams",
   "async_tasks",
