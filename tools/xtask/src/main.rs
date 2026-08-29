@@ -210,7 +210,7 @@ fn check(root: &Path) -> anyhow::Result<()> {
             "warnings",
         ],
     )?;
-    run(root, "cargo", &["test", "--workspace", "--keep-going"])?;
+    run(root, "cargo", &["test", "--workspace", "--no-fail-fast"])?;
     run(root, "bun", &["run", "--cwd", "apps/web", "typecheck"])?;
     run(root, "bun", &["run", "--cwd", "apps/web", "lint"])?;
     run(root, "bun", &["run", "--cwd", "apps/web", "build"])
