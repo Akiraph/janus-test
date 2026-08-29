@@ -352,7 +352,13 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?;
         let mut count: i64 = 0;
-        while rows.next(&mut *tx).await.transpose().map_err(storage_error)?.is_some() {
+        while rows
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+            .is_some()
+        {
             count += 1;
         }
         Ok(count)
@@ -402,7 +408,12 @@ impl RuntimeInterface {
             .await
             .map_err(storage_error)?;
         let mut projections = Vec::new();
-        while let Some(document) = rows.next(&mut *tx).await.transpose().map_err(storage_error)? {
+        while let Some(document) = rows
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             projections.push(async_task_projection(AsyncTaskRow::from_document(
                 &document,
             )?)?);
@@ -1911,7 +1922,12 @@ impl RuntimeInterface {
             .session(&mut *tx)
             .await
             .map_err(storage_error)?;
-        while let Some(document) = tasks.next(&mut *tx).await.transpose().map_err(storage_error)? {
+        while let Some(document) = tasks
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
             async_task_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
         }
         if async_task_ids.is_empty() {

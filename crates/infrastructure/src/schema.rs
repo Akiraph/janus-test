@@ -7,7 +7,7 @@
 //! comments here in sync with each module's `module.toml`.
 
 use mongodb::{
-    bson::{doc, Document},
+    bson::{Document, doc},
     options::IndexOptions,
     IndexModel,
 };

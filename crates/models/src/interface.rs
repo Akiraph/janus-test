@@ -258,12 +258,10 @@ impl ProviderRow {
             kind: doc.get_str("kind")?.to_owned(),
             display_name: doc.get_str("display_name")?.to_owned(),
             base_url: doc.get_str("base_url")?.to_owned(),
-            api_key_ciphertext: doc
-                .get("api_key_ciphertext")
-                .and_then(|value| match value {
-                    Bson::Binary(binary) => Some(binary.bytes.clone()),
-                    _ => None,
-                }),
+            api_key_ciphertext: doc.get("api_key_ciphertext").and_then(|value| match value {
+                Bson::Binary(binary) => Some(binary.bytes.clone()),
+                _ => None,
+            }),
             api_key_fingerprint: doc
                 .get("api_key_fingerprint")
                 .and_then(Bson::as_str)

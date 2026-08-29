@@ -369,13 +369,11 @@ fn problem(error: IdentityError) -> Problem {
         IdentityError::Storage(_)
         | IdentityError::Data(_)
         | IdentityError::Internal(_)
-        | IdentityError::ValueAccess(_) => {
-            Problem::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_ERROR",
-                "Internal server error",
-                "The identity operation could not be completed.",
-            )
-        }
+        | IdentityError::ValueAccess(_) => Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Internal server error",
+            "The identity operation could not be completed.",
+        ),
     }
 }
