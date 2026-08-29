@@ -704,9 +704,7 @@ fn is_bare_collection_call(expr: &Expr) -> bool {
         Expr::Await(await_) => is_bare_collection_call(&await_.base),
         Expr::Paren(paren) => is_bare_collection_call(&paren.expr),
         Expr::Reference(reference) => is_bare_collection_call(&reference.expr),
-        Expr::MethodCall(call) => {
-            matches!(&call.method, syn::Member::Named(name) if name.to_string() == "collection")
-        }
+        Expr::MethodCall(call) => call.method.to_string() == "collection",
         _ => false,
     }
 }
@@ -716,7 +714,7 @@ fn is_bare_collection_call(expr: &Expr) -> bool {
 fn collection_in_receiver_spine(expr: &Expr) -> Option<String> {
     match expr {
         Expr::MethodCall(call) => {
-            if matches!(&call.method, syn::Member::Named(name) if name.to_string() == "collection") {
+            if call.method.to_string() == "collection" {
                 return literal_string_arg(&call.args);
             }
             collection_in_receiver_spine(&call.receiver)
