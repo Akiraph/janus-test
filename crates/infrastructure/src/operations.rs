@@ -552,10 +552,15 @@ impl OperationInterface {
             }
         };
         let version = format!("v_{}", OperationId::new());
-        self.pool
+        // A later step re-enters while the operation is already `running`, so
+        // the transition filter must accept both. A terminal operation (startup
+        // recovery, a competing finish) must not keep executing steps under a
+        // surviving work lease.
+        let changed = self
+            .pool
             .collection::<Document>("operations")
             .update_one(
-                doc! {"_id": operation_id, "status": "queued"},
+                doc! {"_id": operation_id, "status": {"$in": ["queued", "running"]}},
                 doc! {
                     "$set": {
                         "status": "running",
@@ -566,7 +571,12 @@ impl OperationInterface {
                 },
             )
             .session(&mut *tx.connection())
-            .await?;
+            .await?
+            .matched_count;
+        if changed == 0 {
+            tx.rollback().await?;
+            return Err(OperationError::StaleWorkClaim);
+        }
         tx.commit().await?;
         Ok(state)
     }
@@ -1503,6 +1513,43 @@ mod tests {
         };
         assert!(matches!(
             ops.begin_step_claimed(stale, &op_id, "delete", json!({}))
+                .await
+                .unwrap_err(),
+            OperationError::StaleWorkClaim
+        ));
+    }
+
+    #[tokio::test]
+    async fn begin_step_rejects_terminal_operation() {
+        let (_db, ops, _owner_id) = test_harness().await;
+        let created = ops
+            .create(create_request(None), Some(create_work()))
+            .await
+            .unwrap();
+        let op_id = created.operation.id.clone();
+        let claimed = ops
+            .claim_work("git.clone", 60)
+            .await
+            .unwrap()
+            .expect("claimable");
+        let claim = WorkClaim {
+            id: &claimed.id,
+            nonce: &claimed.nonce,
+        };
+        // Startup recovery can terminalize an operation while its work lease is
+        // still live. Beginning a step on it must fail instead of running the
+        // external effect on a finished operation.
+        ops.finish(
+            &op_id,
+            OperationStatus::Succeeded,
+            Some(json!({"ok": true})),
+            None,
+            CorrelationId::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            ops.begin_step_claimed(claim, &op_id, "clone", json!({"repo": "x"}))
                 .await
                 .unwrap_err(),
             OperationError::StaleWorkClaim
