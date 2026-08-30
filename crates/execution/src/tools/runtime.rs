@@ -596,7 +596,7 @@ mod tests {
         let askpass = super::GitAskpass::create("ghp_secret_token")
             .await
             .expect("create askpass");
-        let script = std::fs::read_to_string(&askpass.path()).expect("read script");
+        let script = std::fs::read_to_string(askpass.path()).expect("read script");
         assert!(script.contains("ghp_secret_token"));
         assert!(script.contains("x-access-token"));
         let path = askpass.path().to_owned();
