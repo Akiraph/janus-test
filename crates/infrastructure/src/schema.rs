@@ -98,7 +98,6 @@ pub const INDEXLESS_COLLECTIONS: &[&str] = &[
     "project_git_state",
     "projection_cursor",
     "event_seq",
-    "command_idempotency_records",
 ];
 
 fn index(name: &str, keys: Document) -> IndexModel {
@@ -200,6 +199,13 @@ pub fn index_specs() -> Vec<(&'static str, Vec<IndexModel>)> {
             "idempotency_records",
             vec![index(
                 "idempotency_records_owner_idx",
+                doc! {"owner_id": 1, "expires_at": 1},
+            )],
+        ),
+        (
+            "command_idempotency_records",
+            vec![index(
+                "command_idempotency_records_owner_idx",
                 doc! {"owner_id": 1, "expires_at": 1},
             )],
         ),

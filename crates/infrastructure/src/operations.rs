@@ -1008,10 +1008,11 @@ impl OperationInterface {
         session: &mut ClientSession,
         idem: &IdempotencyRequest,
     ) -> Result<Option<OperationView>, OperationError> {
+        let now = now_utc_str();
         let document = self
             .pool
             .collection::<Document>("idempotency_records")
-            .find_one(doc! {"_id": &idem.key})
+            .find_one(doc! {"_id": &idem.key, "expires_at": {"$gte": &now}})
             .session(&mut *session)
             .await?;
         let Some(document) = document else {

@@ -19,9 +19,10 @@ pub async fn lookup_in_tx(
     session: &mut ClientSession,
     request: &IdempotencyRequest,
 ) -> anyhow::Result<Option<Value>> {
+    let now = now_utc_str();
     let document = database
         .collection::<Document>("command_idempotency_records")
-        .find_one(doc! {"_id": &request.key})
+        .find_one(doc! {"_id": &request.key, "expires_at": {"$gte": &now}})
         .session(&mut *session)
         .await?;
     let Some(document) = document else {
