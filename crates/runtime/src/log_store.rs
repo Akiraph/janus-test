@@ -109,28 +109,35 @@ impl LogStore {
         let now = now_utc_str();
         // Sync streams are per command invocation. The runtime id is reused
         // for every synchronous command, so it cannot satisfy the historical
-        // owner uniqueness constraint.
-        let stored_owner_id = if owner == LogOwnerKind::Sync {
+        // owner uniqueness constraint; the stream id is stored as `owner_id`
+        // and the originating runtime id is retained in `runtime_id` so
+        // project-scoped cleanup can still find sync streams.
+        let is_sync = owner == LogOwnerKind::Sync;
+        let stored_owner_id = if is_sync {
             id_string.clone()
         } else {
             owner_id.to_owned()
         };
+        let mut stream_doc = doc! {
+            "_id": &id_string,
+            "owner_kind": owner.as_str(),
+            "owner_id": &stored_owner_id,
+            "relative_path": &relative_path,
+            "first_cursor": 0i64,
+            "next_cursor": 0i64,
+            "retained_bytes": 0i64,
+            "total_bytes": 0i64,
+            "truncated": false,
+            "closed": false,
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if is_sync {
+            stream_doc.insert("runtime_id", owner_id);
+        }
         self.pool
             .collection::<Document>("log_streams")
-            .insert_one(doc! {
-                "_id": &id_string,
-                "owner_kind": owner.as_str(),
-                "owner_id": &stored_owner_id,
-                "relative_path": &relative_path,
-                "first_cursor": 0i64,
-                "next_cursor": 0i64,
-                "retained_bytes": 0i64,
-                "total_bytes": 0i64,
-                "truncated": false,
-                "closed": false,
-                "created_at": &now,
-                "updated_at": &now,
-            })
+            .insert_one(stream_doc)
             .await
             .map_err(storage_error)?;
         Ok(LogStreamProjection {

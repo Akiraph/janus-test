@@ -2040,12 +2040,12 @@ impl RuntimeInterface {
         }
         let mut log_ids = Vec::new();
         let filter = if terminal_ids.is_empty() {
-            doc! {"owner_kind": "sync", "owner_id": {"$in": &runtime_ids}}
+            doc! {"owner_kind": "sync", "runtime_id": {"$in": &runtime_ids}}
         } else {
             doc! {
                 "$or": [
                     doc! {"owner_kind": "terminal", "owner_id": {"$in": &terminal_ids}},
-                    doc! {"owner_kind": "sync", "owner_id": {"$in": &runtime_ids}},
+                    doc! {"owner_kind": "sync", "runtime_id": {"$in": &runtime_ids}},
                 ]
             }
         };
