@@ -405,6 +405,21 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         if claimed.matched_count != 1 {
+            // The session is already claimed by another turn (raced between
+            // candidate selection and activation). Undo the promotion inside
+            // this transaction so the turn cannot be left `running` with no
+            // session pointing at it, even if a caller commits regardless.
+            self.pool
+                .collection::<Document>("turns")
+                .update_one(
+                    doc! {
+                        "_id": candidate.turn_id.to_string(),
+                        "status": "running",
+                    },
+                    doc! {"$set": {"status": "queued", "updated_at": now}},
+                )
+                .session(&mut *tx)
+                .await?;
             return Ok(None);
         }
         self.insert_checkpoint_for_turn_in_tx(
