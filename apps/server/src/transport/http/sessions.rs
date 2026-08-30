@@ -145,7 +145,7 @@ pub async fn create_session(
     Extension(context): Extension<RequestContext>,
     body: RawBody,
 ) -> Result<(StatusCode, Json<DataResponse<OperationView>>), Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let input: CreateSessionRequest = serde_json::from_slice(body.as_slice()).map_err(|error| {
         Problem::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -242,7 +242,7 @@ pub async fn compact_context(
     Extension(context): Extension<RequestContext>,
     RawBody(body): RawBody,
 ) -> Result<(StatusCode, Json<DataResponse<OperationView>>), Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -285,7 +285,7 @@ pub async fn delete_session(
     Extension(context): Extension<RequestContext>,
     body: RawBody,
 ) -> Result<(StatusCode, Json<DataResponse<OperationView>>), Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -329,7 +329,7 @@ pub async fn post_message(
     Extension(_context): Extension<RequestContext>,
     Json(body): Json<PostMessageRequest>,
 ) -> Result<Json<DataResponse<MessageRouteResult>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -381,7 +381,7 @@ pub async fn upload_attachment(
     Query(query): Query<UploadAttachmentQuery>,
     RawBody(body): RawBody,
 ) -> Result<(StatusCode, Json<DataResponse<AttachmentView>>), Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -447,7 +447,7 @@ pub async fn delete_attachment(
     headers: HeaderMap,
     Path((id, attachment_id)): Path<(String, String)>,
 ) -> Result<StatusCode, Problem> {
-    let _auth = authenticate(&state, &headers).await?;
+    let _auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -562,7 +562,7 @@ pub async fn steer(
     Extension(context): Extension<RequestContext>,
     Json(body): Json<SteerRequest>,
 ) -> Result<Json<DataResponse<SteerResult>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;
@@ -598,7 +598,7 @@ pub async fn cancel_turn(
     Extension(context): Extension<RequestContext>,
     Json(body): Json<CancelTurnRequest>,
 ) -> Result<Json<DataResponse<CancelResult>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let session_id: SessionId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::SESSION_NOT_FOUND, "invalid session id"))?;

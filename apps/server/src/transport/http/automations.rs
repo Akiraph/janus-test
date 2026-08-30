@@ -124,7 +124,7 @@ pub async fn update_automation_settings(
     headers: HeaderMap,
     Json(input): Json<UpdateAutomationSettingsInput>,
 ) -> Result<Json<DataResponse<AutomationSettingsView>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let settings = state
         .application()
         .update_automation_settings(&auth.owner_id, input)

@@ -20,7 +20,7 @@ use janus_infrastructure::{
     clock::now_utc_str,
     events::{EventStore, EventType, NewEvent},
     id::{CorrelationId, GitUpdateConflictId, ProjectId},
-    operations::{CreateOperation, OperationInterface, OperationStatus, OperationView},
+    operations::{CreateOperation, IdempotencyRequest, OperationInterface, OperationStatus, OperationView},
     secrets::SecretCipher,
     unit_of_work::UnitOfWork,
 };
@@ -801,6 +801,7 @@ impl SourceControlInterface {
         project_id: &str,
         remote: &str,
         correlation_id: CorrelationId,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<OperationView, SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
         let credential = self.credential_for_project(owner_id, project_id).await?;
@@ -814,7 +815,7 @@ impl SourceControlInterface {
                     target_id: Some(project_id),
                     conditions: serde_json::json!({"project_id": project_id, "remote": remote}),
                     correlation_id,
-                    idempotency: None,
+                    idempotency,
                 },
                 None,
             )
@@ -917,6 +918,7 @@ impl SourceControlInterface {
         remote: &str,
         branch: &str,
         correlation_id: CorrelationId,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<OperationView, SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
         let credential = self.credential_for_project(owner_id, project_id).await?;
@@ -934,7 +936,7 @@ impl SourceControlInterface {
                         "branch": branch,
                     }),
                     correlation_id,
-                    idempotency: None,
+                    idempotency,
                 },
                 None,
             )
@@ -980,6 +982,7 @@ impl SourceControlInterface {
         project_id: &str,
         input: GitUpdateInput,
         correlation_id: CorrelationId,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<OperationView, SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
         let credential = self.credential_for_project(owner_id, project_id).await?;
@@ -997,7 +1000,7 @@ impl SourceControlInterface {
                         "branch": input.branch,
                     }),
                     correlation_id,
-                    idempotency: None,
+                    idempotency,
                 },
                 None,
             )
