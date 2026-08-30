@@ -13,7 +13,13 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { NotificationEvent, useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
 import type { CreateProjectInput, OperationView, ProjectView, RepoAccess } from "../../lib/api";
-import { createProject, deleteProject, getErrorMessage, randomUuid, retryProject } from "../../lib/api";
+import {
+  createProject,
+  deleteProject,
+  getErrorMessage,
+  randomUuid,
+  retryProject,
+} from "../../lib/api";
 import { useGithubCredentials, useOperation, useProjects } from "../../lib/queries";
 import "./projects.css";
 

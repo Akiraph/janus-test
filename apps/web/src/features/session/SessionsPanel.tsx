@@ -10,7 +10,13 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { useNotifications } from "../../components/ui/notifications";
 import { SideScrollbar } from "../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../lib/api";
-import { createSession, deleteSession, getErrorMessage, getSession, randomUuid } from "../../lib/api";
+import {
+  createSession,
+  deleteSession,
+  getErrorMessage,
+  getSession,
+  randomUuid,
+} from "../../lib/api";
 import { useOperation, useSessions } from "../../lib/queries";
 import "../projects/workspace/sessions-panel.css";
 
