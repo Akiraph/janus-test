@@ -328,6 +328,40 @@ async function backupContainerSettings(ssh, containerName) {
 }
 
 /**
+ * 检查容器是否存在
+ * @param {Client} ssh
+ * @param {string} containerName
+ * @returns {Promise<boolean>}
+ */
+async function containerExists(ssh, containerName) {
+  try {
+    const result = await execSSHCommand(ssh, `docker inspect ${containerName}`);
+    return result.code === 0 && result.stdout.trim() !== "";
+  } catch (err) {
+    logWarning(`检查容器 ${containerName} 是否存在时出错: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * 从镜像创建一个空容器（不继承任何旧配置）。当 CONTAINER_NAMES 里指定的容器
+ * 在服务器上不存在时，直接以镜像默认配置创建，而不是跳过部署。
+ * @param {Client} ssh
+ * @param {string} containerName
+ * @param {string} imageUrl
+ */
+async function createEmptyContainer(ssh, containerName, imageUrl) {
+  const command = `docker run -d --name ${shellQuote(containerName)} ${shellQuote(imageUrl)}`;
+  logInfo(
+    `容器 ${containerName} 不存在，正在从镜像创建空容器: ${imageUrl}`,
+  );
+  const result = await execSSHCommand(ssh, command);
+  if (result.stdout) logSensitive(result.stdout);
+  if (result.stderr) logSensitive(result.stderr, "ERROR");
+  logInfo(`容器创建完成: ${containerName}`);
+}
+
+/**
  * 检测 Docker 版本和平台信息
  * @param {Client} ssh
  * @returns {Promise<{version: string, platform: string, apiVersion: string}>}
@@ -1263,6 +1297,15 @@ async function main() {
         for (const containerName of containerNames) {
           logInfo(`正在处理容器：${containerName}`);
 
+          // 容器不存在时，直接拉取镜像并创建一个空容器，而不是跳过
+          const exists = await containerExists(ssh, containerName);
+          if (!exists) {
+            logWarning(`容器 ${containerName} 不存在，将创建空容器`);
+            await pullDockerImage(ssh, imageUrl);
+            await createEmptyContainer(ssh, containerName, imageUrl);
+            continue;
+          }
+
           // 备份容器设置
           const backupFile = await backupContainerSettings(ssh, containerName);
           if (!backupFile) {
@@ -1765,6 +1808,8 @@ module.exports = {
   execSSHCommand,
   pullDockerImage,
   backupContainerSettings,
+  containerExists,
+  createEmptyContainer,
   recreateContainer,
   cleanupUnusedImages,
   uploadLogFile,
