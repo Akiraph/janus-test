@@ -378,9 +378,10 @@ to start on invalid input. Most of the surface is parsed and validated in
 | `JANUS_BIND` | `127.0.0.1:4317` | listener socket address |
 | `JANUS_MODE` | `development` | `development` or `production` |
 | `JANUS_DEV_AUTH` | `true` in development, `false` in production | bypass authentication; loopback-only, forbidden in production |
-| `JANUS_PUBLIC_ORIGIN` | `http://<bind>` | absolute http(s) origin with no path, query, or fragment; must be https in production |
-| `JANUS_WEBAUTHN_RP_ID` | host of the public origin, else `localhost` | WebAuthn relying-party ID |
-| `JANUS_WEBAUTHN_RP_NAME` | `Janus` | relying-party display name |
+| `JANUS_PUBLIC_ORIGIN` | `http://<bind>` | absolute http(s) origin with no path, query, or fragment; https required in production for passkey auth, plain http allowed with `JANUS_AUTH_MODE=totp` |
+| `JANUS_AUTH_MODE` | `passkey` | authentication scheme: `passkey` (WebAuthn, requires an https origin) or `totp` (TOTP codes, for http/IP deployments) |
+| `JANUS_WEBAUTHN_RP_ID` | host of the public origin, else `localhost` | WebAuthn relying-party ID; unused when auth mode is `totp` |
+| `JANUS_WEBAUTHN_RP_NAME` | `Janus` | relying-party display name; unused when auth mode is `totp` |
 | `JANUS_DATA_ROOT` | `.janus-dev` | database, workspaces, and blobs; resolved to an absolute path |
 | `JANUS_MONGODB_URI` | `mongodb://localhost:27017/?replicaSet=rs0` | replica-set connection string; must be `mongodb://` or `mongodb+srv://` |
 | `JANUS_MONGODB_DATABASE` | `janus` | database name for the Janus schema |
@@ -392,8 +393,8 @@ to start on invalid input. Most of the surface is parsed and validated in
 | `RUST_LOG` | `janus=info` | tracing filter; logs are emitted as JSON |
 
 Rejected combinations include development auth in production mode, development
-auth on a non-loopback bind, a non-https public origin in production, and an
-enabled webhook without a secret. The SSE heartbeat is fixed at 15 seconds.
+auth on a non-loopback bind, a non-https public origin in production with passkey
+auth, and an enabled webhook without a secret. The SSE heartbeat is fixed at 15 seconds.
 `JANUS_MASTER_KEY` is read by `crates/infrastructure/src/secrets.rs` rather than
 by `Config`, so a production process without it fails during initialization.
 
@@ -590,13 +591,30 @@ replica set running on the host). A real deployment additionally sets
 `JANUS_MODE=production` and an https `JANUS_PUBLIC_ORIGIN` matching the public
 hostname.
 
+For a deployment on plain http or a bare IP address, set `JANUS_AUTH_MODE=totp`
+and give `JANUS_PUBLIC_ORIGIN` an http scheme. The owner signs in with a
+time-based one-time password from an authenticator app instead of WebAuthn, and
+the session cookie is written as plain `janus_session` without the `Secure`
+attribute (browsers refuse `Secure` cookies over plain http), so no further
+configuration is needed:
+
+```text
+docker run --rm -p 4317:4317 -v janus-data:/data \
+  -e JANUS_MODE=production \
+  -e JANUS_PUBLIC_ORIGIN=http://janus.example.com:4317 \
+  -e JANUS_AUTH_MODE=totp \
+  -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
+  janus:local
+```
+
 `janus-admin` ships in the image next to `janus-server`, so administration
 tokens are issued from the deployed image rather than from a checkout. It opens
 the data root exclusively, so run it as a one-off container against the same
 volume while the server container is stopped, with the same environment the
 server gets — `Config::from_env` validates the whole configuration, so a
 production run still needs `JANUS_MASTER_KEY` and an https
-`JANUS_PUBLIC_ORIGIN`.
+`JANUS_PUBLIC_ORIGIN` (or `JANUS_AUTH_MODE=totp` with an http origin for
+http/IP deployments).
 
 ```text
 docker run --rm -v janus-data:/data \
