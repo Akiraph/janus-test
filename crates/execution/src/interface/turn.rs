@@ -1580,10 +1580,11 @@ impl ExecutionInterface {
             }
             None => match execute_tool(&ctx, &accepted.request.name, &input).await {
                 Ok(outcome) => outcome,
-                Err(error @ ExecutionError::Storage(_))
-                | Err(error @ ExecutionError::Serde(_))
-                | Err(error @ ExecutionError::Internal(_)) => return Err(error),
                 Err(error) => {
+                    // Record a failed tool as a failed outcome instead of
+                    // aborting the turn: an error here otherwise leaves the
+                    // tool_call row (set to `running` above) and its round
+                    // stuck `running` with no terminal state.
                     let mut outcome = crate::types::ToolOutcome {
                         disposition: ToolExecutionDisposition::Failed,
                         parts: vec![ToolResultPart::Text {

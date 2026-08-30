@@ -4,6 +4,11 @@ use super::*;
 /// Bytes of an async task's log stream one `read_output` call pulls.
 const READ_OUTPUT_WINDOW_BYTES: usize = 256 * 1024;
 
+/// Default timeout for a sync bash run when the caller does not specify one.
+/// A caller-provided `timeout_ms` overrides this; without a bound, a command
+/// that never returns would pin the tool call (and its lease) forever.
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 300_000;
+
 fn default_limits(timeout_ms: u64) -> janus_runtime::interface::ResourceLimits {
     janus_runtime::interface::ResourceLimits {
         timeout_ms,
@@ -85,7 +90,7 @@ pub(super) async fn tool_bash(
         ));
     }
 
-    let timeout = timeout_ms(input, u64::MAX);
+    let timeout = timeout_ms(input, DEFAULT_BASH_TIMEOUT_MS);
     let repo = ctx.workspace_root.to_path_buf();
     let cwd = working_directory(input)?;
     let fallback_cwd = local_working_directory(&repo, &cwd)?;
@@ -99,8 +104,15 @@ pub(super) async fn tool_bash(
         Ok(runtime) => runtime,
         Err(ExecutionError::Runtime(error)) if error.retryable() => {
             tracing::warn!(%error, "preferred Runtime unavailable; using system Bash fallback");
-            return run_local_sync(ctx, &command, display_command, &fallback_cwd, git_askpass.as_ref())
-                .await;
+            return run_local_sync(
+                ctx,
+                &command,
+                display_command,
+                &fallback_cwd,
+                git_askpass.as_ref(),
+                timeout,
+            )
+            .await;
         }
         Err(error) => return Err(error),
     };
@@ -122,8 +134,15 @@ pub(super) async fn tool_bash(
                 %error,
                 "Runtime sync execution unavailable; using local Git Bash fallback"
             );
-            return run_local_sync(ctx, &command, display_command, &fallback_cwd, git_askpass.as_ref())
-                .await;
+            return run_local_sync(
+                ctx,
+                &command,
+                display_command,
+                &fallback_cwd,
+                git_askpass.as_ref(),
+                timeout,
+            )
+            .await;
         }
         Err(error) => return Err(ExecutionError::Runtime(error)),
     };
@@ -201,13 +220,15 @@ async fn tool_bash_async(
 }
 
 /// Local fallback for sync bash when no Runtime is bound. Windows uses Git
-/// Bash (`bash -c`), other platforms use `/bin/sh -c`.
+/// Bash (`bash -c`), other platforms use `/bin/sh -c`. The command is bounded
+/// by `timeout`; on expiry the shell (and anything it spawned) is killed.
 async fn run_local_sync(
     ctx: &ToolContext<'_>,
     command: &str,
     display_command: &str,
     cwd: &Path,
     askpass: Option<&GitAskpass>,
+    timeout: u64,
 ) -> Result<ToolOutcome, ExecutionError> {
     let Some(program) = bash_program() else {
         let detail = if cfg!(windows) {
@@ -222,22 +243,43 @@ async fn run_local_sync(
     if let Some(askpass) = askpass {
         cmd.env("GIT_ASKPASS", askpass.path());
     }
-    cmd.current_dir(cwd);
-    let started = std::time::Instant::now();
-    let output = cmd.output().await;
-    let (timed_out, exit_code, stdout, stderr) = match output {
-        Ok(out) => {
-            let stdout = decode_process_output(&out.stdout, 1024 * 1024);
-            let stderr = decode_process_output(&out.stderr, 1024 * 1024);
-            (false, out.status.code(), stdout.text, stderr.text)
+    cmd.current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.kill_on_drop(true).spawn().map_err(|e| {
+        ExecutionError::Internal(anyhow::anyhow!("failed to spawn local bash: {e}"))
+    })?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_task = async {
+        let mut buf = Vec::new();
+        if let Some(reader) = stdout.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(reader, &mut buf).await;
         }
-        Err(e) => {
-            return Ok(fail_text(
-                &format!("failed to run command: {e}"),
-                "COMMAND_FAILED",
-            ));
-        }
+        buf
     };
+    let stderr_task = async {
+        let mut buf = Vec::new();
+        if let Some(reader) = stderr.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(reader, &mut buf).await;
+        }
+        buf
+    };
+    let started = std::time::Instant::now();
+    let (timed_out, exit_code) =
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout), child.wait()).await {
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                (true, None)
+            }
+            Ok(Ok(status)) => (false, status.code()),
+            Ok(Err(_)) => (false, None),
+        };
+    let stdout_bytes = stdout_task.await;
+    let stderr_bytes = stderr_task.await;
+    let stdout = decode_process_output(&stdout_bytes, 1024 * 1024);
+    let stderr = decode_process_output(&stderr_bytes, 1024 * 1024);
     let duration_ms = started.elapsed().as_millis() as u64;
     bash_outcome(BashOutcomeInput {
         command: display_command,
@@ -245,8 +287,8 @@ async fn run_local_sync(
         timed_out,
         duration_ms,
         truncated: false,
-        stdout: &stdout,
-        stderr: &stderr,
+        stdout: &stdout.text,
+        stderr: &stderr.text,
         secret_value: ctx.git_token,
     })
 }
