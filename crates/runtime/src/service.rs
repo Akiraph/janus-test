@@ -1,4 +1,9 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures_util::TryStreamExt;
 use janus_infrastructure::clock::{format_utc, now_utc, now_utc_str};
@@ -34,6 +39,47 @@ pub struct RuntimeInterface {
     /// Broadcast of AsyncTask ids that just reached a durable terminal status.
     /// The application delivery worker subscribes and opens a new Turn.
     async_task_settled_tx: tokio::sync::broadcast::Sender<AsyncTaskId>,
+    /// Single-flight for `ensure_runtime` per runtime id: the check-then-insert
+    /// of the starting row and the executor start must run exactly once, or two
+    /// callers can create duplicate rows / overwrite each other's nonce.
+    ensure_locks: Arc<EnsureLocks>,
+}
+
+/// Leak-free keyed mutex: only ids with an ensure in flight are held, and an
+/// entry is removed when the permit drops, so the set stays bounded by the
+/// number of concurrent ensure calls rather than every runtime ever seen.
+struct EnsureLocks {
+    busy: Mutex<HashSet<String>>,
+}
+
+impl EnsureLocks {
+    async fn acquire(&self, key: &str) -> EnsurePermit<'_> {
+        loop {
+            {
+                let mut busy = self.busy.lock().expect("ensure locks poisoned");
+                if busy.insert(key.to_owned()) {
+                    return EnsurePermit {
+                        locks: self,
+                        key: key.to_owned(),
+                    };
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+struct EnsurePermit<'a> {
+    locks: &'a EnsureLocks,
+    key: String,
+}
+
+impl Drop for EnsurePermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.locks.busy.lock() {
+            busy.remove(&self.key);
+        }
+    }
 }
 
 struct RuntimeRow {
@@ -281,6 +327,9 @@ impl RuntimeInterface {
             unit_of_work,
             executor,
             async_task_settled_tx,
+            ensure_locks: Arc::new(EnsureLocks {
+                busy: Mutex::new(HashSet::new()),
+            }),
         }
     }
 
@@ -425,6 +474,7 @@ impl RuntimeInterface {
         &self,
         spec: &RuntimeSpec,
     ) -> Result<RuntimeProjection, RuntimeError> {
+        let _ensure_permit = self.ensure_locks.acquire(&spec.id().to_string()).await;
         if let Some(existing) = self.current_runtime(spec.scope()).await? {
             if existing.id != spec.id() {
                 return Err(RuntimeError::unavailable(format!(

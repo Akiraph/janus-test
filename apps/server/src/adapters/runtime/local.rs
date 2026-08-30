@@ -380,15 +380,19 @@ impl RuntimeExecutor for LocalExecutor {
             let workspace_root = tokio::fs::canonicalize(spec.workspace_root())
                 .await
                 .map_err(|_| RuntimeError::InvalidSpec("workspace root does not exist".into()))?;
-            let nonce = random_token(24);
-            let handle = LocalRuntime {
-                workspace_root,
-                nonce: nonce.clone(),
-            };
-            self.inner.runtimes.write().await.insert(spec.id(), handle);
+            // `entry` makes the check-and-insert atomic: two concurrent ensure
+            // calls for the same runtime cannot each mint their own nonce, so
+            // the executor nonce in the runtime row can never be overwritten by
+            // a sibling call. The nonce is only minted when the entry is absent.
+            let handle = self.inner.runtimes.write().await.entry(spec.id()).or_insert_with(|| {
+                LocalRuntime {
+                    workspace_root,
+                    nonce: random_token(24),
+                }
+            });
             Ok(ExecutorRuntimeHandle {
                 executor_identity: format!("local:{}", spec.id()),
-                executor_nonce: nonce,
+                executor_nonce: handle.nonce.clone(),
             })
         })
     }
