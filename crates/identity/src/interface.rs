@@ -1654,7 +1654,7 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut outer = Sha1::new();
     outer.update(opad);
     outer.update(inner_hash.as_ref());
-    outer.finalize().as_ref().to_vec()
+    outer.finalize().as_slice().to_vec()
 }
 
 /// RFC 6238 TOTP code for a counter (unix seconds / 30).
