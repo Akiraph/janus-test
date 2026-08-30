@@ -4,6 +4,8 @@
 //! make retries and process restarts idempotent. Work kinds and handlers live in
 //! server/application - not here.
 
+use std::collections::HashSet;
+
 use futures_util::TryStreamExt;
 use mongodb::{
     ClientSession,
@@ -190,19 +192,26 @@ impl OperationInterface {
             .session(&mut *work.connection())
             .await?;
         if let Some(idem) = &request.idempotency {
+            // A prior record for this key can linger after its window lapses
+            // (the lookup above only honors live ones). Replace it rather than
+            // collide on the unique `_id`, so a reused key starts a fresh
+            // operation instead of failing with a duplicate-key error.
             self.pool
                 .collection::<Document>("idempotency_records")
-                .insert_one(doc! {
-                    "_id": &idem.key,
-                    "owner_id": &idem.owner_id,
-                    "method": &idem.method,
-                    "normalized_route": &idem.normalized_route,
-                    "request_digest": &idem.digest,
-                    "status": "running",
-                    "operation_id": &operation_id,
-                    "expires_at": &idem.expires_at,
-                })
+                .replace_one(
+                    doc! {"_id": &idem.key},
+                    doc! {
+                        "owner_id": &idem.owner_id,
+                        "method": &idem.method,
+                        "normalized_route": &idem.normalized_route,
+                        "request_digest": &idem.digest,
+                        "status": "running",
+                        "operation_id": &operation_id,
+                        "expires_at": &idem.expires_at,
+                    },
+                )
                 .session(&mut *work.connection())
+                .upsert(true)
                 .await?;
         }
         if let Some(work_item) = work_item {
@@ -981,26 +990,65 @@ impl OperationInterface {
         Ok(document.and_then(|document| document.get_str("_id").ok().map(str::to_owned)))
     }
 
-    /// Operations stuck in `running` with an expired lease - startup recovery must
-    /// resume or terminalize them.
+    /// Operations stuck in `running` with no live work lease - startup recovery
+    /// must resume or terminalize them. The operations document carries no
+    /// lease of its own; ownership lives on the linked `work_items` row, so a
+    /// running operation is stale only when its work item's lease is missing or
+    /// expired (or when no work item exists to resume it). Matching only on the
+    /// operation status would report every running operation after a restart
+    /// even when another worker still holds a live lease.
     pub async fn stale_running(&self) -> Result<Vec<String>, OperationError> {
         let now = now_utc_str();
-        let mut cursor = self
+        let mut running_cursor = self
             .pool
             .collection::<Document>("operations")
-            .find(doc! {
-                "status": "running",
-                "$or": [
-                    {"lease_expires_at": null},
-                    {"lease_expires_at": {"$lt": &now}},
-                ],
-            })
+            .find(doc! {"status": "running"})
+            .projection(doc! {"_id": 1})
             .await?;
-        let mut ids = Vec::new();
-        while let Some(document) = cursor.try_next().await? {
-            ids.push(document.get_str("_id")?.to_owned());
+        let mut running_ids = Vec::new();
+        while let Some(document) = running_cursor.try_next().await? {
+            running_ids.push(document.get_str("_id")?.to_owned());
         }
-        Ok(ids)
+        if running_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut live_cursor = self
+            .pool
+            .collection::<Document>("work_items")
+            .find(doc! {"dead": false, "lease_expires_at": {"$gte": &now}})
+            .projection(doc! {"payload_json": 1})
+            .await?;
+        let mut live_operation_ids = HashSet::new();
+        while let Some(document) = live_cursor.try_next().await? {
+            let payload: Value = serde_json::from_str(document.get_str("payload_json")?)?;
+            if let Some(operation_id) = payload.get("operation_id").and_then(Value::as_str) {
+                live_operation_ids.insert(operation_id.to_owned());
+            }
+        }
+        Ok(running_ids
+            .into_iter()
+            .filter(|id| !live_operation_ids.contains(id))
+            .collect())
+    }
+
+    /// Delete idempotency records whose window has elapsed. Expired records
+    /// must not satisfy lookups, but without pruning the two journals grow
+    /// without bound; startup recovery is a cheap place to sweep them.
+    pub async fn prune_expired_idempotency(&self) -> Result<u64, OperationError> {
+        let now = now_utc_str();
+        let deleted = self
+            .pool
+            .collection::<Document>("idempotency_records")
+            .delete_many(doc! {"expires_at": {"$lt": &now}})
+            .await?
+            .deleted_count;
+        let deleted_command = self
+            .pool
+            .collection::<Document>("command_idempotency_records")
+            .delete_many(doc! {"expires_at": {"$lt": &now}})
+            .await?
+            .deleted_count;
+        Ok(deleted + deleted_command)
     }
 
     async fn lookup_idempotency_in_tx(
@@ -1354,40 +1402,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_running_reports_expired_leases() {
+    async fn stale_running_reports_expired_or_missing_leases() {
         let (db, ops, _owner_id) = test_harness().await;
         let created = ops
             .create(create_request(None), Some(create_work()))
             .await
             .unwrap();
         let op_id = created.operation.id.clone();
-        // Running with a live lease is not stale.
+        let claimed = ops
+            .claim_work("git.clone", 60)
+            .await
+            .unwrap()
+            .expect("claimable");
+        let claim = WorkClaim {
+            id: &claimed.id,
+            nonce: &claimed.nonce,
+        };
+        ops.begin_step_claimed(claim, &op_id, "clone", json!({"repo": "x"}))
+            .await
+            .unwrap();
+        // A running operation whose linked work lease is still live is not stale.
+        assert!(ops.stale_running().await.unwrap().is_empty());
+        // A running operation with no work item cannot be resumed, so it is stale.
+        let bare = ops.create(create_request(None), None).await.unwrap();
+        let bare_id = bare.operation.id.clone();
         db.database()
             .collection::<Document>("operations")
             .update_one(
-                doc! {"_id": &op_id},
-                doc! {
-                    "$set": {
-                        "status": "running",
-                        "lease_nonce": "x",
-                        "lease_expires_at": format_utc(now_utc() + Duration::seconds(60)),
-                    }
-                },
+                doc! {"_id": &bare_id},
+                doc! {"$set": {"status": "running"}},
             )
             .await
             .unwrap();
-        assert!(ops.stale_running().await.unwrap().is_empty());
-        // Expiring the lease makes it stale.
+        assert!(ops.stale_running().await.unwrap().contains(&bare_id));
+        // Expiring the work lease makes the linked running operation stale.
         db.database()
-            .collection::<Document>("operations")
+            .collection::<Document>("work_items")
             .update_one(
-                doc! {"_id": &op_id},
+                doc! {"_id": &claimed.id},
                 doc! {"$set": {"lease_expires_at": format_utc(now_utc() - Duration::seconds(10))}},
             )
             .await
             .unwrap();
         let stale = ops.stale_running().await.unwrap();
         assert!(stale.contains(&op_id));
+        assert!(stale.contains(&bare_id));
     }
 
     #[tokio::test]

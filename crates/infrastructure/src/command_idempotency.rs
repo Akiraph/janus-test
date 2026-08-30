@@ -49,17 +49,20 @@ pub async fn record_in_tx(
     let response_json = serde_json::to_string(response)?;
     database
         .collection::<Document>("command_idempotency_records")
-        .insert_one(doc! {
-            "_id": &request.key,
-            "owner_id": &request.owner_id,
-            "method": &request.method,
-            "normalized_route": &request.normalized_route,
-            "request_digest": &request.digest,
-            "response_json": &response_json,
-            "expires_at": &request.expires_at,
-            "created_at": now_utc_str(),
-        })
+        .replace_one(
+            doc! {"_id": &request.key},
+            doc! {
+                "owner_id": &request.owner_id,
+                "method": &request.method,
+                "normalized_route": &request.normalized_route,
+                "request_digest": &request.digest,
+                "response_json": &response_json,
+                "expires_at": &request.expires_at,
+                "created_at": now_utc_str(),
+            },
+        )
         .session(&mut *session)
+        .upsert(true)
         .await?;
     Ok(())
 }
