@@ -906,6 +906,29 @@ impl ExecutionInterface {
                         break;
                     }
                     FaultClass::Transient => {
+                        // Stop retrying once the Turn is no longer runnable
+                        // (user cancel / control-plane interruption): the outer
+                        // round loop only re-checks after this function returns,
+                        // so without a check here a canceled Turn would keep
+                        // hammering the provider on the unbounded retry cadence.
+                        let still_runnable = match (&req.session_id, &req.turn_id) {
+                            (Some(session_id), Some(turn_id)) => self
+                                .sessions
+                                .turn_is_runnable(
+                                    session_id.parse().map_err(|error| {
+                                        ExecutionError::Internal(anyhow::anyhow!(error))
+                                    })?,
+                                    turn_id.parse().map_err(|error| {
+                                        ExecutionError::Internal(anyhow::anyhow!(error))
+                                    })?,
+                                )
+                                .await?,
+                            _ => true,
+                        };
+                        if !still_runnable {
+                            last_failed_events = events;
+                            return Ok(last_failed_events);
+                        }
                         let retrying = ModelStreamEvent::Retrying {
                             attempt_id: attempt_id.clone(),
                             attempt: retry_attempt,
