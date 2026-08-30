@@ -73,7 +73,7 @@ jobs:
         include:
           - label: combined
             target: combined
-            suffix: ""
+            suffix: "-combined"
           - label: server
             target: server
             suffix: "-server"
@@ -197,6 +197,6 @@ jobs:
           PORT: ${{ secrets.PORT }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
           CONTAINER_NAMES: ${{ secrets.CONTAINER_NAMES }}
-          IMAGE_URL: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}-amd64
+          IMAGE_URL: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}-combined-amd64
           ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
         run: node scripts/deploy_image.js

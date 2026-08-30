@@ -498,14 +498,14 @@ cargo run -p janus-test -- events follow --count 1
 
 | 镜像 | Docker target | 标签 |
 | --- | --- | --- |
-| combined(前后端一体,单进程) | `combined`(默认) | `<ref>-amd64`、`<short-sha>-amd64` |
+| combined(前后端一体,单进程) | `combined`(默认) | `<ref>-combined-amd64`、`<short-sha>-combined-amd64` |
 | server(仅后端) | `server` | `<ref>-server-amd64`、`<short-sha>-server-amd64` |
 | web(nginx 前端 + API 代理) | `web` | `<ref>-web-amd64`、`<short-sha>-web-amd64` |
 
 随后 `scripts/deploy_image.js` 通过 SSH 把某个标签拉到目标主机,并重建 `CONTAINER_NAMES`
 中列出的每个容器,沿用它此前的 `docker inspect` 配置。它读取 `SERVER_ADDRESS`、`USERNAME`、
 `PORT`、`PRIVATE_KEY`、`CONTAINER_NAMES` 和 `ADMIN_PASSWORD` 这几个 secret,并在自己的
-日志中脱敏密钥材料。部署默认拉 combined 镜像标签(`<short-sha>-amd64`);要分开跑前端/后端,
+日志中脱敏密钥材料。部署默认拉 combined 镜像标签(`<short-sha>-combined-amd64`);要分开跑前端/后端,
 把 `CONTAINER_NAMES`/`IMAGE_URL` 指向 `server` 或 `web` 标签。提交信息里包含 `deps):`
 的提交会被跳过。
 

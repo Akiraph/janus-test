@@ -560,7 +560,7 @@ Every push to `main`/`master`/`dev` publishes three images, each under
 
 | Image | Docker target | Tags |
 | --- | --- | --- |
-| combined (frontend + backend, one process) | `combined` (default) | `<ref>-amd64`, `<short-sha>-amd64` |
+| combined (frontend + backend, one process) | `combined` (default) | `<ref>-combined-amd64`, `<short-sha>-combined-amd64` |
 | server (backend only) | `server` | `<ref>-server-amd64`, `<short-sha>-server-amd64` |
 | web (nginx frontend + API proxy) | `web` | `<ref>-web-amd64`, `<short-sha>-web-amd64` |
 
@@ -569,7 +569,7 @@ recreates each container named in `CONTAINER_NAMES`, inheriting its previous
 `docker inspect` configuration. It reads the `SERVER_ADDRESS`, `USERNAME`,
 `PORT`, `PRIVATE_KEY`, `CONTAINER_NAMES`, and `ADMIN_PASSWORD` secrets, and
 redacts key material from its own logs. The deployment uses the combined image
-tag (`<short-sha>-amd64`); point `CONTAINER_NAMES`/`IMAGE_URL` at the `server`
+tag (`<short-sha>-combined-amd64`); point `CONTAINER_NAMES`/`IMAGE_URL` at the `server`
 or `web` tags to run them separately. Commits whose message contains `deps):`
 are skipped.
 
