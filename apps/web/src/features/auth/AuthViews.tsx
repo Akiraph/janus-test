@@ -224,10 +224,10 @@ export function TotpSetupView() {
           }
         >
           <form class="auth-form" onSubmit={confirm}>
-            <label>
+            <div class="auth-secret">
               Secret key
               <code>{provision()?.secret_base32}</code>
-            </label>
+            </div>
             <Button variant="outline" type="button" onClick={() => void copySecret()}>
               <Copy size={16} aria-hidden="true" />
               Copy secret
