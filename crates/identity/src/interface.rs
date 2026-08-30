@@ -741,10 +741,18 @@ impl IdentityInterface {
             return Err(IdentityError::TotpDisabled);
         }
         self.check_origin(origin)?;
-        if !is_totp_code_shape(code) {
-            return Err(IdentityError::InvalidTotpCode);
-        }
         self.check_rate()?;
+        // A 6-digit input is a TOTP code; recovery codes are 22-char base64,
+        // so shape cleanly separates the two credential types.
+        if is_totp_code_shape(code) {
+            self.totp_code_login(code).await
+        } else {
+            self.recovery_code_login(code).await
+        }
+    }
+
+    /// Verify a TOTP code and issue a session with replay protection.
+    async fn totp_code_login(&self, code: &str) -> Result<AuthenticationGrant, IdentityError> {
         let owner = self.owner().await?;
         let owner_doc = self
             .pool
@@ -794,6 +802,53 @@ impl IdentityInterface {
             self.record_failure();
             return Err(IdentityError::InvalidTotpCode);
         }
+        insert_session(
+            &self.pool,
+            &mut session,
+            &owner.id,
+            &session_token,
+            &csrf_token,
+            now,
+        )
+        .await?;
+        session.commit_transaction().await?;
+        Ok(AuthenticationGrant {
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
+            session_token,
+            recovery_codes: None,
+        })
+    }
+
+    /// Redeem a single-use recovery code for a session directly, instead of
+    /// the passkey-rebind path that exchange_recovery enables.
+    async fn recovery_code_login(&self, code: &str) -> Result<AuthenticationGrant, IdentityError> {
+        let now = Utc::now();
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let owner_id = match self.consume_recovery_code(code, &mut session).await {
+            Ok(owner_id) => owner_id,
+            Err(error) => {
+                session.abort_transaction().await?;
+                self.record_failure();
+                return Err(error);
+            }
+        };
+        let owner_doc = self
+            .pool
+            .collection::<Document>("owners")
+            .find_one(doc! {"_id": &owner_id})
+            .session(&mut session)
+            .await?
+            .ok_or(IdentityError::AuthRequired)?;
+        let owner = OwnerRow::from_doc(&owner_doc)?;
+        let session_token = random_token(32);
+        let csrf_token = random_token(24);
         insert_session(
             &self.pool,
             &mut session,
@@ -1087,41 +1142,11 @@ impl IdentityInterface {
                 expires_at: document.get_str("expires_at")?.to_owned(),
             });
         }
-        let code_hash = purpose_hash("recovery-code", code_or_token);
         let mut session = self.pool.client().start_session().await?;
         session.start_transaction().await?;
-        let code = self
-            .pool
-            .collection::<Document>("recovery_codes")
-            .find_one(doc! {"code_hash": &code_hash, "used_at": null})
-            .session(&mut session)
-            .await?
-            .ok_or(IdentityError::InvalidRecoveryCode)?;
-        let code_id = code.get_str("_id")?.to_owned();
-        let batch_id = code.get_str("batch_id")?.to_owned();
-        let batch = self
-            .pool
-            .collection::<Document>("recovery_batches")
-            .find_one(doc! {"_id": &batch_id, "revoked_at": null})
-            .session(&mut session)
-            .await?
-            .ok_or(IdentityError::InvalidRecoveryCode)?;
-        let owner_id = batch.get_str("owner_id")?.to_owned();
-        let used_at = format_utc(now);
-        let consumed = self
-            .pool
-            .collection::<Document>("recovery_codes")
-            .update_one(
-                doc! {"_id": &code_id, "used_at": null},
-                doc! {"$set": {"used_at": &used_at}},
-            )
-            .session(&mut session)
-            .await?
-            .matched_count;
-        if consumed != 1 {
-            session.abort_transaction().await?;
-            return Err(IdentityError::InvalidRecoveryCode);
-        }
+        let owner_id = self
+            .consume_recovery_code(code_or_token, &mut session)
+            .await?;
         let token = random_token(32);
         let id = Uuid::now_v7().to_string();
         let token_hash = purpose_hash("recovery-state", &token);
@@ -1138,6 +1163,49 @@ impl IdentityInterface {
             .await?;
         session.commit_transaction().await?;
         Ok(RecoveryGrant { token, expires_at })
+    }
+
+    /// Find an unused recovery code, resolve its owner, and mark it used.
+    /// Runs inside the caller's transaction so consumption is atomic with the
+    /// caller's follow-up write (a recovery-state token or a session).
+    async fn consume_recovery_code(
+        &self,
+        code: &str,
+        session: &mut ClientSession,
+    ) -> Result<String, IdentityError> {
+        let now = Utc::now();
+        let code_hash = purpose_hash("recovery-code", code);
+        let recovery_code = self
+            .pool
+            .collection::<Document>("recovery_codes")
+            .find_one(doc! {"code_hash": &code_hash, "used_at": null})
+            .session(&mut *session)
+            .await?
+            .ok_or(IdentityError::InvalidRecoveryCode)?;
+        let code_id = recovery_code.get_str("_id")?.to_owned();
+        let batch_id = recovery_code.get_str("batch_id")?.to_owned();
+        let batch = self
+            .pool
+            .collection::<Document>("recovery_batches")
+            .find_one(doc! {"_id": &batch_id, "revoked_at": null})
+            .session(&mut *session)
+            .await?
+            .ok_or(IdentityError::InvalidRecoveryCode)?;
+        let owner_id = batch.get_str("owner_id")?.to_owned();
+        let consumed = self
+            .pool
+            .collection::<Document>("recovery_codes")
+            .update_one(
+                doc! {"_id": &code_id, "used_at": null},
+                doc! {"$set": {"used_at": format_utc(now)}},
+            )
+            .session(&mut *session)
+            .await?
+            .matched_count;
+        if consumed != 1 {
+            return Err(IdentityError::InvalidRecoveryCode);
+        }
+        Ok(owner_id)
     }
 
     pub async fn recovery_passkey_options(
