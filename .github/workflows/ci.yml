@@ -17,9 +17,13 @@ permissions:
 
 jobs:
   verify:
-    name: Docker Build Verification
+    name: Docker Build Verification (${{ matrix.target }})
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [combined, server, web]
     permissions:
       contents: read
     steps:
@@ -38,18 +42,22 @@ jobs:
           BUILDKIT_MEM_LIMIT: 13g
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: linux/amd64
           push: false
-          tags: janus:pr-check
-          no-cache: true
+          tags: janus:${{ matrix.target }}-pr-check
+          cache-from: |
+            type=gha
+          cache-to: |
+            type=gha,mode=max
 
       - name: Verify build success
         run: |
-          echo "Docker image build completed successfully."
+          echo "Docker image target '${{ matrix.target }}' build completed successfully."
           echo "Platform: linux/amd64"
 
   publish-amd64:
-    name: Publish Docker (amd64)
+    name: Publish Docker (amd64) — ${{ matrix.label }}
     if: >
       github.event_name != 'pull_request' &&
       (
@@ -59,6 +67,19 @@ jobs:
       ) &&
       !contains(github.event.head_commit.message || '', 'deps):')
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: combined
+            target: combined
+            suffix: ""
+          - label: server
+            target: server
+            suffix: "-server"
+          - label: web
+            target: web
+            suffix: "-web"
     permissions:
       contents: read
       packages: write
@@ -83,9 +104,10 @@ jobs:
       - name: Prepare tags
         id: tags
         run: |
+          SUFFIX='${{ matrix.suffix }}'
           TAGS=$(cat <<EOF
-          ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.ref_tag }}-amd64
-          ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}-amd64
+          ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.ref_tag }}${SUFFIX}-amd64
+          ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}${SUFFIX}-amd64
           EOF
           )
 
@@ -113,6 +135,7 @@ jobs:
           BUILDKIT_MEM_LIMIT: 13g
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: linux/amd64
           push: true
           build-args: |

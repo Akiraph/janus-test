@@ -493,24 +493,48 @@ cargo run -p janus-test -- events follow --count 1
 | `.github/workflows/quality.yml` | 推送到 `main`、每个 pull request | 固定 Rust `1.97.0` + Bun `1.3.14`,启动 `mongo:7` 副本集 service 容器,`bun install --frozen-lockfile`,为需要提交的测试设置 git 身份,然后执行 `cargo xtask check` |
 | `.github/workflows/ci.yml` | pull request、推送到 `main`/`master`/`dev`、手动 | PR 上构建 Docker 镜像做验证;由允许的 actor 推送时,发布 `linux/amd64` 标签到 GHCR 并运行部署脚本 |
 
-发布的标签是 `ghcr.io/<owner>/<repo>` 下的 `<ref>-amd64` 和 `<short-sha>-amd64`,另有
-用于 buildx 注册表缓存的 `:cache` 标签。随后 `scripts/deploy_image.js` 通过 SSH 把某个
-标签拉到目标主机,并重建 `CONTAINER_NAMES` 中列出的每个容器,沿用它此前的
-`docker inspect` 配置。它读取 `SERVER_ADDRESS`、`USERNAME`、`PORT`、`PRIVATE_KEY`、
-`CONTAINER_NAMES` 和 `ADMIN_PASSWORD` 这几个 secret,并在自己的日志中脱敏密钥材料。
-提交信息里包含 `deps):` 的提交会被跳过。
+每次推送到 `main`/`master`/`dev` 都会发布三个镜像,都在 `ghcr.io/<owner>/<repo>` 下,另有
+用于 buildx 注册表缓存的 `:cache` 标签:
+
+| 镜像 | Docker target | 标签 |
+| --- | --- | --- |
+| combined(前后端一体,单进程) | `combined`(默认) | `<ref>-amd64`、`<short-sha>-amd64` |
+| server(仅后端) | `server` | `<ref>-server-amd64`、`<short-sha>-server-amd64` |
+| web(nginx 前端 + API 代理) | `web` | `<ref>-web-amd64`、`<short-sha>-web-amd64` |
+
+随后 `scripts/deploy_image.js` 通过 SSH 把某个标签拉到目标主机,并重建 `CONTAINER_NAMES`
+中列出的每个容器,沿用它此前的 `docker inspect` 配置。它读取 `SERVER_ADDRESS`、`USERNAME`、
+`PORT`、`PRIVATE_KEY`、`CONTAINER_NAMES` 和 `ADMIN_PASSWORD` 这几个 secret,并在自己的
+日志中脱敏密钥材料。部署默认拉 combined 镜像标签(`<short-sha>-amd64`);要分开跑前端/后端,
+把 `CONTAINER_NAMES`/`IMAGE_URL` 指向 `server` 或 `web` 标签。提交信息里包含 `deps):`
+的提交会被跳过。
 
 GitHub Actions 是正确性的权威:用 `gh run list` 和 `gh run view --log-failed` 判断,
 而不是把本地通过当成构建为绿。
 
 ## 容器部署
 
-`Dockerfile` 产出一个把前端和后端作为单进程运行的镜像:第一阶段用 Bun 构建 Web 产物,
+`Dockerfile` 暴露三个 build target,它们共享同一批构建阶段:第一阶段用 Bun 构建 Web 产物,
 第二阶段用 `rust:1.97.0-bookworm` 构建 `janus-server`,Debian slim 运行时保留 `git`
 (供源码控制适配器使用)和 `tini`(回收派生出的会话与终端进程)。
 
+| Target | 镜像内容 |
+| --- | --- |
+| `combined`(默认) | 前端 + 后端单进程;web 产物与 API、健康探针、SPA 同源托管 |
+| `server` | 仅后端:`janus-server` + `janus-admin`,不含 web 客户端 |
+| `web` | 仅前端:nginx 托管 web 产物,并把 `/api`、`/health` 代理到 `JANUS_API_TARGET` 指向的后端 |
+
+用 `docker build --target <name>` 构建任意 target:
+
 ```text
 docker build -t janus:local .
+docker build --target server -t janus-server:local .
+docker build --target web -t janus-web:local .
+```
+
+combined 镜像把前后端作为一个进程运行:
+
+```text
 docker run --rm -p 4317:4317 -v janus-data:/data \
   -e JANUS_MONGODB_URI=mongodb://host.docker.internal:27017/?replicaSet=rs0 \
   janus:local
@@ -550,6 +574,55 @@ docker run --rm -v janus-data:/data \
   -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
   janus:local janus-admin issue-initialization-token
 ```
+
+### 前后端分离
+
+`server` 与 `web` 两个镜像把前后端拆成两个容器。web 镜像托管 SPA,并在同一个 origin 下把
+API 代理回后端,因此浏览器仍用相对 `/api` 路径,`SameSite=Strict` 会话 cookie 与后端的
+Origin 校验照常工作。把 `JANUS_API_TARGET` 指向后端,并把后端的 `JANUS_PUBLIC_ORIGIN`
+设成 web 镜像的公网地址:
+
+```text
+# 后端(server 镜像)
+docker run --rm -d --name janus-server -v janus-data:/data \
+  -e JANUS_MODE=production \
+  -e JANUS_PUBLIC_ORIGIN=https://frontend.example.com \
+  -e JANUS_MONGODB_URI=mongodb://mongo:27017/?replicaSet=rs0 \
+  -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
+  janus-server:local
+
+# 前端(web 镜像;每个前端 origin 一个容器)
+docker run --rm -d -p 8080:80 \
+  -e JANUS_API_TARGET=http://janus-server:4317 \
+  janus-web:local
+```
+
+web 镜像的 nginx 转发 `/api`(含 SSE)与 `/health`,并把终端 WebSocket 升级到后端。纯 http
+部署仍需在后端设置 `JANUS_AUTH_MODE=totp` 与匹配前端 origin 的 http `JANUS_PUBLIC_ORIGIN`,
+同上。
+
+### Vercel 部署
+
+web 客户端是静态 Vite 构建,可直接部署到 Vercel,无需改任何代码。仓库根目录的 `vercel.json`
+把构建指向 `apps/web`(`rootDirectory`),并用 `routes` 把 `/api`、`/health` 代理到后端。
+在 Vercel 项目设置(Settings → Environment Variables)里用 `JANUS_API_TARGET` 环境变量配置
+后端地址;`routes` 通过其 `env` 白名单在请求时展开该变量:
+
+```json
+{
+  "routes": [
+    { "src": "/api/(.*)", "dest": "${JANUS_API_TARGET}/api/$1", "env": ["JANUS_API_TARGET"] },
+    { "src": "/health/(.*)", "dest": "${JANUS_API_TARGET}/health/$1", "env": ["JANUS_API_TARGET"] },
+    { "src": "/((?!api/|health/).*)", "dest": "/index.html" }
+  ]
+}
+```
+
+代理让浏览器始终停留在 Vercel origin,会话 cookie 与 Origin 校验照常工作 —— 把后端的
+`JANUS_PUBLIC_ORIGIN` 设成 Vercel 域名。两点注意:Vercel 的外部 origin route **不**转发
+WebSocket 升级,所以终端功能在 Vercel 部署上不可用;需要终端请改用 Docker 镜像部署。另外
+`/api` 响应无需写入 Vercel CDN 缓存 —— Vercel 遵循上游 `cache-control`,而 API 不返回该头,
+默认不会被缓存。
 
 ## Fork-sync 自动化
 
