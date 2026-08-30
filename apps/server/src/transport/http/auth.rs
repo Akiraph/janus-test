@@ -10,7 +10,7 @@ use crate::{
     transport::http::{
         dto::{
             CeremonyCompleteRequest, DataResponse, InitializeOptionsRequest, PasskeyOptionsRequest,
-            RecoveryExchangeRequest, RenamePasskeyRequest,
+            RecoveryExchangeRequest, RenamePasskeyRequest, TotpCodeRequest, TotpLoginRequest,
         },
         problem::Problem,
     },
@@ -36,6 +36,7 @@ pub async fn initialize_complete(
     Json(input): Json<CeremonyCompleteRequest>,
 ) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     grant_response(
+        &state,
         state
             .identity()
             .initialize_complete(&input.ceremony_id, input.credential)
@@ -58,6 +59,7 @@ pub async fn login_complete(
     Json(input): Json<CeremonyCompleteRequest>,
 ) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     grant_response(
+        &state,
         state
             .identity()
             .login_complete(&input.ceremony_id, input.credential)
@@ -86,9 +88,14 @@ pub async fn logout(
     let mut output = HeaderMap::new();
     output.insert(
         header::SET_COOKIE,
-        HeaderValue::from_static(
-            "__Host-janus_session=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict",
-        ),
+        HeaderValue::from_str(&session_cookie(&state, "", 0)).map_err(|_| {
+            Problem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Internal server error",
+                "The login cookie could not be cleared.",
+            )
+        })?,
     );
     Ok((output, StatusCode::NO_CONTENT))
 }
@@ -233,6 +240,7 @@ pub async fn recovery_passkey_complete(
     let token = cookie(&headers, "janus_recovery")
         .ok_or_else(|| problem(IdentityError::InvalidRecoveryCode))?;
     grant_response(
+        &state,
         state
             .identity()
             .recovery_passkey_complete(&token, &input.ceremony_id, input.credential)
@@ -241,8 +249,61 @@ pub async fn recovery_passkey_complete(
     )
 }
 
+#[utoipa::path(post, path = "/api/v1/auth/totp/initialize/options", request_body = InitializeOptionsRequest, responses((status = 200, body = DataResponse<janus_identity::TotpProvision>), (status = 400, body = Problem)))]
+pub async fn totp_initialize_options(
+    State(state): State<AppState>,
+    Json(input): Json<InitializeOptionsRequest>,
+) -> Result<Json<DataResponse<janus_identity::TotpProvision>>, Problem> {
+    Ok(Json(DataResponse {
+        data: state
+            .identity()
+            .totp_initialize_options(&input.initialization_token, &input.display_name)
+            .await
+            .map_err(problem)?,
+    }))
+}
+
+#[utoipa::path(post, path = "/api/v1/auth/totp/initialize/complete", request_body = TotpCodeRequest, responses((status = 200, body = DataResponse<janus_identity::OwnerView>), (status = 400, body = Problem)))]
+pub async fn totp_initialize_complete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TotpCodeRequest>,
+) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    grant_response(
+        &state,
+        state
+            .identity()
+            .totp_initialize_complete(&input.ceremony_id, &input.code, origin)
+            .await
+            .map_err(problem)?,
+    )
+}
+
+#[utoipa::path(post, path = "/api/v1/auth/totp/login", request_body = TotpLoginRequest, responses((status = 200, body = DataResponse<janus_identity::OwnerView>), (status = 400, body = Problem)))]
+pub async fn totp_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TotpLoginRequest>,
+) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    grant_response(
+        &state,
+        state
+            .identity()
+            .totp_login(&input.code, origin)
+            .await
+            .map_err(problem)?,
+    )
+}
+
 pub async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, Problem> {
-    let token = cookie(headers, "__Host-janus_session");
+    let name = if state.config().public_origin.scheme() == "https" {
+        "__Host-janus_session"
+    } else {
+        "janus_session"
+    };
+    let token = cookie(headers, name);
     state
         .identity()
         .authenticate(token.as_deref())
@@ -262,14 +323,24 @@ pub async fn authorized(state: &AppState, headers: &HeaderMap) -> Result<AuthCon
     Ok(auth)
 }
 
+/// Session cookie name and attributes depend on the origin scheme: browsers
+/// refuse `Secure` cookies (and `__Host-` names) over plain http, which is
+/// exactly the deployment TOTP mode exists for. https origins keep the
+/// hardened name.
+fn session_cookie(state: &AppState, token: &str, max_age: u64) -> String {
+    let (name, secure) = match state.config().public_origin.scheme() {
+        "https" => ("__Host-janus_session", "; Secure"),
+        _ => ("janus_session", ""),
+    };
+    format!("{name}={token}; Path=/; Max-Age={max_age}{secure}; HttpOnly; SameSite=Strict")
+}
+
 fn grant_response(
+    state: &AppState,
     grant: AuthenticationGrant,
 ) -> Result<(HeaderMap, Json<DataResponse<janus_identity::OwnerView>>), Problem> {
     let mut headers = HeaderMap::new();
-    let cookie = format!(
-        "__Host-janus_session={}; Path=/; Max-Age=604800; Secure; HttpOnly; SameSite=Strict",
-        grant.session_token
-    );
+    let cookie = session_cookie(state, &grant.session_token, 604800);
     headers.insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).map_err(|_| {
@@ -364,6 +435,30 @@ fn problem(error: IdentityError) -> Problem {
             StatusCode::UNAUTHORIZED,
             "RECOVERY_CODE_INVALID",
             "Recovery failed",
+            error.to_string(),
+        ),
+        IdentityError::PasskeyDisabled => Problem::new(
+            StatusCode::FORBIDDEN,
+            "PASSKEY_DISABLED",
+            "Passkey authentication is disabled",
+            error.to_string(),
+        ),
+        IdentityError::TotpDisabled => Problem::new(
+            StatusCode::FORBIDDEN,
+            "TOTP_DISABLED",
+            "TOTP authentication is disabled",
+            error.to_string(),
+        ),
+        IdentityError::InvalidTotpCode => Problem::new(
+            StatusCode::UNAUTHORIZED,
+            "TOTP_CODE_INVALID",
+            "TOTP code invalid",
+            error.to_string(),
+        ),
+        IdentityError::RateLimited => Problem::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Rate limit exceeded",
             error.to_string(),
         ),
         IdentityError::Storage(_)

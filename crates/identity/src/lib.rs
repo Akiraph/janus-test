@@ -1,8 +1,8 @@
-//! Owner authentication, passkey ceremonies, and recovery.
+//! Owner authentication, passkey ceremonies, TOTP login, and recovery.
 
 pub mod interface;
 
 pub use interface::{
-    AuthContext, AuthenticationGrant, AuthenticationMode, CeremonyOptions, IdentityError,
-    IdentityInterface, InitializationState, OwnerView, PasskeyView, RecoveryGrant,
+    AuthContext, AuthMode, AuthenticationGrant, AuthenticationMode, CeremonyOptions, IdentityError,
+    IdentityInterface, InitializationState, OwnerView, PasskeyView, RecoveryGrant, TotpProvision,
 };

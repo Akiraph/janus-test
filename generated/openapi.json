@@ -430,6 +430,126 @@
         }
       }
     },
+    "/api/v1/auth/totp/initialize/complete": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "totp_initialize_complete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpCodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OwnerView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/totp/initialize/options": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "totp_initialize_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InitializeOptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_TotpProvision"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/totp/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "totp_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_OwnerView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/automation/settings": {
       "get": {
         "tags": [
@@ -4765,10 +4885,18 @@
           }
         }
       },
+      "AuthMode": {
+        "type": "string",
+        "enum": [
+          "passkey",
+          "totp"
+        ]
+      },
       "AuthenticationMode": {
         "type": "string",
         "enum": [
           "passkey",
+          "totp",
           "development"
         ]
       },
@@ -4916,6 +5044,7 @@
       "BootstrapData": {
         "type": "object",
         "required": [
+          "auth_mode",
           "state",
           "development_auth",
           "webauthn_rp_name",
@@ -4923,6 +5052,9 @@
           "limits"
         ],
         "properties": {
+          "auth_mode": {
+            "$ref": "#/components/schemas/AuthMode"
+          },
           "development_auth": {
             "type": "boolean"
           },
@@ -6248,6 +6380,33 @@
         "properties": {
           "data": {
             "type": "string"
+          }
+        }
+      },
+      "DataResponse_TotpProvision": {
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "ceremony_id",
+              "secret_base32",
+              "otpauth_uri"
+            ],
+            "properties": {
+              "ceremony_id": {
+                "type": "string"
+              },
+              "otpauth_uri": {
+                "type": "string"
+              },
+              "secret_base32": {
+                "type": "string"
+              }
+            }
           }
         }
       },
@@ -9314,6 +9473,53 @@
       "ToolCallId": {
         "type": "string",
         "format": "uuid"
+      },
+      "TotpCodeRequest": {
+        "type": "object",
+        "required": [
+          "ceremony_id",
+          "code"
+        ],
+        "properties": {
+          "ceremony_id": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string",
+            "writeOnly": true
+          }
+        }
+      },
+      "TotpLoginRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "writeOnly": true
+          }
+        }
+      },
+      "TotpProvision": {
+        "type": "object",
+        "required": [
+          "ceremony_id",
+          "secret_base32",
+          "otpauth_uri"
+        ],
+        "properties": {
+          "ceremony_id": {
+            "type": "string"
+          },
+          "otpauth_uri": {
+            "type": "string"
+          },
+          "secret_base32": {
+            "type": "string"
+          }
+        }
       },
       "TurnId": {
         "type": "string",

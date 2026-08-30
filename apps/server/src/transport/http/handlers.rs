@@ -82,6 +82,7 @@ pub async fn bootstrap(
         headers,
         Json(BootstrapResponse {
             data: BootstrapData {
+                auth_mode: state.config().auth_mode,
                 state: match state.identity().initialization_state().await.map_err(|error| {
                     tracing::error!(request_id = %context.request_id, %error, "read initialization state");
                     internal_problem(&context, "The initialization state could not be read.")

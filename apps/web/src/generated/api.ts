@@ -180,6 +180,54 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v1/auth/totp/initialize/complete": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["totp_initialize_complete"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/auth/totp/initialize/options": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["totp_initialize_options"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/api/v1/auth/totp/login": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post: operations["totp_login"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v1/automation/settings": {
     parameters: {
       query?: never;
@@ -1296,7 +1344,9 @@ export interface components {
       version: string;
     };
     /** @enum {string} */
-    AuthenticationMode: "passkey" | "development";
+    AuthMode: "passkey" | "totp";
+    /** @enum {string} */
+    AuthenticationMode: "passkey" | "totp" | "development";
     AutomationRepositoryView: {
       detail?: string | null;
       project_id?: string | null;
@@ -1329,6 +1379,7 @@ export interface components {
       secret_configured: boolean;
     };
     BootstrapData: {
+      auth_mode: components["schemas"]["AuthMode"];
       development_auth: boolean;
       limits: components["schemas"]["PublicLimits"];
       state: components["schemas"]["BootstrapState"];
@@ -1712,6 +1763,9 @@ export interface components {
         newest_cursor?: string | null;
         oldest_cursor?: string | null;
       };
+    };
+    DataResponse_TotpProvision: {
+      data: components["schemas"]["TotpProvision"];
     };
     DataResponse_TurnSummary: {
       data: {
@@ -2472,6 +2526,18 @@ export interface components {
     };
     /** Format: uuid */
     ToolCallId: string;
+    TotpCodeRequest: {
+      ceremony_id: string;
+      code: string;
+    };
+    TotpLoginRequest: {
+      code: string;
+    };
+    TotpProvision: {
+      ceremony_id: string;
+      secret_base32: string;
+      otpauth_uri: string;
+    };
     /** Format: uuid */
     TurnId: string;
     /**
@@ -2885,6 +2951,99 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["DataResponse_CeremonyOptions"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  totp_initialize_complete: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["TotpCodeRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OwnerView"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  totp_initialize_options: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["InitializeOptionsRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_TotpProvision"];
+        };
+      };
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
+  totp_login: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["TotpLoginRequest"];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["DataResponse_OwnerView"];
         };
       };
       400: {

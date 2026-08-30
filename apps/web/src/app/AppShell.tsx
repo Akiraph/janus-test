@@ -12,7 +12,7 @@ import { Match, Show, Suspense, Switch } from "solid-js";
 import { JanusLogo } from "../components/JanusLogo";
 import { Button } from "../components/ui/Button";
 import { type TabItem, Tabs } from "../components/ui/Tabs";
-import { LoginView, SetupView } from "../features/auth/AuthViews";
+import { LoginView, SetupView, TotpLoginView, TotpSetupView } from "../features/auth/AuthViews";
 import { IdeShellScaffold } from "../features/projects/workspace/IdeShellScaffold";
 import { useBootstrap, useMe } from "../lib/queries";
 import { useEventStream } from "../lib/useEventStream";
@@ -70,7 +70,7 @@ export function AppShell(props: AppShellProps) {
           bootstrap.data?.data.state === "uninitialized" && !bootstrap.data.data.development_auth
         }
       >
-        <SetupView />
+        {bootstrap.data?.data.auth_mode === "totp" ? <TotpSetupView /> : <SetupView />}
       </Match>
       <Match when={bootstrap.data?.data.development_auth}>
         <AuthenticatedShell route={() => props.children} />
@@ -88,6 +88,7 @@ interface RoutedShellProps {
 
 function OwnerGate(props: RoutedShellProps) {
   const me = useMe();
+  const bootstrap = useBootstrap();
 
   return (
     <Switch fallback={<RouteLoading />}>
@@ -95,7 +96,7 @@ function OwnerGate(props: RoutedShellProps) {
         <RouteLoading />
       </Match>
       <Match when={me.isError}>
-        <LoginView />
+        {bootstrap.data?.data.auth_mode === "totp" ? <TotpLoginView /> : <LoginView />}
       </Match>
       <Match when={me.isSuccess}>
         <AuthenticatedShell route={props.route} />

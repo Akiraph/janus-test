@@ -33,6 +33,11 @@ pub struct Config {
     pub web_dist: Option<PathBuf>,
     pub mode: RunMode,
     pub development_auth: bool,
+    /// Authentication scheme the deployment uses. `Passkey` is the default and
+    /// requires a real https domain; `Totp` is for http/IP deployments where
+    /// WebAuthn cannot run and the owner signs in with a time-based one-time
+    /// password instead.
+    pub auth_mode: janus_identity::AuthMode,
     pub webauthn_rp_name: String,
     pub webauthn_rp_id: String,
     pub public_origin: url::Url,
@@ -50,6 +55,8 @@ pub enum ConfigError {
     InvalidMode,
     #[error("JANUS_DEV_AUTH must be true or false")]
     InvalidDevelopmentAuth,
+    #[error("JANUS_AUTH_MODE must be passkey or totp")]
+    InvalidAuthMode,
     #[error("development authentication is forbidden in production")]
     UnsafeProductionAuth,
     #[error("development authentication requires a loopback bind address")]
@@ -85,6 +92,14 @@ impl Config {
             "false" | "0" => false,
             _ => return Err(ConfigError::InvalidDevelopmentAuth),
         };
+        let auth_mode = match env::var("JANUS_AUTH_MODE")
+            .unwrap_or_else(|_| "passkey".into())
+            .as_str()
+        {
+            "passkey" => janus_identity::AuthMode::Passkey,
+            "totp" => janus_identity::AuthMode::Totp,
+            _ => return Err(ConfigError::InvalidAuthMode),
+        };
         let origin_value =
             env::var("JANUS_PUBLIC_ORIGIN").unwrap_or_else(|_| format!("http://{}", bind));
         let public_origin = url::Url::parse(&origin_value)
@@ -116,6 +131,7 @@ impl Config {
                 .filter(|path| !path.as_os_str().is_empty()),
             mode,
             development_auth,
+            auth_mode,
             webauthn_rp_name: env::var("JANUS_WEBAUTHN_RP_NAME").unwrap_or_else(|_| "Janus".into()),
             webauthn_rp_id: env::var("JANUS_WEBAUTHN_RP_ID")
                 .unwrap_or_else(|_| public_origin.host_str().unwrap_or("localhost").into()),
@@ -153,7 +169,13 @@ impl Config {
                 self.public_origin.to_string(),
             ));
         }
-        if self.mode == RunMode::Production && self.public_origin.scheme() != "https" {
+        // WebAuthn only works on a secure context, so passkey deployments must
+        // serve https in production. TOTP mode has no such requirement and is
+        // the supported way to run an http/IP deployment.
+        if self.mode == RunMode::Production
+            && self.auth_mode == janus_identity::AuthMode::Passkey
+            && self.public_origin.scheme() != "https"
+        {
             return Err(ConfigError::InsecureProductionOrigin);
         }
         if self.automation_webhook_enabled && self.automation_webhook_secret.is_none() {
@@ -191,6 +213,7 @@ mod tests {
             web_dist: None,
             mode: RunMode::Production,
             development_auth: true,
+            auth_mode: janus_identity::AuthMode::Passkey,
             webauthn_rp_name: "Janus".into(),
             webauthn_rp_id: "localhost".into(),
             public_origin: url::Url::parse("https://localhost").expect("static URL"),

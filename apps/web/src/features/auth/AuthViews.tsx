@@ -7,6 +7,7 @@ import type { Component } from "solid-js";
 import { createSignal, For, Show } from "solid-js";
 import { Button } from "../../components/ui/Button";
 import { NotificationEvent } from "../../components/ui/notifications";
+import type { TotpProvision } from "../../lib/api";
 import {
   getErrorMessage,
   initializeComplete,
@@ -16,6 +17,9 @@ import {
   recoveryComplete,
   recoveryExchange,
   recoveryOptions,
+  totpInitializeComplete,
+  totpInitializeOptions,
+  totpLogin,
 } from "../../lib/api";
 import { authenticationOptions, credentialPayload, registrationOptions } from "../../lib/webauthn";
 import "./auth.css";
@@ -123,6 +127,145 @@ export function SetupView() {
   );
 }
 
+export function TotpSetupView() {
+  const queryClient = useQueryClient();
+  const [token, setToken] = createSignal("");
+  const [name, setName] = createSignal("Owner");
+  const [provision, setProvision] = createSignal<TotpProvision | null>(null);
+  const [code, setCode] = createSignal("");
+  const [codes, setCodes] = createSignal<string[]>([]);
+  const [copyState, setCopyState] = createSignal("");
+  const [error, setError] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+
+  async function submit(event: SubmitEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      setProvision(await totpInitializeOptions(token(), name()));
+    } catch (value) {
+      setError(authErrorMessage(value, "Initialization failed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirm(event: SubmitEvent) {
+    event.preventDefault();
+    const current = provision();
+    if (!current) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await totpInitializeComplete(current.ceremony_id, code());
+      setCodes(result.recoveryCodes);
+      await queryClient.invalidateQueries({ queryKey: ["bootstrap"] });
+      await queryClient.invalidateQueries({ queryKey: ["me"] });
+    } catch (value) {
+      setError(authErrorMessage(value, "Initialization failed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copySecret() {
+    const current = provision();
+    if (!current) return;
+    try {
+      await navigator.clipboard.writeText(current.secret_base32);
+      setCopyState("Secret key copied to your clipboard.");
+    } catch {
+      setCopyState("Copy failed. Select the key and copy it manually.");
+    }
+  }
+
+  return (
+    <AuthSurface
+      icon={KeyRound}
+      title="Initialize Janus"
+      subtitle="Enroll an authenticator app for this deployment."
+      wide
+    >
+      <Show
+        when={codes().length === 0}
+        fallback={<RecoveryCodes codes={codes()} done={() => location.reload()} />}
+      >
+        <Show
+          when={provision()}
+          fallback={
+            <form class="auth-form" onSubmit={submit}>
+              <label>
+                Display name
+                <input
+                  class="ui-input"
+                  value={name()}
+                  onInput={(event) => setName(event.currentTarget.value)}
+                  required
+                />
+              </label>
+              <label>
+                Initialization token
+                <input
+                  class="ui-input"
+                  type="password"
+                  value={token()}
+                  onInput={(event) => setToken(event.currentTarget.value)}
+                  autocomplete="off"
+                  required
+                />
+              </label>
+              <NotificationEvent message={error()} variant="danger" />
+              <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
+                <KeyRound size={17} aria-hidden="true" />
+                {busy() ? "Generating key..." : "Generate TOTP key"}
+              </Button>
+            </form>
+          }
+        >
+          <form class="auth-form" onSubmit={confirm}>
+            <label>
+              Secret key
+              <code>{provision()?.secret_base32}</code>
+            </label>
+            <Button variant="outline" type="button" onClick={() => void copySecret()}>
+              <Copy size={16} aria-hidden="true" />
+              Copy secret
+            </Button>
+            <Show when={copyState()}>
+              <p class="auth-note" role="status">
+                {copyState()}
+              </p>
+            </Show>
+            <p class="auth-note">
+              Add this key to your authenticator app (e.g. Google Authenticator or 1Password),
+              manually or by scanning the URI below if your app supports it.
+            </p>
+            <code>{provision()?.otpauth_uri}</code>
+            <label>
+              Confirmation code
+              <input
+                class="ui-input"
+                inputmode="numeric"
+                maxLength={6}
+                value={code()}
+                onInput={(event) => setCode(event.currentTarget.value)}
+                autocomplete="off"
+                required
+              />
+            </label>
+            <NotificationEvent message={error()} variant="danger" />
+            <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
+              <KeyRound size={17} aria-hidden="true" />
+              {busy() ? "Confirming..." : "Confirm code"}
+            </Button>
+          </form>
+        </Show>
+      </Show>
+    </AuthSurface>
+  );
+}
+
 export function LoginView() {
   const queryClient = useQueryClient();
   const [error, setError] = createSignal("");
@@ -217,6 +360,56 @@ export function LoginView() {
           </form>
         </Show>
       </div>
+    </AuthSurface>
+  );
+}
+
+export function TotpLoginView() {
+  const queryClient = useQueryClient();
+  const [code, setCode] = createSignal("");
+  const [error, setError] = createSignal("");
+  const [busy, setBusy] = createSignal(false);
+
+  async function login(event: SubmitEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await totpLogin(code());
+      await queryClient.invalidateQueries({ queryKey: ["me"] });
+    } catch (value) {
+      setError(authErrorMessage(value, "Login failed."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <AuthSurface
+      icon={LockKeyhole}
+      title="Welcome back"
+      subtitle="Enter the code from your authenticator app."
+    >
+      <form class="auth-form" onSubmit={login}>
+        <label>
+          6-digit code
+          <input
+            class="ui-input"
+            inputmode="numeric"
+            maxLength={6}
+            value={code()}
+            onInput={(event) => setCode(event.currentTarget.value)}
+            autocomplete="off"
+            required
+          />
+        </label>
+        <p class="auth-note">Enter the 6-digit code from your authenticator app.</p>
+        <NotificationEvent message={error()} variant="danger" />
+        <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
+          <KeyRound size={17} aria-hidden="true" />
+          {busy() ? "Verifying..." : "Continue"}
+        </Button>
+      </form>
     </AuthSurface>
   );
 }
