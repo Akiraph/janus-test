@@ -15,7 +15,7 @@ use std::{
 
 use serde_json::Value;
 use tokio::{
-    sync::{oneshot, Semaphore},
+    sync::{Semaphore, oneshot},
     task::JoinHandle,
     time::MissedTickBehavior,
 };

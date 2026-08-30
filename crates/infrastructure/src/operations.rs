@@ -1438,10 +1438,7 @@ mod tests {
         let bare_id = bare.operation.id.clone();
         db.database()
             .collection::<Document>("operations")
-            .update_one(
-                doc! {"_id": &bare_id},
-                doc! {"$set": {"status": "running"}},
-            )
+            .update_one(doc! {"_id": &bare_id}, doc! {"$set": {"status": "running"}})
             .await
             .unwrap();
         assert!(ops.stale_running().await.unwrap().contains(&bare_id));

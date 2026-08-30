@@ -912,17 +912,18 @@ impl ExecutionInterface {
                         // so without a check here a canceled Turn would keep
                         // hammering the provider on the unbounded retry cadence.
                         let still_runnable = match (&req.session_id, &req.turn_id) {
-                            (Some(session_id), Some(turn_id)) => self
-                                .sessions
-                                .turn_is_runnable(
-                                    session_id.parse::<SessionId>().map_err(|error| {
-                                        ExecutionError::Internal(anyhow::anyhow!(error))
-                                    })?,
-                                    turn_id.parse::<TurnId>().map_err(|error| {
-                                        ExecutionError::Internal(anyhow::anyhow!(error))
-                                    })?,
-                                )
-                                .await?,
+                            (Some(session_id), Some(turn_id)) => {
+                                self.sessions
+                                    .turn_is_runnable(
+                                        session_id.parse::<SessionId>().map_err(|error| {
+                                            ExecutionError::Internal(anyhow::anyhow!(error))
+                                        })?,
+                                        turn_id.parse::<TurnId>().map_err(|error| {
+                                            ExecutionError::Internal(anyhow::anyhow!(error))
+                                        })?,
+                                    )
+                                    .await?
+                            }
                             _ => true,
                         };
                         if !still_runnable {

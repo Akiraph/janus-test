@@ -188,21 +188,21 @@ impl LogStore {
         }
         let total_bytes = to_u64(row.total_bytes, "total_bytes")?
             .saturating_add(u64::try_from(input.len()).unwrap_or(u64::MAX));
-        let (first_cursor, retained_bytes, truncated) =
-            if total_bytes <= retention.raw_limit_bytes {
-                // Nothing has been trimmed yet: the first chunk still starts at
-                // zero and retained bytes grow by the redacted text just
-                // written. Reading the directory back to recompute these would
-                // re-read the whole stream on every append.
-                (
-                    0,
-                    to_u64(row.retained_bytes, "retained_bytes")?
-                        .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX)),
-                    false,
-                )
-            } else {
-                enforce_retention(&directory, cursor, total_bytes, retention).await?
-            };
+        let (first_cursor, retained_bytes, truncated) = if total_bytes <= retention.raw_limit_bytes
+        {
+            // Nothing has been trimmed yet: the first chunk still starts at
+            // zero and retained bytes grow by the redacted text just
+            // written. Reading the directory back to recompute these would
+            // re-read the whole stream on every append.
+            (
+                0,
+                to_u64(row.retained_bytes, "retained_bytes")?
+                    .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX)),
+                false,
+            )
+        } else {
+            enforce_retention(&directory, cursor, total_bytes, retention).await?
+        };
         let now = now_utc_str();
         let first_cursor = to_i64(first_cursor)?;
         let next_cursor = to_i64(cursor)?;
@@ -554,10 +554,7 @@ async fn read_chunks_from(directory: &Path, after: u64) -> Result<Vec<DiskChunk>
     let mut chunks: Vec<DiskChunk> = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(storage_error)? {
         let path = entry.path();
-        let is_json = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            == Some("json");
+        let is_json = path.extension().and_then(|extension| extension.to_str()) == Some("json");
         if !is_json || !entry.file_type().await.map_err(storage_error)?.is_file() {
             continue;
         }

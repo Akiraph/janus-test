@@ -20,7 +20,9 @@ use janus_infrastructure::{
     clock::now_utc_str,
     events::{EventStore, EventType, NewEvent},
     id::{CorrelationId, GitUpdateConflictId, ProjectId},
-    operations::{CreateOperation, IdempotencyRequest, OperationInterface, OperationStatus, OperationView},
+    operations::{
+        CreateOperation, IdempotencyRequest, OperationInterface, OperationStatus, OperationView,
+    },
     secrets::SecretCipher,
     unit_of_work::UnitOfWork,
 };

@@ -689,9 +689,13 @@ mod tests {
             );
         }
 
-        let denied = resolve_workspace_path(root.path(), Path::new("external/secret.txt"), "external/secret.txt")
-            .await
-            .expect_err("link must be rejected");
+        let denied = resolve_workspace_path(
+            root.path(),
+            Path::new("external/secret.txt"),
+            "external/secret.txt",
+        )
+        .await
+        .expect_err("link must be rejected");
         assert!(matches!(denied, WorkspaceError::PermissionDenied(_)));
     }
 }

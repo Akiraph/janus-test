@@ -1401,6 +1401,9 @@ mod tests {
         assert_eq!(sanitize_untrusted(&long).len(), 2000);
 
         assert_eq!(sanitize_untrusted("  padded  "), "padded");
-        assert_eq!(sanitize_untrusted("keep\nnewline\ttab"), "keep\nnewline\ttab");
+        assert_eq!(
+            sanitize_untrusted("keep\nnewline\ttab"),
+            "keep\nnewline\ttab"
+        );
     }
 }

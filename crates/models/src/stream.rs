@@ -314,21 +314,18 @@ impl ModelsInterface {
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
         loop {
-            let chunk =
-                match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await {
-                    Err(_) => {
-                        return Err(ModelsError::Internal(anyhow::anyhow!(
-                            "provider stream idle timeout"
-                        )));
-                    }
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk.map_err(|e| {
-                        ModelsError::Internal(anyhow::anyhow!(
-                            "stream read: {}",
-                            classify_reqwest(&e)
-                        ))
-                    })?,
-                };
+            let chunk = match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await
+            {
+                Err(_) => {
+                    return Err(ModelsError::Internal(anyhow::anyhow!(
+                        "provider stream idle timeout"
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk.map_err(|e| {
+                    ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+                })?,
+            };
             for (_ev, data) in parser.push(&chunk) {
                 let more = assembler
                     .ingest_data(attempt_id, &data)
@@ -404,21 +401,18 @@ impl ModelsInterface {
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
         loop {
-            let chunk =
-                match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await {
-                    Err(_) => {
-                        return Err(ModelsError::Internal(anyhow::anyhow!(
-                            "provider stream idle timeout"
-                        )));
-                    }
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk.map_err(|e| {
-                        ModelsError::Internal(anyhow::anyhow!(
-                            "stream read: {}",
-                            classify_reqwest(&e)
-                        ))
-                    })?,
-                };
+            let chunk = match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await
+            {
+                Err(_) => {
+                    return Err(ModelsError::Internal(anyhow::anyhow!(
+                        "provider stream idle timeout"
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk.map_err(|e| {
+                    ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+                })?,
+            };
             for (event_name, data) in parser.push(&chunk) {
                 let more = assembler
                     .ingest_event(attempt_id, &event_name, &data)
@@ -506,21 +500,18 @@ impl ModelsInterface {
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
         loop {
-            let chunk =
-                match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await {
-                    Err(_) => {
-                        return Err(ModelsError::Internal(anyhow::anyhow!(
-                            "provider stream idle timeout"
-                        )));
-                    }
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk.map_err(|e| {
-                        ModelsError::Internal(anyhow::anyhow!(
-                            "stream read: {}",
-                            classify_reqwest(&e)
-                        ))
-                    })?,
-                };
+            let chunk = match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await
+            {
+                Err(_) => {
+                    return Err(ModelsError::Internal(anyhow::anyhow!(
+                        "provider stream idle timeout"
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk.map_err(|e| {
+                    ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+                })?,
+            };
             for (ev, data) in parser.push(&chunk) {
                 let more = assembler
                     .ingest(attempt_id, &ev, &data)

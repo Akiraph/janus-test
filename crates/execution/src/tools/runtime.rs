@@ -304,7 +304,10 @@ fn sync_environment(
 ) -> Result<janus_runtime::interface::ExecutionEnvironment, ExecutionError> {
     let mut ordinary = std::collections::BTreeMap::new();
     if let Some(askpass) = askpass {
-        ordinary.insert("GIT_ASKPASS".into(), askpass.path().to_string_lossy().into_owned());
+        ordinary.insert(
+            "GIT_ASKPASS".into(),
+            askpass.path().to_string_lossy().into_owned(),
+        );
     }
     janus_runtime::interface::ExecutionEnvironment::new(ordinary, Vec::new())
         .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("env: {error}")))
@@ -344,12 +347,14 @@ impl GitAskpass {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(&path)
-                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("askpass metadata: {error}")))?;
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                ExecutionError::Internal(anyhow::anyhow!("askpass metadata: {error}"))
+            })?;
             let mut permissions = metadata.permissions();
             permissions.set_mode(0o700);
-            std::fs::set_permissions(&path, permissions)
-                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("askpass chmod: {error}")))?;
+            std::fs::set_permissions(&path, permissions).map_err(|error| {
+                ExecutionError::Internal(anyhow::anyhow!("askpass chmod: {error}"))
+            })?;
         }
         Ok(GitAskpass { path })
     }
