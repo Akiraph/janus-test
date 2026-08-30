@@ -13,7 +13,7 @@ use crate::{
     AppState,
     application::{context::CompactContextRequest, session_flow::PostSessionMessage},
     transport::http::{
-        auth::authenticate,
+        auth::{authenticate, authorized},
         conditions::{RawBody, if_match_version, require_idempotency},
         dto::DataResponse,
         problem::{Problem, codes},

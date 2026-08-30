@@ -13,7 +13,11 @@ use crate::{
     application::automation::{
         AutomationRunView, AutomationSettingsView, UpdateAutomationSettingsInput,
     },
-    transport::http::{auth::authenticate, dto::DataResponse, problem::Problem},
+    transport::http::{
+        auth::{authenticate, authorized},
+        dto::DataResponse,
+        problem::Problem,
+    },
 };
 
 #[derive(Debug, Deserialize)]

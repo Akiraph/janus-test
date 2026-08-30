@@ -594,7 +594,7 @@ mod tests {
         let script = std::fs::read_to_string(&askpass.path()).expect("read script");
         assert!(script.contains("ghp_secret_token"));
         assert!(script.contains("x-access-token"));
-        let path = askpass.path().clone();
+        let path = askpass.path().to_owned();
         drop(askpass);
         assert!(
             !path.exists(),

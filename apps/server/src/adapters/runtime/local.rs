@@ -387,7 +387,8 @@ impl RuntimeExecutor for LocalExecutor {
             // calls for the same runtime cannot each mint their own nonce, so
             // the executor nonce in the runtime row can never be overwritten by
             // a sibling call. The nonce is only minted when the entry is absent.
-            let handle = self.inner.runtimes.write().await.entry(spec.id()).or_insert_with(|| {
+            let mut runtimes = self.inner.runtimes.write().await;
+            let handle = runtimes.entry(spec.id()).or_insert_with(|| {
                 LocalRuntime {
                     workspace_root,
                     nonce: random_token(24),

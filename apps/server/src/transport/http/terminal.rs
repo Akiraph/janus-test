@@ -30,7 +30,7 @@ use utoipa::ToSchema;
 use crate::{
     AppState,
     transport::http::{
-        auth::authenticate,
+        auth::{authenticate, authorized},
         dto::DataResponse,
         problem::{Problem, codes, map_runtime_error},
     },

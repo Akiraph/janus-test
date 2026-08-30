@@ -257,7 +257,7 @@ async fn run_once(
             let _automation_permit = automation_permit;
             let _session_permit = session_permit;
             let target_key = work_target_key(&worker_kind, &claimed.payload);
-            let (lost_tx, lost_rx) = oneshot::channel();
+            let (lost_tx, mut lost_rx) = oneshot::channel();
             let lease_heartbeat = spawn_lease_heartbeat(
                 worker_state.operations().clone(),
                 work_id.clone(),
