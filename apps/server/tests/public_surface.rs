@@ -236,7 +236,9 @@ async fn generated_webhook_secret_authorizes_the_webhook() -> anyhow::Result<()>
     }"#;
 
     let before = client
-        .get(format!("{base}/api/v1/automation/webhook/config?reveal=true"))
+        .get(format!(
+            "{base}/api/v1/automation/webhook/config?reveal=true"
+        ))
         .send()
         .await?;
     assert_eq!(before.status(), reqwest::StatusCode::OK);
@@ -259,7 +261,9 @@ async fn generated_webhook_secret_authorizes_the_webhook() -> anyhow::Result<()>
     assert_eq!(generated_body["data"]["secret_source"], "generated");
 
     let after = client
-        .get(format!("{base}/api/v1/automation/webhook/config?reveal=true"))
+        .get(format!(
+            "{base}/api/v1/automation/webhook/config?reveal=true"
+        ))
         .send()
         .await?;
     let after_body: Value = after.json().await?;

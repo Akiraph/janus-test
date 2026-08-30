@@ -367,10 +367,7 @@ impl Application {
     pub(crate) async fn generate_automation_webhook_secret(
         &self,
     ) -> Result<String, AutomationError> {
-        Ok(self
-            .models()
-            .rotate_automation_webhook_secret()
-            .await?)
+        Ok(self.models().rotate_automation_webhook_secret().await?)
     }
 
     async fn model_display_name(
