@@ -90,16 +90,21 @@ pub(super) async fn tool_bash(
     let cwd = working_directory(input)?;
     let fallback_cwd = local_working_directory(&repo, &cwd)?;
     let command = display_command.to_owned();
+    let git_askpass = match ctx.git_token {
+        Some(token) if !token.is_empty() => Some(GitAskpass::create(token).await?),
+        _ => None,
+    };
 
     let runtime_proj = match ensure_project_runtime(ctx).await {
         Ok(runtime) => runtime,
         Err(ExecutionError::Runtime(error)) if error.retryable() => {
             tracing::warn!(%error, "preferred Runtime unavailable; using system Bash fallback");
-            return run_local_sync(ctx, &command, display_command, &fallback_cwd).await;
+            return run_local_sync(ctx, &command, display_command, &fallback_cwd, git_askpass.as_ref())
+                .await;
         }
         Err(error) => return Err(error),
     };
-    let environment = execution_environment(ctx)?;
+    let environment = sync_environment(git_askpass.as_ref())?;
     let spec = ExecutionSpec::new(
         runtime_proj.id,
         cwd,
@@ -117,7 +122,8 @@ pub(super) async fn tool_bash(
                 %error,
                 "Runtime sync execution unavailable; using local Git Bash fallback"
             );
-            return run_local_sync(ctx, &command, display_command, &fallback_cwd).await;
+            return run_local_sync(ctx, &command, display_command, &fallback_cwd, git_askpass.as_ref())
+                .await;
         }
         Err(error) => return Err(ExecutionError::Runtime(error)),
     };
@@ -153,7 +159,7 @@ async fn tool_bash_async(
         cwd,
         ValidatedCommand::shell(command)
             .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("command: {e}")))?,
-        execution_environment(ctx)?,
+        empty_environment()?,
         default_limits(timeout),
     )
     .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("execution: {e}")))?;
@@ -201,6 +207,7 @@ async fn run_local_sync(
     command: &str,
     display_command: &str,
     cwd: &Path,
+    askpass: Option<&GitAskpass>,
 ) -> Result<ToolOutcome, ExecutionError> {
     let Some(program) = bash_program() else {
         let detail = if cfg!(windows) {
@@ -212,9 +219,8 @@ async fn run_local_sync(
     };
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(["-c", command]);
-    if let Some(token) = ctx.git_token {
-        cmd.env("GH_TOKEN", token);
-        cmd.env("GITHUB_TOKEN", token);
+    if let Some(askpass) = askpass {
+        cmd.env("GIT_ASKPASS", askpass.path());
     }
     cmd.current_dir(cwd);
     let started = std::time::Instant::now();
@@ -245,25 +251,79 @@ async fn run_local_sync(
     })
 }
 
-fn execution_environment(
-    ctx: &ToolContext<'_>,
+/// Environment for a synchronous bash run. Git authenticates through a
+/// short-lived `GIT_ASKPASS` helper that answers git's prompt from the token
+/// embedded in the script, so the PAT never appears in the process environment
+/// where arbitrary commands in the workspace could read it.
+fn sync_environment(
+    askpass: Option<&GitAskpass>,
 ) -> Result<janus_runtime::interface::ExecutionEnvironment, ExecutionError> {
-    use janus_infrastructure::secrets::Secret;
-    use janus_runtime::interface::SecretEnvironmentVariable;
-    let ordinary = std::collections::BTreeMap::new();
-    let mut secrets = Vec::new();
-    if let Some(token) = ctx.git_token {
-        secrets.push(
-            SecretEnvironmentVariable::new("GH_TOKEN", Secret::new(token.to_owned()))
-                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?,
-        );
-        secrets.push(
-            SecretEnvironmentVariable::new("GITHUB_TOKEN", Secret::new(token.to_owned()))
-                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?,
-        );
+    let mut ordinary = std::collections::BTreeMap::new();
+    if let Some(askpass) = askpass {
+        ordinary.insert("GIT_ASKPASS".into(), askpass.path().to_string_lossy().into_owned());
     }
-    janus_runtime::interface::ExecutionEnvironment::new(ordinary, secrets)
+    janus_runtime::interface::ExecutionEnvironment::new(ordinary, Vec::new())
         .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("env: {error}")))
+}
+
+/// Environment for a background async bash task. The git credential is not
+/// delivered here: an async task outlives this tool call, so no long-lived
+/// background process carries the PAT in its environment.
+fn empty_environment() -> Result<janus_runtime::interface::ExecutionEnvironment, ExecutionError> {
+    janus_runtime::interface::ExecutionEnvironment::new(
+        std::collections::BTreeMap::new(),
+        Vec::new(),
+    )
+    .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("env: {error}")))
+}
+
+/// A short-lived `GIT_ASKPASS` helper that answers git's credential prompts
+/// from the token embedded in the script, so the PAT never enters the
+/// environment of the command being run. Deletes the script on drop.
+struct GitAskpass {
+    path: PathBuf,
+}
+
+impl GitAskpass {
+    async fn create(token: &str) -> Result<GitAskpass, ExecutionError> {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        let nonce = hex::encode(bytes);
+        let path = std::env::temp_dir().join(format!("janus-exec-askpass-{nonce}.sh"));
+        let token = shell_quote(token);
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  *sername*) echo 'x-access-token' ;;\n  *assword*) echo '{token}' ;;\nesac\n"
+        );
+        std::fs::write(&path, script)
+            .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("write askpass: {error}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("askpass metadata: {error}")))?;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions)
+                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("askpass chmod: {error}")))?;
+        }
+        Ok(GitAskpass { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for GitAskpass {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Quote a value for embedding inside single quotes in a POSIX shell script.
+fn shell_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
 }
 
 fn local_working_directory(
@@ -469,4 +529,32 @@ pub(super) async fn tool_stop(
         error_code: None,
         finish_summary: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("ghp_abc123"), "ghp_abc123");
+        assert_eq!(shell_quote("a'b"), "a'\\''b");
+        assert_eq!(shell_quote(""), "");
+    }
+
+    #[tokio::test]
+    async fn git_askpass_script_answers_prompts_without_echoing_the_token() {
+        let askpass = super::GitAskpass::create("ghp_secret_token")
+            .await
+            .expect("create askpass");
+        let script = std::fs::read_to_string(&askpass.path()).expect("read script");
+        assert!(script.contains("ghp_secret_token"));
+        assert!(script.contains("x-access-token"));
+        let path = askpass.path().clone();
+        drop(askpass);
+        assert!(
+            !path.exists(),
+            "askpass script must be removed when the guard drops"
+        );
+    }
 }
