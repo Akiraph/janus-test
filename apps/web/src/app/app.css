@@ -271,20 +271,6 @@
   }
 }
 
-@media (max-width: 900px) {
-  .home-route:has(.project-page--ide) {
-    height: auto;
-    min-height: calc(100vh - 74px);
-    padding: 0;
-  }
-
-  @supports (height: 100dvh) {
-    .home-route:has(.project-page--ide) {
-      min-height: calc(100dvh - 74px);
-    }
-  }
-}
-
 @media (max-width: 560px) {
   .settings-shell {
     flex-direction: column;
