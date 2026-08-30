@@ -4,6 +4,8 @@ export type BootstrapResponse = components["schemas"]["BootstrapResponse"];
 export type SystemInfoResponse = components["schemas"]["SystemInfoResponse"];
 export type CeremonyOptions = components["schemas"]["CeremonyOptions"];
 export type OwnerView = components["schemas"]["OwnerView"];
+export type TotpProvision = components["schemas"]["TotpProvision"];
+export type AuthMode = components["schemas"]["AuthMode"];
 export type ProviderView = components["schemas"]["ProviderView"];
 export type ProviderInput = components["schemas"]["ProviderInput"];
 export type EmbeddedModelInput = components["schemas"]["EmbeddedModelInput"];
@@ -167,6 +169,43 @@ export async function loginComplete(ceremony_id: string, credential: unknown): P
   const response = await requestJson<{ data: OwnerView }>(
     "/api/v1/auth/passkey/complete",
     { method: "POST", body: JSON.stringify({ ceremony_id, credential }) },
+    isDataResponse,
+  );
+  rememberCsrf(response.data.csrf_token);
+  return response.data;
+}
+
+export async function totpInitializeOptions(
+  initialization_token: string,
+  display_name: string,
+): Promise<TotpProvision> {
+  const response = await requestJson<{ data: TotpProvision }>(
+    "/api/v1/auth/totp/initialize/options",
+    { method: "POST", body: JSON.stringify({ initialization_token, display_name }) },
+    isDataResponse,
+  );
+  return response.data;
+}
+
+export async function totpInitializeComplete(
+  ceremony_id: string,
+  code: string,
+): Promise<{ data: OwnerView; recoveryCodes: string[] }> {
+  const response = await fetch(
+    "/api/v1/auth/totp/initialize/complete",
+    requestInit("POST", { ceremony_id, code }),
+  );
+  if (!response.ok) throw await toApiError(response);
+  const codesHeader = response.headers.get("x-janus-recovery-codes");
+  const result = (await response.json()) as { data: OwnerView };
+  rememberCsrf(result.data.csrf_token);
+  return { ...result, recoveryCodes: codesHeader ? (JSON.parse(codesHeader) as string[]) : [] };
+}
+
+export async function totpLogin(code: string): Promise<OwnerView> {
+  const response = await requestJson<{ data: OwnerView }>(
+    "/api/v1/auth/totp/login",
+    { method: "POST", body: JSON.stringify({ code }) },
     isDataResponse,
   );
   rememberCsrf(response.data.csrf_token);
@@ -1068,6 +1107,7 @@ function isBootstrapResponse(value: unknown): value is BootstrapResponse {
   if (!isRecord(value) || !isRecord(value.data)) return false;
   const { data } = value;
   return (
+    (data.auth_mode === "passkey" || data.auth_mode === "totp") &&
     (data.state === "uninitialized" || data.state === "initialized") &&
     typeof data.development_auth === "boolean" &&
     typeof data.webauthn_rp_name === "string" &&

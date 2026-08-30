@@ -22,6 +22,7 @@ pub struct BootstrapResponse {
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BootstrapData {
+    pub auth_mode: janus_identity::AuthMode,
     pub state: BootstrapState,
     pub development_auth: bool,
     pub webauthn_rp_name: String,
@@ -106,6 +107,19 @@ pub struct RenamePasskeyRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct RecoveryExchangeRequest {
+    #[schema(write_only)]
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TotpCodeRequest {
+    pub ceremony_id: String,
+    #[schema(write_only)]
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TotpLoginRequest {
     #[schema(write_only)]
     pub code: String,
 }

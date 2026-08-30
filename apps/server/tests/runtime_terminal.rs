@@ -25,6 +25,7 @@ fn test_config(data_root: PathBuf) -> Config {
         web_dist: None,
         mode: RunMode::Development,
         development_auth: true,
+        auth_mode: janus_identity::AuthMode::Passkey,
         webauthn_rp_name: "Janus Test".into(),
         webauthn_rp_id: "localhost".into(),
         public_origin: url::Url::parse("http://localhost").expect("static URL"),

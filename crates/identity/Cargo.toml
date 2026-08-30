@@ -10,8 +10,10 @@ chrono.workspace = true
 futures-util.workspace = true
 janus-infrastructure = { path = "../infrastructure" }
 mongodb.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
 thiserror.workspace = true
 url.workspace = true
 utoipa.workspace = true

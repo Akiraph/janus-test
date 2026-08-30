@@ -84,9 +84,15 @@ impl SecretCipher {
 }
 
 pub fn random_token(bytes: usize) -> String {
+    URL_SAFE_NO_PAD.encode(random_bytes(bytes))
+}
+
+/// Cryptographically random bytes. Callers that need raw key material rather
+/// than a printable token should use this instead of `random_token`.
+pub fn random_bytes(bytes: usize) -> Vec<u8> {
     let mut value = vec![0_u8; bytes];
     rand::rng().fill_bytes(&mut value);
-    URL_SAFE_NO_PAD.encode(value)
+    value
 }
 
 pub fn purpose_hash(purpose: &str, value: &str) -> String {

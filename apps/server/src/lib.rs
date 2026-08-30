@@ -79,6 +79,7 @@ impl AppState {
             &config.public_origin,
             &config.webauthn_rp_name,
             config.development_auth,
+            config.auth_mode,
         )?;
         let models = ModelsInterface::new(pool.clone(), secrets.clone(), events.clone())?;
         let notifications =

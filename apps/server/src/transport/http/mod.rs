@@ -43,6 +43,7 @@ pub use problem::Problem;
         auth::passkey_complete, auth::rename_passkey, auth::revoke_passkey,
         auth::regenerate_recovery_codes, auth::recovery_exchange,
         auth::recovery_passkey_options, auth::recovery_passkey_complete,
+        auth::totp_initialize_options, auth::totp_initialize_complete, auth::totp_login,
         models::providers, models::create_provider, models::update_provider,
         models::delete_provider, models::probe_provider,
         projects::list_projects, projects::create_project, projects::get_project,
@@ -82,10 +83,14 @@ pub use problem::Problem;
         dto::PasskeyOptionsRequest,
         dto::RenamePasskeyRequest,
         dto::RecoveryExchangeRequest,
+        dto::TotpCodeRequest,
+        dto::TotpLoginRequest,
+        janus_identity::AuthMode,
         janus_identity::CeremonyOptions,
         janus_identity::OwnerView,
         janus_identity::AuthenticationMode,
         janus_identity::PasskeyView,
+        janus_identity::TotpProvision,
         janus_models::interface::ProviderInput,
         janus_models::interface::ProviderView,
         janus_models::interface::ProviderKind,
@@ -247,6 +252,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/auth/recovery/passkey/complete",
             post(auth::recovery_passkey_complete),
         )
+        .route(
+            "/api/v1/auth/totp/initialize/options",
+            post(auth::totp_initialize_options),
+        )
+        .route(
+            "/api/v1/auth/totp/initialize/complete",
+            post(auth::totp_initialize_complete),
+        )
+        .route("/api/v1/auth/totp/login", post(auth::totp_login))
         .route(
             "/api/v1/model-providers",
             get(models::providers).post(models::create_provider),

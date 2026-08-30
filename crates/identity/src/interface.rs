@@ -1,5 +1,11 @@
-//! Public identity capability boundary.
+//! Owner authentication, passkey ceremonies, and TOTP login.
 
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
 use futures_util::TryStreamExt;
 use janus_infrastructure::clock::{format_utc, now_utc_str};
@@ -7,8 +13,10 @@ use mongodb::{
     ClientSession, Database,
     bson::{Bson, Document, doc},
 };
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -22,12 +30,26 @@ use webauthn_rs::{
 
 use janus_infrastructure::{
     id::{OwnerId, PasskeyId},
-    secrets::{purpose_hash, random_token},
+    secrets::{purpose_hash, random_bytes, random_token},
 };
 
 const CEREMONY_TTL: Duration = Duration::minutes(5);
 const SESSION_IDLE_TTL: Duration = Duration::days(7);
 const RECOVERY_TTL: Duration = Duration::minutes(10);
+const TOTP_INIT_TTL: Duration = Duration::minutes(15);
+const TOTP_WINDOW_SECS: i64 = 30;
+const RATE_WINDOW_SECS: u64 = 60;
+const RATE_MAX_ATTEMPTS: usize = 5;
+
+/// Which primary authentication mechanism the deployment uses. Passkey is the
+/// default and requires an https domain origin; TOTP is meant for deployments
+/// served over plain http or an IP address, where WebAuthn cannot work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    Passkey,
+    Totp,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitializationState {
@@ -53,7 +75,18 @@ pub struct OwnerView {
 #[serde(rename_all = "snake_case")]
 pub enum AuthenticationMode {
     Passkey,
+    Totp,
     Development,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct TotpProvision {
+    pub ceremony_id: String,
+    /// Base32 (RFC 4648) TOTP shared secret, for manual entry into an
+    /// authenticator app.
+    pub secret_base32: String,
+    /// `otpauth://` URI carrying the same secret, scannable as a QR code.
+    pub otpauth_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -108,6 +141,14 @@ pub enum IdentityError {
     OriginRejected,
     #[error("the CSRF token is invalid")]
     CsrfRejected,
+    #[error("passkey authentication is disabled")]
+    PasskeyDisabled,
+    #[error("totp authentication is disabled")]
+    TotpDisabled,
+    #[error("the TOTP code is invalid")]
+    InvalidTotpCode,
+    #[error("too many failed attempts; try again later")]
+    RateLimited,
     #[error("identity storage failed")]
     Storage(#[from] mongodb::error::Error),
     #[error("identity data is invalid")]
@@ -121,9 +162,40 @@ pub enum IdentityError {
 #[derive(Clone)]
 pub struct IdentityInterface {
     pool: Database,
-    webauthn: Webauthn,
+    /// `None` when `auth_mode` is TOTP, so the deployment does not need a
+    /// WebAuthn-compatible origin.
+    webauthn: Option<Webauthn>,
     origin: String,
     development_auth: bool,
+    auth_mode: AuthMode,
+    /// Shared sliding-window limiter over failed TOTP code attempts. Janus has
+    /// a single owner, so a deployment-wide budget is the right granularity.
+    rate: Arc<Mutex<LoginRate>>,
+}
+
+/// In-memory sliding window of recent failed TOTP attempts.
+#[derive(Default)]
+struct LoginRate {
+    failures: std::collections::VecDeque<Instant>,
+}
+
+impl LoginRate {
+    /// Whether a new attempt is allowed within the current window.
+    fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        while self
+            .failures
+            .front()
+            .is_some_and(|at| now.duration_since(*at).as_secs() > RATE_WINDOW_SECS)
+        {
+            self.failures.pop_front();
+        }
+        self.failures.len() < RATE_MAX_ATTEMPTS
+    }
+
+    fn record(&mut self) {
+        self.failures.push_back(Instant::now());
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -139,6 +211,16 @@ struct RegistrationState {
 #[derive(Serialize, Deserialize)]
 struct AuthenticationState {
     state: PasskeyAuthentication,
+}
+
+/// Pending TOTP enrollment during initialization. Stored as a ceremony so the
+/// secret is held server-side until the owner proves they scanned it.
+#[derive(Serialize, Deserialize)]
+struct TotpInitializeState {
+    token_hash: String,
+    owner_id: String,
+    display_name: String,
+    secret_base32: String,
 }
 
 struct OwnerRow {
@@ -162,17 +244,43 @@ impl IdentityInterface {
         public_origin: &url::Url,
         webauthn_rp_name: &str,
         development_auth: bool,
+        auth_mode: AuthMode,
     ) -> anyhow::Result<Self> {
-        let webauthn = WebauthnBuilder::new(webauthn_rp_id, public_origin)?
-            .rp_name(webauthn_rp_name)
-            .build()?;
+        let webauthn = if auth_mode == AuthMode::Passkey {
+            // webauthn-rs reports every builder rejection as a bare "The
+            // configuration was invalid", so name both inputs and the constraint
+            // that links them: the RP ID must be the origin host or a registrable
+            // suffix of it, and an IP-address host has no domain to match at all.
+            Some(
+                WebauthnBuilder::new(webauthn_rp_id, public_origin)
+                    .and_then(|builder| builder.rp_name(webauthn_rp_name).build())
+                    .with_context(|| {
+                        format!(
+                            "build WebAuthn from JANUS_WEBAUTHN_RP_ID={webauthn_rp_id:?} and \
+                             JANUS_PUBLIC_ORIGIN={public_origin} (origin host {:?} must be a domain \
+                             name, not an IP address, and must equal or end with the RP ID)",
+                            public_origin.host_str().unwrap_or_default()
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let service = Self {
             pool,
             webauthn,
             origin: public_origin.origin().ascii_serialization(),
             development_auth,
+            auth_mode,
+            rate: Arc::new(Mutex::new(LoginRate::default())),
         };
         Ok(service)
+    }
+
+    /// Access the WebAuthn engine, rejecting the call when the deployment uses
+    /// TOTP authentication instead of passkeys.
+    fn webauthn(&self) -> Result<&Webauthn, IdentityError> {
+        self.webauthn.as_ref().ok_or(IdentityError::PasskeyDisabled)
     }
 
     pub async fn initialization_state(&self) -> Result<InitializationState, IdentityError> {
@@ -284,7 +392,7 @@ impl IdentityInterface {
         let credential: RegisterPublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
         let passkey = self
-            .webauthn
+            .webauthn()?
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
@@ -365,6 +473,7 @@ impl IdentityInterface {
                 &state.display_name,
                 csrf_token.clone(),
                 false,
+                self.auth_mode,
             ),
             session_token,
             recovery_codes: Some(recovery_codes),
@@ -390,7 +499,7 @@ impl IdentityInterface {
             .map(|raw| serde_json::from_str::<Passkey>(&raw))
             .collect::<Result<Vec<_>, _>>()?;
         let (options, state) = self
-            .webauthn
+            .webauthn()?
             .start_passkey_authentication(&passkeys)
             .map_err(|_| IdentityError::InvalidCredential)?;
         self.store_ceremony(
@@ -411,7 +520,7 @@ impl IdentityInterface {
         let credential: PublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
         let result = self
-            .webauthn
+            .webauthn()?
             .finish_passkey_authentication(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let owner = self.owner().await?;
@@ -456,7 +565,253 @@ impl IdentityInterface {
         .await?;
         session.commit_transaction().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false),
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
+            session_token,
+            recovery_codes: None,
+        })
+    }
+
+    /// Begin TOTP enrollment: generate a shared secret and store it as a
+    /// pending ceremony keyed by the initialization token. The returned
+    /// provision is shown to the operator once, and completion requires a code
+    /// proving the authenticator was enrolled.
+    pub async fn totp_initialize_options(
+        &self,
+        token: &str,
+        display_name: &str,
+    ) -> Result<TotpProvision, IdentityError> {
+        if self.auth_mode != AuthMode::Totp {
+            return Err(IdentityError::TotpDisabled);
+        }
+        if self.initialization_state().await? == InitializationState::Initialized {
+            return Err(IdentityError::AlreadyInitialized);
+        }
+        let token_hash = purpose_hash("initialization-token", token);
+        let now = now_utc_str();
+        let valid = self
+            .pool
+            .collection::<Document>("initialization_tokens")
+            .count_documents(doc! {
+                "token_hash": &token_hash,
+                "used_at": null,
+                "expires_at": {"$gt": &now},
+            })
+            .await?;
+        if valid != 1 {
+            return Err(IdentityError::InvalidInitializationToken);
+        }
+        let secret_base32 = base32_encode(&random_bytes(20));
+        let owner_id = OwnerId::new().to_string();
+        let display_name = normalize_name(display_name, "Owner")?;
+        // The label is a URI component; unencoded `&`/`?`/spaces would break
+        // the otpauth URI that authenticator apps scan or parse manually.
+        let label_input = format!("Janus:{display_name}");
+        let label = utf8_percent_encode(&label_input, NON_ALPHANUMERIC);
+        let otpauth_uri = format!(
+            "otpauth://totp/{label}?secret={secret_base32}&issuer=Janus&algorithm=SHA1&digits=6&period=30"
+        );
+        let ceremony_id = self
+            .store_totp_initialization(&TotpInitializeState {
+                token_hash,
+                owner_id,
+                display_name,
+                secret_base32: secret_base32.clone(),
+            })
+            .await?;
+        Ok(TotpProvision {
+            ceremony_id,
+            secret_base32,
+            otpauth_uri,
+        })
+    }
+
+    pub async fn totp_initialize_complete(
+        &self,
+        ceremony_id: &str,
+        code: &str,
+        origin: Option<&str>,
+    ) -> Result<AuthenticationGrant, IdentityError> {
+        if self.auth_mode != AuthMode::Totp {
+            return Err(IdentityError::TotpDisabled);
+        }
+        self.check_origin(origin)?;
+        if !is_totp_code_shape(code) {
+            return Err(IdentityError::InvalidTotpCode);
+        }
+        self.check_rate()?;
+        let state_json = self.take_ceremony(ceremony_id, "totp_initialize").await?;
+        let state: TotpInitializeState = serde_json::from_str(&state_json)?;
+        let secret = base32_decode(&state.secret_base32)?;
+        let counter = match verify_totp(&secret, code, Utc::now().timestamp(), None) {
+            Some(counter) => counter,
+            None => {
+                self.record_failure();
+                return Err(IdentityError::InvalidTotpCode);
+            }
+        };
+        let now = Utc::now();
+        let session_token = random_token(32);
+        let csrf_token = random_token(24);
+        let recovery_codes = (0..10).map(|_| random_token(16)).collect::<Vec<_>>();
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let used_at = format_utc(now);
+        let consumed = self
+            .pool
+            .collection::<Document>("initialization_tokens")
+            .update_one(
+                doc! {
+                    "token_hash": &state.token_hash,
+                    "used_at": null,
+                    "expires_at": {"$gt": &used_at},
+                },
+                doc! {"$set": {"used_at": &used_at}},
+            )
+            .session(&mut session)
+            .await?
+            .matched_count;
+        let owner_count = self
+            .pool
+            .collection::<Document>("owners")
+            .count_documents(doc! {})
+            .session(&mut session)
+            .await?;
+        if consumed != 1 || owner_count != 0 {
+            session.abort_transaction().await?;
+            return Err(IdentityError::InvalidInitializationToken);
+        }
+        let created_at = format_utc(now);
+        self.pool
+            .collection::<Document>("owners")
+            .insert_one(doc! {
+                "_id": &state.owner_id,
+                "display_name": &state.display_name,
+                "totp_secret": &state.secret_base32,
+                "totp_last_counter": counter,
+                "created_at": &created_at,
+            })
+            .session(&mut session)
+            .await?;
+        insert_recovery_codes(
+            &self.pool,
+            &mut session,
+            &state.owner_id,
+            &recovery_codes,
+            now,
+        )
+        .await?;
+        insert_session(
+            &self.pool,
+            &mut session,
+            &state.owner_id,
+            &session_token,
+            &csrf_token,
+            now,
+        )
+        .await?;
+        session.commit_transaction().await?;
+        Ok(AuthenticationGrant {
+            owner: owner_view(
+                &state.owner_id,
+                &state.display_name,
+                csrf_token.clone(),
+                false,
+                self.auth_mode,
+            ),
+            session_token,
+            recovery_codes: Some(recovery_codes),
+        })
+    }
+
+    /// Verify a TOTP code against the enrolled owner secret and mint a session.
+    /// Replay protection is atomic: the counter update only matches when the
+    /// presented code is newer than the last accepted one.
+    pub async fn totp_login(
+        &self,
+        code: &str,
+        origin: Option<&str>,
+    ) -> Result<AuthenticationGrant, IdentityError> {
+        if self.auth_mode != AuthMode::Totp {
+            return Err(IdentityError::TotpDisabled);
+        }
+        self.check_origin(origin)?;
+        if !is_totp_code_shape(code) {
+            return Err(IdentityError::InvalidTotpCode);
+        }
+        self.check_rate()?;
+        let owner = self.owner().await?;
+        let owner_doc = self
+            .pool
+            .collection::<Document>("owners")
+            .find_one(doc! {"_id": &owner.id})
+            .await?
+            .ok_or(IdentityError::AuthRequired)?;
+        let secret_base32 = owner_doc
+            .get("totp_secret")
+            .and_then(Bson::as_str)
+            .ok_or(IdentityError::TotpDisabled)?
+            .to_owned();
+        let last_counter = owner_doc
+            .get("totp_last_counter")
+            .and_then(Bson::as_i64)
+            .unwrap_or(-1);
+        let secret = base32_decode(&secret_base32)?;
+        let counter = match verify_totp(&secret, code, Utc::now().timestamp(), Some(last_counter)) {
+            Some(counter) => counter,
+            None => {
+                self.record_failure();
+                return Err(IdentityError::InvalidTotpCode);
+            }
+        };
+        let now = Utc::now();
+        let session_token = random_token(32);
+        let csrf_token = random_token(24);
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        let updated = self
+            .pool
+            .collection::<Document>("owners")
+            .update_one(
+                doc! {"_id": &owner.id, "totp_last_counter": {"$lt": counter}},
+                doc! {
+                    "$set": {
+                        "totp_last_counter": counter,
+                        "last_totp_at": format_utc(now),
+                    }
+                },
+            )
+            .session(&mut session)
+            .await?
+            .matched_count;
+        if updated != 1 {
+            session.abort_transaction().await?;
+            self.record_failure();
+            return Err(IdentityError::InvalidTotpCode);
+        }
+        insert_session(
+            &self.pool,
+            &mut session,
+            &owner.id,
+            &session_token,
+            &csrf_token,
+            now,
+        )
+        .await?;
+        session.commit_transaction().await?;
+        Ok(AuthenticationGrant {
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
             session_token,
             recovery_codes: None,
         })
@@ -529,6 +884,7 @@ impl IdentityInterface {
             &auth.display_name,
             csrf_token.into(),
             auth.development,
+            self.auth_mode,
         )
     }
 
@@ -612,7 +968,7 @@ impl IdentityInterface {
         let credential: RegisterPublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
         let passkey = self
-            .webauthn
+            .webauthn()?
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
@@ -839,7 +1195,7 @@ impl IdentityInterface {
         let credential: RegisterPublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
         let passkey = self
-            .webauthn
+            .webauthn()?
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
@@ -890,7 +1246,13 @@ impl IdentityInterface {
         .await?;
         session.commit_transaction().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false),
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
             session_token,
             recovery_codes: None,
         })
@@ -903,7 +1265,7 @@ impl IdentityInterface {
         let user_id = Uuid::parse_str(&seed.owner_id)
             .map_err(|error| IdentityError::Internal(error.into()))?;
         let (options, state) = self
-            .webauthn
+            .webauthn()?
             .start_passkey_registration(
                 user_id,
                 "owner@janus.local",
@@ -1044,6 +1406,59 @@ impl IdentityInterface {
         session.commit_transaction().await?;
         Ok(())
     }
+
+    /// Reject a request whose Origin header, when present, does not match the
+    /// configured public origin. Unlike `authorize_mutation` this tolerates a
+    /// missing header so API clients can log in without a browser.
+    fn check_origin(&self, origin: Option<&str>) -> Result<(), IdentityError> {
+        if let Some(origin) = origin
+            && origin != self.origin
+        {
+            return Err(IdentityError::OriginRejected);
+        }
+        Ok(())
+    }
+
+    fn check_rate(&self) -> Result<(), IdentityError> {
+        let mut rate = self
+            .rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !rate.allow() {
+            return Err(IdentityError::RateLimited);
+        }
+        Ok(())
+    }
+
+    fn record_failure(&self) {
+        let mut rate = self
+            .rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        rate.record();
+    }
+
+    async fn store_totp_initialization(
+        &self,
+        state: &TotpInitializeState,
+    ) -> Result<String, IdentityError> {
+        let id = Uuid::now_v7().to_string();
+        let now = Utc::now();
+        let expires_at = format_utc(now + TOTP_INIT_TTL);
+        let created_at = format_utc(now);
+        let state_json = serde_json::to_string(state)?;
+        self.pool
+            .collection::<Document>("ceremonies")
+            .insert_one(doc! {
+                "_id": &id,
+                "kind": "totp_initialize",
+                "state_json": &state_json,
+                "expires_at": &expires_at,
+                "created_at": &created_at,
+            })
+            .await?;
+        Ok(id)
+    }
 }
 
 struct RegistrationStateSeed {
@@ -1068,12 +1483,20 @@ fn normalize_name(value: &str, fallback: &str) -> Result<String, IdentityError> 
     })
 }
 
-fn owner_view(id: &str, display_name: &str, csrf_token: String, development: bool) -> OwnerView {
+fn owner_view(
+    id: &str,
+    display_name: &str,
+    csrf_token: String,
+    development: bool,
+    auth_mode: AuthMode,
+) -> OwnerView {
     OwnerView {
         id: id.into(),
         display_name: display_name.into(),
         authentication_mode: if development {
             AuthenticationMode::Development
+        } else if auth_mode == AuthMode::Totp {
+            AuthenticationMode::Totp
         } else {
             AuthenticationMode::Passkey
         },
@@ -1183,4 +1606,125 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, IdentityError> {
     Ok(DateTime::parse_from_rfc3339(value)
         .map_err(|error| IdentityError::Internal(error.into()))?
         .with_timezone(&Utc))
+}
+
+/// RFC 4648 base32 encoder without padding, used for the TOTP shared secret.
+fn base32_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut output = String::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for &byte in input {
+        buffer = (buffer << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            let index = ((buffer >> (bits - 5)) & 0x1f) as usize;
+            output.push(ALPHABET[index] as char);
+            bits -= 5;
+        }
+    }
+    if bits > 0 {
+        let index = ((buffer << (5 - bits)) & 0x1f) as usize;
+        output.push(ALPHABET[index] as char);
+    }
+    output
+}
+
+/// RFC 4648 base32 decoder that tolerates optional `=` padding and whitespace.
+fn base32_decode(input: &str) -> Result<Vec<u8>, IdentityError> {
+    let mut output = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits = 0;
+    for ch in input.chars() {
+        let value = match ch {
+            'A'..='Z' => ch as u8 - b'A',
+            'a'..='z' => ch as u8 - b'a',
+            '2'..='7' => ch as u8 - b'2' + 26,
+            '=' | ' ' | '\t' | '\r' | '\n' | '-' => continue,
+            _ => return Err(IdentityError::InvalidTotpCode),
+        };
+        buffer = (buffer << 5) | u32::from(value);
+        bits += 5;
+        if bits >= 8 {
+            output.push(((buffer >> (bits - 8)) & 0xff) as u8);
+            bits -= 8;
+        }
+    }
+    Ok(output)
+}
+
+/// HMAC-SHA1 built from the `sha1` crate's digest API, so TOTP does not pull a
+/// dedicated HMAC crate into the dependency tree.
+fn hmac_sha1(key: &[u8], data: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    let mut block_key = [0_u8; BLOCK];
+    if key.len() > BLOCK {
+        let mut hasher = Sha1::new();
+        hasher.update(key);
+        block_key[..20].copy_from_slice(hasher.finalize().as_ref());
+    } else {
+        block_key[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36_u8; BLOCK];
+    let mut opad = [0x5c_u8; BLOCK];
+    for (i, (ipad_byte, opad_byte)) in ipad.iter_mut().zip(opad.iter_mut()).enumerate() {
+        *ipad_byte ^= block_key[i];
+        *opad_byte ^= block_key[i];
+    }
+    let mut inner = Sha1::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha1::new();
+    outer.update(opad);
+    outer.update(inner_hash.as_slice());
+    outer.finalize().as_slice().to_vec()
+}
+
+/// RFC 6238 TOTP code for a counter (unix seconds / 30).
+fn totp_code(secret: &[u8], counter: u64) -> u32 {
+    let digest = hmac_sha1(secret, &counter.to_be_bytes());
+    let offset = (digest[19] & 0x0f) as usize;
+    let binary = (u32::from(digest[offset] & 0x7f) << 24)
+        | (u32::from(digest[offset + 1]) << 16)
+        | (u32::from(digest[offset + 2]) << 8)
+        | u32::from(digest[offset + 3]);
+    binary % 1_000_000
+}
+
+/// Verify a 6-digit code against the current 30-second window plus one window
+/// of clock skew. Returns the matched counter so callers can enforce replay
+/// protection; `min_counter` rejects codes already accepted.
+fn verify_totp(secret: &[u8], code: &str, now_secs: i64, min_counter: Option<i64>) -> Option<i64> {
+    let window = now_secs.div_euclid(TOTP_WINDOW_SECS);
+    for candidate in [window - 1, window, window + 1] {
+        if candidate < 0 {
+            continue;
+        }
+        if let Some(minimum) = min_counter
+            && candidate <= minimum
+        {
+            continue;
+        }
+        let expected = format!("{:06}", totp_code(secret, candidate as u64));
+        if constant_time_eq(code.as_bytes(), expected.as_bytes()) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_totp_code_shape(code: &str) -> bool {
+    code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (a, b) in left.iter().zip(right) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }

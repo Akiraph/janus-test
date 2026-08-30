@@ -6,6 +6,7 @@
 /.janus-dev/
 /scripts/node_modules/
 /scripts/.deploy_image.lock
+/.env
 *.db
 *.db-shm
 *.db-wal
