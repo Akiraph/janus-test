@@ -476,7 +476,9 @@ impl GitRunner for SystemGit {
             // a single `git clone` HTTP stream is cut on the deployment host
             // (fatal 128 / early EOF), while 16 parallel connections complete
             // reliably. When aria2c is unavailable the plain git path runs.
-            if let Some(repo) = github_repo(url) && aria2c_available().await {
+            if let Some(repo) = github_repo(url)
+                && aria2c_available().await
+            {
                 return clone_github_tarball(&repo, branch, url, into, credential).await;
             }
             let mut command = Command::new("git");
