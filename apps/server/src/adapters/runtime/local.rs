@@ -48,6 +48,7 @@ struct LocalRuntime {
 #[derive(Clone)]
 struct ManagedProcess {
     nonce: String,
+    runtime_id: RuntimeId,
     process_identity: String,
     control: mpsc::Sender<ProcessCommand>,
     completion: watch::Receiver<Option<ProcessCompletion>>,
@@ -234,6 +235,7 @@ impl LocalExecutor {
         }));
         Ok(ManagedProcess {
             nonce: runtime.nonce,
+            runtime_id: spec.runtime_id(),
             process_identity: pid.to_string(),
             control,
             completion,
@@ -358,6 +360,7 @@ impl LocalExecutor {
         }));
         Ok(ManagedProcess {
             nonce: runtime.nonce,
+            runtime_id: spec.runtime_id,
             process_identity: pid.to_string(),
             control,
             completion,
@@ -408,6 +411,33 @@ impl RuntimeExecutor for LocalExecutor {
                 return Err(RuntimeError::unavailable(format!(
                     "runtime {runtime_id} executor nonce mismatch"
                 )));
+            }
+            // Terminate every managed process bound to this runtime before
+            // dropping the handle, otherwise stopping a runtime orphans running
+            // async tasks and terminal shells launched against it. The map
+            // entries are left in place so the background wait-finalizers
+            // observe the exit and release them.
+            let mut affected = Vec::new();
+            {
+                let tasks = self.inner.async_tasks.read().await;
+                affected.extend(
+                    tasks
+                        .values()
+                        .filter(|process| process.runtime_id == runtime_id)
+                        .cloned(),
+                );
+            }
+            {
+                let terminals = self.inner.terminals.read().await;
+                affected.extend(
+                    terminals
+                        .values()
+                        .filter(|process| process.runtime_id == runtime_id)
+                        .cloned(),
+                );
+            }
+            for process in affected {
+                let _ = Self::terminate_managed(process, executor_nonce).await;
             }
             self.inner.runtimes.write().await.remove(&runtime_id);
             Ok(())
@@ -521,7 +551,12 @@ impl RuntimeExecutor for LocalExecutor {
                 .get(&id)
                 .cloned()
                 .ok_or(RuntimeError::AsyncTaskLost(id))?;
-            Self::wait_managed(process, executor_nonce).await
+            let completion = Self::wait_managed(process, executor_nonce).await?;
+            // The background finalizer is the only wait caller, so it is safe to
+            // drop the entry once the exit has been observed; otherwise every
+            // async task ever started leaks a managed-process slot.
+            self.inner.async_tasks.write().await.remove(&id);
+            Ok(completion)
         })
     }
 
@@ -721,7 +756,12 @@ impl RuntimeExecutor for LocalExecutor {
                 .get(&id)
                 .cloned()
                 .ok_or(RuntimeError::TerminalNotWritable(id))?;
-            Self::wait_managed(process, executor_nonce).await
+            let completion = Self::wait_managed(process, executor_nonce).await?;
+            // The background finalizer is the only await caller, so the entry
+            // can be dropped once the natural exit has been observed. Explicit
+            // close_terminal already removes its own entry.
+            self.inner.terminals.write().await.remove(&id);
+            Ok(completion)
         })
     }
 }
@@ -1041,7 +1081,9 @@ async fn terminate_process_tree(child: &mut Child, pid: u32, process_group_id: O
     cleanup_descendants(pid, process_group_id).await;
     let _ = child.start_kill();
     let _ = tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, child.wait()).await;
-    cleanup_descendants(pid, process_group_id).await;
+    // A graceful TERM can be ignored by a daemonized grandchild; mirror the
+    // Windows recursive hard-kill so no descendant survives runtime teardown.
+    signal_descendants(pid, "KILL").await;
 }
 
 #[cfg(windows)]
@@ -1097,10 +1139,25 @@ async fn kill_msys_process_group(process_group_id: Option<u32>) {
 
 #[cfg(not(windows))]
 async fn cleanup_descendants(pid: u32, _process_group_id: Option<u32>) {
+    signal_descendants(pid, "TERM").await;
+}
+
+#[cfg(not(windows))]
+async fn signal_descendants(pid: u32, signal: &str) {
+    // Collect the full descendant tree (not just direct children) and signal
+    // it. `pkill -TERM -P` only covers direct children that are still alive,
+    // so a grandchild (e.g. a backgrounded pipeline) would otherwise survive.
+    let script = format!(
+        "ps -eo pid=,ppid= | awk -v root={pid} '{{ ppid[$2] = ppid[$2] \" \" $1 }} \
+         function push_children(p,    a, i, n) {{ n = split(ppid[p], a, \" \"); \
+         for (i = 1; i <= n; i++) if (a[i] != \"\") {{ print a[i]; stack[++top] = a[i] }} }} \
+         END {{ stack[1] = root; top = 1; \
+         for (j = 1; j <= top; j++) push_children(stack[j]) }}' | xargs kill -{signal}"
+    );
     let _ = tokio::time::timeout(
         PROCESS_TERMINATION_TIMEOUT,
-        Command::new("pkill")
-            .args(["-TERM", "-P", &pid.to_string()])
+        Command::new("sh")
+            .args(["-c", &script])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status(),
