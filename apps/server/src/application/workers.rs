@@ -7,10 +7,18 @@
 //! operations are durable Operations; the worker focuses on their external
 //! side effects so an HTTP disconnect cannot lose the work.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use serde_json::Value;
-use tokio::{sync::Semaphore, task::JoinHandle, time::MissedTickBehavior};
+use tokio::{
+    sync::{oneshot, Semaphore},
+    task::JoinHandle,
+    time::MissedTickBehavior,
+};
 use tracing::{error, info, warn};
 
 use crate::application::Application;
@@ -76,11 +84,75 @@ impl From<anyhow::Error> for WorkFailure {
     }
 }
 
+/// Serializes durable work items that mutate the same project/session so two
+/// clones, a clone plus a delete, or two session lifecycles for one target
+/// cannot run their filesystem side effects concurrently. Only keys whose work
+/// is currently in flight are held; the entry is removed when the permit drops,
+/// so the set stays bounded by the number of concurrently dispatched targets.
+struct TargetLocks {
+    busy: Mutex<HashSet<String>>,
+}
+
+impl TargetLocks {
+    async fn acquire(&self, key: &str) -> TargetPermit<'_> {
+        loop {
+            {
+                let mut busy = self.busy.lock().expect("target locks poisoned");
+                if busy.insert(key.to_owned()) {
+                    return TargetPermit {
+                        locks: self,
+                        key: key.to_owned(),
+                    };
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+struct TargetPermit<'a> {
+    locks: &'a TargetLocks,
+    key: String,
+}
+
+impl Drop for TargetPermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.locks.busy.lock() {
+            busy.remove(&self.key);
+        }
+    }
+}
+
+/// Which resource a work item mutates, used to avoid dispatching two items that
+/// touch the same workspace/DB state concurrently. Automation kinds are already
+/// serialized by the automation semaphore, so they need no target key.
+fn work_target_key(kind: &str, payload: &Value) -> Option<String> {
+    match kind {
+        KIND_CLONE | KIND_DELETE_PROJECT => payload
+            .get("project_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("project:{id}")),
+        KIND_CREATE_SESSION | KIND_DELETE_SESSION | KIND_CONTEXT_COMPACT => payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("session:{id}")),
+        KIND_TURN_WAKE => payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("turn:{id}")),
+        KIND_PULL_REQUEST_AUTOMATION | KIND_FORK_SYNC_BATCH => None,
+        _ => None,
+    }
+}
+
 /// Spawn the background worker. Runs until the runtime shuts down.
 pub fn spawn(state: Application) {
     let session_lifecycle = Arc::new(Semaphore::new(1));
     let work_concurrency = Arc::new(Semaphore::new(MAX_CONCURRENT_WORK));
     let automation_concurrency = Arc::new(Semaphore::new(MAX_CONCURRENT_AUTOMATION));
+    let target_locks = Arc::new(TargetLocks {
+        busy: Mutex::new(HashSet::new()),
+    });
     tokio::spawn(async move {
         info!("janus worker started");
         loop {
@@ -89,6 +161,7 @@ pub fn spawn(state: Application) {
                 &session_lifecycle,
                 &work_concurrency,
                 &automation_concurrency,
+                &target_locks,
             )
             .await
             {
@@ -126,6 +199,7 @@ async fn run_once(
     session_lifecycle: &Arc<Semaphore>,
     work_concurrency: &Arc<Semaphore>,
     automation_concurrency: &Arc<Semaphore>,
+    target_locks: &Arc<TargetLocks>,
 ) -> anyhow::Result<()> {
     for kind in HANDLED_KINDS {
         let is_automation = matches!(*kind, KIND_PULL_REQUEST_AUTOMATION | KIND_FORK_SYNC_BATCH);
@@ -175,25 +249,46 @@ async fn run_once(
         };
         let worker_state = state.clone();
         let worker_kind = (*kind).to_owned();
+        let worker_locks = Arc::clone(target_locks);
         let work_id = claimed.id.clone();
         let work_nonce = claimed.nonce.clone();
         tokio::spawn(async move {
             let _work_permit = work_permit;
             let _automation_permit = automation_permit;
             let _session_permit = session_permit;
+            let target_key = work_target_key(&worker_kind, &claimed.payload);
+            let (lost_tx, lost_rx) = oneshot::channel();
             let lease_heartbeat = spawn_lease_heartbeat(
                 worker_state.operations().clone(),
                 work_id.clone(),
                 work_nonce.clone(),
+                lost_tx,
             );
-            let outcome = dispatch(
-                &worker_state,
-                &worker_kind,
-                &claimed.payload,
-                &work_id,
-                &work_nonce,
-            )
-            .await;
+            // Dispatch is raced against lease loss so that once another worker
+            // reclaims the item (or the lease lapses) we stop applying side
+            // effects; the reclaimer re-runs the durable item from its step
+            // record. Waiting on the per-target lock is inside the race, so a
+            // busy target never lets the lease lapse while we hold it.
+            let outcome = tokio::select! {
+                outcome = async {
+                    let _target_permit = match &target_key {
+                        Some(key) => Some(worker_locks.acquire(key).await),
+                        None => None,
+                    };
+                    dispatch(
+                        &worker_state,
+                        &worker_kind,
+                        &claimed.payload,
+                        &work_id,
+                        &work_nonce,
+                    )
+                    .await
+                } => outcome,
+                _ = &mut lost_rx => {
+                    warn!(%work_id, kind = %worker_kind, "work lease lost; aborting dispatch");
+                    return;
+                }
+            };
             lease_heartbeat.abort();
             let _ = lease_heartbeat.await;
             match outcome {
@@ -490,6 +585,7 @@ fn spawn_lease_heartbeat(
     operations: OperationInterface,
     work_id: String,
     work_nonce: String,
+    lost_tx: oneshot::Sender<()>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(LEASE_RENEW_INTERVAL_SECONDS));
@@ -504,6 +600,7 @@ fn spawn_lease_heartbeat(
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(%work_id, "work lease could not be renewed");
+                    let _ = lost_tx.send(());
                     break;
                 }
                 Err(error) => {
