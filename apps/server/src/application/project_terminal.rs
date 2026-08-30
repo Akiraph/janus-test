@@ -30,7 +30,13 @@ impl Application {
         let scope = RuntimeScope::project(project_id);
         let runtime = match self.runtime().current_runtime(scope).await? {
             Some(runtime) if runtime.status == RuntimeStatus::Ready => runtime,
-            Some(_) => return Err(RuntimeError::RuntimeUnavailable.into()),
+            Some(runtime) => {
+                return Err(RuntimeError::unavailable(format!(
+                    "project runtime {} is not ready (status {:?})",
+                    runtime.id, runtime.status
+                ))
+                .into());
+            }
             None => {
                 let limits = ResourceLimits {
                     timeout_ms: 30_000,
