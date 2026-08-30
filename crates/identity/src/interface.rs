@@ -1144,7 +1144,9 @@ impl IdentityInterface {
         }
         let mut session = self.pool.client().start_session().await?;
         session.start_transaction().await?;
-        let owner_id = self.consume_recovery_code(code_or_token, &mut session).await?;
+        let owner_id = self
+            .consume_recovery_code(code_or_token, &mut session)
+            .await?;
         let token = random_token(32);
         let id = Uuid::now_v7().to_string();
         let token_hash = purpose_hash("recovery-state", &token);
