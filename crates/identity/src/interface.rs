@@ -391,7 +391,8 @@ impl IdentityInterface {
             .await?;
         let credential: RegisterPublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
-        let passkey = self.webauthn()?
+        let passkey = self
+            .webauthn()?
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
@@ -497,7 +498,8 @@ impl IdentityInterface {
             .into_iter()
             .map(|raw| serde_json::from_str::<Passkey>(&raw))
             .collect::<Result<Vec<_>, _>>()?;
-        let (options, state) = self.webauthn()?
+        let (options, state) = self
+            .webauthn()?
             .start_passkey_authentication(&passkeys)
             .map_err(|_| IdentityError::InvalidCredential)?;
         self.store_ceremony(
@@ -517,7 +519,8 @@ impl IdentityInterface {
         let state: AuthenticationState = serde_json::from_str(&state_json)?;
         let credential: PublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
-        let result = self.webauthn()?
+        let result = self
+            .webauthn()?
             .finish_passkey_authentication(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let owner = self.owner().await?;
@@ -562,7 +565,13 @@ impl IdentityInterface {
         .await?;
         session.commit_transaction().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false, self.auth_mode),
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
             session_token,
             recovery_codes: None,
         })
@@ -796,7 +805,13 @@ impl IdentityInterface {
         .await?;
         session.commit_transaction().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false, self.auth_mode),
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
             session_token,
             recovery_codes: None,
         })
@@ -952,7 +967,8 @@ impl IdentityInterface {
         }
         let credential: RegisterPublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
-        let passkey = self.webauthn()?
+        let passkey = self
+            .webauthn()?
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
@@ -1178,7 +1194,8 @@ impl IdentityInterface {
             .ok_or(IdentityError::InvalidCeremony)?;
         let credential: RegisterPublicKeyCredential =
             serde_json::from_value(credential).map_err(|_| IdentityError::InvalidCredential)?;
-        let passkey = self.webauthn()?
+        let passkey = self
+            .webauthn()?
             .finish_passkey_registration(&credential, &state.state)
             .map_err(|_| IdentityError::InvalidCredential)?;
         let now = Utc::now();
@@ -1229,7 +1246,13 @@ impl IdentityInterface {
         .await?;
         session.commit_transaction().await?;
         Ok(AuthenticationGrant {
-            owner: owner_view(&owner.id, &owner.display_name, csrf_token, false, self.auth_mode),
+            owner: owner_view(
+                &owner.id,
+                &owner.display_name,
+                csrf_token,
+                false,
+                self.auth_mode,
+            ),
             session_token,
             recovery_codes: None,
         })
@@ -1241,7 +1264,8 @@ impl IdentityInterface {
     ) -> Result<CeremonyOptions, IdentityError> {
         let user_id = Uuid::parse_str(&seed.owner_id)
             .map_err(|error| IdentityError::Internal(error.into()))?;
-        let (options, state) = self.webauthn()?
+        let (options, state) = self
+            .webauthn()?
             .start_passkey_registration(
                 user_id,
                 "owner@janus.local",
