@@ -473,6 +473,7 @@ fn openapi_contains_every_public_route() {
         "/api/v1/events",
         "/api/v1/automation/webhook",
         "/api/v1/automation/webhook/config",
+        "/api/v1/automation/webhook/secret",
         "/api/v1/automations",
         "/api/v1/automation/settings",
         "/api/v1/auth/initialize/options",
