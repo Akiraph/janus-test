@@ -1845,20 +1845,29 @@ impl RuntimeInterface {
         id: AsyncTaskId,
         nonce: &str,
     ) -> Result<AsyncTaskProjection, RuntimeError> {
-        match tokio::time::timeout(
+        // Kill the process; the spawned wait_async_task watcher settles the
+        // durable projection once the process exits. Finalizing here as well
+        // would open a second transaction writing the same async_tasks
+        // document concurrently (MongoDB WriteConflict), so poll for the
+        // terminal state instead and fall back to marking the task lost if the
+        // watcher never settles.
+        let _ = tokio::time::timeout(
             ASYNC_TASK_CANCEL_TIMEOUT,
             self.executor.cancel_async_task(id, nonce),
         )
-        .await
-        {
-            Ok(Ok(completion)) => {
-                self.finalize_async_task(id, completion, Some(AsyncTaskStatus::Canceled))
-                    .await?;
+        .await;
+        let deadline = tokio::time::Instant::now() + ASYNC_TASK_SETTLE_GRACE;
+        loop {
+            let async_task = self.async_task(id).await?;
+            if async_task.status.is_terminal() {
+                return Ok(async_task);
             }
-            Ok(Err(_)) | Err(_) => {
-                self.mark_async_task_lost(id, "cancel_unconfirmed").await?;
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
+            tokio::time::sleep(ASYNC_TASK_CANCEL_POLL_INTERVAL).await;
         }
+        self.mark_async_task_lost(id, "cancel_unconfirmed").await?;
         self.async_task(id).await
     }
 
@@ -2065,6 +2074,9 @@ impl RuntimeInterface {
 const TICKET_TTL: chrono::TimeDelta = chrono::Duration::seconds(30);
 const ASYNC_TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const ASYNC_TASK_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a cancel waits for the wait_async_task watcher to settle the
+/// durable projection after the process has been killed.
+const ASYNC_TASK_SETTLE_GRACE: Duration = Duration::from_secs(2);
 const COMMAND_SUMMARY_MAX_CHARS: usize = 120;
 
 fn terminal_projection(row: TerminalRow) -> Result<TerminalProjection, RuntimeError> {
