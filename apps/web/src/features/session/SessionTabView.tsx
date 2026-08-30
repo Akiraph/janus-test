@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/solid-query";
 import { createEffect, createMemo, createSignal, For } from "solid-js";
+import { useNotifications } from "../../components/ui/notifications";
 import {
   ApiError,
   type ContextUsageView,
@@ -55,6 +56,7 @@ interface SessionTabViewProps {
 
 export function SessionTabView(props: SessionTabViewProps) {
   const queryClient = useQueryClient();
+  const notify = useNotifications().notify;
   const queriesEnabled = () => {
     if (!props.creating()) return true;
     const cached = queryClient.getQueryData<SessionSummary>(["session", props.sessionId()]);
@@ -116,23 +118,23 @@ export function SessionTabView(props: SessionTabViewProps) {
     const sessionId = props.sessionId();
     const page = timelineWithHistory();
     if (!sessionId || loadingOlder()) return;
-    // Cursor to fetch before: the oldest item we currently hold.
-    const oldest = page?.items[0]?.id;
-    if (!oldest) return;
+    // The server's timeline cursor is a `display_order`, not an item id — it
+    // parses the value as an integer and rejects anything else outright.
+    const oldest = page?.items[0]?.display_order;
+    if (oldest == null) return;
     setLoadingOlder(true);
     try {
-      const older = await getSessionTimeline(sessionId, { before: oldest, limit: 100 });
+      const older = await getSessionTimeline(sessionId, { before: String(oldest), limit: 100 });
       queryClient.setQueryData<TimelinePage | null>(
         ["session-timeline-history", sessionId],
         (current) => {
           const existing = current?.items ?? [];
           const existingIds = new Set(existing.map((item) => item.id));
-          const merged = [...existing];
-          for (const item of older.items) {
-            if (!existingIds.has(item.id)) merged.push(item);
-          }
+          // Each fetched page is older than the last, so it belongs in front of
+          // what we already hold for the merged document to stay in order.
+          const prefix = older.items.filter((item) => !existingIds.has(item.id));
           return {
-            items: merged,
+            items: [...prefix, ...existing],
             has_older: older.has_older,
             has_newer: false,
             oldest_cursor: older.oldest_cursor ?? null,
@@ -140,6 +142,8 @@ export function SessionTabView(props: SessionTabViewProps) {
           };
         },
       );
+    } catch (error) {
+      notify(getErrorMessage(error, "Failed to load earlier messages"), { variant: "danger" });
     } finally {
       setLoadingOlder(false);
     }

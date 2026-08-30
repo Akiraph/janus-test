@@ -503,9 +503,11 @@
 }
 
 @media (max-width: 900px) {
+  /* The shell keeps the viewport height here too. Letting it grow with its
+     content (height: auto + min-height) makes every inner `height: 100%` /
+     `flex: 1` scroller resolve to content height, so the conversation timeline
+     and the sessions list stop scrolling on touch devices. */
   .project-page--ide {
-    height: auto;
-    min-height: calc(100dvh - 74px);
     border-right: 0;
     border-left: 0;
     border-radius: 0;
@@ -513,7 +515,6 @@
 
   .ide-shell.ide-shell--compact {
     grid-template-rows: minmax(0, 1fr);
-    min-height: 70dvh;
   }
 
   .ide-shell.ide-shell--compact:not(.ide-shell--sidebar-collapsed) {
