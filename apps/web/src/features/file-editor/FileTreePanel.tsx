@@ -52,12 +52,13 @@ export function FileTreePanel(props: FileTreePanelProps) {
         [path]: getErrorMessage(error, "Failed to load directory"),
       }));
     } finally {
-      if (requestEpoch !== loadEpoch) return;
-      setLoading((current) => {
-        const next = new Set(current);
-        next.delete(path);
-        return next;
-      });
+      if (requestEpoch === loadEpoch) {
+        setLoading((current) => {
+          const next = new Set(current);
+          next.delete(path);
+          return next;
+        });
+      }
     }
   }
 
