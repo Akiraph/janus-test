@@ -164,7 +164,7 @@ async fn clone_github_tarball(
         .ok_or_else(|| GitError::BadOutput("clone target has no parent dir".into()))?;
     let extract = parent.join(format!(".janus-github-extract-{nonce}"));
     let scratch = CloneScratch {
-        into: into.to_path_buf(),
+        into: Some(into.to_path_buf()),
         extras: vec![tarball.clone(), extract.clone()],
     };
 
