@@ -50,7 +50,8 @@ export function Select(props: SelectProps) {
 
   const activeIndex = () => {
     const buttons = optionButtons();
-    return buttons.findIndex((button) => button === document.activeElement);
+    const active = document.activeElement;
+    return active instanceof HTMLButtonElement ? buttons.indexOf(active) : -1;
   };
 
   const position = () => {
