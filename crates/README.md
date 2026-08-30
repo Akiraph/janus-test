@@ -9,7 +9,7 @@ and composition remain in `apps/server/application/`.
 
 | Crate | Current ownership | Dependency direction |
 | --- | --- | --- |
-| `janus-infrastructure` | Generic IDs, clocks, SQLite, transactions, public events, operation journals, and Blob storage | Generic technical libraries only |
+| `janus-infrastructure` | Generic IDs, clocks, MongoDB, transactions, public events, operation journals, and Blob storage | Generic technical libraries only |
 | `janus-workspace` | Main copy, content revisions, snapshots, manifests, diffs, and controlled file mutations | `infrastructure` |
 | `janus-source-control` | Git errors, status/log values, update outcomes, and the `GitRunner` port | Generic serialization and standard future types |
 | `janus-identity` | Single-owner passkeys, recovery grants, and authentication state | `infrastructure` plus WebAuthn implementation |
@@ -20,8 +20,8 @@ and composition remain in `apps/server/application/`.
 | `janus-execution` | Round, Tool Call, plan, context, and stream-diagnostic projections | `infrastructure`, `models`, `projects`, `runtime`, `sessions`, `workspace` |
 
 `janus-source-control` owns Git protocol values, the Git port, and Git state and
-conflict tables. The system Git process adapter remains in server. Table names,
-event names, and migration-owner normalization are fixed deployment contracts.
+conflict collections. The system Git process adapter remains in server. Collection
+names, event names, and migration-owner normalization are fixed deployment contracts.
 
 ## Boundary rules
 
@@ -34,7 +34,8 @@ event names, and migration-owner normalization are fixed deployment contracts.
   introducing a shared layer for a few lines of code.
 - Do not suppress lint or boundary problems with blanket attributes. Fix the
   code, narrow the interface, or add a focused test.
-- The deployment uses one `0001_initial.sql` migration. Do not add migration
+- The schema is MongoDB collections initialized by an idempotent per-collection
+  `create_indexes` pass (`janus-infrastructure::schema`). Do not add migration
   history or compatibility shims for removed features.
 
 ## Documentation rules
@@ -54,5 +55,5 @@ cargo run -p xtask -- check architecture
 git diff --check
 ```
 
-When server wiring or real file/SQLite behavior changes, also verify with the
-compiled server, real SQLite, public HTTP/SSE, and `janus-test`.
+When server wiring or real storage behavior changes, also verify with the
+compiled server, real MongoDB, public HTTP/SSE, and `janus-test`.
