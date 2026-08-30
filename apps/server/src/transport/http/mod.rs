@@ -37,6 +37,7 @@ pub use problem::Problem;
         sse::events
         , webhooks::webhook
         , automations::list_automations, automations::webhook_config,
+        automations::generate_webhook_secret,
         automations::get_automation_settings, automations::update_automation_settings
         , auth::initialize_options, auth::initialize_complete, auth::login_options,
         auth::login_complete, auth::me, auth::logout, auth::passkeys, auth::passkey_options,
@@ -189,6 +190,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/automation/webhook/config",
             get(automations::webhook_config),
+        )
+        .route(
+            "/api/v1/automation/webhook/secret",
+            post(automations::generate_webhook_secret),
         )
         .route("/api/v1/automations", get(automations::list_automations))
         .route(

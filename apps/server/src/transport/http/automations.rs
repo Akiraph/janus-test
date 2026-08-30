@@ -32,7 +32,12 @@ pub struct AutomationWebhookConfigView {
     pub enabled: bool,
     pub endpoint: String,
     pub secret_configured: bool,
+    /// One-time revealed plaintext; only present with `?reveal=true` and only
+    /// when a secret is configured.
     pub secret: Option<String>,
+    /// Where the effective secret comes from: "generated" (stored in the
+    /// database) or "env" (JANUS_AUTOMATION_WEBHOOK_SECRET at process start).
+    pub secret_source: Option<String>,
 }
 
 #[utoipa::path(
@@ -73,7 +78,11 @@ pub async fn webhook_config(
     headers: HeaderMap,
 ) -> Result<Json<DataResponse<AutomationWebhookConfigView>>, Problem> {
     authenticate(&state, &headers).await?;
-    let secret = state.config().automation_webhook_secret.clone();
+    let effective = state
+        .application()
+        .effective_automation_webhook_secret(state.config().automation_webhook_secret.as_deref())
+        .await
+        .map_err(|error| Problem::from_code("INTERNAL_ERROR", error.to_string()))?;
     let endpoint = format!(
         "{}/api/v1/automation/webhook",
         state.config().public_origin.as_str().trim_end_matches('/')
@@ -82,8 +91,42 @@ pub async fn webhook_config(
         data: AutomationWebhookConfigView {
             enabled: state.config().automation_webhook_enabled,
             endpoint,
-            secret_configured: secret.is_some(),
-            secret: query.reveal.then_some(secret).flatten(),
+            secret_configured: effective.secret.is_some(),
+            secret: query.reveal.then_some(effective.secret).flatten(),
+            secret_source: effective.source.map(str::to_owned),
+        },
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/automation/webhook/secret",
+    responses(
+        (status = 200, body = DataResponse<AutomationWebhookConfigView>),
+        (status = 401, body = Problem)
+    )
+)]
+pub async fn generate_webhook_secret(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DataResponse<AutomationWebhookConfigView>>, Problem> {
+    authenticate(&state, &headers).await?;
+    let secret = state
+        .application()
+        .generate_automation_webhook_secret()
+        .await
+        .map_err(|error| Problem::from_code("INTERNAL_ERROR", error.to_string()))?;
+    let endpoint = format!(
+        "{}/api/v1/automation/webhook",
+        state.config().public_origin.as_str().trim_end_matches('/')
+    );
+    Ok(Json(DataResponse {
+        data: AutomationWebhookConfigView {
+            enabled: state.config().automation_webhook_enabled,
+            endpoint,
+            secret_configured: true,
+            secret: Some(secret),
+            secret_source: Some("generated".into()),
         },
     }))
 }

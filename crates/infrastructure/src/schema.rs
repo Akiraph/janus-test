@@ -49,6 +49,7 @@ pub const COLLECTIONS: &[(&str, &str)] = &[
     ("model_attempts", "models"),
     ("model_usage_ledger", "models"),
     ("automation_settings", "models"),
+    ("automation_webhook_secrets", "models"),
     // projects
     ("projects", "projects"),
     ("github_credentials", "projects"),
@@ -95,6 +96,7 @@ pub const INDEXLESS_COLLECTIONS: &[&str] = &[
     "ceremonies",
     "recovery_batches",
     "automation_settings",
+    "automation_webhook_secrets",
     "project_git_state",
     "projection_cursor",
     "event_seq",

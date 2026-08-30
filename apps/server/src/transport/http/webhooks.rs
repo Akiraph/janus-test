@@ -77,9 +77,11 @@ pub async fn webhook(
         ));
     }
     let secret = state
-        .config()
-        .automation_webhook_secret
-        .as_deref()
+        .application()
+        .effective_automation_webhook_secret(state.config().automation_webhook_secret.as_deref())
+        .await
+        .map_err(|error| Problem::from_code("INTERNAL_ERROR", error.to_string()))?
+        .secret
         .ok_or_else(|| {
             Problem::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -88,7 +90,7 @@ pub async fn webhook(
                 "The automation endpoint has no configured secret.",
             )
         })?;
-    if !authorized(&headers, secret) {
+    if !authorized(&headers, &secret) {
         return Err(Problem::new(
             StatusCode::UNAUTHORIZED,
             "WEBHOOK_UNAUTHORIZED",

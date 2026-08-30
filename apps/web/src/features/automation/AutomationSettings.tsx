@@ -26,6 +26,7 @@ import type {
 import {
   createGithubCredential,
   deleteGithubCredential,
+  generateAutomationWebhookSecret,
   getAutomationWebhookConfig,
   getErrorMessage,
   probeGithubCredential,
@@ -58,6 +59,7 @@ export function AutomationSettings() {
   const [deleting, setDeleting] = createSignal(false);
   const [probing, setProbing] = createSignal<string | null>(null);
   const [secretLoading, setSecretLoading] = createSignal(false);
+  const [secretGenerating, setSecretGenerating] = createSignal(false);
 
   const modelOptions = () =>
     (providers.data ?? []).flatMap((provider) =>
@@ -111,6 +113,25 @@ export function AutomationSettings() {
       notify(getErrorMessage(error, "Webhook secret could not be loaded"), { variant: "danger" });
     } finally {
       setSecretLoading(false);
+    }
+  }
+
+  async function generateWebhookSecret() {
+    setSecretGenerating(true);
+    try {
+      const config = await generateAutomationWebhookSecret();
+      setWebhookSecret(config.secret ?? null);
+      setSecretVisible(Boolean(config.secret));
+      await queryClient.invalidateQueries({ queryKey: ["automation-webhook-config"] });
+      notify("Webhook secret generated. Copy it now — it won't be shown again", {
+        variant: "success",
+      });
+    } catch (error) {
+      notify(getErrorMessage(error, "Webhook secret could not be generated"), {
+        variant: "danger",
+      });
+    } finally {
+      setSecretGenerating(false);
     }
   }
 
@@ -327,8 +348,37 @@ export function AutomationSettings() {
                   <Copy size={15} aria-hidden="true" />
                 </Button>
               </Show>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={secretGenerating()}
+                onClick={() => void generateWebhookSecret()}
+              >
+                {secretGenerating() ? (
+                  <>
+                    <Loader2 size={14} class="ui-spinner" aria-hidden="true" /> Generating…
+                  </>
+                ) : webhookConfig.data?.secret_configured ? (
+                  <>
+                    <RefreshCw size={14} aria-hidden="true" /> Rotate
+                  </>
+                ) : (
+                  <>
+                    <Plus size={14} aria-hidden="true" /> Generate
+                  </>
+                )}
+              </Button>
             </div>
           </div>
+          <Show when={webhookConfig.data?.secret_source}>
+            {(source) => (
+              <small>
+                {source() === "generated"
+                  ? "Generated from this page and stored encrypted in the deployment database."
+                  : "Supplied by JANUS_AUTOMATION_WEBHOOK_SECRET at process start."}
+              </small>
+            )}
+          </Show>
           <small>
             Send <code>X-Janus-Webhook-Secret</code> with the request. This inbound webhook is
             separate from outbound email notifications.

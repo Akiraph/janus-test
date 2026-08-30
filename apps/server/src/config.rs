@@ -65,8 +65,6 @@ pub enum ConfigError {
     InvalidPublicOrigin(String),
     #[error("production WebAuthn requires an https public origin")]
     InsecureProductionOrigin,
-    #[error("JANUS_AUTOMATION_WEBHOOK_SECRET is required when automation webhooks are enabled")]
-    AutomationWebhookSecretRequired,
     #[error("JANUS_MONGODB_URI must be a mongodb:// or mongodb+srv:// connection string: {0}")]
     InvalidMongodbUri(String),
 }
@@ -177,9 +175,6 @@ impl Config {
             && self.public_origin.scheme() != "https"
         {
             return Err(ConfigError::InsecureProductionOrigin);
-        }
-        if self.automation_webhook_enabled && self.automation_webhook_secret.is_none() {
-            return Err(ConfigError::AutomationWebhookSecretRequired);
         }
         if !self.mongodb_uri.starts_with("mongodb://")
             && !self.mongodb_uri.starts_with("mongodb+srv://")

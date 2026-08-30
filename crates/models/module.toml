@@ -7,6 +7,7 @@ owned_collections = [
   "model_attempts",
   "model_usage_ledger",
   "automation_settings",
+  "automation_webhook_secrets",
 ]
 publishes = ["model_config.changed"]
 allowed_module_dependencies = []
