@@ -555,13 +555,22 @@ flow; external tokens must never leak into ordinary tests, logs, or commits.
 | `.github/workflows/quality.yml` | push to `main`, every pull request | pin Rust `1.97.0` + Bun `1.3.14`, start a `mongo:7` replica-set service container, `bun install --frozen-lockfile`, set a git identity for tests that commit, then `cargo xtask check` |
 | `.github/workflows/ci.yml` | pull requests, pushes to `main`/`master`/`dev`, manual | build the Docker image for verification on PRs; on pushes by allowed actors, publish `linux/amd64` tags to GHCR and run the deployment script |
 
-Published tags are `<ref>-amd64` and `<short-sha>-amd64` under
-`ghcr.io/<owner>/<repo>`, with a `:cache` tag for the buildx registry cache.
+Every push to `main`/`master`/`dev` publishes three images, each under
+`ghcr.io/<owner>/<repo>` with a `:cache` tag for the buildx registry cache:
+
+| Image | Docker target | Tags |
+| --- | --- | --- |
+| combined (frontend + backend, one process) | `combined` (default) | `<ref>-combined-amd64`, `<short-sha>-combined-amd64` |
+| server (backend only) | `server` | `<ref>-server-amd64`, `<short-sha>-server-amd64` |
+| web (nginx frontend + API proxy) | `web` | `<ref>-web-amd64`, `<short-sha>-web-amd64` |
+
 `scripts/deploy_image.js` then pulls a tag onto the target host over SSH and
 recreates each container named in `CONTAINER_NAMES`, inheriting its previous
 `docker inspect` configuration. It reads the `SERVER_ADDRESS`, `USERNAME`,
 `PORT`, `PRIVATE_KEY`, `CONTAINER_NAMES`, and `ADMIN_PASSWORD` secrets, and
-redacts key material from its own logs. Commits whose message contains `deps):`
+redacts key material from its own logs. The deployment uses the combined image
+tag (`<short-sha>-combined-amd64`); point `CONTAINER_NAMES`/`IMAGE_URL` at the `server`
+or `web` tags to run them separately. Commits whose message contains `deps):`
 are skipped.
 
 GitHub Actions is the authority on correctness: check `gh run list` and
@@ -569,14 +578,29 @@ GitHub Actions is the authority on correctness: check `gh run list` and
 
 ## Container deployment
 
-The `Dockerfile` produces one image that runs frontend and backend as a single
-process: stage 1 builds the web bundle with Bun, stage 2 builds `janus-server`
+The `Dockerfile` exposes three build targets that share the same builder
+stages: stage 1 builds the web bundle with Bun, stage 2 builds `janus-server`
 with `rust:1.97.0-bookworm`, and the Debian slim runtime keeps `git` (for the
 source-control adapter) and `tini` (to reap spawned session and terminal
 processes).
 
+| Target | Image | Contents |
+| --- | --- | --- |
+| `combined` (default) | frontend + backend, one process | web bundle served from the same origin as the API, the health probes, and the SPA |
+| `server` | backend only | `janus-server` + `janus-admin`, no web client |
+| `web` | frontend only | nginx serving the web bundle and proxying `/api` + `/health` to the backend at `JANUS_API_TARGET` |
+
+Build any target with `docker build --target <name>`:
+
 ```text
 docker build -t janus:local .
+docker build --target server -t janus-server:local .
+docker build --target web -t janus-web:local .
+```
+
+The combined image runs everything in one process:
+
+```text
 docker run --rm -p 4317:4317 -v janus-data:/data \
   -e JANUS_MONGODB_URI=mongodb://host.docker.internal:27017/?replicaSet=rs0 \
   janus:local
@@ -623,6 +647,64 @@ docker run --rm -v janus-data:/data \
   -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
   janus:local janus-admin issue-initialization-token
 ```
+
+### Frontend / backend split
+
+The `server` and `web` images run the two halves separately. The web image
+serves the SPA and proxies the API back to the backend over one origin, so the
+browser keeps using relative `/api` paths and the `SameSite=Strict` session
+cookie plus the backend's Origin check keep working. Point `JANUS_API_TARGET`
+at the backend and set the backend's `JANUS_PUBLIC_ORIGIN` to the web image's
+public origin:
+
+```text
+# backend (the server image)
+docker run --rm -d --name janus-server -v janus-data:/data \
+  -e JANUS_MODE=production \
+  -e JANUS_PUBLIC_ORIGIN=https://frontend.example.com \
+  -e JANUS_MONGODB_URI=mongodb://mongo:27017/?replicaSet=rs0 \
+  -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
+  janus-server:local
+
+# frontend (the web image; one container per frontend origin)
+docker run --rm -d -p 8080:80 \
+  -e JANUS_API_TARGET=http://janus-server:4317 \
+  janus-web:local
+```
+
+The web image's nginx forwards `/api` (SSE included) and `/health`, and upgrades
+the terminal WebSocket to the backend. A deployment on plain http still needs
+`JANUS_AUTH_MODE=totp` on the backend and an http `JANUS_PUBLIC_ORIGIN`
+matching the frontend origin, as above.
+
+### Vercel deployment
+
+The web client is a static Vite build and deploys to Vercel as-is — no code
+changes are required. The repository root carries a `vercel.json` that points
+the build at `apps/web` (`rootDirectory`), and its `routes` proxy `/api` and
+`/health` to the backend. Configure the backend address with the
+`JANUS_API_TARGET` environment variable in the Vercel project settings
+(Settings → Environment Variables); `routes` expands it via its `env` allowlist
+at request time:
+
+```json
+{
+  "routes": [
+    { "src": "/api/(.*)", "dest": "${JANUS_API_TARGET}/api/$1", "env": ["JANUS_API_TARGET"] },
+    { "src": "/health/(.*)", "dest": "${JANUS_API_TARGET}/health/$1", "env": ["JANUS_API_TARGET"] },
+    { "src": "/((?!api/|health/).*)", "dest": "/index.html" }
+  ]
+}
+```
+
+The proxy keeps the browser on the Vercel origin, so the session cookie and
+Origin checks work — set the backend's `JANUS_PUBLIC_ORIGIN` to the Vercel
+domain. Two caveats: Vercel's external-origin routes do **not** forward
+WebSocket upgrades, so the terminal feature is unavailable in a Vercel
+deployment; use the Docker images when terminals are required. And keep the
+`/api` responses out of the Vercel CDN cache — Vercel honors upstream
+`cache-control`, and the API returns none, so responses are not cached by
+default.
 
 ## Fork-sync automation
 

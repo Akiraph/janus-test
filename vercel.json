@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rootDirectory": "apps/web",
+  "framework": "vite",
+  "buildCommand": "bun run build",
+  "outputDirectory": "dist",
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "${JANUS_API_TARGET}/api/$1",
+      "env": ["JANUS_API_TARGET"]
+    },
+    {
+      "src": "/health/(.*)",
+      "dest": "${JANUS_API_TARGET}/health/$1",
+      "env": ["JANUS_API_TARGET"]
+    },
+    {
+      "src": "/((?!api/|health/).*)",
+      "dest": "/index.html"
+    }
+  ]
+}

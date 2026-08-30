@@ -1,0 +1,64 @@
+# Frontend nginx config for the Janus web image.
+#
+# Serves the built SPA from /usr/share/nginx/html and proxies the API, health
+# probes, SSE, and terminal WebSockets to the backend at ${JANUS_API_TARGET}
+# (substituted at container start by nginx-entrypoint.sh). The browser only
+# ever talks to this origin, so the SameSite=Strict session cookie and the
+# backend's Origin check keep working — the backend's JANUS_PUBLIC_ORIGIN must
+# be set to this nginx origin.
+
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # SPA asset files are hashed and immutable once published.
+    location /assets/ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # API + health probes. No URI part in proxy_pass, so the original path
+    # (e.g. /api/v1/bootstrap) is forwarded unchanged to the backend.
+    location /api/ {
+        proxy_pass ${JANUS_API_TARGET};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # SSE (/api/v1/events) must not be buffered.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+    }
+
+    location /health {
+        proxy_pass ${JANUS_API_TARGET};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+
+    # Terminal WebSocket upgrade. The longest-prefix match wins over /api/, so
+    # only this location handles the connect upgrade.
+    location /api/v1/terminals/ {
+        proxy_pass ${JANUS_API_TARGET};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+    }
+
+    # Client-side routing fallback.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
