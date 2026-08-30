@@ -16,7 +16,7 @@ use utoipa::ToSchema;
 use janus_infrastructure::{
     events::{EventStore, EventType, NewEvent},
     id::{AttemptId, ModelId, ProviderId, RoundId},
-    secrets::{Secret, SecretCipher, fingerprint, mask_key},
+    secrets::{Secret, SecretCipher, fingerprint, mask_key, random_token},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
 
@@ -466,6 +466,65 @@ impl ModelsInterface {
             .upsert(true)
             .await?;
         Ok(())
+    }
+
+    /// The deployment-scoped inbound webhook secret, if one was generated from
+    /// the UI. Stored encrypted; absent until the first rotation.
+    pub async fn automation_webhook_secret(&self) -> Result<Option<String>, ModelsError> {
+        let document = self
+            .pool
+            .collection::<Document>("automation_webhook_secrets")
+            .find_one(doc! {"_id": WEBHOOK_SECRET_ID})
+            .await?;
+        let Some(document) = document else {
+            return Ok(None);
+        };
+        let Some(ciphertext) = document
+            .get("secret_ciphertext")
+            .and_then(|value| match value {
+                Bson::Binary(binary) => Some(binary.bytes.clone()),
+                _ => None,
+            })
+        else {
+            return Ok(None);
+        };
+        let plaintext = self
+            .cipher
+            .decrypt(&ciphertext, WEBHOOK_SECRET_AAD)
+            .map_err(ModelsError::from)?;
+        Ok(Some(plaintext.expose().to_owned()))
+    }
+
+    /// Mint a fresh webhook secret, persist it encrypted, and hand the
+    /// plaintext back exactly once for the UI to show the caller.
+    pub async fn rotate_automation_webhook_secret(&self) -> Result<String, ModelsError> {
+        let secret = random_token(32);
+        let ciphertext = self
+            .cipher
+            .encrypt(&Secret::new(secret.clone()), WEBHOOK_SECRET_AAD)
+            .map_err(ModelsError::from)?;
+        let now = now_utc_str();
+        self.pool
+            .collection::<Document>("automation_webhook_secrets")
+            .update_one(
+                doc! {"_id": WEBHOOK_SECRET_ID},
+                doc! {
+                    "$set": {
+                        "secret_ciphertext": mongodb::bson::Binary {
+                            subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                            bytes: ciphertext,
+                        },
+                        "secret_fingerprint": fingerprint(&secret),
+                        "updated_at": &now,
+                    },
+                    "$setOnInsert": {
+                        "created_at": &now,
+                    },
+                },
+            )
+            .upsert(true)
+            .await?;
+        Ok(secret)
     }
 
     pub async fn provider_kind_in_tx(
@@ -1554,6 +1613,13 @@ fn append_path_segment(base: &str, segment: &str) -> Result<Url, ModelsError> {
 fn key_aad(owner_id: &str, id: &str) -> String {
     format!("v1/{owner_id}/model_providers/{id}/api_key")
 }
+
+/// Singleton document key and encryption context for the deployment-scoped
+/// webhook secret. No owner id participates because the secret protects the
+/// whole deployment, not one owner.
+const WEBHOOK_SECRET_ID: &str = "deployment";
+const WEBHOOK_SECRET_AAD: &str = "v1/automation-webhook-secret";
+
 fn provider_view(row: ProviderRow) -> Result<ProviderView, ModelsError> {
     let models: Vec<EmbeddedModelView> = serde_json::from_str(&row.models_json)?;
     Ok(ProviderView {

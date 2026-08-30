@@ -213,6 +213,89 @@ async fn optional_webhook_requires_enablement_and_secret() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn generated_webhook_secret_authorizes_the_webhook() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let mut config = test_config(directory.path().into());
+    config.automation_webhook_enabled = true;
+    config.automation_webhook_secret = Some("env-secret".into());
+    config.automation_github_token = Some("ghp-test-automation".into());
+    let state = AppState::initialize(config).await?;
+    state.identity().authenticate(None).await?;
+    let (base, task) = spawn(state).await?;
+    let client = Client::new();
+    let body = r#"{
+      "event": "fork_sync_conflict",
+      "timestamp": "2026-08-19T06:00:00.000Z",
+      "summary": {"scanned": 1, "conflicts": 1},
+      "conflicts": [
+        {"fullName": "acme/widget", "htmlUrl": "https://github.com/acme/widget",
+         "parentFullName": "acme/upstream", "defaultBranch": "main",
+         "parentDefaultBranch": "main", "prNumber": 42,
+         "prUrl": "https://github.com/acme/widget/pull/42", "message": "conflict"}
+      ]
+    }"#;
+
+    let before = client
+        .get(format!(
+            "{base}/api/v1/automation/webhook/config?reveal=true"
+        ))
+        .send()
+        .await?;
+    assert_eq!(before.status(), reqwest::StatusCode::OK);
+    let before_body: Value = before.json().await?;
+    assert_eq!(before_body["data"]["secret"], "env-secret");
+    assert_eq!(before_body["data"]["secret_source"], "env");
+
+    let generated = client
+        .post(format!("{base}/api/v1/automation/webhook/secret"))
+        .send()
+        .await?;
+    assert_eq!(generated.status(), reqwest::StatusCode::OK);
+    let generated_body: Value = generated.json().await?;
+    let new_secret = generated_body["data"]["secret"]
+        .as_str()
+        .expect("generated secret is revealed once")
+        .to_owned();
+    assert!(!new_secret.is_empty());
+    assert_eq!(generated_body["data"]["secret_configured"], true);
+    assert_eq!(generated_body["data"]["secret_source"], "generated");
+
+    let after = client
+        .get(format!(
+            "{base}/api/v1/automation/webhook/config?reveal=true"
+        ))
+        .send()
+        .await?;
+    let after_body: Value = after.json().await?;
+    assert_eq!(after_body["data"]["secret"], new_secret);
+    assert_eq!(after_body["data"]["secret_source"], "generated");
+
+    let authorized = client
+        .post(format!("{base}/api/v1/automation/webhook"))
+        .header("content-type", "application/json")
+        .header("x-janus-webhook-secret", &new_secret)
+        .header("idempotency-key", "webhook-test-generated")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(authorized.status(), reqwest::StatusCode::ACCEPTED);
+
+    // A generated secret replaces the process-start env value entirely.
+    let stale_env_secret = client
+        .post(format!("{base}/api/v1/automation/webhook"))
+        .header("content-type", "application/json")
+        .header("x-janus-webhook-secret", "env-secret")
+        .header("idempotency-key", "webhook-test-stale-env")
+        .body(body)
+        .send()
+        .await?;
+    assert_eq!(stale_env_secret.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn github_credentials_require_explicit_automation_opt_in() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
@@ -390,6 +473,7 @@ fn openapi_contains_every_public_route() {
         "/api/v1/events",
         "/api/v1/automation/webhook",
         "/api/v1/automation/webhook/config",
+        "/api/v1/automation/webhook/secret",
         "/api/v1/automations",
         "/api/v1/automation/settings",
         "/api/v1/auth/initialize/options",

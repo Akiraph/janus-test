@@ -269,6 +269,12 @@ pub(crate) struct UpdateAutomationSettingsInput {
     pub model_upstream_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EffectiveAutomationWebhookSecret {
+    pub(crate) secret: Option<String>,
+    pub(crate) source: Option<&'static str>,
+}
+
 impl Application {
     pub(crate) async fn get_automation_settings(
         &self,
@@ -334,6 +340,34 @@ impl Application {
             model_upstream_id: upstream_id,
             model_display_name: display_name,
         })
+    }
+
+    /// The webhook secret currently in force, merging a UI-generated value from
+    /// the database over the process-start env value. `source` tells the UI
+    /// where the secret came from so it can label the row honestly.
+    pub(crate) async fn effective_automation_webhook_secret(
+        &self,
+        env_secret: Option<&str>,
+    ) -> Result<EffectiveAutomationWebhookSecret, AutomationError> {
+        let stored = self.models().automation_webhook_secret().await?;
+        let secret = match &stored {
+            Some(value) => Some(value.clone()),
+            None => env_secret.map(str::to_owned),
+        };
+        let source = match (&secret, &stored) {
+            (Some(_), Some(_)) => Some("generated"),
+            (Some(_), None) => Some("env"),
+            (None, _) => None,
+        };
+        Ok(EffectiveAutomationWebhookSecret { secret, source })
+    }
+
+    /// Mint a fresh webhook secret, persist it encrypted, and hand the
+    /// plaintext back exactly once for the UI to show the caller.
+    pub(crate) async fn generate_automation_webhook_secret(
+        &self,
+    ) -> Result<String, AutomationError> {
+        Ok(self.models().rotate_automation_webhook_secret().await?)
     }
 
     async fn model_display_name(

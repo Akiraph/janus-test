@@ -820,6 +820,16 @@ export async function getAutomationWebhookConfig(
   ).data;
 }
 
+export async function generateAutomationWebhookSecret(): Promise<AutomationWebhookConfigView> {
+  return (
+    await requestJson<{ data: AutomationWebhookConfigView }>(
+      "/api/v1/automation/webhook/secret",
+      { method: "POST" },
+      isDataResponse,
+    )
+  ).data;
+}
+
 export async function getAutomationSettings(): Promise<AutomationSettingsView> {
   return (
     await requestJson<{ data: AutomationSettingsView }>(
