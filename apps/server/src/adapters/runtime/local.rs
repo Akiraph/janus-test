@@ -401,7 +401,9 @@ impl RuntimeExecutor for LocalExecutor {
         Box::pin(async move {
             let current = self.runtime(runtime_id).await?;
             if current.nonce != executor_nonce {
-                return Err(RuntimeError::RuntimeUnavailable);
+                return Err(RuntimeError::unavailable(format!(
+                    "runtime {runtime_id} executor nonce mismatch"
+                )));
             }
             self.inner.runtimes.write().await.remove(&runtime_id);
             Ok(())
@@ -740,7 +742,9 @@ async fn manage_process(input: ProcessMonitor) {
             command = commands.recv() => match command {
                 Some(ProcessCommand::Stdin(input, response)) => {
                     let result = if let Some(writer) = stdin.as_mut() {
-                        writer.write_all(&input).await.map_err(|_| RuntimeError::RuntimeUnavailable)
+                        writer.write_all(&input).await.map_err(|error| {
+                            RuntimeError::unavailable(format!("failed to write process stdin: {error}"))
+                        })
                     } else {
                         Err(RuntimeError::ResourceBusy)
                     };
@@ -755,7 +759,11 @@ async fn manage_process(input: ProcessMonitor) {
                         writer
                             .write_all(b"\x03")
                             .await
-                            .map_err(|_| RuntimeError::RuntimeUnavailable)
+                            .map_err(|error| {
+                                RuntimeError::unavailable(format!(
+                                    "failed to send interrupt to process stdin: {error}"
+                                ))
+                            })
                     } else {
                         Err(RuntimeError::ResourceBusy)
                     };
@@ -800,17 +808,26 @@ async fn manage_terminal(input: TerminalMonitor) {
             command = commands.recv() => match command {
                 Some(ProcessCommand::Stdin(input, response)) => {
                     let result = if let Some(writer) = stdin.as_mut() {
-                        writer.write_all(&input).await.map_err(|_| RuntimeError::RuntimeUnavailable)
+                        writer.write_all(&input).await.map_err(|error| {
+                            RuntimeError::unavailable(format!("failed to write process stdin: {error}"))
+                        })
                     } else {
-                        Err(RuntimeError::RuntimeUnavailable)
+                        Err(RuntimeError::unavailable("process stdin pipe is not available"))
                     };
                     let _ = response.send(result);
                 }
                 Some(ProcessCommand::Interrupt(response)) => {
                     let result = if let Some(writer) = stdin.as_mut() {
-                        writer.write_all(b"\x03").await.map_err(|_| RuntimeError::RuntimeUnavailable)
+                        writer
+                            .write_all(b"\x03")
+                            .await
+                            .map_err(|error| {
+                                RuntimeError::unavailable(format!(
+                                    "failed to send interrupt to process stdin: {error}"
+                                ))
+                            })
                     } else {
-                        Err(RuntimeError::RuntimeUnavailable)
+                        Err(RuntimeError::unavailable("process stdin pipe is not available"))
                     };
                     let _ = response.send(result);
                 }
@@ -943,7 +960,7 @@ fn ensure_nonce(process: &ManagedProcess, expected: &str) -> Result<(), RuntimeE
     if process.nonce == expected {
         Ok(())
     } else {
-        Err(RuntimeError::RuntimeUnavailable)
+        Err(RuntimeError::unavailable("process executor nonce mismatch"))
     }
 }
 
@@ -1264,7 +1281,7 @@ mod tests {
             executor
                 .write_async_task_stdin(async_task_id, "stale-nonce", b"ignored".to_vec())
                 .await,
-            Err(RuntimeError::RuntimeUnavailable)
+            Err(RuntimeError::RuntimeUnavailableDetail(_))
         ));
 
         let child_pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {

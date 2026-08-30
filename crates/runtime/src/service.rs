@@ -427,7 +427,10 @@ impl RuntimeInterface {
     ) -> Result<RuntimeProjection, RuntimeError> {
         if let Some(existing) = self.current_runtime(spec.scope()).await? {
             if existing.id != spec.id() {
-                return Err(RuntimeError::RuntimeUnavailable);
+                return Err(RuntimeError::unavailable(format!(
+                    "a different runtime {} already exists for this scope",
+                    existing.id
+                )));
             }
             if matches!(
                 existing.status,
@@ -460,7 +463,10 @@ impl RuntimeInterface {
                     .map_err(storage_error)?;
                 return self.runtime(existing.id).await;
             }
-            return Err(RuntimeError::RuntimeUnavailable);
+            return Err(RuntimeError::unavailable(format!(
+                "runtime {} is not ready (status {:?})",
+                existing.id, existing.status
+            )));
         }
         let now = now_utc_str();
         let placeholder_nonce = format!("pending-{}", spec.id());
@@ -705,7 +711,7 @@ impl RuntimeInterface {
                 .await;
                 self.mark_async_task_lost(async_task_id, "executor_nonce_mismatch")
                     .await?;
-                Err(RuntimeError::RuntimeUnavailable)
+                Err(RuntimeError::unavailable("async task executor nonce mismatch"))
             }
             Err(error) => {
                 self.mark_async_task_lost(async_task_id, "start_failed")
@@ -1104,7 +1110,7 @@ impl RuntimeInterface {
             }
             Ok(_) => {
                 self.mark_terminal_failed(terminal_id).await?;
-                Err(RuntimeError::RuntimeUnavailable)
+                Err(RuntimeError::unavailable("terminal executor nonce mismatch"))
             }
             Err(error) => {
                 self.mark_terminal_failed(terminal_id).await?;
@@ -1592,7 +1598,7 @@ impl RuntimeInterface {
             .session(&mut *work.connection())
             .await
             .map_err(storage_error)?
-            .ok_or(RuntimeError::RuntimeUnavailable)?;
+            .ok_or_else(|| RuntimeError::unavailable(format!("runtime {id} was not found")))?;
         let runtime = runtime_projection(RuntimeRow::from_document(&document)?)?;
         work.append_event(NewEvent {
             event_type: EventType::RuntimeChanged,
@@ -1713,13 +1719,13 @@ impl RuntimeInterface {
             .map_err(storage_error)?
             .map(|document| RuntimeRow::from_document(&document))
             .transpose()?
-            .ok_or(RuntimeError::RuntimeUnavailable)
+            .ok_or_else(|| RuntimeError::unavailable(format!("runtime {id} was not found")))
     }
 
     async fn runtime_nonce(&self, id: RuntimeId) -> Result<String, RuntimeError> {
         let row = self.runtime_row(id).await?;
         if row.status != "ready" {
-            return Err(RuntimeError::RuntimeUnavailable);
+            return Err(RuntimeError::unavailable(format!("runtime {id} is not ready")));
         }
         Ok(row.executor_nonce)
     }
@@ -2007,7 +2013,10 @@ const COMMAND_SUMMARY_MAX_CHARS: usize = 120;
 
 fn terminal_projection(row: TerminalRow) -> Result<TerminalProjection, RuntimeError> {
     if row.owner_kind != "project" {
-        return Err(RuntimeError::RuntimeUnavailable);
+        return Err(RuntimeError::unavailable(format!(
+            "terminal owner kind is {:?}, not \"project\"",
+            row.owner_kind
+        )));
     }
     let exit = row
         .exit_json
@@ -2046,7 +2055,9 @@ fn parse_terminal_status(value: &str) -> Result<TerminalStatus, RuntimeError> {
         "exited" => Ok(TerminalStatus::Exited),
         "failed" => Ok(TerminalStatus::Failed),
         "lost" => Ok(TerminalStatus::Lost),
-        _ => Err(RuntimeError::RuntimeUnavailable),
+        _ => Err(RuntimeError::unavailable(format!(
+            "unknown terminal status {value:?}"
+        ))),
     }
 }
 
@@ -2099,7 +2110,9 @@ fn runtime_projection(row: RuntimeRow) -> Result<RuntimeProjection, RuntimeError
 fn runtime_scope(kind: &str, id: &str) -> Result<RuntimeScope, RuntimeError> {
     match kind {
         "project" => Ok(RuntimeScope::project(id.parse().map_err(storage_error)?)),
-        _ => Err(RuntimeError::RuntimeUnavailable),
+        _ => Err(RuntimeError::unavailable(format!(
+            "unknown runtime scope kind {kind:?}"
+        ))),
     }
 }
 
@@ -2136,7 +2149,9 @@ fn parse_runtime_status(value: &str) -> Result<RuntimeStatus, RuntimeError> {
         "stopped" => Ok(RuntimeStatus::Stopped),
         "failed" => Ok(RuntimeStatus::Failed),
         "lost" => Ok(RuntimeStatus::Lost),
-        _ => Err(RuntimeError::RuntimeUnavailable),
+        _ => Err(RuntimeError::unavailable(format!(
+            "unknown runtime status {value:?}"
+        ))),
     }
 }
 
@@ -2148,7 +2163,9 @@ fn parse_async_task_status(value: &str) -> Result<AsyncTaskStatus, RuntimeError>
         "failed" => Ok(AsyncTaskStatus::Failed),
         "canceled" => Ok(AsyncTaskStatus::Canceled),
         "lost" => Ok(AsyncTaskStatus::Lost),
-        _ => Err(RuntimeError::RuntimeUnavailable),
+        _ => Err(RuntimeError::unavailable(format!(
+            "unknown async task status {value:?}"
+        ))),
     }
 }
 
@@ -2197,8 +2214,8 @@ fn new_version() -> String {
     format!("v_{}", RuntimeId::new())
 }
 
-fn storage_error(_error: impl Into<anyhow::Error>) -> RuntimeError {
-    RuntimeError::RuntimeUnavailable
+fn storage_error(error: impl Into<anyhow::Error>) -> RuntimeError {
+    RuntimeError::unavailable(error.into().to_string())
 }
 
 #[cfg(test)]

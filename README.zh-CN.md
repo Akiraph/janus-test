@@ -340,9 +340,10 @@ Rust 路由 + utoipa 注解
 | `JANUS_BIND` | `127.0.0.1:4317` | 监听的 socket 地址 |
 | `JANUS_MODE` | `development` | `development` 或 `production` |
 | `JANUS_DEV_AUTH` | 开发模式 `true`,生产模式 `false` | 绕过认证;仅限回环地址,生产模式下禁止 |
-| `JANUS_PUBLIC_ORIGIN` | `http://<bind>` | 绝对的 http(s) origin,不含 path、query、fragment;生产模式必须是 https |
-| `JANUS_WEBAUTHN_RP_ID` | 公开 origin 的 host,否则 `localhost` | WebAuthn relying-party ID |
-| `JANUS_WEBAUTHN_RP_NAME` | `Janus` | relying-party 显示名 |
+| `JANUS_PUBLIC_ORIGIN` | `http://<bind>` | 绝对的 http(s) origin,不含 path、query、fragment;passkey 认证下生产模式必须 https,totp 部署(http/IP)可为 http |
+| `JANUS_AUTH_MODE` | `passkey` | 认证方式:`passkey`(WebAuthn,要求 https origin)或 `totp`(TOTP 验证码,用于 http/IP 部署) |
+| `JANUS_WEBAUTHN_RP_ID` | 公开 origin 的 host,否则 `localhost` | WebAuthn relying-party ID;totp 模式下不使用 |
+| `JANUS_WEBAUTHN_RP_NAME` | `Janus` | relying-party 显示名;totp 模式下不使用 |
 | `JANUS_DATA_ROOT` | `.janus-dev` | 数据库、工作区与 blob;会解析为绝对路径 |
 | `JANUS_WEB_DIST` | 未设置 | 构建好的 Web 客户端目录,用于同源提供 |
 | `JANUS_MASTER_KEY` | 未设置 | base64url(无填充)密钥,解码后必须正好 32 字节;用于加密存储的密钥。生产必需;开发模式会生成并复用 `<data root>/development-master.key` |
@@ -351,8 +352,8 @@ Rust 路由 + utoipa 注解
 | `JANUS_AUTOMATION_GITHUB_TOKEN` | 未设置 | 用于私有仓库克隆和 `gh` push 的 classic PAT |
 | `RUST_LOG` | `janus=info` | tracing 过滤器;日志以 JSON 输出 |
 
-被拒绝的组合包括:生产模式下启用开发认证、在非回环绑定上启用开发认证、生产模式下使用
-非 https 的公开 origin,以及启用了 webhook 却没有 secret。SSE 心跳固定为 15 秒。
+被拒绝的组合包括:生产模式下启用开发认证、在非回环绑定上启用开发认证、passkey 认证下生产
+模式使用非 https 的公开 origin,以及启用了 webhook 却没有 secret。SSE 心跳固定为 15 秒。
 `JANUS_MASTER_KEY` 由 `crates/infrastructure/src/secrets.rs` 读取而不是由 `Config`
 读取,所以缺少它的生产进程会在初始化阶段失败。
 
@@ -522,10 +523,25 @@ docker run --rm -p 4317:4317 -v janus-data:/data \
 真实部署还需设置 `JANUS_MODE=production`,以及与公开主机名匹配的 https
 `JANUS_PUBLIC_ORIGIN`。
 
+若部署在纯 http 或裸 IP 地址上,改为设置 `JANUS_AUTH_MODE=totp` 并把
+`JANUS_PUBLIC_ORIGIN` 写成 http scheme。所有者改用验证器 App 的一次性口令(TOTP)
+登录,不再用 WebAuthn;会话 cookie 写成普通 `janus_session`、去掉 `Secure` 属性
+(纯 http 下浏览器会拒收 `Secure` cookie),因此无需其他配置:
+
+```text
+docker run --rm -p 4317:4317 -v janus-data:/data \
+  -e JANUS_MODE=production \
+  -e JANUS_PUBLIC_ORIGIN=http://janus.example.com:4317 \
+  -e JANUS_AUTH_MODE=totp \
+  -e JANUS_MASTER_KEY="$JANUS_MASTER_KEY" \
+  janus:local
+```
+
 `janus-admin` 与 `janus-server` 一起打进镜像,因此管理令牌直接用部署好的镜像签发,不
 需要代码检出。它会独占打开数据根,所以要在服务端容器停止时,以一次性容器的形式针对同
 一个卷运行,并给它和服务端相同的环境 —— `Config::from_env` 会校验整份配置,所以生产环
-境下仍需 `JANUS_MASTER_KEY` 和 https 的 `JANUS_PUBLIC_ORIGIN`。
+境下仍需 `JANUS_MASTER_KEY` 和 https 的 `JANUS_PUBLIC_ORIGIN`(http/IP 部署则用
+`JANUS_AUTH_MODE=totp` + http origin)。
 
 ```text
 docker run --rm -v janus-data:/data \
