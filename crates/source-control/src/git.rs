@@ -6,13 +6,15 @@
 //! refresh the index and fail when a reader races a writer. The server
 //! composition root injects `system_runner()` into the capability interfaces.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rand::RngCore;
 use tokio::process::Command;
+use url::Url;
 
 use crate::interface::{
     DiffView, GitCredential, GitError, GitLogEntry, GitRunner, GitStatus, UpdateConflictPath,
@@ -77,6 +79,302 @@ impl SystemGit {
                 &output.stderr,
                 &output.stdout,
             )))
+        }
+    }
+}
+
+/// A `github.com`-hosted repository identified from a clone URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubRepo {
+    owner: String,
+    repo: String,
+}
+
+/// Parse a repository URL into its GitHub owner/repo, or `None` when it is not
+/// hosted on GitHub. Accepts https/http, the scp-like `git@github.com:o/r`
+/// form, ssh/git schemes, and the bare `github.com/o/r` form.
+fn github_repo(url: &str) -> Option<GithubRepo> {
+    let url = url.trim();
+    if let Some(path) = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("git@www.github.com:"))
+        .or_else(|| url.strip_prefix("github.com/"))
+        .or_else(|| url.strip_prefix("www.github.com/"))
+    {
+        let (owner, repo) = path.split_once('/')?;
+        return github_pair(owner, repo);
+    }
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.host_str(), Some("github.com") | Some("www.github.com")) {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?;
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    github_pair(owner, repo)
+}
+
+fn github_pair(owner: &str, repo: &str) -> Option<GithubRepo> {
+    let owner = owner.trim_end_matches('/');
+    let repo = repo.trim_end_matches('/').trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(GithubRepo {
+        owner: owner.to_owned(),
+        repo: repo.to_owned(),
+    })
+}
+
+/// Whether the `aria2c` downloader is on PATH; when missing, the caller falls
+/// back to the plain `git clone` path.
+async fn aria2c_available() -> bool {
+    Command::new("aria2c")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Clone a GitHub repository by downloading its tarball with `aria2c -x16`
+/// (16 parallel connections bypass the per-connection cap / stream cut that
+/// makes `git clone` fail with fatal 128) and extracting it, then initialize
+/// the extracted tree as a fresh git repo so the status/diff/log/commit
+/// surface keeps working. The import commit carries no upstream history;
+/// fetch/push/update against the remote remain possible but on divergent
+/// history.
+async fn clone_github_tarball(
+    repo: &GithubRepo,
+    branch: Option<&str>,
+    url: &str,
+    into: &Path,
+    credential: &GitCredential,
+) -> Result<(), GitError> {
+    let branch = branch.filter(|value| !value.is_empty());
+    let nonce = random_hex();
+    let dir = std::env::temp_dir();
+    let file_name = format!("janus-github-{nonce}.tar.gz");
+    let tarball = dir.join(&file_name);
+    let parent = into
+        .parent()
+        .ok_or_else(|| GitError::BadOutput("clone target has no parent dir".into()))?;
+    let extract = parent.join(format!(".janus-github-extract-{nonce}"));
+    let scratch = CloneScratch {
+        into: into.to_path_buf(),
+        extras: vec![tarball.clone(), extract.clone()],
+    };
+
+    // Download the branch tarball; HEAD resolves to the default branch.
+    let ref_path = match branch {
+        Some(branch) => {
+            let encoded = encode_branch(branch);
+            format!("refs/heads/{encoded}")
+        }
+        None => "HEAD".to_owned(),
+    };
+    let owner = repo.owner.as_str();
+    let repo_name = repo.repo.as_str();
+    // codeload is the redirect target of the github.com/archive URL; hitting it
+    // directly keeps basic auth on the right host for private repositories.
+    let archive_url = format!("https://codeload.github.com/{owner}/{repo_name}/tar.gz/{ref_path}");
+
+    let mut download = Command::new("aria2c");
+    download
+        .arg("-x16")
+        .arg("-s16")
+        .arg("-q")
+        .arg("--summary-interval=0")
+        .arg("--file-allocation=none")
+        .arg("-d")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&file_name);
+    if let GitCredential::HttpsBasic { password, .. } = credential {
+        // codeload's basic-auth convention is username = PAT, password = the
+        // literal "x-oauth-basic"; janus stores the pair the other way around
+        // for git's smart-HTTP endpoints, so swap them for the download.
+        download.arg("--http-user").arg(password);
+        download.arg("--http-passwd").arg("x-oauth-basic");
+    }
+    download.arg(&archive_url);
+    let output = download
+        .output()
+        .await
+        .map_err(|error| GitError::CommandFailed(format!("aria2c: {error}")))?;
+    if !output.status.success() {
+        return Err(classify_download_failure(&failure_output(
+            &output.stderr,
+            &output.stdout,
+        )));
+    }
+
+    std::fs::create_dir_all(&extract).map_err(|error| GitError::CommandFailed(error.to_string()))?;
+    let extracted = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&extract)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| GitError::CommandFailed(error.to_string()))?;
+    if !extracted.status.success() {
+        return Err(classify_download_failure(&failure_output(
+            &extracted.stderr,
+            &extracted.stdout,
+        )));
+    }
+
+    // GitHub archives are a single `<repo>-<branch>` directory; its name gives
+    // the branch when HEAD was downloaded.
+    let top_level = top_level_dir(&extract).await?;
+    let branch_name = match branch {
+        Some(branch) => branch.to_owned(),
+        None => branch_from_folder(&top_level, repo_name).unwrap_or_else(|| "main".to_owned()),
+    };
+
+    remove_best_effort(into);
+    std::fs::rename(extract.join(&top_level), into)
+        .map_err(|error| GitError::CommandFailed(format!("move extracted tree: {error}")))?;
+
+    initialize_import_repo(into, url, &branch_name).await?;
+    scratch.disarm();
+    Ok(())
+}
+
+/// Turn the extracted tree into a working git repo: a default branch holding
+/// the full tree as one import commit, with `origin` pointing at the source URL
+/// so the existing git surface (status/diff/log/commit) behaves as after a
+/// clone. The import identity is set inline so the commit never depends on a
+/// global git config being present.
+async fn initialize_import_repo(repo_dir: &Path, url: &str, branch: &str) -> Result<(), GitError> {
+    let mut init = SystemGit::base(repo_dir);
+    init.arg("init").arg("-b").arg(branch);
+    SystemGit::run(&mut init).await?;
+
+    let mut remote = SystemGit::base(repo_dir);
+    remote.arg("remote").arg("add").arg("origin").arg(url);
+    SystemGit::run(&mut remote).await?;
+
+    let mut add = SystemGit::base(repo_dir);
+    add.arg("add").arg("-A");
+    SystemGit::run(&mut add).await?;
+
+    let mut commit = SystemGit::base(repo_dir);
+    commit
+        .arg("-c")
+        .arg("user.name=Janus")
+        .arg("-c")
+        .arg("user.email=janus@local.invalid")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("commit")
+        .arg("-m")
+        .arg(format!("Import from {url}@{branch}"));
+    SystemGit::run(&mut commit).await?;
+    Ok(())
+}
+
+/// Return the single top-level entry name of an extracted GitHub archive.
+async fn top_level_dir(extract: &Path) -> Result<String, GitError> {
+    let mut entries = tokio::fs::read_dir(extract)
+        .await
+        .map_err(|error| GitError::CommandFailed(error.to_string()))?;
+    let mut names = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|error| GitError::CommandFailed(error.to_string()))?
+    {
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_owned());
+        }
+    }
+    if names.len() != 1 {
+        return Err(GitError::BadOutput(format!(
+            "GitHub tarball did not contain a single top-level directory (found {names:?})"
+        )));
+    }
+    Ok(names.remove(0))
+}
+
+/// GitHub tarball folders are named `<repo>-<branch>`; recover the branch.
+fn branch_from_folder(folder: &str, repo: &str) -> Option<String> {
+    let branch = folder.strip_prefix(&format!("{repo}-"))?;
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_owned())
+    }
+}
+
+/// Percent-encode the branch for a URL path segment (a `/` becomes `%2F`).
+fn encode_branch(branch: &str) -> String {
+    utf8_percent_encode(branch, NON_ALPHANUMERIC).to_string()
+}
+
+/// Map an aria2c/tar failure to a `GitError`. GitHub answers 404 for a missing
+/// repo and for a repo the credential cannot see (never 403), so that maps to
+/// `RepositoryNotFound` like the git adapter reports it.
+fn classify_download_failure(output: &str) -> GitError {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("404") || lower.contains("not found") || lower.contains("that's an error") {
+        GitError::RepositoryNotFound
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("authorization")
+    {
+        GitError::AuthFailed
+    } else if lower.contains("could not resolve")
+        || lower.contains("timed out")
+        || lower.contains("connection")
+        || lower.contains("dns")
+    {
+        GitError::RemoteUnavailable
+    } else {
+        GitError::CommandFailed(output.trim().to_owned())
+    }
+}
+
+fn random_hex() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Remove a file or directory, ignoring "not found" and kind-mismatch errors.
+fn remove_best_effort(path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Removes clone scratch paths on drop. `into` is removed only on failure so a
+/// retried clone starts from a clean directory; `disarm` keeps it on success.
+struct CloneScratch {
+    into: Option<PathBuf>,
+    extras: Vec<PathBuf>,
+}
+
+impl CloneScratch {
+    fn disarm(mut self) {
+        self.into = None;
+    }
+}
+
+impl Drop for CloneScratch {
+    fn drop(&mut self) {
+        if let Some(into) = &self.into {
+            remove_best_effort(into);
+        }
+        for extra in &self.extras {
+            remove_best_effort(extra);
         }
     }
 }
@@ -170,6 +468,15 @@ impl GitRunner for SystemGit {
                 .parent()
                 .ok_or_else(|| GitError::BadOutput("clone target has no parent dir".into()))?;
             std::fs::create_dir_all(parent).ok();
+            // GitHub-hosted repos are fetched as a tarball via `aria2c -x16`:
+            // a single `git clone` HTTP stream is cut on the deployment host
+            // (fatal 128 / early EOF), while 16 parallel connections complete
+            // reliably. When aria2c is unavailable the plain git path runs.
+            if let Some(repo) = github_repo(url) {
+                if aria2c_available().await {
+                    return clone_github_tarball(&repo, branch, url, into, credential).await;
+                }
+            }
             let mut command = Command::new("git");
             command
                 .arg("-c")
@@ -949,8 +1256,10 @@ fn write_askpass_script(username: &str, password: &str) -> Result<std::path::Pat
 
 #[cfg(test)]
 mod tests {
+    use super::branch_from_folder;
     use super::classify_failure;
     use super::failure_output;
+    use super::github_repo;
     use super::parse_git_log;
     use super::parse_porcelain_v2;
     use crate::interface::GitError;
@@ -1086,5 +1395,43 @@ mod tests {
         assert_eq!(entries[1].parents, Vec::<String>::new());
         assert_eq!(entries[1].changed_files, 1);
         assert_eq!(entries[1].insertions, 10);
+    }
+
+    #[test]
+    fn parses_github_repository_urls() {
+        for url in [
+            "https://github.com/octo/hello",
+            "https://github.com/octo/hello.git",
+            "http://www.github.com/octo/hello/",
+            "git@github.com:octo/hello.git",
+            "ssh://git@github.com/octo/hello",
+            "github.com/octo/hello",
+        ] {
+            let repo = github_repo(url).unwrap_or_else(|| panic!("expected {url} to parse"));
+            assert_eq!(repo.owner, "octo");
+            assert_eq!(repo.repo, "hello");
+        }
+    }
+
+    #[test]
+    fn rejects_non_github_repository_urls() {
+        for url in [
+            "https://gitlab.com/octo/hello",
+            "https://example.com/octo/hello.git",
+            "git@gitlab.com:octo/hello.git",
+            "https://github.com/",
+            "file:///tmp/repo",
+            "not a url",
+        ] {
+            assert!(github_repo(url).is_none(), "expected {url} to be rejected");
+        }
+    }
+
+    #[test]
+    fn extracts_branch_from_github_archive_folder() {
+        assert_eq!(branch_from_folder("hello-main", "hello").as_deref(), Some("main"));
+        assert_eq!(branch_from_folder("hello-feature/x", "hello").as_deref(), Some("feature/x"));
+        assert_eq!(branch_from_folder("hello", "hello"), None);
+        assert_eq!(branch_from_folder("world-main", "hello"), None);
     }
 }

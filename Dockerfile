@@ -59,10 +59,11 @@ RUN cargo build --release -p janus-server
 # ============================================
 FROM debian:bookworm-slim AS runtime-base
 
-# git backs the source-control adapter; tini reaps the session and terminal
-# processes Janus spawns.
+# git backs the source-control adapter; aria2 downloads GitHub repos as
+# tarballs (git clone is cut with fatal 128 on the deployment host); tini reaps
+# the session and terminal processes Janus spawns.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git tini \
+    && apt-get install -y --no-install-recommends ca-certificates git aria2 tini \
     && rm -rf /var/lib/apt/lists/*
 
 # JANUS_DEV_AUTH must be off because the listener is not loopback. Real
