@@ -369,6 +369,7 @@ export function TotpLoginView() {
   const [code, setCode] = createSignal("");
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(false);
+  const [recovery, setRecovery] = createSignal(false);
 
   async function login(event: SubmitEvent) {
     event.preventDefault();
@@ -378,7 +379,7 @@ export function TotpLoginView() {
       await totpLogin(code());
       await queryClient.invalidateQueries({ queryKey: ["me"] });
     } catch (value) {
-      setError(authErrorMessage(value, "Login failed."));
+      setError(authErrorMessage(value, recovery() ? "Recovery failed." : "Login failed."));
     } finally {
       setBusy(false);
     }
@@ -392,22 +393,36 @@ export function TotpLoginView() {
     >
       <form class="auth-form" onSubmit={login}>
         <label>
-          6-digit code
+          {recovery() ? "One-time recovery code" : "6-digit code"}
           <input
             class="ui-input"
-            inputmode="numeric"
-            maxLength={6}
+            inputmode={recovery() ? "text" : "numeric"}
+            maxLength={recovery() ? 64 : 6}
             value={code()}
             onInput={(event) => setCode(event.currentTarget.value)}
             autocomplete="off"
             required
           />
         </label>
-        <p class="auth-note">Enter the 6-digit code from your authenticator app.</p>
+        <p class="auth-note">
+          {recovery()
+            ? "Enter one of your single-use recovery codes."
+            : "Enter the 6-digit code from your authenticator app."}
+        </p>
         <NotificationEvent message={error()} variant="danger" />
         <Button variant="primary" class="auth-submit" type="submit" disabled={busy()}>
           <KeyRound size={17} aria-hidden="true" />
           {busy() ? "Verifying..." : "Continue"}
+        </Button>
+        <Button
+          variant="ghost"
+          type="button"
+          onClick={() => {
+            setRecovery(!recovery());
+            setCode("");
+          }}
+        >
+          {recovery() ? "Enter a 6-digit code" : "Lost your authenticator? Use a recovery code"}
         </Button>
       </form>
     </AuthSurface>
