@@ -11,6 +11,7 @@ import {
   getSessionTimeline,
   postSessionMessage,
   type QueuedTurnItem,
+  randomUuid,
   type SessionModelPreference,
   type SessionSummary,
   steerSession,
@@ -299,7 +300,7 @@ export function SessionTabView(props: SessionTabViewProps) {
     const sid = props.sessionId();
     if (!turnId) return;
     const commandId = ++commandSerial;
-    const idempotencyKey = crypto.randomUUID();
+    const idempotencyKey = randomUuid();
     const result = await withFreshSessionVersion(
       (version) => cancelTurn(sid, turnId, version, "user_cancel", idempotencyKey),
       (snapshot) => snapshot.active_turn_id === turnId,
@@ -312,7 +313,7 @@ export function SessionTabView(props: SessionTabViewProps) {
 
   async function handleQueuedTurnCancel(turn: QueuedTurnItem) {
     const commandId = ++commandSerial;
-    const idempotencyKey = crypto.randomUUID();
+    const idempotencyKey = randomUuid();
     const result = await withFreshSessionVersion(
       (version) =>
         cancelTurn(props.sessionId(), turn.turn_id, version, "user_cancel", idempotencyKey),
@@ -332,7 +333,7 @@ export function SessionTabView(props: SessionTabViewProps) {
     const activeTurn = actionTurnId();
     if (!activeTurn) throw new Error("There is no active turn to steer");
     const commandId = ++commandSerial;
-    const steerKey = crypto.randomUUID();
+    const steerKey = randomUuid();
     const steer = await withFreshSessionVersion(
       (version) => steerSession(props.sessionId(), turn.message_text, version, steerKey),
       (snapshot) => snapshot.active_turn_id === activeTurn,
@@ -342,7 +343,7 @@ export function SessionTabView(props: SessionTabViewProps) {
 
     // The queued message has now been consumed as a durable steer. Remove the
     // queued Turn with a second idempotent command so it cannot execute again.
-    const cancelKey = crypto.randomUUID();
+    const cancelKey = randomUuid();
     const canceled = await withFreshSessionVersion(
       (version) => cancelTurn(props.sessionId(), turn.turn_id, version, "steered", cancelKey),
       async (snapshot) => {
@@ -451,7 +452,7 @@ export function SessionTabView(props: SessionTabViewProps) {
     goalMode: boolean,
   ) {
     const commandId = ++commandSerial;
-    const idempotencyKey = crypto.randomUUID();
+    const idempotencyKey = randomUuid();
     setSubmittingMessage(content);
     try {
       const result = await withFreshSessionVersion((version) =>
@@ -487,7 +488,7 @@ export function SessionTabView(props: SessionTabViewProps) {
 
   async function compactContext() {
     const sessionId = props.sessionId();
-    const operation = await compactSession(sessionId, crypto.randomUUID());
+    const operation = await compactSession(sessionId, randomUuid());
     queryClient.setQueryData(["operations", operation.id], operation);
     if (operation.status === "queued") {
       queryClient.setQueryData<ContextUsageView | null>(

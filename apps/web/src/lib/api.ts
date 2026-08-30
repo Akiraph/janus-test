@@ -115,6 +115,16 @@ export function getErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
+export function randomUuid(): string {
+  const randomUUID: unknown = crypto.randomUUID;
+  if (typeof randomUUID === "function") return randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export async function getBootstrap(): Promise<BootstrapResponse> {
   return getJson("/api/v1/bootstrap", isBootstrapResponse);
 }
@@ -389,7 +399,7 @@ export async function deleteSession(
 export async function postSessionMessage(
   id: string,
   input: PostMessageRequest,
-  idempotencyKey = crypto.randomUUID(),
+  idempotencyKey = randomUuid(),
 ): Promise<MessageRouteResult> {
   return (
     await requestJson<{ data: MessageRouteResult }>(
@@ -409,7 +419,7 @@ export async function cancelTurn(
   turnId: string,
   expectedSessionVersion: string,
   reason = "user_cancel",
-  idempotencyKey = crypto.randomUUID(),
+  idempotencyKey = randomUuid(),
 ): Promise<CancelResult> {
   return (
     await requestJson<{ data: CancelResult }>(
@@ -428,7 +438,7 @@ export async function steerSession(
   sessionId: string,
   content: string,
   expectedSessionVersion: string,
-  idempotencyKey = crypto.randomUUID(),
+  idempotencyKey = randomUuid(),
 ): Promise<SteerResult> {
   return (
     await requestJson<{ data: SteerResult }>(
@@ -1059,7 +1069,7 @@ function requestInit(
 }
 
 function requestHeaders(extraHeaders?: Record<string, string>): Headers {
-  const headers = new Headers({ "X-Request-Id": crypto.randomUUID(), Accept: "application/json" });
+  const headers = new Headers({ "X-Request-Id": randomUuid(), Accept: "application/json" });
   if (csrfToken) headers.set("X-CSRF-Token", csrfToken);
   if (extraHeaders) {
     for (const [key, value] of Object.entries(extraHeaders)) headers.set(key, value);

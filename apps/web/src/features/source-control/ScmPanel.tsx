@@ -17,6 +17,7 @@ import {
   gitUnstage,
   gitUpdate,
   listGitUpdateConflicts,
+  randomUuid,
   resolveGitUpdateConflict,
 } from "../../lib/api";
 import { useGitStatus } from "../../lib/queries";
@@ -126,7 +127,7 @@ export function ScmPanel(props: ScmPanelProps) {
     if (!id) return;
     await run(
       async () => {
-        await gitFetch(id, await resolveRemote(id), crypto.randomUUID());
+        await gitFetch(id, await resolveRemote(id), randomUuid());
       },
       { pending: "Fetching…", success: "Fetch started", failure: "Fetch failed" },
     );
@@ -138,7 +139,7 @@ export function ScmPanel(props: ScmPanelProps) {
     if (!id || !branch) return;
     await run(
       async () => {
-        await gitUpdate(id, await resolveRemote(id), branch, crypto.randomUUID());
+        await gitUpdate(id, await resolveRemote(id), branch, randomUuid());
       },
       { pending: "Updating…", success: "Update started", failure: "Update failed" },
     );
@@ -150,7 +151,7 @@ export function ScmPanel(props: ScmPanelProps) {
     if (!id || !branch) return;
     await run(
       async () => {
-        await gitPush(id, await resolveRemote(id), branch, crypto.randomUUID());
+        await gitPush(id, await resolveRemote(id), branch, randomUuid());
       },
       { pending: "Pushing…", success: "Push started", failure: "Push failed" },
     );

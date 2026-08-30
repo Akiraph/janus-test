@@ -10,7 +10,7 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { useNotifications } from "../../components/ui/notifications";
 import { SideScrollbar } from "../../components/ui/SideScrollbar";
 import type { SessionSummary } from "../../lib/api";
-import { createSession, deleteSession, getErrorMessage, getSession } from "../../lib/api";
+import { createSession, deleteSession, getErrorMessage, getSession, randomUuid } from "../../lib/api";
 import { useOperation, useSessions } from "../../lib/queries";
 import "../projects/workspace/sessions-panel.css";
 
@@ -150,7 +150,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
     if (props.projectReady && !props.projectReady()) return;
     props.onCreatingChange(true);
     try {
-      const accepted = await createSession(id, { title: "New session" }, crypto.randomUUID());
+      const accepted = await createSession(id, { title: "New session" }, randomUuid());
       const sessionId = accepted.target_id;
       if (!sessionId) throw new Error("Session creation was accepted without a Session id");
       queryClient.setQueryData(["operations", accepted.id], accepted);
@@ -198,7 +198,7 @@ export function SessionsPanel(props: SessionsPanelProps) {
     if (deletingId()) return;
     setDeletingId(session.id);
     try {
-      const accepted = await deleteSession(session.id, session.version, crypto.randomUUID());
+      const accepted = await deleteSession(session.id, session.version, randomUuid());
       queryClient.setQueryData(["operations", accepted.id], accepted);
       props.onSessionDeleted?.(session.id);
       queryClient.setQueryData<SessionSummary[]>(["sessions", session.project_id], (prev) =>

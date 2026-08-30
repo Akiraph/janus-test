@@ -13,7 +13,7 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { NotificationEvent, useNotifications } from "../../components/ui/notifications";
 import { Select, type SelectOption } from "../../components/ui/Select";
 import type { CreateProjectInput, OperationView, ProjectView, RepoAccess } from "../../lib/api";
-import { createProject, deleteProject, getErrorMessage, retryProject } from "../../lib/api";
+import { createProject, deleteProject, getErrorMessage, randomUuid, retryProject } from "../../lib/api";
 import { useGithubCredentials, useOperation, useProjects } from "../../lib/queries";
 import "./projects.css";
 
@@ -111,7 +111,7 @@ export function ProjectsOverview() {
   async function onDelete(project: ProjectView) {
     if (!confirm(`Delete project “${project.name}”? This removes the local workspace.`)) return;
     try {
-      const operation = await deleteProject(project.id, project.version, crypto.randomUUID());
+      const operation = await deleteProject(project.id, project.version, randomUuid());
       setTracking({
         operationId: operation.id,
         projectId: project.id,
@@ -302,7 +302,7 @@ function CreateProjectDialog(props: CreateProjectDialogProps) {
     setSubmitting(true);
     setError("");
     try {
-      const operation = await createProject(input, crypto.randomUUID());
+      const operation = await createProject(input, randomUuid());
       notify("Project creation started");
       await props.created(operation, input);
     } catch (value) {
