@@ -1,4 +1,6 @@
 //! Bash/runtime and process-control tools (bash, read_output, stop).
+use std::path::PathBuf;
+
 use super::*;
 
 /// Bytes of an async task's log stream one `read_output` call pulls.

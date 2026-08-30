@@ -915,10 +915,10 @@ impl ExecutionInterface {
                             (Some(session_id), Some(turn_id)) => self
                                 .sessions
                                 .turn_is_runnable(
-                                    session_id.parse().map_err(|error| {
+                                    session_id.parse::<SessionId>().map_err(|error| {
                                         ExecutionError::Internal(anyhow::anyhow!(error))
                                     })?,
-                                    turn_id.parse().map_err(|error| {
+                                    turn_id.parse::<TurnId>().map_err(|error| {
                                         ExecutionError::Internal(anyhow::anyhow!(error))
                                     })?,
                                 )
