@@ -116,8 +116,9 @@ export function getErrorMessage(error: unknown, fallback: string): string {
 }
 
 export function randomUuid(): string {
-  const randomUUID: unknown = crypto.randomUUID;
-  if (typeof randomUUID === "function") return randomUUID();
+  // crypto.randomUUID is a WebIDL method and must be called on `crypto`;
+  // detaching it and invoking bare throws "Illegal invocation" in browsers.
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   const uuid = `${hex.slice(0, 12)}4${hex.slice(13, 16)}8${hex.slice(17)}`;
