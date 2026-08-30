@@ -1,6 +1,7 @@
 //! Stream completion entry point and attempt/usage ledger writes.
 
 use std::future::Future;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use janus_infrastructure::clock::now_utc_str;
@@ -18,6 +19,11 @@ use janus_infrastructure::{id::AttemptId, secrets::Secret};
 
 const MAX_PROVIDER_ERROR_BYTES: usize = 8 * 1024;
 
+/// Idle timeout between provider stream chunks. A provider that opens the
+/// stream but then stops sending (a hang rather than an explicit failure)
+/// otherwise stalls the attempt forever.
+const PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn key_aad(owner_id: &str, id: &str) -> String {
     format!("v1/{owner_id}/model_providers/{id}/api_key")
 }
@@ -25,6 +31,60 @@ fn key_aad(owner_id: &str, id: &str) -> String {
 fn append_path_segment(base: &str, segment: &str) -> Result<String, ModelsError> {
     let base = base.trim_end_matches('/');
     Ok(format!("{base}/{segment}"))
+}
+
+/// Ensures a running `model_attempts` row is finalized even when the caller
+/// cancels the stream mid-flight: dropping the guard without an explicit
+/// `complete()` writes a failed terminal row from a background task, so a
+/// canceled attempt cannot be left permanently `running`.
+struct AttemptFinalizer {
+    interface: ModelsInterface,
+    attempt_id: String,
+    request: ModelRequest,
+    finalized: bool,
+}
+
+impl AttemptFinalizer {
+    fn new(interface: ModelsInterface, attempt_id: String, request: ModelRequest) -> Self {
+        Self {
+            interface,
+            attempt_id,
+            request,
+            finalized: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.finalized = true;
+    }
+}
+
+impl Drop for AttemptFinalizer {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        let interface = self.interface.clone();
+        let attempt_id = self.attempt_id.clone();
+        let request = self.request.clone();
+        tokio::spawn(async move {
+            let _ = interface
+                .finalize_attempt(
+                    &attempt_id,
+                    AttemptFinalization {
+                        status: "failed",
+                        input_tokens: None,
+                        output_tokens: None,
+                        cache_tokens: None,
+                        error_json: Some(
+                            &serde_json::json!({"code": "PROVIDER_STREAM_CANCELED", "detail": "stream canceled before completion"}),
+                        ),
+                        request: &request,
+                    },
+                )
+                .await;
+        });
+    }
 }
 
 impl ModelsInterface {
@@ -108,6 +168,9 @@ impl ModelsInterface {
         })
         .await?;
 
+        let mut attempt_finalizer =
+            AttemptFinalizer::new(self.clone(), attempt_id.clone(), req.clone());
+
         let result = match kind {
             ProviderKind::OpenaiChat => {
                 self.stream_openai_chat(&req, &row.base_url, key.as_ref(), &attempt_id, on_event)
@@ -160,6 +223,7 @@ impl ModelsInterface {
                     },
                 )
                 .await?;
+                attempt_finalizer.complete();
                 Ok(events)
             }
             Err(e) => {
@@ -186,6 +250,7 @@ impl ModelsInterface {
                     },
                 )
                 .await?;
+                attempt_finalizer.complete();
                 Ok(vec![failed])
             }
         }
@@ -248,10 +313,19 @@ impl ModelsInterface {
         let mut timing = StreamTiming::default();
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| {
-                ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
-            })?;
+        loop {
+            let chunk = match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await
+            {
+                Err(_) => {
+                    return Err(ModelsError::Internal(anyhow::anyhow!(
+                        "provider stream idle timeout"
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk.map_err(|e| {
+                    ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+                })?,
+            };
             for (_ev, data) in parser.push(&chunk) {
                 let more = assembler
                     .ingest_data(attempt_id, &data)
@@ -326,10 +400,19 @@ impl ModelsInterface {
         let mut timing = StreamTiming::default();
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| {
-                ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
-            })?;
+        loop {
+            let chunk = match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await
+            {
+                Err(_) => {
+                    return Err(ModelsError::Internal(anyhow::anyhow!(
+                        "provider stream idle timeout"
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk.map_err(|e| {
+                    ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+                })?,
+            };
             for (event_name, data) in parser.push(&chunk) {
                 let more = assembler
                     .ingest_event(attempt_id, &event_name, &data)
@@ -416,10 +499,19 @@ impl ModelsInterface {
         let mut timing = StreamTiming::default();
         let mut events = Vec::new();
         let mut body = response.bytes_stream();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| {
-                ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
-            })?;
+        loop {
+            let chunk = match tokio::time::timeout(PROVIDER_STREAM_IDLE_TIMEOUT, body.next()).await
+            {
+                Err(_) => {
+                    return Err(ModelsError::Internal(anyhow::anyhow!(
+                        "provider stream idle timeout"
+                    )));
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk.map_err(|e| {
+                    ModelsError::Internal(anyhow::anyhow!("stream read: {}", classify_reqwest(&e)))
+                })?,
+            };
             for (ev, data) in parser.push(&chunk) {
                 let more = assembler
                     .ingest(attempt_id, &ev, &data)

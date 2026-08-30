@@ -193,8 +193,12 @@ pub async fn recovery_exchange(
         .await
         .map_err(problem)?;
     let mut headers = HeaderMap::new();
+    let secure = match state.config().public_origin.scheme() {
+        "https" => "; Secure",
+        _ => "",
+    };
     let cookie = format!(
-        "janus_recovery={}; Path=/api/v1/auth/recovery; Max-Age=600; Secure; HttpOnly; SameSite=Strict",
+        "janus_recovery={}; Path=/api/v1/auth/recovery; Max-Age=600{secure}; HttpOnly; SameSite=Strict",
         grant.token
     );
     headers.insert(

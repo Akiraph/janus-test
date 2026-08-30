@@ -927,7 +927,7 @@ impl IdentityInterface {
             return Err(IdentityError::OriginRejected);
         }
         let csrf = csrf_token.ok_or(IdentityError::CsrfRejected)?;
-        if csrf != auth.csrf_token {
+        if !constant_time_eq(csrf.as_bytes(), auth.csrf_token.as_bytes()) {
             return Err(IdentityError::CsrfRejected);
         }
         Ok(())

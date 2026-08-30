@@ -20,7 +20,9 @@ use janus_infrastructure::{
     clock::now_utc_str,
     events::{EventStore, EventType, NewEvent},
     id::{CorrelationId, GitUpdateConflictId, ProjectId},
-    operations::{CreateOperation, OperationInterface, OperationStatus, OperationView},
+    operations::{
+        CreateOperation, IdempotencyRequest, OperationInterface, OperationStatus, OperationView,
+    },
     secrets::SecretCipher,
     unit_of_work::UnitOfWork,
 };
@@ -795,13 +797,37 @@ impl SourceControlInterface {
 
     // ----- Git commands -----
 
+    /// Git takes `remote`/`branch` as positional arguments; a value beginning
+    /// with `-` is parsed as an option instead (e.g. `--delete` on push), so
+    /// refuse option-shaped inputs at the capability edge. Refs also cannot
+    /// contain spaces or control bytes per git-check-ref-format.
+    fn validate_git_arg(name: &str, value: &str) -> Result<(), SourceControlError> {
+        if value.is_empty() {
+            return Err(SourceControlError::Validation(format!(
+                "{name} must not be empty"
+            )));
+        }
+        if value.starts_with('-')
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(SourceControlError::Validation(format!(
+                "{name} must not start with '-' or contain whitespace or control characters"
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn git_fetch(
         &self,
         owner_id: &str,
         project_id: &str,
         remote: &str,
         correlation_id: CorrelationId,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<OperationView, SourceControlError> {
+        Self::validate_git_arg("remote", remote)?;
         self.require_ready(owner_id, project_id).await?;
         let credential = self.credential_for_project(owner_id, project_id).await?;
         let created = self
@@ -814,7 +840,7 @@ impl SourceControlInterface {
                     target_id: Some(project_id),
                     conditions: serde_json::json!({"project_id": project_id, "remote": remote}),
                     correlation_id,
-                    idempotency: None,
+                    idempotency,
                 },
                 None,
             )
@@ -917,7 +943,10 @@ impl SourceControlInterface {
         remote: &str,
         branch: &str,
         correlation_id: CorrelationId,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<OperationView, SourceControlError> {
+        Self::validate_git_arg("remote", remote)?;
+        Self::validate_git_arg("branch", branch)?;
         self.require_ready(owner_id, project_id).await?;
         let credential = self.credential_for_project(owner_id, project_id).await?;
         let created = self
@@ -934,7 +963,7 @@ impl SourceControlInterface {
                         "branch": branch,
                     }),
                     correlation_id,
-                    idempotency: None,
+                    idempotency,
                 },
                 None,
             )
@@ -980,7 +1009,10 @@ impl SourceControlInterface {
         project_id: &str,
         input: GitUpdateInput,
         correlation_id: CorrelationId,
+        idempotency: Option<IdempotencyRequest>,
     ) -> Result<OperationView, SourceControlError> {
+        Self::validate_git_arg("remote", &input.remote)?;
+        Self::validate_git_arg("branch", &input.branch)?;
         self.require_ready(owner_id, project_id).await?;
         let credential = self.credential_for_project(owner_id, project_id).await?;
         let created = self
@@ -997,7 +1029,7 @@ impl SourceControlInterface {
                         "branch": input.branch,
                     }),
                     correlation_id,
-                    idempotency: None,
+                    idempotency,
                 },
                 None,
             )

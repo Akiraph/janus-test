@@ -109,28 +109,35 @@ impl LogStore {
         let now = now_utc_str();
         // Sync streams are per command invocation. The runtime id is reused
         // for every synchronous command, so it cannot satisfy the historical
-        // owner uniqueness constraint.
-        let stored_owner_id = if owner == LogOwnerKind::Sync {
+        // owner uniqueness constraint; the stream id is stored as `owner_id`
+        // and the originating runtime id is retained in `runtime_id` so
+        // project-scoped cleanup can still find sync streams.
+        let is_sync = owner == LogOwnerKind::Sync;
+        let stored_owner_id = if is_sync {
             id_string.clone()
         } else {
             owner_id.to_owned()
         };
+        let mut stream_doc = doc! {
+            "_id": &id_string,
+            "owner_kind": owner.as_str(),
+            "owner_id": &stored_owner_id,
+            "relative_path": &relative_path,
+            "first_cursor": 0i64,
+            "next_cursor": 0i64,
+            "retained_bytes": 0i64,
+            "total_bytes": 0i64,
+            "truncated": false,
+            "closed": false,
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if is_sync {
+            stream_doc.insert("runtime_id", owner_id);
+        }
         self.pool
             .collection::<Document>("log_streams")
-            .insert_one(doc! {
-                "_id": &id_string,
-                "owner_kind": owner.as_str(),
-                "owner_id": &stored_owner_id,
-                "relative_path": &relative_path,
-                "first_cursor": 0i64,
-                "next_cursor": 0i64,
-                "retained_bytes": 0i64,
-                "total_bytes": 0i64,
-                "truncated": false,
-                "closed": false,
-                "created_at": &now,
-                "updated_at": &now,
-            })
+            .insert_one(stream_doc)
             .await
             .map_err(storage_error)?;
         Ok(LogStreamProjection {
@@ -181,8 +188,21 @@ impl LogStore {
         }
         let total_bytes = to_u64(row.total_bytes, "total_bytes")?
             .saturating_add(u64::try_from(input.len()).unwrap_or(u64::MAX));
-        let (first_cursor, retained_bytes, truncated) =
-            enforce_retention(&directory, cursor, total_bytes, retention).await?;
+        let (first_cursor, retained_bytes, truncated) = if total_bytes <= retention.raw_limit_bytes
+        {
+            // Nothing has been trimmed yet: the first chunk still starts at
+            // zero and retained bytes grow by the redacted text just
+            // written. Reading the directory back to recompute these would
+            // re-read the whole stream on every append.
+            (
+                0,
+                to_u64(row.retained_bytes, "retained_bytes")?
+                    .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX)),
+                false,
+            )
+        } else {
+            enforce_retention(&directory, cursor, total_bytes, retention).await?
+        };
         let now = now_utc_str();
         let first_cursor = to_i64(first_cursor)?;
         let next_cursor = to_i64(cursor)?;
@@ -260,8 +280,7 @@ impl LogStore {
             });
         }
         let limit = limit_bytes.clamp(1, MAX_READ_BYTES);
-        let mut chunks = read_chunks(&self.root.join(&row.relative_path)).await?;
-        chunks.sort_by_key(|chunk| (chunk.start, !chunk.marker));
+        let chunks = read_chunks_from(&self.root.join(&row.relative_path), after.value()).await?;
         let mut remaining = limit;
         let mut result = Vec::new();
         for chunk in chunks.into_iter().filter(|chunk| chunk.end > after.value()) {
@@ -520,6 +539,53 @@ async fn read_chunks(directory: &Path) -> Result<Vec<DiskChunk>, RuntimeError> {
     }
     chunks.sort_by_key(|chunk| chunk.start);
     Ok(chunks)
+}
+
+/// Load only the chunks that can contribute to a window starting at `after`.
+/// Chunk file names encode their `{start}-{end}` byte cursors, so a directory
+/// listing alone is enough to skip stale files without reading the whole
+/// stream; only the single truncation marker needs its content read to learn
+/// its range. Long streams therefore pay for what they read, not for the full
+/// retained backlog on every request.
+async fn read_chunks_from(directory: &Path, after: u64) -> Result<Vec<DiskChunk>, RuntimeError> {
+    let mut entries = tokio::fs::read_dir(directory)
+        .await
+        .map_err(storage_error)?;
+    let mut chunks: Vec<DiskChunk> = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(storage_error)? {
+        let path = entry.path();
+        let is_json = path.extension().and_then(|extension| extension.to_str()) == Some("json");
+        if !is_json || !entry.file_type().await.map_err(storage_error)?.is_file() {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if file_name == "truncation-marker.json" {
+            let bytes = tokio::fs::read(&path).await.map_err(storage_error)?;
+            let marker: DiskChunk = serde_json::from_slice(&bytes).map_err(storage_error)?;
+            if marker.end > after {
+                chunks.push(marker);
+            }
+        } else if let Some((_, end)) = parse_chunk_range(file_name)
+            && end > after
+        {
+            let bytes = tokio::fs::read(&path).await.map_err(storage_error)?;
+            chunks.push(serde_json::from_slice(&bytes).map_err(storage_error)?);
+        }
+    }
+    chunks.sort_by_key(|chunk| (chunk.start, !chunk.marker));
+    Ok(chunks)
+}
+
+fn parse_chunk_range(file_name: &str) -> Option<(u64, u64)> {
+    let dash = file_name.find('-')?;
+    let start = file_name.get(..dash)?.parse().ok()?;
+    let rest = file_name.get(dash + 1..)?;
+    let dash = rest.find('-')?;
+    let end = rest.get(..dash)?.parse().ok()?;
+    Some((start, end))
 }
 
 fn chunk_file_name(chunk: &DiskChunk) -> String {

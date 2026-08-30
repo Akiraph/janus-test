@@ -59,6 +59,7 @@ pub struct SessionDeletionPlan {
     pub project_id: ProjectId,
     pub version: String,
     pub turn_ids: Vec<TurnId>,
+    pub attachment_ids: Vec<AttachmentId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -659,10 +660,25 @@ impl SessionsInterface {
                     .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
             );
         }
+        let mut attachments = self
+            .pool
+            .collection::<Document>("attachments")
+            .find(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        let mut attachment_ids = Vec::new();
+        while let Some(document) = attachments.next(&mut *tx).await.transpose()? {
+            let id = read_str(&document, "_id")?;
+            attachment_ids.push(
+                id.parse::<AttachmentId>()
+                    .map_err(|error| SessionsError::Internal(anyhow::anyhow!(error)))?,
+            );
+        }
         Ok(Some(SessionDeletionPlan {
             project_id,
             version,
             turn_ids,
+            attachment_ids,
         }))
     }
 
@@ -671,6 +687,64 @@ impl SessionsInterface {
         tx: &mut ClientSession,
         session_id: SessionId,
     ) -> Result<bool, SessionsError> {
+        // Cascade-delete every Session-owned row and the blob references behind
+        // its attachments. The session row is the only parent that makes the
+        // rest reachable, so without this the Turn/Message/timeline/checkpoint
+        // rows and their attachment blobs would be orphaned after deletion.
+        let mut attachments = self
+            .pool
+            .collection::<Document>("attachments")
+            .find(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        let mut attachment_ids = Vec::new();
+        let mut upload_ids = Vec::new();
+        while let Some(document) = attachments.next(&mut *tx).await.transpose()? {
+            let id = read_str(&document, "_id")?;
+            attachment_ids.push(id);
+            if let Some(upload_id) = opt_str(&document, "upload_id") {
+                upload_ids.push(upload_id);
+            }
+        }
+        self.pool
+            .collection::<Document>("attachments")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        if !attachment_ids.is_empty() {
+            self.pool
+                .collection::<Document>("message_attachments")
+                .delete_many(doc! {"attachment_id": {"$in": &attachment_ids}})
+                .session(&mut *tx)
+                .await?;
+        }
+        if !upload_ids.is_empty() {
+            self.pool
+                .collection::<Document>("uploads")
+                .delete_many(doc! {"_id": {"$in": &upload_ids}})
+                .session(&mut *tx)
+                .await?;
+        }
+        self.pool
+            .collection::<Document>("messages")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        self.pool
+            .collection::<Document>("timeline_items")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        self.pool
+            .collection::<Document>("turns")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
+        self.pool
+            .collection::<Document>("checkpoints")
+            .delete_many(doc! {"session_id": session_id.to_string()})
+            .session(&mut *tx)
+            .await?;
         let deleted = self
             .pool
             .collection::<Document>("sessions")
@@ -678,6 +752,27 @@ impl SessionsInterface {
             .session(&mut *tx)
             .await?;
         Ok(deleted.deleted_count > 0)
+    }
+
+    /// Best-effort removal of blob references for a deleted session's
+    /// attachments. Called after the owning transaction commits; a failure only
+    /// delays cleanup, and the next BlobStore sweep reclaims the bytes.
+    pub async fn drop_session_attachment_blobs(&self, attachment_ids: &[AttachmentId]) {
+        for attachment_id in attachment_ids {
+            let reference = BlobReference::new(
+                "sessions",
+                "attachment",
+                &attachment_id.to_string(),
+                "content",
+            );
+            if let Err(error) = self.blobs.drop_reference(&reference).await {
+                tracing::error!(
+                    %error,
+                    attachment_id = %attachment_id.to_string(),
+                    "blob reference cleanup was deferred or failed"
+                );
+            }
+        }
     }
 
     // ----------------------------------------------------------------------

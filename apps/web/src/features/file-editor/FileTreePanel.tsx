@@ -25,11 +25,15 @@ export function FileTreePanel(props: FileTreePanelProps) {
   const [focusedPath, setFocusedPath] = createSignal<string | null>(null);
   let treeEl: HTMLDivElement | undefined;
   let prefetchTimer: ReturnType<typeof setTimeout> | undefined;
+  // Bumped whenever the tree is reloaded (project switch or revision refresh).
+  // In-flight requests from an older epoch must not overwrite the newer state.
+  let loadEpoch = 0;
 
   async function loadPath(path: string, force = false) {
     const id = props.projectId();
     if (!id) return;
     if (!force && children()[path] !== undefined && !errors()[path]) return;
+    const requestEpoch = loadEpoch;
 
     setLoading((current) => new Set(current).add(path));
     setErrors((current) => {
@@ -39,18 +43,22 @@ export function FileTreePanel(props: FileTreePanelProps) {
     });
     try {
       const entries = sortTreeEntries(await listFileTree(id, path || undefined));
+      if (requestEpoch !== loadEpoch) return;
       setChildren((current) => ({ ...current, [path]: entries }));
     } catch (error) {
+      if (requestEpoch !== loadEpoch) return;
       setErrors((current) => ({
         ...current,
         [path]: getErrorMessage(error, "Failed to load directory"),
       }));
     } finally {
-      setLoading((current) => {
-        const next = new Set(current);
-        next.delete(path);
-        return next;
-      });
+      if (requestEpoch === loadEpoch) {
+        setLoading((current) => {
+          const next = new Set(current);
+          next.delete(path);
+          return next;
+        });
+      }
     }
   }
 
@@ -59,6 +67,7 @@ export function FileTreePanel(props: FileTreePanelProps) {
     if (!id) return;
     // Re-run on save / revision refresh without collapsing the tree.
     props.refreshToken?.();
+    loadEpoch += 1;
     setChildren({});
     setErrors({});
     const paths = untrack(() => {

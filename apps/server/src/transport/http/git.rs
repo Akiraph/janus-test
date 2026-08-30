@@ -354,7 +354,7 @@ pub async fn git_fetch(
         )
     })?;
     let correlation_id = CorrelationId::new();
-    let _idempotency = require_idempotency(
+    let idempotency = require_idempotency(
         &headers,
         &auth.owner_id,
         "POST",
@@ -363,7 +363,13 @@ pub async fn git_fetch(
     )?;
     let operation = state
         .source_control()
-        .git_fetch(&auth.owner_id, &id, &input.remote, correlation_id)
+        .git_fetch(
+            &auth.owner_id,
+            &id,
+            &input.remote,
+            correlation_id,
+            Some(idempotency),
+        )
         .await
         .map_err(problem)?;
     Ok((StatusCode::ACCEPTED, Json(DataResponse { data: operation })))
@@ -489,7 +495,7 @@ pub async fn git_push(
         )
     })?;
     let correlation_id = CorrelationId::new();
-    let _idempotency = require_idempotency(
+    let idempotency = require_idempotency(
         &headers,
         &auth.owner_id,
         "POST",
@@ -506,6 +512,7 @@ pub async fn git_push(
             &input.remote,
             &input.branch,
             correlation_id,
+            Some(idempotency),
         )
         .await
         .map_err(problem)?;
@@ -547,7 +554,7 @@ pub async fn git_update(
         )
     })?;
     let correlation_id = CorrelationId::new();
-    let _idempotency = require_idempotency(
+    let idempotency = require_idempotency(
         &headers,
         &auth.owner_id,
         "POST",
@@ -564,6 +571,7 @@ pub async fn git_update(
                 branch: input.branch,
             },
             correlation_id,
+            Some(idempotency),
         )
         .await
         .map_err(problem)?;

@@ -485,6 +485,39 @@ Rules:
 const MAX_COMPACT_TRANSCRIPT_CHARS: usize = 400_000;
 
 impl Application {
+    /// Every timeline item for a session, oldest first. The public timeline
+    /// endpoint caps each page at 100 rows, so a single `timeline` call would
+    /// silently truncate the transcript to the newest window. Compaction must
+    /// summarize the whole covered range, so this paginates through to the
+    /// oldest item.
+    async fn full_timeline_for_compact(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<janus_sessions::interface::TimelineItemView>, SessionsError> {
+        let mut pages: Vec<Vec<janus_sessions::interface::TimelineItemView>> = Vec::new();
+        let mut before: Option<String> = None;
+        loop {
+            let page = self
+                .sessions()
+                .timeline(session_id, before.as_deref(), None, 100)
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            let has_older = page.has_older;
+            before = page.oldest_cursor;
+            pages.push(page.items);
+            if !has_older {
+                break;
+            }
+        }
+        let mut items = Vec::new();
+        for page in pages.into_iter().rev() {
+            items.extend(page);
+        }
+        Ok(items)
+    }
+
     /// Run the model pass that turns the covered timeline range into a real
     /// compact summary. Degrades to the mechanical digest when no model is
     /// configured or the attempt fails, with the outcome recorded in the
@@ -509,13 +542,12 @@ impl Application {
             .await
             .map_err(|error| anyhow::anyhow!("resolve project owner: {error}"))?;
 
-        let timeline = self
-            .sessions()
-            .timeline(session_id, None, None, 10_000)
+        let timeline_items = self
+            .full_timeline_for_compact(session_id)
             .await
             .map_err(|error| anyhow::anyhow!("load timeline for compact: {error}"))?;
-        let transcript = compact_transcript(&timeline.items);
-        let digest = compact_timeline_digest(&timeline.items);
+        let transcript = compact_transcript(&timeline_items);
+        let digest = compact_timeline_digest(&timeline_items);
         let summary_base = input.summary.clone();
 
         let mut request = {

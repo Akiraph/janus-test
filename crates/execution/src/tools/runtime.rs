@@ -1,8 +1,15 @@
 //! Bash/runtime and process-control tools (bash, read_output, stop).
+use std::path::PathBuf;
+
 use super::*;
 
 /// Bytes of an async task's log stream one `read_output` call pulls.
 const READ_OUTPUT_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Default timeout for a sync bash run when the caller does not specify one.
+/// A caller-provided `timeout_ms` overrides this; without a bound, a command
+/// that never returns would pin the tool call (and its lease) forever.
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 300_000;
 
 fn default_limits(timeout_ms: u64) -> janus_runtime::interface::ResourceLimits {
     janus_runtime::interface::ResourceLimits {
@@ -85,21 +92,33 @@ pub(super) async fn tool_bash(
         ));
     }
 
-    let timeout = timeout_ms(input, u64::MAX);
+    let timeout = timeout_ms(input, DEFAULT_BASH_TIMEOUT_MS);
     let repo = ctx.workspace_root.to_path_buf();
     let cwd = working_directory(input)?;
     let fallback_cwd = local_working_directory(&repo, &cwd)?;
     let command = display_command.to_owned();
+    let git_askpass = match ctx.git_token {
+        Some(token) if !token.is_empty() => Some(GitAskpass::create(token).await?),
+        _ => None,
+    };
 
     let runtime_proj = match ensure_project_runtime(ctx).await {
         Ok(runtime) => runtime,
         Err(ExecutionError::Runtime(error)) if error.retryable() => {
             tracing::warn!(%error, "preferred Runtime unavailable; using system Bash fallback");
-            return run_local_sync(ctx, &command, display_command, &fallback_cwd).await;
+            return run_local_sync(
+                ctx,
+                &command,
+                display_command,
+                &fallback_cwd,
+                git_askpass.as_ref(),
+                timeout,
+            )
+            .await;
         }
         Err(error) => return Err(error),
     };
-    let environment = execution_environment(ctx)?;
+    let environment = sync_environment(git_askpass.as_ref())?;
     let spec = ExecutionSpec::new(
         runtime_proj.id,
         cwd,
@@ -117,7 +136,15 @@ pub(super) async fn tool_bash(
                 %error,
                 "Runtime sync execution unavailable; using local Git Bash fallback"
             );
-            return run_local_sync(ctx, &command, display_command, &fallback_cwd).await;
+            return run_local_sync(
+                ctx,
+                &command,
+                display_command,
+                &fallback_cwd,
+                git_askpass.as_ref(),
+                timeout,
+            )
+            .await;
         }
         Err(error) => return Err(ExecutionError::Runtime(error)),
     };
@@ -153,7 +180,7 @@ async fn tool_bash_async(
         cwd,
         ValidatedCommand::shell(command)
             .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("command: {e}")))?,
-        execution_environment(ctx)?,
+        empty_environment()?,
         default_limits(timeout),
     )
     .map_err(|e| ExecutionError::Internal(anyhow::anyhow!("execution: {e}")))?;
@@ -195,12 +222,15 @@ async fn tool_bash_async(
 }
 
 /// Local fallback for sync bash when no Runtime is bound. Windows uses Git
-/// Bash (`bash -c`), other platforms use `/bin/sh -c`.
+/// Bash (`bash -c`), other platforms use `/bin/sh -c`. The command is bounded
+/// by `timeout`; on expiry the shell (and anything it spawned) is killed.
 async fn run_local_sync(
     ctx: &ToolContext<'_>,
     command: &str,
     display_command: &str,
     cwd: &Path,
+    askpass: Option<&GitAskpass>,
+    timeout: u64,
 ) -> Result<ToolOutcome, ExecutionError> {
     let Some(program) = bash_program() else {
         let detail = if cfg!(windows) {
@@ -212,26 +242,46 @@ async fn run_local_sync(
     };
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(["-c", command]);
-    if let Some(token) = ctx.git_token {
-        cmd.env("GH_TOKEN", token);
-        cmd.env("GITHUB_TOKEN", token);
+    if let Some(askpass) = askpass {
+        cmd.env("GIT_ASKPASS", askpass.path());
     }
-    cmd.current_dir(cwd);
-    let started = std::time::Instant::now();
-    let output = cmd.output().await;
-    let (timed_out, exit_code, stdout, stderr) = match output {
-        Ok(out) => {
-            let stdout = decode_process_output(&out.stdout, 1024 * 1024);
-            let stderr = decode_process_output(&out.stderr, 1024 * 1024);
-            (false, out.status.code(), stdout.text, stderr.text)
+    cmd.current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.kill_on_drop(true).spawn().map_err(|e| {
+        ExecutionError::Internal(anyhow::anyhow!("failed to spawn local bash: {e}"))
+    })?;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let stdout_task = async {
+        let mut buf = Vec::new();
+        if let Some(reader) = stdout.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(reader, &mut buf).await;
         }
-        Err(e) => {
-            return Ok(fail_text(
-                &format!("failed to run command: {e}"),
-                "COMMAND_FAILED",
-            ));
-        }
+        buf
     };
+    let stderr_task = async {
+        let mut buf = Vec::new();
+        if let Some(reader) = stderr.as_mut() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(reader, &mut buf).await;
+        }
+        buf
+    };
+    let started = std::time::Instant::now();
+    let (timed_out, exit_code) =
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout), child.wait()).await {
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                (true, None)
+            }
+            Ok(Ok(status)) => (false, status.code()),
+            Ok(Err(_)) => (false, None),
+        };
+    let stdout_bytes = stdout_task.await;
+    let stderr_bytes = stderr_task.await;
+    let stdout = decode_process_output(&stdout_bytes, 1024 * 1024);
+    let stderr = decode_process_output(&stderr_bytes, 1024 * 1024);
     let duration_ms = started.elapsed().as_millis() as u64;
     bash_outcome(BashOutcomeInput {
         command: display_command,
@@ -239,31 +289,90 @@ async fn run_local_sync(
         timed_out,
         duration_ms,
         truncated: false,
-        stdout: &stdout,
-        stderr: &stderr,
+        stdout: &stdout.text,
+        stderr: &stderr.text,
         secret_value: ctx.git_token,
     })
 }
 
-fn execution_environment(
-    ctx: &ToolContext<'_>,
+/// Environment for a synchronous bash run. Git authenticates through a
+/// short-lived `GIT_ASKPASS` helper that answers git's prompt from the token
+/// embedded in the script, so the PAT never appears in the process environment
+/// where arbitrary commands in the workspace could read it.
+fn sync_environment(
+    askpass: Option<&GitAskpass>,
 ) -> Result<janus_runtime::interface::ExecutionEnvironment, ExecutionError> {
-    use janus_infrastructure::secrets::Secret;
-    use janus_runtime::interface::SecretEnvironmentVariable;
-    let ordinary = std::collections::BTreeMap::new();
-    let mut secrets = Vec::new();
-    if let Some(token) = ctx.git_token {
-        secrets.push(
-            SecretEnvironmentVariable::new("GH_TOKEN", Secret::new(token.to_owned()))
-                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?,
-        );
-        secrets.push(
-            SecretEnvironmentVariable::new("GITHUB_TOKEN", Secret::new(token.to_owned()))
-                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?,
+    let mut ordinary = std::collections::BTreeMap::new();
+    if let Some(askpass) = askpass {
+        ordinary.insert(
+            "GIT_ASKPASS".into(),
+            askpass.path().to_string_lossy().into_owned(),
         );
     }
-    janus_runtime::interface::ExecutionEnvironment::new(ordinary, secrets)
+    janus_runtime::interface::ExecutionEnvironment::new(ordinary, Vec::new())
         .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("env: {error}")))
+}
+
+/// Environment for a background async bash task. The git credential is not
+/// delivered here: an async task outlives this tool call, so no long-lived
+/// background process carries the PAT in its environment.
+fn empty_environment() -> Result<janus_runtime::interface::ExecutionEnvironment, ExecutionError> {
+    janus_runtime::interface::ExecutionEnvironment::new(
+        std::collections::BTreeMap::new(),
+        Vec::new(),
+    )
+    .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("env: {error}")))
+}
+
+/// A short-lived `GIT_ASKPASS` helper that answers git's credential prompts
+/// from the token embedded in the script, so the PAT never enters the
+/// environment of the command being run. Deletes the script on drop.
+struct GitAskpass {
+    path: PathBuf,
+}
+
+impl GitAskpass {
+    async fn create(token: &str) -> Result<GitAskpass, ExecutionError> {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut bytes);
+        let nonce = hex::encode(bytes);
+        let path = std::env::temp_dir().join(format!("janus-exec-askpass-{nonce}.sh"));
+        let token = shell_quote(token);
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  *sername*) echo 'x-access-token' ;;\n  *assword*) echo '{token}' ;;\nesac\n"
+        );
+        std::fs::write(&path, script)
+            .map_err(|error| ExecutionError::Internal(anyhow::anyhow!("write askpass: {error}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                ExecutionError::Internal(anyhow::anyhow!("askpass metadata: {error}"))
+            })?;
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&path, permissions).map_err(|error| {
+                ExecutionError::Internal(anyhow::anyhow!("askpass chmod: {error}"))
+            })?;
+        }
+        Ok(GitAskpass { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for GitAskpass {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Quote a value for embedding inside single quotes in a POSIX shell script.
+fn shell_quote(value: &str) -> String {
+    value.replace('\'', "'\\''")
 }
 
 fn local_working_directory(
@@ -469,4 +578,32 @@ pub(super) async fn tool_stop(
         error_code: None,
         finish_summary: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote;
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("ghp_abc123"), "ghp_abc123");
+        assert_eq!(shell_quote("a'b"), "a'\\''b");
+        assert_eq!(shell_quote(""), "");
+    }
+
+    #[tokio::test]
+    async fn git_askpass_script_answers_prompts_without_echoing_the_token() {
+        let askpass = super::GitAskpass::create("ghp_secret_token")
+            .await
+            .expect("create askpass");
+        let script = std::fs::read_to_string(askpass.path()).expect("read script");
+        assert!(script.contains("ghp_secret_token"));
+        assert!(script.contains("x-access-token"));
+        let path = askpass.path().to_owned();
+        drop(askpass);
+        assert!(
+            !path.exists(),
+            "askpass script must be removed when the guard drops"
+        );
+    }
 }

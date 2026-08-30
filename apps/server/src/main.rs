@@ -45,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
         .recover_blobs()
         .await
         .context("recover durable blobs on startup")?;
+    state
+        .operations()
+        .prune_expired_idempotency()
+        .await
+        .context("prune expired idempotency records on startup")?;
     for op_id in state
         .operations()
         .stale_running()

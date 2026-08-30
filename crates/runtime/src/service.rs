@@ -1,4 +1,9 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures_util::TryStreamExt;
 use janus_infrastructure::clock::{format_utc, now_utc, now_utc_str};
@@ -34,6 +39,47 @@ pub struct RuntimeInterface {
     /// Broadcast of AsyncTask ids that just reached a durable terminal status.
     /// The application delivery worker subscribes and opens a new Turn.
     async_task_settled_tx: tokio::sync::broadcast::Sender<AsyncTaskId>,
+    /// Single-flight for `ensure_runtime` per runtime id: the check-then-insert
+    /// of the starting row and the executor start must run exactly once, or two
+    /// callers can create duplicate rows / overwrite each other's nonce.
+    ensure_locks: Arc<EnsureLocks>,
+}
+
+/// Leak-free keyed mutex: only ids with an ensure in flight are held, and an
+/// entry is removed when the permit drops, so the set stays bounded by the
+/// number of concurrent ensure calls rather than every runtime ever seen.
+struct EnsureLocks {
+    busy: Mutex<HashSet<String>>,
+}
+
+impl EnsureLocks {
+    async fn acquire(&self, key: &str) -> EnsurePermit<'_> {
+        loop {
+            {
+                let mut busy = self.busy.lock().expect("ensure locks poisoned");
+                if busy.insert(key.to_owned()) {
+                    return EnsurePermit {
+                        locks: self,
+                        key: key.to_owned(),
+                    };
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+struct EnsurePermit<'a> {
+    locks: &'a EnsureLocks,
+    key: String,
+}
+
+impl Drop for EnsurePermit<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.locks.busy.lock() {
+            busy.remove(&self.key);
+        }
+    }
 }
 
 struct RuntimeRow {
@@ -281,6 +327,9 @@ impl RuntimeInterface {
             unit_of_work,
             executor,
             async_task_settled_tx,
+            ensure_locks: Arc::new(EnsureLocks {
+                busy: Mutex::new(HashSet::new()),
+            }),
         }
     }
 
@@ -425,6 +474,7 @@ impl RuntimeInterface {
         &self,
         spec: &RuntimeSpec,
     ) -> Result<RuntimeProjection, RuntimeError> {
+        let _ensure_permit = self.ensure_locks.acquire(&spec.id().to_string()).await;
         if let Some(existing) = self.current_runtime(spec.scope()).await? {
             if existing.id != spec.id() {
                 return Err(RuntimeError::unavailable(format!(
@@ -1795,20 +1845,29 @@ impl RuntimeInterface {
         id: AsyncTaskId,
         nonce: &str,
     ) -> Result<AsyncTaskProjection, RuntimeError> {
-        match tokio::time::timeout(
+        // Kill the process; the spawned wait_async_task watcher settles the
+        // durable projection once the process exits. Finalizing here as well
+        // would open a second transaction writing the same async_tasks
+        // document concurrently (MongoDB WriteConflict), so poll for the
+        // terminal state instead and fall back to marking the task lost if the
+        // watcher never settles.
+        let _ = tokio::time::timeout(
             ASYNC_TASK_CANCEL_TIMEOUT,
             self.executor.cancel_async_task(id, nonce),
         )
-        .await
-        {
-            Ok(Ok(completion)) => {
-                self.finalize_async_task(id, completion, Some(AsyncTaskStatus::Canceled))
-                    .await?;
+        .await;
+        let deadline = tokio::time::Instant::now() + ASYNC_TASK_SETTLE_GRACE;
+        loop {
+            let async_task = self.async_task(id).await?;
+            if async_task.status.is_terminal() {
+                return Ok(async_task);
             }
-            Ok(Err(_)) | Err(_) => {
-                self.mark_async_task_lost(id, "cancel_unconfirmed").await?;
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
+            tokio::time::sleep(ASYNC_TASK_CANCEL_POLL_INTERVAL).await;
         }
+        self.mark_async_task_lost(id, "cancel_unconfirmed").await?;
         self.async_task(id).await
     }
 
@@ -1990,12 +2049,12 @@ impl RuntimeInterface {
         }
         let mut log_ids = Vec::new();
         let filter = if terminal_ids.is_empty() {
-            doc! {"owner_kind": "sync", "owner_id": {"$in": &runtime_ids}}
+            doc! {"owner_kind": "sync", "runtime_id": {"$in": &runtime_ids}}
         } else {
             doc! {
                 "$or": [
                     doc! {"owner_kind": "terminal", "owner_id": {"$in": &terminal_ids}},
-                    doc! {"owner_kind": "sync", "owner_id": {"$in": &runtime_ids}},
+                    doc! {"owner_kind": "sync", "runtime_id": {"$in": &runtime_ids}},
                 ]
             }
         };
@@ -2015,6 +2074,9 @@ impl RuntimeInterface {
 const TICKET_TTL: chrono::TimeDelta = chrono::Duration::seconds(30);
 const ASYNC_TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const ASYNC_TASK_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a cancel waits for the wait_async_task watcher to settle the
+/// durable projection after the process has been killed.
+const ASYNC_TASK_SETTLE_GRACE: Duration = Duration::from_secs(2);
 const COMMAND_SUMMARY_MAX_CHARS: usize = 120;
 
 fn terminal_projection(row: TerminalRow) -> Result<TerminalProjection, RuntimeError> {

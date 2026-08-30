@@ -253,6 +253,7 @@ export async function recoveryComplete(
 
 export async function logout(): Promise<void> {
   await requestJson("/api/v1/auth/logout", { method: "POST" }, () => true);
+  csrfToken = undefined;
 }
 
 export async function regenerateRecoveryCodes(): Promise<string[]> {
@@ -1101,6 +1102,7 @@ async function requestJson<T>(
 }
 
 async function toApiError(response: Response): Promise<ApiError> {
+  if (response.status === 401 || response.status === 403) csrfToken = undefined;
   const value = (await response.json().catch(() => undefined)) as
     | { detail?: string; title?: string; code?: string; request_id?: string | null }
     | undefined;

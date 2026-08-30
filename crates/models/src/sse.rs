@@ -2,7 +2,7 @@
 
 /// Incremental SSE parser that yields complete `(event, data)` frames.
 pub struct SseParser {
-    buffer: String,
+    buffer: Vec<u8>,
     event_name: String,
     data_lines: Vec<String>,
 }
@@ -10,17 +10,19 @@ pub struct SseParser {
 impl SseParser {
     pub fn new() -> Self {
         Self {
-            buffer: String::new(),
+            buffer: Vec::new(),
             event_name: String::new(),
             data_lines: Vec::new(),
         }
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<(String, String)> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        self.buffer.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(idx) = self.buffer.find('\n') {
-            let mut line = self.buffer[..idx].to_string();
+        while let Some(idx) = self.buffer.iter().position(|&b| b == b'\n') {
+            // Decode only complete lines so a multi-byte UTF-8 sequence split
+            // across chunk boundaries is reassembled before decoding.
+            let mut line = String::from_utf8_lossy(&self.buffer[..idx]).into_owned();
             self.buffer.drain(..=idx);
             if line.ends_with('\r') {
                 line.pop();

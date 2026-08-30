@@ -130,8 +130,8 @@ pub async fn system_info(
                 schema_version,
                 mode: state.config().mode.as_str().into(),
                 database: DatabaseInfo {
-                    engine: "sqlite",
-                    journal_mode: "wal",
+                    engine: "mongodb",
+                    journal_mode: "on",
                     ready: state.system().ready().await,
                 },
                 events: EventInfo {

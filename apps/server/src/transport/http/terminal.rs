@@ -30,7 +30,7 @@ use utoipa::ToSchema;
 use crate::{
     AppState,
     transport::http::{
-        auth::authenticate,
+        auth::{authenticate, authorized},
         dto::DataResponse,
         problem::{Problem, codes, map_runtime_error},
     },
@@ -99,7 +99,7 @@ pub async fn create_terminal(
     headers: HeaderMap,
     Json(body): Json<CreateTerminalRequest>,
 ) -> Result<(StatusCode, Json<DataResponse<TerminalProjection>>), Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let project_id: ProjectId = body
         .project_id
         .parse()
@@ -180,7 +180,7 @@ pub async fn issue_terminal_ticket(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<(StatusCode, Json<DataResponse<TerminalTicket>>), Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let terminal_id: TerminalId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid terminal id"))?;
@@ -211,7 +211,7 @@ pub async fn resize_terminal(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<ResizeTerminalRequest>,
 ) -> Result<Json<DataResponse<TerminalProjection>>, Problem> {
-    let _auth = authenticate(&state, &headers).await?;
+    let _auth = authorized(&state, &headers).await?;
     let terminal_id: TerminalId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid terminal id"))?;
@@ -238,7 +238,7 @@ pub async fn signal_terminal(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(body): Json<SignalTerminalRequest>,
 ) -> Result<StatusCode, Problem> {
-    let _auth = authenticate(&state, &headers).await?;
+    let _auth = authorized(&state, &headers).await?;
     let terminal_id: TerminalId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid terminal id"))?;
@@ -261,7 +261,7 @@ pub async fn close_terminal(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<DataResponse<TerminalProjection>>, Problem> {
-    let _auth = authenticate(&state, &headers).await?;
+    let _auth = authorized(&state, &headers).await?;
     let terminal_id: TerminalId = id
         .parse()
         .map_err(|_| Problem::from_code(codes::VALIDATION_FAILED, "invalid terminal id"))?;

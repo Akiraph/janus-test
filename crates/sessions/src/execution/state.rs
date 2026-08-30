@@ -57,7 +57,22 @@ impl SessionsInterface {
             )
             .session(&mut *tx)
             .await?;
-        Ok(claimed.matched_count == 1)
+        if claimed.matched_count != 1 {
+            // The session is already claimed by another turn. Undo the
+            // promotion inside this transaction so the turn cannot be left
+            // `running` with no session pointing at it, even if a caller
+            // commits despite the `false` result.
+            self.pool
+                .collection::<Document>("turns")
+                .update_one(
+                    doc! {"_id": turn_id, "status": "running"},
+                    doc! {"$set": {"status": "queued", "updated_at": now}},
+                )
+                .session(&mut *tx)
+                .await?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Rename a session that still carries its creation placeholder, guarded by

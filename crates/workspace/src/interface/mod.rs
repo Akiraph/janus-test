@@ -32,7 +32,7 @@ use janus_infrastructure::managed_storage::BlobStore;
 pub use super::diff::{DiffLineKind, line_hunks};
 use super::manifest::{
     ManifestNode, ManifestRoot, NodeKind, collect_manifest as walk_manifest, hash_file_node,
-    is_text_bytes,
+    is_link_or_reparse, is_text_bytes,
 };
 pub use super::path::{PathError, validate_workspace_path};
 use super::working_tree::hash_working_tree;

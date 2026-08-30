@@ -727,6 +727,10 @@ async fn delete_session_records(
     })
     .await?;
     work.commit().await?;
+    state
+        .sessions()
+        .drop_session_attachment_blobs(&plan.attachment_ids)
+        .await;
     Ok(())
 }
 

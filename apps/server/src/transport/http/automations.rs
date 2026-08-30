@@ -13,7 +13,11 @@ use crate::{
     application::automation::{
         AutomationRunView, AutomationSettingsView, UpdateAutomationSettingsInput,
     },
-    transport::http::{auth::authenticate, dto::DataResponse, problem::Problem},
+    transport::http::{
+        auth::{authenticate, authorized},
+        dto::DataResponse,
+        problem::Problem,
+    },
 };
 
 #[derive(Debug, Deserialize)]
@@ -167,7 +171,7 @@ pub async fn update_automation_settings(
     headers: HeaderMap,
     Json(input): Json<UpdateAutomationSettingsInput>,
 ) -> Result<Json<DataResponse<AutomationSettingsView>>, Problem> {
-    let auth = authenticate(&state, &headers).await?;
+    let auth = authorized(&state, &headers).await?;
     let settings = state
         .application()
         .update_automation_settings(&auth.owner_id, input)
