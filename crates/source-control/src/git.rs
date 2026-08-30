@@ -105,7 +105,10 @@ fn github_repo(url: &str) -> Option<GithubRepo> {
         return github_pair(owner, repo);
     }
     let parsed = Url::parse(url).ok()?;
-    if !matches!(parsed.host_str(), Some("github.com") | Some("www.github.com")) {
+    if !matches!(
+        parsed.host_str(),
+        Some("github.com") | Some("www.github.com")
+    ) {
         return None;
     }
     let mut segments = parsed.path_segments()?;
@@ -212,7 +215,8 @@ async fn clone_github_tarball(
         )));
     }
 
-    std::fs::create_dir_all(&extract).map_err(|error| GitError::CommandFailed(error.to_string()))?;
+    std::fs::create_dir_all(&extract)
+        .map_err(|error| GitError::CommandFailed(error.to_string()))?;
     let extracted = Command::new("tar")
         .arg("-xzf")
         .arg(&tarball)
@@ -1429,8 +1433,14 @@ mod tests {
 
     #[test]
     fn extracts_branch_from_github_archive_folder() {
-        assert_eq!(branch_from_folder("hello-main", "hello").as_deref(), Some("main"));
-        assert_eq!(branch_from_folder("hello-feature/x", "hello").as_deref(), Some("feature/x"));
+        assert_eq!(
+            branch_from_folder("hello-main", "hello").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            branch_from_folder("hello-feature/x", "hello").as_deref(),
+            Some("feature/x")
+        );
         assert_eq!(branch_from_folder("hello", "hello"), None);
         assert_eq!(branch_from_folder("world-main", "hello"), None);
     }
