@@ -22,8 +22,9 @@ impl WorkspaceInterface {
     ) -> Result<FileMetaView, WorkspaceError> {
         let rel = validate_workspace_path(raw_path)?;
         let _lock = self.acquire_mutation_lock(handle).await?;
-        let abs = self.workspace_root(handle).await?.join(&rel);
-        let meta = tokio::fs::metadata(&abs)
+        let root = self.workspace_root(handle).await?;
+        let abs = resolve_workspace_path(&root, &rel, raw_path).await?;
+        let meta = tokio::fs::symlink_metadata(&abs)
             .await
             .map_err(|error| read_error(raw_path, error))?;
         let revision = self
@@ -47,8 +48,9 @@ impl WorkspaceInterface {
     ) -> Result<Vec<u8>, WorkspaceError> {
         let rel = validate_workspace_path(raw_path)?;
         let _lock = self.acquire_mutation_lock(handle).await?;
-        let abs = self.workspace_root(handle).await?.join(rel);
-        let meta = tokio::fs::metadata(&abs)
+        let root = self.workspace_root(handle).await?;
+        let abs = resolve_workspace_path(&root, &rel, raw_path).await?;
+        let meta = tokio::fs::symlink_metadata(&abs)
             .await
             .map_err(|error| read_error(raw_path, error))?;
         if meta.is_dir() {
@@ -70,7 +72,18 @@ impl WorkspaceInterface {
             validate_workspace_path(raw_path)?
         };
         let _lock = self.acquire_mutation_lock(handle).await?;
-        let abs = self.workspace_root(handle).await?.join(&rel);
+        let root = self.workspace_root(handle).await?;
+        let abs = if rel.as_os_str().is_empty() {
+            root
+        } else {
+            resolve_workspace_path(&root, &rel, raw_path).await?
+        };
+        let dir_meta = tokio::fs::symlink_metadata(&abs)
+            .await
+            .map_err(|error| read_error(raw_path, error))?;
+        if is_link_or_reparse(&dir_meta) {
+            return Err(WorkspaceError::PermissionDenied(raw_path.to_owned()));
+        }
         let mut entries = tokio::fs::read_dir(&abs)
             .await
             .map_err(|error| read_error(raw_path, error))?;
@@ -88,6 +101,9 @@ impl WorkspaceInterface {
                 .metadata()
                 .await
                 .map_err(|error| WorkspaceError::Internal(error.into()))?;
+            if is_link_or_reparse(&meta) {
+                continue;
+            }
             let child_path = if rel.as_os_str().is_empty() {
                 name.clone()
             } else {
@@ -588,6 +604,29 @@ impl WorkspaceInterface {
     }
 }
 
+/// Resolve a validated relative path beneath the workspace root, rejecting any
+/// symlink or reparse point along the way so a link planted inside the
+/// workspace cannot redirect a read outside it.
+async fn resolve_workspace_path(
+    root: &Path,
+    rel: &Path,
+    raw_path: &str,
+) -> Result<PathBuf, WorkspaceError> {
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component.as_os_str());
+        let meta = tokio::fs::symlink_metadata(&current)
+            .await
+            .map_err(|error| read_error(raw_path, error))?;
+        if is_link_or_reparse(&meta) {
+            return Err(WorkspaceError::PermissionDenied(
+                current.to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    Ok(current)
+}
+
 /// Separate the filesystem refusals a user can act on from a genuinely missing
 /// path. Reporting every read failure as `PathNotFound` tells a user that a file
 /// they are looking at in the tree does not exist, and hides the real cause.
@@ -603,7 +642,9 @@ fn read_error(raw_path: &str, error: std::io::Error) -> WorkspaceError {
 
 #[cfg(test)]
 mod tests {
-    use super::read_error;
+    use std::path::Path;
+
+    use super::{read_error, resolve_workspace_path};
     use crate::interface::WorkspaceError;
 
     #[test]
@@ -618,5 +659,39 @@ mod tests {
             denied.to_string(),
             "permission denied by the filesystem: src/main.rs"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_path_rejects_link_components() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let link = root.path().join("external");
+        std::fs::write(outside.path().join("secret.txt"), b"outside").expect("outside file");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).expect("create directory link");
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    link.to_str().expect("link path"),
+                    outside.path().to_str().expect("outside path"),
+                ])
+                .output()
+                .expect("create directory junction");
+            assert!(
+                result.status.success(),
+                "failed to create junction: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        let denied = resolve_workspace_path(root.path(), Path::new("external/secret.txt"), "external/secret.txt")
+            .await
+            .expect_err("link must be rejected");
+        assert!(matches!(denied, WorkspaceError::PermissionDenied(_)));
     }
 }
