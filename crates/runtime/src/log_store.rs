@@ -280,7 +280,7 @@ impl LogStore {
             });
         }
         let limit = limit_bytes.clamp(1, MAX_READ_BYTES);
-        let mut chunks = read_chunks_from(&self.root.join(&row.relative_path), after.value()).await?;
+        let chunks = read_chunks_from(&self.root.join(&row.relative_path), after.value()).await?;
         let mut remaining = limit;
         let mut result = Vec::new();
         for chunk in chunks.into_iter().filter(|chunk| chunk.end > after.value()) {
@@ -571,7 +571,7 @@ async fn read_chunks_from(directory: &Path, after: u64) -> Result<Vec<DiskChunk>
             if marker.end > after {
                 chunks.push(marker);
             }
-        } else if let Some((start, end)) = parse_chunk_range(file_name)
+        } else if let Some((_, end)) = parse_chunk_range(file_name)
             && end > after
         {
             let bytes = tokio::fs::read(&path).await.map_err(storage_error)?;
