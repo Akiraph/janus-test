@@ -119,10 +119,9 @@ export function randomUuid(): string {
   const randomUUID: unknown = crypto.randomUUID;
   if (typeof randomUUID === "function") return randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  const uuid = `${hex.slice(0, 12)}4${hex.slice(13, 16)}8${hex.slice(17)}`;
+  return `${uuid.slice(0, 8)}-${uuid.slice(8, 12)}-${uuid.slice(12, 16)}-${uuid.slice(16, 20)}-${uuid.slice(20)}`;
 }
 
 export async function getBootstrap(): Promise<BootstrapResponse> {
