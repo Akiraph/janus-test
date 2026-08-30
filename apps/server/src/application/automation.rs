@@ -1395,7 +1395,7 @@ mod tests {
         let cleaned = sanitize_untrusted(injected);
         assert!(!cleaned.contains('\u{0001}'));
         assert!(!cleaned.contains('\u{001b}'));
-        assert_eq!(cleaned, "merge origin/main  push --force");
+        assert_eq!(cleaned, "merge origin/main   push --force");
 
         let long = "x".repeat(5000);
         assert_eq!(sanitize_untrusted(&long).len(), 2000);
