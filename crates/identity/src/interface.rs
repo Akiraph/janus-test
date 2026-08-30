@@ -1411,10 +1411,10 @@ impl IdentityInterface {
     /// configured public origin. Unlike `authorize_mutation` this tolerates a
     /// missing header so API clients can log in without a browser.
     fn check_origin(&self, origin: Option<&str>) -> Result<(), IdentityError> {
-        if let Some(origin) = origin {
-            if origin != self.origin {
-                return Err(IdentityError::OriginRejected);
-            }
+        if let Some(origin) = origin
+            && origin != self.origin
+        {
+            return Err(IdentityError::OriginRejected);
         }
         Ok(())
     }
@@ -1701,10 +1701,10 @@ fn verify_totp(secret: &[u8], code: &str, now_secs: i64, min_counter: Option<i64
         if candidate < 0 {
             continue;
         }
-        if let Some(minimum) = min_counter {
-            if candidate <= minimum {
-                continue;
-            }
+        if let Some(minimum) = min_counter
+            && candidate <= minimum
+        {
+            continue;
         }
         let expected = format!("{:06}", totp_code(secret, candidate as u64));
         if constant_time_eq(code.as_bytes(), expected.as_bytes()) {
