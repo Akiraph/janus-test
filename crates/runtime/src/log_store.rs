@@ -332,12 +332,9 @@ impl LogStore {
 
 fn projection_from_row(row: &StreamRow) -> Result<LogStreamProjection, RuntimeError> {
     Ok(LogStreamProjection {
-        id: row
-            .id
-            .parse()
-            .map_err(|_| {
-                RuntimeError::unavailable(format!("log stream id {:?} is invalid", row.id))
-            })?,
+        id: row.id.parse().map_err(|_| {
+            RuntimeError::unavailable(format!("log stream id {:?} is invalid", row.id))
+        })?,
         first_cursor: LogCursor::new(to_u64(row.first_cursor, "first_cursor")?),
         next_cursor: LogCursor::new(to_u64(row.next_cursor, "next_cursor")?),
         retained_bytes: to_u64(row.retained_bytes, "retained_bytes")?,

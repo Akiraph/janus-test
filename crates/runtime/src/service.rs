@@ -711,7 +711,9 @@ impl RuntimeInterface {
                 .await;
                 self.mark_async_task_lost(async_task_id, "executor_nonce_mismatch")
                     .await?;
-                Err(RuntimeError::unavailable("async task executor nonce mismatch"))
+                Err(RuntimeError::unavailable(
+                    "async task executor nonce mismatch",
+                ))
             }
             Err(error) => {
                 self.mark_async_task_lost(async_task_id, "start_failed")
@@ -1110,7 +1112,9 @@ impl RuntimeInterface {
             }
             Ok(_) => {
                 self.mark_terminal_failed(terminal_id).await?;
-                Err(RuntimeError::unavailable("terminal executor nonce mismatch"))
+                Err(RuntimeError::unavailable(
+                    "terminal executor nonce mismatch",
+                ))
             }
             Err(error) => {
                 self.mark_terminal_failed(terminal_id).await?;
@@ -1725,7 +1729,9 @@ impl RuntimeInterface {
     async fn runtime_nonce(&self, id: RuntimeId) -> Result<String, RuntimeError> {
         let row = self.runtime_row(id).await?;
         if row.status != "ready" {
-            return Err(RuntimeError::unavailable(format!("runtime {id} is not ready")));
+            return Err(RuntimeError::unavailable(format!(
+                "runtime {id} is not ready"
+            )));
         }
         Ok(row.executor_nonce)
     }
