@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use janus_infrastructure::{
     clock::now_utc_str,
     events::{EventStore, EventType, NewEvent},
@@ -9,10 +10,13 @@ use janus_infrastructure::{
     secrets::{Secret, SecretCipher},
     unit_of_work::{UnitOfWork, UnitOfWorkTransaction},
 };
+use mongodb::{
+    Database,
+    bson::{Bson, Document, doc},
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
 use url::Url;
 use utoipa::ToSchema;
@@ -100,24 +104,25 @@ pub enum NotificationsError {
     #[error("the notification channel was not found")]
     ChannelNotFound,
     #[error("notification storage failed")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("notification data is invalid")]
     Data(#[from] serde_json::Error),
     #[error("notification operation failed")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
     #[error("notification delivery failed: {0}")]
     Delivery(String),
 }
 
 #[derive(Clone)]
 pub struct NotificationsInterface {
-    pool: SqlitePool,
+    pool: Database,
     unit_of_work: UnitOfWork,
     cipher: SecretCipher,
     client: Client,
 }
 
-#[derive(Debug, FromRow)]
 struct ChannelRow {
     id: String,
     owner_id: String,
@@ -127,13 +132,34 @@ struct ChannelRow {
     secret_ciphertext: Option<Vec<u8>>,
     target_json: String,
     events_json: String,
-    enabled: i64,
+    enabled: bool,
     created_at: String,
     updated_at: String,
 }
 
+impl ChannelRow {
+    fn from_doc(doc: &Document) -> Result<Self, NotificationsError> {
+        Ok(Self {
+            id: doc.get_str("_id")?.to_owned(),
+            owner_id: doc.get_str("owner_id")?.to_owned(),
+            kind: doc.get_str("kind")?.to_owned(),
+            display_name: doc.get_str("display_name")?.to_owned(),
+            endpoint_url: doc.get_str("endpoint_url")?.to_owned(),
+            secret_ciphertext: doc.get("secret_ciphertext").and_then(|value| match value {
+                Bson::Binary(binary) => Some(binary.bytes.clone()),
+                _ => None,
+            }),
+            target_json: doc.get_str("target_json")?.to_owned(),
+            events_json: doc.get_str("events_json")?.to_owned(),
+            enabled: doc.get("enabled").and_then(Bson::as_bool).unwrap_or(false),
+            created_at: doc.get_str("created_at")?.to_owned(),
+            updated_at: doc.get_str("updated_at")?.to_owned(),
+        })
+    }
+}
+
 impl NotificationsInterface {
-    pub fn new(pool: SqlitePool, cipher: SecretCipher, events: EventStore) -> anyhow::Result<Self> {
+    pub fn new(pool: Database, cipher: SecretCipher, events: EventStore) -> anyhow::Result<Self> {
         Ok(Self {
             unit_of_work: UnitOfWork::new(pool.clone(), events),
             pool,
@@ -150,14 +176,16 @@ impl NotificationsInterface {
         &self,
         owner_id: &str,
     ) -> Result<Vec<NotificationChannelView>, NotificationsError> {
-        let rows = sqlx::query_as::<_, ChannelRow>(
-            "SELECT id, owner_id, kind, display_name, endpoint_url, secret_ciphertext, \
-             target_json, events_json, enabled, created_at, updated_at \
-             FROM notification_channels WHERE owner_id = ? ORDER BY display_name, id",
-        )
-        .bind(owner_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("notification_channels")
+            .find(doc! {"owner_id": owner_id})
+            .sort(doc! {"display_name": 1, "_id": 1})
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push(ChannelRow::from_doc(&document)?);
+        }
         rows.into_iter().map(channel_view).collect()
     }
 
@@ -173,26 +201,34 @@ impl NotificationsInterface {
         let secret = encrypt_secret(&self.cipher, owner_id, &id, input.secret.as_deref())?;
         let target_json = serde_json::to_string(&input.target)?;
         let events_json = serde_json::to_string(&input.events)?;
+        let endpoint_url = normalize_url(&input.endpoint_url)?;
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query(
-            "INSERT INTO notification_channels \
-             (id, owner_id, kind, display_name, endpoint_url, secret_ciphertext, target_json, \
-              events_json, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(owner_id)
-        .bind(kind_str(input.kind))
-        .bind(input.display_name.trim())
-        .bind(normalize_url(&input.endpoint_url)?)
-        .bind(secret)
-        .bind(target_json)
-        .bind(events_json)
-        .bind(input.enabled)
-        .bind(&now)
-        .bind(&now)
-        .execute(work.connection())
-        .await?;
+        let mut document = doc! {
+            "_id": &id,
+            "owner_id": owner_id,
+            "kind": kind_str(input.kind),
+            "display_name": input.display_name.trim(),
+            "endpoint_url": &endpoint_url,
+            "target_json": &target_json,
+            "events_json": &events_json,
+            "enabled": input.enabled,
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if let Some(bytes) = &secret {
+            document.insert(
+                "secret_ciphertext",
+                Bson::Binary(mongodb::bson::Binary {
+                    subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                    bytes: bytes.clone(),
+                }),
+            );
+        }
+        self.pool
+            .collection::<Document>("notification_channels")
+            .insert_one(document)
+            .session(work.connection())
+            .await?;
         append_changed(&mut work, owner_id, &id, "created", correlation_id).await?;
         work.commit().await?;
         self.channel(owner_id, &id).await
@@ -214,25 +250,38 @@ impl NotificationsInterface {
         let now = now_utc_str();
         let target_json = serde_json::to_string(&input.target)?;
         let events_json = serde_json::to_string(&input.events)?;
+        let endpoint_url = normalize_url(&input.endpoint_url)?;
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query(
-            "UPDATE notification_channels SET kind=?, display_name=?, endpoint_url=?, \
-             secret_ciphertext=?, target_json=?, events_json=?, enabled=?, updated_at=? \
-             WHERE id=? AND owner_id=?",
-        )
-        .bind(kind_str(input.kind))
-        .bind(input.display_name.trim())
-        .bind(normalize_url(&input.endpoint_url)?)
-        .bind(secret)
-        .bind(target_json)
-        .bind(events_json)
-        .bind(input.enabled)
-        .bind(&now)
-        .bind(id)
-        .bind(owner_id)
-        .execute(work.connection())
-        .await?
-        .rows_affected();
+        let mut set = doc! {
+            "kind": kind_str(input.kind),
+            "display_name": input.display_name.trim(),
+            "endpoint_url": &endpoint_url,
+            "target_json": &target_json,
+            "events_json": &events_json,
+            "enabled": input.enabled,
+            "updated_at": &now,
+        };
+        match &secret {
+            Some(bytes) => {
+                set.insert(
+                    "secret_ciphertext",
+                    Bson::Binary(mongodb::bson::Binary {
+                        subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                        bytes: bytes.clone(),
+                    }),
+                );
+            }
+            None => {
+                set.insert("secret_ciphertext", Bson::Null);
+            }
+        }
+        let changed = self
+            .pool
+            .collection::<Document>("notification_channels")
+            .update_one(doc! {"_id": id, "owner_id": owner_id}, doc! {"$set": set})
+            .session(work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(NotificationsError::ChannelNotFound);
@@ -249,13 +298,13 @@ impl NotificationsInterface {
         correlation_id: &str,
     ) -> Result<(), NotificationsError> {
         let mut work = self.unit_of_work.begin().await?;
-        let changed =
-            sqlx::query("DELETE FROM notification_channels WHERE id = ? AND owner_id = ?")
-                .bind(id)
-                .bind(owner_id)
-                .execute(work.connection())
-                .await?
-                .rows_affected();
+        let changed = self
+            .pool
+            .collection::<Document>("notification_channels")
+            .delete_one(doc! {"_id": id, "owner_id": owner_id})
+            .session(work.connection())
+            .await?
+            .deleted_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(NotificationsError::ChannelNotFound);
@@ -287,15 +336,16 @@ impl NotificationsInterface {
         owner_id: &str,
         event: &NotificationEvent,
     ) -> Result<(), NotificationsError> {
-        let rows = sqlx::query_as::<_, ChannelRow>(
-            "SELECT id, owner_id, kind, display_name, endpoint_url, secret_ciphertext, \
-             target_json, events_json, enabled, created_at, updated_at \
-             FROM notification_channels WHERE owner_id = ? AND enabled = 1 \
-             ORDER BY id",
-        )
-        .bind(owner_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("notification_channels")
+            .find(doc! {"owner_id": owner_id, "enabled": true})
+            .sort(doc! {"_id": 1})
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push(ChannelRow::from_doc(&document)?);
+        }
         let mut errors = Vec::new();
         for row in rows {
             // A channel whose stored filter cannot be read must not abort the
@@ -398,16 +448,13 @@ impl NotificationsInterface {
         owner_id: &str,
         id: &str,
     ) -> Result<ChannelRow, NotificationsError> {
-        sqlx::query_as::<_, ChannelRow>(
-            "SELECT id, owner_id, kind, display_name, endpoint_url, secret_ciphertext, \
-             target_json, events_json, enabled, created_at, updated_at \
-             FROM notification_channels WHERE id = ? AND owner_id = ?",
-        )
-        .bind(id)
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(NotificationsError::ChannelNotFound)
+        let document = self
+            .pool
+            .collection::<Document>("notification_channels")
+            .find_one(doc! {"_id": id, "owner_id": owner_id})
+            .await?
+            .ok_or(NotificationsError::ChannelNotFound)?;
+        ChannelRow::from_doc(&document)
     }
 }
 
@@ -546,14 +593,14 @@ fn channel_view(row: ChannelRow) -> Result<NotificationChannelView, Notification
         secret_is_set: row.secret_ciphertext.is_some(),
         target: serde_json::from_str(&row.target_json)?,
         events: serde_json::from_str(&row.events_json)?,
-        enabled: row.enabled != 0,
+        enabled: row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
 }
 
 async fn append_changed(
-    work: &mut UnitOfWorkTransaction<'_>,
+    work: &mut UnitOfWorkTransaction,
     owner_id: &str,
     channel_id: &str,
     operation: &str,

@@ -1,8 +1,18 @@
 //! Turn execution state machine: round streaming, tool execution,
 //! completion and failure settlement.
 use super::*;
+use futures_util::TryStreamExt;
 use janus_infrastructure::id::ProjectId;
+use mongodb::bson::{Bson, Document, doc};
 use std::path::Path;
+
+fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write))
+            if write.code == 11000
+    )
+}
 
 fn as_i64_tokens(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -138,11 +148,14 @@ impl ExecutionInterface {
         let mut finished = false;
         let mut finish_summary: Option<CompletionSummary> = None;
 
-        let last_round_sequence: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM rounds WHERE turn_id = ?")
-                .bind(turn_id.to_string())
-                .fetch_one(&self.pool)
-                .await?;
+        let last_round_sequence: i64 = self
+            .pool
+            .collection::<Document>("rounds")
+            .find_one(doc! {"turn_id": turn_id.to_string()})
+            .sort(doc! {"sequence": -1})
+            .await?
+            .and_then(|doc| doc.get("sequence").and_then(Bson::as_i64))
+            .unwrap_or(0);
         let mut round_seq = last_round_sequence.saturating_add(1);
         loop {
             if !self.sessions.turn_is_runnable(session_id, turn_id).await? {
@@ -154,13 +167,19 @@ impl ExecutionInterface {
             // attempt that belongs to this Turn, including retries/failovers,
             // while removing that prefix from each request. The ledger is the
             // authoritative source; rounds only retain the winning attempt.
-            let usage_rows: Vec<(i64, i64)> = sqlx::query_as(
-                "SELECT input_tokens, output_tokens FROM model_usage_ledger \
-                 WHERE turn_id = ? ORDER BY occurred_at, id",
-            )
-            .bind(turn_id.to_string())
-            .fetch_all(&self.pool)
-            .await?;
+            let mut usage_cursor = self
+                .pool
+                .collection::<Document>("model_usage_ledger")
+                .find(doc! {"turn_id": turn_id.to_string()})
+                .sort(doc! {"occurred_at": 1, "_id": 1})
+                .await?;
+            let mut usage_rows = Vec::new();
+            while let Some(document) = usage_cursor.try_next().await? {
+                usage_rows.push((
+                    document.get_i64("input_tokens")?,
+                    document.get_i64("output_tokens")?,
+                ));
+            }
             let turn_exchange = aggregate_turn_token_exchange(&usage_rows, system_prompt_tokens);
             let turn_input_base = turn_exchange.upload_tokens;
             let turn_output_base = turn_exchange.download_tokens;
@@ -184,6 +203,7 @@ impl ExecutionInterface {
                 return Ok(TurnExecutionOutcome);
             }
             let context_version_id = record_context_version_in_tx(
+                &self.pool,
                 work.connection(),
                 session_id,
                 Some(&turn_id.to_string()),
@@ -197,26 +217,32 @@ impl ExecutionInterface {
             )
             .await
             .map_err(ExecutionError::Internal)?;
-            let inserted = sqlx::query(
-                "INSERT INTO rounds \
-                 (id, turn_id, sequence, context_version, status, candidate_snapshot_json, \
-                  final_attempt_id, output_summary_json, input_tokens, output_tokens, \
-                  stop_reason, version, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, 'running', ?, NULL, NULL, 0, 0, NULL, ?, ?, ?)",
-            )
-            .bind(round_id.to_string())
-            .bind(turn_id.to_string())
-            .bind(round_seq)
-            .bind(&context_version_id)
-            .bind(serde_json::to_string(&model_snapshot.failover)?)
-            .bind(&version)
-            .bind(&now)
-            .bind(&now)
-            .execute(work.connection())
-            .await?;
-            if inserted.rows_affected() != 1 {
-                work.rollback().await?;
-                return Ok(TurnExecutionOutcome);
+            let failover_json = serde_json::to_string(&model_snapshot.failover)?;
+            let inserted = self
+                .pool
+                .collection::<Document>("rounds")
+                .insert_one(doc! {
+                    "_id": round_id.to_string(),
+                    "turn_id": turn_id.to_string(),
+                    "sequence": round_seq,
+                    "context_version": &context_version_id,
+                    "status": "running",
+                    "candidate_snapshot_json": &failover_json,
+                    "input_tokens": 0i64,
+                    "output_tokens": 0i64,
+                    "version": &version,
+                    "created_at": &now,
+                    "updated_at": &now,
+                })
+                .session(&mut *work.connection())
+                .await;
+            match inserted {
+                Ok(_) => {}
+                Err(error) if is_duplicate_key(&error) => {
+                    work.rollback().await?;
+                    return Ok(TurnExecutionOutcome);
+                }
+                Err(error) => return Err(error.into()),
             }
             work.append_event(NewEvent {
                 event_type: EventType::RoundChanged,
@@ -928,22 +954,32 @@ impl ExecutionInterface {
         if let Some(raw) = reasoning_content {
             round_body["reasoning_content"] = json!(raw);
         }
-        let accepted = sqlx::query(
-            "UPDATE rounds SET status = 'succeeded', final_attempt_id = ?, input_tokens = ?, \
-             output_tokens = ?, stop_reason = ?, output_summary_json = ?, updated_at = ? \
-             WHERE id = ? AND status = 'running' AND turn_id = ?",
-        )
-        .bind(attempt_id)
-        .bind(input_tokens)
-        .bind(output_tokens)
-        .bind(stop_reason)
-        .bind(round_body.to_string())
-        .bind(&now)
-        .bind(round_id.to_string())
-        .bind(turn_id.to_string())
-        .execute(work.connection())
-        .await?;
-        if accepted.rows_affected() != 1 {
+        let round_body_string = round_body.to_string();
+        let mut round_set = doc! {
+            "status": "succeeded",
+            "final_attempt_id": attempt_id,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "output_summary_json": &round_body_string,
+            "updated_at": &now,
+        };
+        if let Some(stop_reason) = stop_reason {
+            round_set.insert("stop_reason", stop_reason);
+        }
+        let accepted = self
+            .pool
+            .collection::<Document>("rounds")
+            .update_one(
+                doc! {
+                    "_id": round_id.to_string(),
+                    "status": "running",
+                    "turn_id": turn_id.to_string(),
+                },
+                doc! {"$set": round_set},
+            )
+            .session(&mut *work.connection())
+            .await?;
+        if accepted.matched_count != 1 {
             return Ok(None);
         }
 
@@ -976,52 +1012,66 @@ impl ExecutionInterface {
             // logical call delivered through two event shapes — used to hit
             // the unique index and abort the whole round as a storage error.
             // Re-accepting replaces the pending row instead of failing.
-            let existing_id: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM tool_calls WHERE round_id = ? AND provider_call_id = ?",
-            )
-            .bind(round_id.to_string())
-            .bind(&request.id)
-            .fetch_optional(work.connection())
-            .await?;
+            let existing_id: Option<String> = self
+                .pool
+                .collection::<Document>("tool_calls")
+                .find_one(doc! {
+                    "round_id": round_id.to_string(),
+                    "provider_call_id": &request.id,
+                })
+                .session(&mut *work.connection())
+                .await?
+                .map(|doc| doc.get_str("_id").map(str::to_owned))
+                .transpose()?;
             let id = if let Some(stored) = existing_id {
                 let id: ToolCallId = stored.parse().map_err(|error| {
                     ExecutionError::Internal(anyhow::anyhow!(
                         "stored Tool Call id is not a ToolCallId: {error}"
                     ))
                 })?;
-                sqlx::query(
-                    "UPDATE tool_calls SET ord = ?, tool_name = ?, input_json = ?, \
-                      status = 'requested', actor_json = ?, error_code = NULL, \
-                      started_at = NULL, ended_at = NULL, version = ? WHERE id = ?",
-                )
-                .bind(ordinal as i64)
-                .bind(&request.name)
-                .bind(input.to_string())
-                .bind(actor.to_string())
-                .bind(format!("v_{}", ToolCallId::new()))
-                .bind(&stored)
-                .execute(work.connection())
-                .await?;
+                let input_json = input.to_string();
+                let actor_json = actor.to_string();
+                let tool_version = format!("v_{}", ToolCallId::new());
+                self.pool
+                    .collection::<Document>("tool_calls")
+                    .update_one(
+                        doc! {"_id": &stored},
+                        doc! {
+                            "$set": {
+                                "ord": ordinal as i64,
+                                "tool_name": &request.name,
+                                "input_json": &input_json,
+                                "status": "requested",
+                                "actor_json": &actor_json,
+                                "version": &tool_version,
+                            },
+                            "$unset": {"error_code": "", "started_at": "", "ended_at": ""},
+                        },
+                    )
+                    .session(&mut *work.connection())
+                    .await?;
                 id
             } else {
                 let id = ToolCallId::new();
-                sqlx::query(
-                    "INSERT INTO tool_calls \
-                     (id, round_id, ord, tool_name, schema_version, input_json, result_summary_json, \
-                      status, actor_json, error_code, provider_call_id, started_at, ended_at, version) \
-                     VALUES (?, ?, ?, ?, ?, ?, NULL, 'requested', ?, NULL, ?, NULL, NULL, ?)",
-                )
-                .bind(id.to_string())
-                .bind(round_id.to_string())
-                .bind(ordinal as i64)
-                .bind(&request.name)
-                .bind(SCHEMA_VERSION)
-                .bind(input.to_string())
-                .bind(actor.to_string())
-                .bind(&request.id)
-                .bind(format!("v_{}", ToolCallId::new()))
-                .execute(work.connection())
-                .await?;
+                let input_json = input.to_string();
+                let actor_json = actor.to_string();
+                let tool_version = format!("v_{}", ToolCallId::new());
+                self.pool
+                    .collection::<Document>("tool_calls")
+                    .insert_one(doc! {
+                        "_id": id.to_string(),
+                        "round_id": round_id.to_string(),
+                        "ord": ordinal as i64,
+                        "tool_name": &request.name,
+                        "schema_version": SCHEMA_VERSION,
+                        "input_json": &input_json,
+                        "status": "requested",
+                        "actor_json": &actor_json,
+                        "provider_call_id": &request.id,
+                        "version": &tool_version,
+                    })
+                    .session(&mut *work.connection())
+                    .await?;
                 id
             };
             persisted_calls.push(AcceptedToolCall {
@@ -1109,17 +1159,37 @@ impl ExecutionInterface {
             return Ok(());
         }
         // Idempotent: a retried failure path can try to persist the same
-        // round's partial output twice.
-        let already: Option<String> = sqlx::query_scalar(
-            "SELECT source_resource_id FROM timeline_items \
-             WHERE session_id = ? AND turn_id = ? AND kind = 'assistant_message' \
-               AND json_extract(projection_json, '$.round_id') = ? AND status = 'active'",
-        )
-        .bind(session_id.to_string())
-        .bind(turn_id.to_string())
-        .bind(round_id.to_string())
-        .fetch_optional(work.connection())
-        .await?;
+        // round's partial output twice. The projection JSON is parsed here
+        // because `timeline_items` is owned by the Sessions capability.
+        let round_id_str = round_id.to_string();
+        let mut timeline = self
+            .pool
+            .collection::<Document>("timeline_items")
+            .find(doc! {
+                "session_id": session_id.to_string(),
+                "turn_id": turn_id.to_string(),
+                "kind": "assistant_message",
+                "status": "active",
+            })
+            .session(&mut *work.connection())
+            .await?;
+        let mut already = None;
+        while let Some(document) = timeline.next(&mut *work.connection()).await.transpose()? {
+            let projection: Value = document
+                .get("projection_json")
+                .and_then(Bson::as_str)
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| ExecutionError::Internal(anyhow::anyhow!(error)))?
+                .unwrap_or(json!({}));
+            if projection.get("round_id").and_then(Value::as_str) == Some(round_id_str.as_str()) {
+                already = document
+                    .get_str("source_resource_id")
+                    .ok()
+                    .map(str::to_owned);
+                break;
+            }
+        }
         if already.is_some() {
             return Ok(());
         }
@@ -1179,18 +1249,28 @@ impl ExecutionInterface {
         {
             return Ok(());
         }
-        let changed = sqlx::query(
-            "UPDATE rounds SET status = 'failed', stop_reason = ?, output_summary_json = ?, \
-              updated_at = ? WHERE id = ? AND status = 'running' AND turn_id = ?",
-        )
-        .bind("error")
-        .bind(json!({"error": detail}).to_string())
-        .bind(&now)
-        .bind(round_id.to_string())
-        .bind(turn_id.to_string())
-        .execute(work.connection())
-        .await?;
-        if changed.rows_affected() != 1 {
+        let output_json = json!({"error": detail}).to_string();
+        let changed = self
+            .pool
+            .collection::<Document>("rounds")
+            .update_one(
+                doc! {
+                    "_id": round_id.to_string(),
+                    "status": "running",
+                    "turn_id": turn_id.to_string(),
+                },
+                doc! {
+                    "$set": {
+                        "status": "failed",
+                        "stop_reason": "error",
+                        "output_summary_json": &output_json,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await?;
+        if changed.matched_count != 1 {
             return Ok(());
         }
         work.append_event(NewEvent {
@@ -1250,21 +1330,37 @@ impl ExecutionInterface {
         attach_tool_display(&accepted.request.name, &input, &mut outcome);
         let summary = outcome.summary;
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query(
-            "UPDATE tool_calls SET status = 'canceled', result_summary_json = ?, error_code = ?, \
-              ended_at = ?, version = ? \
-             WHERE id = ? AND status = 'requested' \
-               AND round_id IN (SELECT id FROM rounds WHERE turn_id = ?)",
-        )
-        .bind(summary.to_string())
-        .bind("TOOL_SKIPPED_AFTER_BLOCK")
-        .bind(&now)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .bind(accepted.id.to_string())
-        .bind(turn_id.to_string())
-        .execute(work.connection())
-        .await?;
-        if changed.rows_affected() == 1 {
+        let round_ids = self
+            .round_ids_for_turns_in_tx(work.connection(), &[turn_id])
+            .await?;
+        let round_ids_str = round_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        let summary_json = summary.to_string();
+        let tool_version = format!("v_{}", ToolCallId::new());
+        let changed = self
+            .pool
+            .collection::<Document>("tool_calls")
+            .update_one(
+                doc! {
+                    "_id": accepted.id.to_string(),
+                    "status": "requested",
+                    "round_id": {"$in": round_ids_str},
+                },
+                doc! {
+                    "$set": {
+                        "status": "canceled",
+                        "result_summary_json": &summary_json,
+                        "error_code": "TOOL_SKIPPED_AFTER_BLOCK",
+                        "ended_at": &now,
+                        "version": &tool_version,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await?;
+        if changed.matched_count == 1 {
             let (_, timeline_item_id, _) = self
                 .sessions
                 .append_tool_result_in_tx(
@@ -1312,15 +1408,36 @@ impl ExecutionInterface {
         &self,
         turn_id: TurnId,
     ) -> Result<HashSet<String>, ExecutionError> {
-        let paths: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT json_extract(tc.input_json, '$.path') FROM tool_calls tc \
-             JOIN rounds r ON r.id = tc.round_id \
-             WHERE r.turn_id = ? AND tc.tool_name = 'read' AND tc.status = 'succeeded'",
-        )
-        .bind(turn_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(paths.into_iter().flatten().collect())
+        let mut round_cursor = self
+            .pool
+            .collection::<Document>("rounds")
+            .find(doc! {"turn_id": turn_id.to_string()})
+            .await?;
+        let mut round_ids = Vec::new();
+        while let Some(document) = round_cursor.try_next().await? {
+            round_ids.push(document.get_str("_id")?.to_owned());
+        }
+        let mut cursor = self
+            .pool
+            .collection::<Document>("tool_calls")
+            .find(doc! {
+                "round_id": {"$in": round_ids},
+                "tool_name": "read",
+                "status": "succeeded",
+            })
+            .await?;
+        let mut paths = HashSet::new();
+        while let Some(document) = cursor.try_next().await? {
+            let input_json = document
+                .get("input_json")
+                .and_then(Bson::as_str)
+                .unwrap_or("{}");
+            let input: Value = serde_json::from_str(input_json).unwrap_or_else(|_| json!({}));
+            if let Some(path) = input.get("path").and_then(Value::as_str) {
+                paths.insert(path.to_owned());
+            }
+        }
+        Ok(paths)
     }
 
     async fn run_one_tool(
@@ -1355,18 +1472,34 @@ impl ExecutionInterface {
             work.rollback().await?;
             return Ok(None);
         }
-        let started = sqlx::query(
-            "UPDATE tool_calls SET status = 'running', started_at = ?, version = ? \
-             WHERE id = ? AND status = 'requested' \
-               AND round_id IN (SELECT id FROM rounds WHERE turn_id = ?)",
-        )
-        .bind(&now)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .bind(accepted.id.to_string())
-        .bind(turn_id.to_string())
-        .execute(work.connection())
-        .await?;
-        if started.rows_affected() != 1 {
+        let round_ids = self
+            .round_ids_for_turns_in_tx(work.connection(), &[turn_id])
+            .await?;
+        let round_ids_str = round_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        let tool_version = format!("v_{}", ToolCallId::new());
+        let started = self
+            .pool
+            .collection::<Document>("tool_calls")
+            .update_one(
+                doc! {
+                    "_id": accepted.id.to_string(),
+                    "status": "requested",
+                    "round_id": {"$in": round_ids_str},
+                },
+                doc! {
+                    "$set": {
+                        "status": "running",
+                        "started_at": &now,
+                        "version": &tool_version,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await?;
+        if started.matched_count != 1 {
             work.rollback().await?;
             return Ok(None);
         }
@@ -1464,19 +1597,29 @@ impl ExecutionInterface {
         let (message, durable_parts) = tool_result_message(&outcome, &accepted.request.id);
         let status = outcome.disposition.as_str();
         let ended_at = Some(ended.as_str());
-        let finalized = sqlx::query(
-            "UPDATE tool_calls SET status = ?, result_summary_json = ?, error_code = ?, \
-              ended_at = ?, version = ? WHERE id = ? AND status = 'running'",
-        )
-        .bind(status)
-        .bind(outcome.summary.to_string())
-        .bind(&outcome.error_code)
-        .bind(ended_at)
-        .bind(format!("v_{}", ToolCallId::new()))
-        .bind(accepted.id.to_string())
-        .execute(work.connection())
-        .await?;
-        if finalized.rows_affected() != 1 {
+        let outcome_summary = outcome.summary.to_string();
+        let tool_version = format!("v_{}", ToolCallId::new());
+        let mut final_set = doc! {
+            "status": status,
+            "result_summary_json": &outcome_summary,
+            "version": &tool_version,
+        };
+        if let Some(ended_at) = ended_at {
+            final_set.insert("ended_at", ended_at);
+        }
+        if let Some(error_code) = outcome.error_code.as_deref() {
+            final_set.insert("error_code", error_code);
+        }
+        let finalized = self
+            .pool
+            .collection::<Document>("tool_calls")
+            .update_one(
+                doc! {"_id": accepted.id.to_string(), "status": "running"},
+                doc! {"$set": final_set},
+            )
+            .session(&mut *work.connection())
+            .await?;
+        if finalized.matched_count != 1 {
             work.rollback().await?;
             return Ok(None);
         }
@@ -1528,26 +1671,41 @@ impl ExecutionInterface {
         let now = now_utc_str();
         let summary_value = serde_json::to_value(&summary)?;
         let mut work = self.unit_of_work.begin().await?;
-        let unfinished_calls: i64 = sqlx::query_scalar(
-            "SELECT COUNT(1) FROM tool_calls AS call \
-             JOIN rounds AS round ON round.id = call.round_id \
-             WHERE round.turn_id = ? AND call.status IN ('requested', 'running')",
-        )
-        .bind(turn_id.to_string())
-        .fetch_one(work.connection())
-        .await?;
+        let round_ids = self
+            .round_ids_for_turns_in_tx(work.connection(), &[turn_id])
+            .await?;
+        let round_ids_str = round_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        let unfinished_calls = self
+            .pool
+            .collection::<Document>("tool_calls")
+            .count_documents(doc! {
+                "round_id": {"$in": round_ids_str},
+                "status": {"$in": ["requested", "running"]},
+            })
+            .session(&mut *work.connection())
+            .await?;
         if unfinished_calls > 0 {
             return Err(ExecutionError::Internal(anyhow::anyhow!(
                 "Turn completion attempted with unfinished Tool Calls"
             )));
         }
-        let (input_tokens, output_tokens): (i64, i64) = sqlx::query_as(
-            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) \
-             FROM rounds WHERE turn_id = ? AND status = 'succeeded'",
-        )
-        .bind(turn_id.to_string())
-        .fetch_one(work.connection())
-        .await?;
+        let mut sum_cursor = self
+            .pool
+            .collection::<Document>("rounds")
+            .find(doc! {"turn_id": turn_id.to_string(), "status": "succeeded"})
+            .session(&mut *work.connection())
+            .await?;
+        let mut input_tokens = 0i64;
+        let mut output_tokens = 0i64;
+        while let Some(document) = sum_cursor.next(&mut *work.connection()).await.transpose()? {
+            input_tokens =
+                input_tokens.saturating_add(document.get_i64("input_tokens").unwrap_or(0));
+            output_tokens =
+                output_tokens.saturating_add(document.get_i64("output_tokens").unwrap_or(0));
+        }
         let transition = self
             .sessions
             .settle_active_turn_in_tx(

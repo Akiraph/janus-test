@@ -1,5 +1,5 @@
 name = "notifications"
 public_root = "interface.rs"
-owned_tables = ["notification_channels"]
+owned_collections = ["notification_channels"]
 publishes = ["notification_channel.changed"]
 allowed_module_dependencies = []

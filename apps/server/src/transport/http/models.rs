@@ -110,7 +110,10 @@ fn problem(error: ModelsError) -> Problem {
             "Resource not found",
             error.to_string(),
         ),
-        ModelsError::Storage(_) | ModelsError::Data(_) | ModelsError::Internal(_) => Problem::new(
+        ModelsError::Storage(_)
+        | ModelsError::Data(_)
+        | ModelsError::Internal(_)
+        | ModelsError::ValueAccess(_) => Problem::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
             "Internal server error",

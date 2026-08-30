@@ -1,22 +1,19 @@
-use std::{fs::OpenOptions, path::Path, str::FromStr, time::Duration};
+use std::{fs::OpenOptions, path::Path};
 
 use anyhow::{Context, bail};
 use fs2::FileExt;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-};
+use mongodb::bson::{Document, doc};
+
+use crate::schema::{COLLECTIONS, INDEXLESS_COLLECTIONS, SCHEMA_VERSION, index_specs};
 
 pub struct Database {
-    pool: SqlitePool,
+    client: mongodb::Client,
+    database: mongodb::Database,
     _data_root_lock: std::fs::File,
 }
 
 impl Database {
-    pub async fn open(
-        data_root: &Path,
-        migrator: &sqlx::migrate::Migrator,
-    ) -> anyhow::Result<Self> {
+    pub async fn open(data_root: &Path, uri: &str, database_name: &str) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_root)
             .with_context(|| format!("create data root {}", data_root.display()))?;
         let lock_path = data_root.join("janus.lock");
@@ -31,45 +28,78 @@ impl Database {
             bail!("data root is already in use: {}", data_root.display());
         }
 
-        let database_path = data_root.join("janus.db");
-        let options = SqliteConnectOptions::from_str(&database_path.to_string_lossy())?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(options)
+        let client = mongodb::Client::with_uri_str(uri)
             .await
-            .with_context(|| format!("open SQLite database {}", database_path.display()))?;
-        migrator
-            .run(&pool)
+            .with_context(|| format!("connect to MongoDB at {uri}"))?;
+        let database = client.database(database_name);
+
+        // `create_indexes` implicitly materializes an indexed collection, but an
+        // index-less collection never would, so create those explicitly first.
+        for name in INDEXLESS_COLLECTIONS {
+            let exists = database
+                .list_collection_names()
+                .await?
+                .iter()
+                .any(|existing| existing == name);
+            if !exists {
+                database
+                    .create_collection(*name)
+                    .await
+                    .with_context(|| format!("create collection {name}"))?;
+            }
+        }
+        for (name, models) in index_specs() {
+            database
+                .collection::<Document>(name)
+                .create_indexes(models)
+                .await
+                .with_context(|| format!("create indexes on {name}"))?;
+        }
+        // Seed the event cursor counter so the first append is deterministic.
+        database
+            .collection::<Document>("event_seq")
+            .update_one(
+                doc! {"_id": "global"},
+                doc! {"$setOnInsert": {"value": 0i64}},
+            )
+            .upsert(true)
             .await
-            .context("run global database migrations")?;
+            .context("seed event cursor counter")?;
 
         Ok(Self {
-            pool,
+            client,
+            database,
             _data_root_lock: lock,
         })
     }
 
-    pub const fn pool(&self) -> &SqlitePool {
-        &self.pool
+    pub fn client(&self) -> &mongodb::Client {
+        &self.client
+    }
+
+    pub const fn pool(&self) -> &mongodb::Database {
+        &self.database
+    }
+
+    /// Convenience handle for a collection; collection names are inline
+    /// literals at every call site so the xtask ownership pass can find them.
+    pub fn collection(&self, name: &str) -> mongodb::Collection<Document> {
+        self.database.collection::<Document>(name)
+    }
+
+    /// All collections this schema knows about, for startup sanity checks.
+    pub fn known_collections() -> Vec<String> {
+        COLLECTIONS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
     }
 
     pub async fn schema_version(&self) -> anyhow::Result<i64> {
-        let version = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT MAX(version) FROM _sqlx_migrations WHERE success = 1",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(version.unwrap_or(0))
+        Ok(SCHEMA_VERSION)
     }
 
     pub async fn ready(&self) -> bool {
-        sqlx::query_scalar::<_, i64>("SELECT 1")
-            .fetch_one(&self.pool)
-            .await
-            .is_ok()
+        self.database.run_command(doc! {"ping": 1}).await.is_ok()
     }
 }

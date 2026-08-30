@@ -13,9 +13,12 @@ use janus_models::interface::{
     ChatMessage, ChatRole, ContentPart, ModelClient, ModelRequest, ModelStreamEvent,
     ModelsInterface, ProviderInput, ProviderKind,
 };
+use mongodb::bson::{Bson, Document, doc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct FixtureState {
     last_auth: Mutex<Option<String>>,
@@ -106,15 +109,23 @@ async fn spawn_fixture(mode: &str) -> anyhow::Result<(SocketAddr, Arc<FixtureSta
 }
 
 async fn models_with_root(temp: &TempDir) -> anyhow::Result<(Database, ModelsInterface, String)> {
-    let database = Database::open(temp.path(), janus_server::migrator()).await?;
+    let uri = std::env::var("JANUS_MONGODB_URI")
+        .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into());
+    let database_name = format!(
+        "janus_test_{}_{}",
+        std::process::id(),
+        TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let database = Database::open(temp.path(), &uri, &database_name).await?;
     let pool = database.pool().clone();
     let now = "2026-01-01T00:00:00.000Z";
     let owner_id = "owner-test";
-    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
-        .bind(owner_id)
-        .bind("Test Owner")
-        .bind(now)
-        .execute(&pool)
+    pool.collection::<Document>("owners")
+        .insert_one(doc! {
+            "_id": owner_id,
+            "display_name": "Test Owner",
+            "created_at": now,
+        })
         .await?;
     let cipher = SecretCipher::load(temp.path(), false)?;
     let events = EventStore::new(pool.clone());
@@ -219,20 +230,29 @@ async fn openai_chat_stream() -> anyhow::Result<()> {
     }
 
     // Attempt + ledger rows.
-    let attempts: i64 =
-        sqlx::query_scalar("SELECT COUNT(1) FROM model_attempts WHERE status = 'succeeded'")
-            .fetch_one(_db.pool())
-            .await?;
+    let attempts = _db
+        .pool()
+        .collection::<Document>("model_attempts")
+        .count_documents(doc! {"status": "succeeded"})
+        .await?;
     assert_eq!(attempts, 1);
-    let ledger: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM model_usage_ledger")
-        .fetch_one(_db.pool())
+    let ledger = _db
+        .pool()
+        .collection::<Document>("model_usage_ledger")
+        .count_documents(doc! {})
         .await?;
     assert_eq!(ledger, 1);
-    let ledger_usage: (i64, i64, i64) = sqlx::query_as(
-        "SELECT input_tokens, output_tokens, cache_tokens FROM model_usage_ledger LIMIT 1",
-    )
-    .fetch_one(_db.pool())
-    .await?;
+    let ledger_doc = _db
+        .pool()
+        .collection::<Document>("model_usage_ledger")
+        .find_one(doc! {})
+        .await?
+        .expect("ledger row");
+    let ledger_usage = (
+        ledger_doc.get_i64("input_tokens")?,
+        ledger_doc.get_i64("output_tokens")?,
+        ledger_doc.get_i64("cache_tokens")?,
+    );
     assert_eq!(ledger_usage, (2, 2, 1));
 
     Ok(())
@@ -348,24 +368,32 @@ async fn failed_attempt_has_no_completed_output() -> anyhow::Result<()> {
         }) if code == "PROVIDER_AUTH_FAILED"
     ));
 
-    let failed: i64 =
-        sqlx::query_scalar("SELECT COUNT(1) FROM model_attempts WHERE status = 'failed'")
-            .fetch_one(_db.pool())
-            .await?;
+    let failed = _db
+        .pool()
+        .collection::<Document>("model_attempts")
+        .count_documents(doc! {"status": "failed"})
+        .await?;
     assert_eq!(failed, 1);
     // No usage reported → no ledger row.
-    let ledger: i64 = sqlx::query_scalar("SELECT COUNT(1) FROM model_usage_ledger")
-        .fetch_one(_db.pool())
+    let ledger = _db
+        .pool()
+        .collection::<Document>("model_usage_ledger")
+        .count_documents(doc! {})
         .await?;
     assert_eq!(ledger, 0);
 
     // The upstream error message is surfaced (sanitized of secrets), but the
     // raw API key must never appear in the stored error detail.
-    let err: Option<String> =
-        sqlx::query_scalar("SELECT normalized_error_json FROM model_attempts LIMIT 1")
-            .fetch_one(_db.pool())
-            .await?;
-    let err = err.unwrap_or_default();
+    let err = _db
+        .pool()
+        .collection::<Document>("model_attempts")
+        .find_one(doc! {})
+        .await?
+        .expect("attempt row")
+        .get("normalized_error_json")
+        .and_then(Bson::as_str)
+        .unwrap_or_default()
+        .to_owned();
     assert!(
         !err.contains("sk-bad"),
         "secret leaked into error detail: {err}"

@@ -25,10 +25,13 @@ use janus_server::{
     AppState,
     config::{Config, RunMode},
 };
+use mongodb::bson::{Document, doc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const NOW: &str = "2026-08-19T00:00:00.000Z";
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -44,6 +47,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -77,69 +87,86 @@ async fn seed_session_with_timeline(state: &AppState) -> anyhow::Result<SessionI
     let pool = state.pool();
     let project_id = ProjectId::new();
     let session_id = SessionId::new();
-    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES ('owner', 'Owner', ?)")
-        .bind(NOW)
-        .execute(pool)
+    pool.collection::<Document>("owners")
+        .insert_one(doc! {
+            "_id": "owner",
+            "display_name": "Owner",
+            "created_at": NOW,
+        })
         .await?;
-    sqlx::query(
-        "INSERT INTO projects \
-         (id, owner_id, name, state, repo_access, repo_url, version, \
-          created_at, updated_at, last_activity_at) \
-         VALUES (?, 'owner', 'Compact Fixture', 'ready', 'public_https', \
-                 'https://example.com/repo.git', 'v1', ?, ?, ?)",
-    )
-    .bind(project_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO sessions \
-         (id, project_id, title, state, active_turn_id, version, created_at, updated_at, \
-          last_activity_at) \
-         VALUES (?, ?, 'Compact me', 'ready', NULL, 'v_session', ?, ?, ?)",
-    )
-    .bind(session_id.to_string())
-    .bind(project_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
+    pool.collection::<Document>("projects")
+        .insert_one(doc! {
+            "_id": project_id.to_string(),
+            "owner_id": "owner",
+            "name": "Compact Fixture",
+            "state": "ready",
+            "repo_access": "public_https",
+            "repo_url": "https://example.com/repo.git",
+            "repo_branch": null,
+            "github_credential_id": null,
+            "default_model_id": null,
+            "main_workspace_handle": null,
+            "clone_error": null,
+            "version": "v1",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
+    pool.collection::<Document>("sessions")
+        .insert_one(doc! {
+            "_id": session_id.to_string(),
+            "project_id": project_id.to_string(),
+            "title": "Compact me",
+            "state": "ready",
+            "next_model_ref": null,
+            "active_turn_id": null,
+            "version": "v_session",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
 
     // A minimal user/assistant exchange on the visible timeline.
-    sqlx::query(
-        "INSERT INTO timeline_items \
-         (id, session_id, turn_id, kind, source_resource_id, display_order, projection_json, \
-          status, version, created_at, updated_at) \
-         VALUES \
-           ('tl-user-1', ?, NULL, 'user_message', 'msg-user-1', 1, ?, 'active', 'v1', ?, ?), \
-           ('tl-assistant-1', ?, NULL, 'assistant_message', 'msg-assistant-1', 2, ?, 'active', \
-            'v1', ?, ?)",
-    )
-    .bind(session_id.to_string())
-    .bind(
-        json!({
+    pool.collection::<Document>("timeline_items")
+        .insert_one(doc! {
+            "_id": "tl-user-1",
+            "session_id": session_id.to_string(),
+            "turn_id": null,
             "kind": "user_message",
-            "text": "Fix the login bug in auth.rs and run the tests.",
+            "source_resource_id": "msg-user-1",
+            "display_order": 1i64,
+            "projection_json": json!({
+                "kind": "user_message",
+                "text": "Fix the login bug in auth.rs and run the tests.",
+            })
+            .to_string(),
+            "status": "active",
+            "version": "v1",
+            "created_at": NOW,
+            "updated_at": NOW,
         })
-        .to_string(),
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .bind(session_id.to_string())
-    .bind(
-        json!({
+        .await?;
+    pool.collection::<Document>("timeline_items")
+        .insert_one(doc! {
+            "_id": "tl-assistant-1",
+            "session_id": session_id.to_string(),
+            "turn_id": null,
             "kind": "assistant_message",
-            "text": "Fixed auth.rs and ran cargo test: 18 passed.",
+            "source_resource_id": "msg-assistant-1",
+            "display_order": 2i64,
+            "projection_json": json!({
+                "kind": "assistant_message",
+                "text": "Fixed auth.rs and ran cargo test: 18 passed.",
+            })
+            .to_string(),
+            "status": "active",
+            "version": "v1",
+            "created_at": NOW,
+            "updated_at": NOW,
         })
-        .to_string(),
-    )
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
+        .await?;
     Ok(session_id)
 }
 
@@ -210,28 +237,38 @@ async fn compact_generates_a_model_summary_with_real_tokens() -> anyhow::Result<
             "compact-fixture",
         )
         .await?;
-    let model_id: String = sqlx::query_scalar(
-        "SELECT id FROM models WHERE provider_id = ? ORDER BY created_at LIMIT 1",
-    )
-    .bind(&provider.id)
-    .fetch_one(state.pool())
-    .await?;
-    sqlx::query("UPDATE projects SET default_model_id = ? WHERE owner_id = 'owner'")
-        .bind(&model_id)
-        .execute(state.pool())
+    let model_id: String = {
+        let model = state
+            .pool()
+            .collection::<Document>("models")
+            .find_one(doc! {"provider_id": &provider.id})
+            .sort(doc! {"created_at": 1})
+            .await?
+            .expect("fixture model should be persisted");
+        model.get_str("_id")?.to_owned()
+    };
+    state
+        .pool()
+        .collection::<Document>("projects")
+        .update_one(
+            doc! {"owner_id": "owner"},
+            doc! {"$set": {"default_model_id": &model_id}},
+        )
         .await?;
 
     request_compact(&state, session_id).await?;
 
     // The compact summary row now carries the model's text and real usage.
-    let (summary_json, input_tokens, output_tokens, attempt_id): (String, i64, i64, String) =
-        sqlx::query_as(
-            "SELECT summary_json, input_tokens, output_tokens, model_attempt_id \
-             FROM compact_summaries WHERE session_id = ?",
-        )
-        .bind(session_id.to_string())
-        .fetch_one(state.pool())
-        .await?;
+    let summary_doc = state
+        .pool()
+        .collection::<Document>("compact_summaries")
+        .find_one(doc! {"session_id": session_id.to_string()})
+        .await?
+        .expect("compact summary should be persisted");
+    let summary_json = summary_doc.get_str("summary_json")?.to_owned();
+    let input_tokens = summary_doc.get_i64("input_tokens")?;
+    let output_tokens = summary_doc.get_i64("output_tokens")?;
+    let attempt_id = summary_doc.get_str("model_attempt_id")?.to_owned();
     let summary: Value = serde_json::from_str(&summary_json)?;
     assert_eq!(
         summary["text"].as_str().expect("model summary text"),
@@ -243,32 +280,38 @@ async fn compact_generates_a_model_summary_with_real_tokens() -> anyhow::Result<
     assert!(summary.get("timeline_digest").is_none());
 
     // The attempt ledger row is tagged as a compact attempt.
-    let attempt_type: String =
-        sqlx::query_scalar("SELECT attempt_type FROM model_attempts WHERE id = ?")
-            .bind(&attempt_id)
-            .fetch_one(state.pool())
-            .await?;
+    let attempt_type: String = state
+        .pool()
+        .collection::<Document>("model_attempts")
+        .find_one(doc! {"_id": &attempt_id})
+        .await?
+        .expect("compact model attempt should be persisted")
+        .get_str("attempt_type")?
+        .to_owned();
     assert_eq!(attempt_type, "compact");
 
     // The context version completed with the real token count.
-    let (status, estimated): (String, i64) = sqlx::query_as(
-        "SELECT compact_status, estimated_input_tokens FROM context_versions \
-         WHERE session_id = ? ORDER BY sequence DESC LIMIT 1",
-    )
-    .bind(session_id.to_string())
-    .fetch_one(state.pool())
-    .await?;
+    let version_doc = state
+        .pool()
+        .collection::<Document>("context_versions")
+        .find_one(doc! {"session_id": session_id.to_string()})
+        .sort(doc! {"sequence": -1})
+        .await?
+        .expect("context version should be persisted");
+    let status = version_doc.get_str("compact_status")?.to_owned();
+    let estimated = version_doc.get_i64("estimated_input_tokens")?;
     assert_eq!(status, "succeeded");
     assert_eq!(estimated, 4200);
 
     // The visible timeline item exposes the generated summary.
-    let projection: String = sqlx::query_scalar(
-        "SELECT projection_json FROM timeline_items \
-         WHERE session_id = ? AND kind = 'context_compacted'",
-    )
-    .bind(session_id.to_string())
-    .fetch_one(state.pool())
-    .await?;
+    let projection: String = state
+        .pool()
+        .collection::<Document>("timeline_items")
+        .find_one(doc! {"session_id": session_id.to_string(), "kind": "context_compacted"})
+        .await?
+        .expect("context_compacted timeline item should be persisted")
+        .get_str("projection_json")?
+        .to_owned();
     let projection: Value = serde_json::from_str(&projection)?;
     assert_eq!(
         projection["summary"]["text"]
@@ -288,14 +331,24 @@ async fn compact_without_a_model_degrades_to_the_digest() -> anyhow::Result<()> 
     // No provider configured: the compact must still complete.
     request_compact(&state, session_id).await?;
 
-    let (summary_json, status): (String, String) = sqlx::query_as(
-        "SELECT summary_json, compact_status FROM compact_summaries \
-         JOIN context_versions ON context_versions.compact_summary_id = compact_summaries.id \
-         WHERE compact_summaries.session_id = ?",
-    )
-    .bind(session_id.to_string())
-    .fetch_one(state.pool())
-    .await?;
+    let summary_doc = state
+        .pool()
+        .collection::<Document>("compact_summaries")
+        .find_one(doc! {"session_id": session_id.to_string()})
+        .await?
+        .expect("compact summary should be persisted");
+    let summary_json = summary_doc.get_str("summary_json")?.to_owned();
+    let compact_summary_id = summary_doc.get_str("_id")?.to_owned();
+    let version_doc = state
+        .pool()
+        .collection::<Document>("context_versions")
+        .find_one(doc! {
+            "session_id": session_id.to_string(),
+            "compact_summary_id": &compact_summary_id,
+        })
+        .await?
+        .expect("context version should be persisted");
+    let status = version_doc.get_str("compact_status")?.to_owned();
     let summary: Value = serde_json::from_str(&summary_json)?;
     assert_eq!(summary["summary_model_status"], "no_model_configured");
     assert_eq!(status, "succeeded");

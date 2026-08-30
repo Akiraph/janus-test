@@ -1,6 +1,6 @@
 name = "sessions"
 public_root = "interface.rs"
-owned_tables = [
+owned_collections = [
   "sessions",
   "turns",
   "messages",

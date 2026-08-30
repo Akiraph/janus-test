@@ -154,5 +154,11 @@ fn problem(error: NotificationsError) -> Problem {
             "Internal server error",
             error.to_string(),
         ),
+        NotificationsError::ValueAccess(error) => Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            codes::INTERNAL_ERROR,
+            "Internal server error",
+            error.to_string(),
+        ),
     }
 }

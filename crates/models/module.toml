@@ -1,6 +1,6 @@
 name = "models"
 public_root = "interface.rs"
-owned_tables = [
+owned_collections = [
   "model_providers",
   "models",
   "model_failover",

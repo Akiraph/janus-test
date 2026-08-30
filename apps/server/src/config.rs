@@ -1,4 +1,4 @@
-﻿use std::{env, net::IpAddr, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, net::IpAddr, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use thiserror::Error;
 
@@ -21,6 +21,11 @@ impl RunMode {
 pub struct Config {
     pub bind: SocketAddr,
     pub data_root: PathBuf,
+    /// MongoDB connection string. The server requires a replica set for
+    /// multi-document transactions (single-node replica set in development).
+    pub mongodb_uri: String,
+    /// MongoDB database name holding the Janus collections.
+    pub mongodb_database: String,
     /// Directory holding the built web client. When set, the HTTP transport
     /// serves it from the same origin as `/api` and `/health`, which is how the
     /// deployment image ships frontend and backend as one process. Unset in
@@ -55,6 +60,8 @@ pub enum ConfigError {
     InsecureProductionOrigin,
     #[error("JANUS_AUTOMATION_WEBHOOK_SECRET is required when automation webhooks are enabled")]
     AutomationWebhookSecretRequired,
+    #[error("JANUS_MONGODB_URI must be a mongodb:// or mongodb+srv:// connection string: {0}")]
+    InvalidMongodbUri(String),
 }
 
 impl Config {
@@ -101,6 +108,9 @@ impl Config {
         let config = Self {
             bind,
             data_root,
+            mongodb_uri: env::var("JANUS_MONGODB_URI")
+                .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+            mongodb_database: env::var("JANUS_MONGODB_DATABASE").unwrap_or_else(|_| "janus".into()),
             web_dist: env::var_os("JANUS_WEB_DIST")
                 .map(PathBuf::from)
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -149,6 +159,11 @@ impl Config {
         if self.automation_webhook_enabled && self.automation_webhook_secret.is_none() {
             return Err(ConfigError::AutomationWebhookSecretRequired);
         }
+        if !self.mongodb_uri.starts_with("mongodb://")
+            && !self.mongodb_uri.starts_with("mongodb+srv://")
+        {
+            return Err(ConfigError::InvalidMongodbUri(self.mongodb_uri.clone()));
+        }
         Ok(())
     }
 }
@@ -171,6 +186,8 @@ mod tests {
         let config = Config {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             data_root: PathBuf::from("unused"),
+            mongodb_uri: "mongodb://localhost:27017/?replicaSet=rs0".into(),
+            mongodb_database: "janus_test".into(),
             web_dist: None,
             mode: RunMode::Production,
             development_auth: true,

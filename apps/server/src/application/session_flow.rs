@@ -72,9 +72,13 @@ impl Application {
         let now = now_utc_str();
         let mut work = self.unit_of_work().begin().await?;
         if let Some(request) = idempotency.as_ref()
-            && let Some(response) = command_idempotency::lookup_in_tx(work.connection(), request)
-                .await
-                .map_err(SessionsError::Internal)?
+            && let Some(response) = command_idempotency::lookup_in_tx(
+                self.unit_of_work().pool(),
+                work.connection(),
+                request,
+            )
+            .await
+            .map_err(SessionsError::Internal)?
         {
             return serde_json::from_value(response).map_err(SessionsError::Serde);
         }
@@ -110,9 +114,14 @@ impl Application {
         }
         if let Some(request) = idempotency.as_ref() {
             let response = serde_json::to_value(&result)?;
-            command_idempotency::record_in_tx(work.connection(), request, &response)
-                .await
-                .map_err(SessionsError::Internal)?;
+            command_idempotency::record_in_tx(
+                self.unit_of_work().pool(),
+                work.connection(),
+                request,
+                &response,
+            )
+            .await
+            .map_err(SessionsError::Internal)?;
         }
         work.commit().await?;
         if let Some(turn_id) = scheduled_turn {
@@ -154,7 +163,7 @@ impl Application {
 
     async fn route_session_input_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         input: SessionInput<'_>,
     ) -> Result<MessageRouteResult, SessionsError> {
         let SessionInput {
@@ -298,7 +307,7 @@ impl Application {
     /// never rewrite a name the user may have set manually.
     async fn maybe_derive_session_title_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         session_id: SessionId,
         created_turn_id: &str,
         content: &str,

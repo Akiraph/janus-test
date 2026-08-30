@@ -4,14 +4,16 @@
 //! collection. Only objects with no logical reference can reach `trash`.
 
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use crate::clock::{format_utc, now_utc, now_utc_str};
 use anyhow::Context;
+use futures_util::TryStreamExt;
+use mongodb::bson::{Document, doc};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt;
 
 use crate::{id::BlobSha, random_hex_token};
@@ -37,14 +39,14 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 
 #[derive(Clone)]
 pub struct BlobStore {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     objects_root: PathBuf,
     incoming_root: PathBuf,
     storage_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BlobStore {
-    pub fn new(pool: SqlitePool, data_root: &Path) -> anyhow::Result<Self> {
+    pub fn new(pool: mongodb::Database, data_root: &Path) -> anyhow::Result<Self> {
         let objects_root = data_root.join("objects");
         let incoming_root = objects_root.join("incoming");
         std::fs::create_dir_all(&objects_root)
@@ -116,13 +118,14 @@ impl BlobStore {
 
     /// Verify a present object's stored length matches the recorded size.
     pub async fn verify_length(&self, sha: &str, expected: usize) -> anyhow::Result<()> {
-        let row =
-            sqlx::query_scalar::<_, i64>("SELECT byte_size FROM blob_objects WHERE sha256 = ?")
-                .bind(sha)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some(recorded) => {
+        let document = self
+            .pool
+            .collection::<Document>("blob_objects")
+            .find_one(doc! {"_id": sha})
+            .await?;
+        match document {
+            Some(document) => {
+                let recorded = document.get_i64("byte_size")?;
                 if usize::try_from(recorded)? == expected {
                     Ok(())
                 } else {
@@ -136,14 +139,20 @@ impl BlobStore {
                 let meta = tokio::fs::metadata(&path).await?;
                 let size = i64::try_from(meta.len())?;
                 let now = now_utc_str();
-                sqlx::query(
-                    "INSERT OR IGNORE INTO blob_objects (sha256, byte_size, storage_state, first_written_at) VALUES (?, ?, 'present', ?)",
-                )
-                .bind(sha)
-                .bind(size)
-                .bind(&now)
-                .execute(&self.pool)
-                .await?;
+                self.pool
+                    .collection::<Document>("blob_objects")
+                    .update_one(
+                        doc! {"_id": sha},
+                        doc! {
+                            "$setOnInsert": {
+                                "byte_size": size,
+                                "storage_state": "present",
+                                "first_written_at": &now,
+                            }
+                        },
+                    )
+                    .upsert(true)
+                    .await?;
                 Ok(())
             }
         }
@@ -155,40 +164,57 @@ impl BlobStore {
         size: usize,
         reference: BlobReference,
     ) -> anyhow::Result<()> {
+        let size = i64::try_from(size)?;
         let now = now_utc_str();
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO blob_objects (sha256, byte_size, storage_state, first_written_at) VALUES (?, ?, 'present', ?)",
-        )
-        .bind(sha)
-        .bind(i64::try_from(size)?)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("INSERT OR IGNORE INTO blob_references (owner_module, owner_type, owner_id, purpose, blob_sha, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(reference.owner_module)
-            .bind(reference.owner_type)
-            .bind(reference.owner_id.as_str())
-            .bind(reference.purpose)
-            .bind(sha)
-            .bind(&now)
-            .execute(&mut *tx)
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        self.pool
+            .collection::<Document>("blob_objects")
+            .update_one(
+                doc! {"_id": sha},
+                doc! {
+                    "$setOnInsert": {
+                        "byte_size": size,
+                        "storage_state": "present",
+                        "first_written_at": &now,
+                    }
+                },
+            )
+            .upsert(true)
+            .session(&mut session)
             .await?;
-        tx.commit().await?;
+        self.pool
+            .collection::<Document>("blob_references")
+            .update_one(
+                doc! {
+                    "owner_module": reference.owner_module,
+                    "owner_type": reference.owner_type,
+                    "owner_id": reference.owner_id.as_str(),
+                    "purpose": reference.purpose,
+                },
+                doc! {"$setOnInsert": {"blob_sha": sha, "created_at": &now}},
+            )
+            .upsert(true)
+            .session(&mut session)
+            .await?;
+        session.commit_transaction().await?;
         Ok(())
     }
 
     /// Remove a single logical reference. Returns true if the reference existed.
     pub async fn drop_reference(&self, reference: &BlobReference) -> anyhow::Result<bool> {
-        let result = sqlx::query("DELETE FROM blob_references WHERE owner_module = ? AND owner_type = ? AND owner_id = ? AND purpose = ?")
-            .bind(reference.owner_module)
-            .bind(reference.owner_type)
-            .bind(reference.owner_id.as_str())
-            .bind(reference.purpose)
-            .execute(&self.pool)
+        let result = self
+            .pool
+            .collection::<Document>("blob_references")
+            .delete_one(doc! {
+                "owner_module": reference.owner_module,
+                "owner_type": reference.owner_type,
+                "owner_id": reference.owner_id.as_str(),
+                "purpose": reference.purpose,
+            })
             .await;
         match result {
-            Ok(result) => Ok(result.rows_affected() > 0),
+            Ok(result) => Ok(result.deleted_count > 0),
             Err(error) => {
                 self.enqueue_cleanup(reference, &error.to_string()).await?;
                 Err(error.into())
@@ -201,55 +227,57 @@ impl BlobStore {
     /// database outage cannot silently accumulate ownership drift.
     pub async fn recover_cleanup(&self) -> anyhow::Result<usize> {
         let now = now_utc_str();
-        let rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
-            "SELECT id, owner_module, owner_type, owner_id, purpose \
-             FROM blob_cleanup_intents WHERE next_attempt_at <= ? \
-             ORDER BY next_attempt_at, updated_at, id",
-        )
-        .bind(&now)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("blob_cleanup_intents")
+            .find(doc! {"next_attempt_at": {"$lte": &now}})
+            .sort(doc! {"next_attempt_at": 1, "updated_at": 1, "_id": 1})
+            .await?;
         let mut recovered = 0;
-        for (id, owner_module, owner_type, owner_id, purpose) in rows {
-            match sqlx::query(
-                "DELETE FROM blob_references WHERE owner_module = ? AND owner_type = ? AND owner_id = ? AND purpose = ?",
-            )
-            .bind(&owner_module)
-            .bind(&owner_type)
-            .bind(&owner_id)
-            .bind(&purpose)
-            .execute(&self.pool)
-            .await
+        while let Some(document) = cursor.try_next().await? {
+            let id = document.get_str("_id")?.to_owned();
+            let owner_module = document.get_str("owner_module")?;
+            let owner_type = document.get_str("owner_type")?;
+            let owner_id = document.get_str("owner_id")?;
+            let purpose = document.get_str("purpose")?;
+            match self
+                .pool
+                .collection::<Document>("blob_references")
+                .delete_one(doc! {
+                    "owner_module": owner_module,
+                    "owner_type": owner_type,
+                    "owner_id": owner_id,
+                    "purpose": purpose,
+                })
+                .await
             {
                 Ok(_) => {
-                    sqlx::query("DELETE FROM blob_cleanup_intents WHERE id = ?")
-                        .bind(&id)
-                        .execute(&self.pool)
+                    self.pool
+                        .collection::<Document>("blob_cleanup_intents")
+                        .delete_one(doc! {"_id": &id})
                         .await?;
                     recovered += 1;
                 }
                 Err(error) => {
-                    let attempts: i64 = sqlx::query_scalar(
-                        "SELECT attempts FROM blob_cleanup_intents WHERE id = ?",
-                    )
-                    .bind(&id)
-                    .fetch_one(&self.pool)
-                    .await?;
+                    let attempts = document.get_i64("attempts").unwrap_or(0);
                     let next_attempt = format_utc(
                         now_utc() + chrono::Duration::seconds((1_i64 << attempts.min(6)).min(60)),
                     );
-                    sqlx::query(
-                        "UPDATE blob_cleanup_intents SET attempts = attempts + 1, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
-                    )
-                    .bind(next_attempt)
-                    .bind(error.to_string())
-                    .bind(now_utc_str())
-                    .bind(&id)
-                    .execute(&self.pool)
-                    .await?;
-                    return Err(anyhow::anyhow!(
-                        "blob cleanup intent {id} failed: {error}"
-                    ));
+                    self.pool
+                        .collection::<Document>("blob_cleanup_intents")
+                        .update_one(
+                            doc! {"_id": &id},
+                            doc! {
+                                "$inc": {"attempts": 1i64},
+                                "$set": {
+                                    "next_attempt_at": next_attempt,
+                                    "last_error": error.to_string(),
+                                    "updated_at": now_utc_str(),
+                                }
+                            },
+                        )
+                        .await?;
+                    return Err(anyhow::anyhow!("blob cleanup intent {id} failed: {error}"));
                 }
             }
         }
@@ -262,37 +290,51 @@ impl BlobStore {
     /// removal, and the final reference check protects a newly-created root.
     pub async fn sweep_unreferenced(&self) -> anyhow::Result<usize> {
         let _storage_lock = self.storage_lock.lock().await;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT object.sha256, object.storage_state FROM blob_objects AS object \
-             WHERE object.storage_state IN ('present', 'trash') \
-               AND NOT EXISTS (SELECT 1 FROM blob_references AS reference \
-                               WHERE reference.blob_sha = object.sha256) \
-             ORDER BY object.first_written_at, object.sha256",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut swept = 0;
-        for (sha, state) in rows {
-            let has_reference: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM blob_references WHERE blob_sha = ?)",
-            )
-            .bind(&sha)
-            .fetch_one(&self.pool)
+        let mut objects = self
+            .pool
+            .collection::<Document>("blob_objects")
+            .find(doc! {"storage_state": {"$in": ["present", "trash"]}})
+            .sort(doc! {"first_written_at": 1, "_id": 1})
             .await?;
-            if has_reference {
-                sqlx::query("UPDATE blob_objects SET storage_state = 'present' WHERE sha256 = ?")
-                    .bind(&sha)
-                    .execute(&self.pool)
+        let mut candidates = Vec::new();
+        while let Some(document) = objects.try_next().await? {
+            candidates.push(document);
+        }
+        // Referenced set replaces the SQL `NOT EXISTS` correlation.
+        let mut references = self
+            .pool
+            .collection::<Document>("blob_references")
+            .find(doc! {})
+            .await?;
+        let mut referenced = HashSet::new();
+        while let Some(document) = references.try_next().await? {
+            if let Ok(sha) = document.get_str("blob_sha") {
+                referenced.insert(sha.to_owned());
+            }
+        }
+        let mut swept = 0;
+        for document in candidates {
+            let sha = document.get_str("_id")?.to_owned();
+            let state = document.get_str("storage_state")?.to_owned();
+            // A reference may have landed after the snapshot was taken.
+            if referenced.contains(&sha) {
+                self.pool
+                    .collection::<Document>("blob_objects")
+                    .update_one(
+                        doc! {"_id": &sha},
+                        doc! {"$set": {"storage_state": "present"}},
+                    )
                     .await?;
                 continue;
             }
             if state == "present" {
-                sqlx::query(
-                    "UPDATE blob_objects SET storage_state = 'trash' WHERE sha256 = ? AND storage_state = 'present'",
-                )
-                .bind(&sha)
-                .execute(&self.pool)
-                .await?;
+                self.pool
+                    .collection::<Document>("blob_objects")
+                    .update_one(
+                        doc! {"_id": &sha, "storage_state": "present"},
+                        doc! {"$set": {"storage_state": "trash"}},
+                    )
+                    .await?;
             }
             let path = object_path(&self.objects_root, &sha);
             match tokio::fs::remove_file(&path).await {
@@ -302,21 +344,37 @@ impl BlobStore {
                     anyhow::bail!("sweep blob {}: {}", sha, error);
                 }
             }
-            let deleted = sqlx::query(
-                "DELETE FROM blob_objects WHERE sha256 = ? AND storage_state = 'trash' \
-                 AND NOT EXISTS (SELECT 1 FROM blob_references WHERE blob_sha = ?)",
-            )
-            .bind(&sha)
-            .bind(&sha)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+            // Final fence against a newly-registered root between snapshot and file removal.
+            let still_referenced = self
+                .pool
+                .collection::<Document>("blob_references")
+                .find_one(doc! {"blob_sha": &sha})
+                .await?;
+            if still_referenced.is_some() {
+                self.pool
+                    .collection::<Document>("blob_objects")
+                    .update_one(
+                        doc! {"_id": &sha},
+                        doc! {"$set": {"storage_state": "present"}},
+                    )
+                    .await?;
+                continue;
+            }
+            let deleted = self
+                .pool
+                .collection::<Document>("blob_objects")
+                .delete_one(doc! {"_id": &sha, "storage_state": "trash"})
+                .await?
+                .deleted_count;
             if deleted > 0 {
                 swept += 1;
             } else {
-                sqlx::query("UPDATE blob_objects SET storage_state = 'present' WHERE sha256 = ?")
-                    .bind(&sha)
-                    .execute(&self.pool)
+                self.pool
+                    .collection::<Document>("blob_objects")
+                    .update_one(
+                        doc! {"_id": &sha},
+                        doc! {"$set": {"storage_state": "present"}},
+                    )
                     .await?;
             }
         }
@@ -325,24 +383,30 @@ impl BlobStore {
 
     async fn enqueue_cleanup(&self, reference: &BlobReference, error: &str) -> anyhow::Result<()> {
         let now = now_utc_str();
-        sqlx::query(
-            "INSERT INTO blob_cleanup_intents \
-             (id, owner_module, owner_type, owner_id, purpose, next_attempt_at, last_error, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(owner_module, owner_type, owner_id, purpose) DO UPDATE SET \
-             next_attempt_at = excluded.next_attempt_at, last_error = excluded.last_error, updated_at = excluded.updated_at",
-        )
-        .bind(format!("blob_cleanup_{}", uuid::Uuid::now_v7()))
-        .bind(reference.owner_module)
-        .bind(reference.owner_type)
-        .bind(&reference.owner_id)
-        .bind(reference.purpose)
-        .bind(&now)
-        .bind(error)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        self.pool
+            .collection::<Document>("blob_cleanup_intents")
+            .update_one(
+                doc! {
+                    "owner_module": reference.owner_module,
+                    "owner_type": reference.owner_type,
+                    "owner_id": reference.owner_id.as_str(),
+                    "purpose": reference.purpose,
+                },
+                doc! {
+                    "$set": {
+                        "next_attempt_at": &now,
+                        "last_error": error,
+                        "updated_at": &now,
+                    },
+                    "$setOnInsert": {
+                        "_id": format!("blob_cleanup_{}", uuid::Uuid::now_v7()),
+                        "attempts": 0i64,
+                        "created_at": &now,
+                    }
+                },
+            )
+            .upsert(true)
+            .await?;
         Ok(())
     }
 

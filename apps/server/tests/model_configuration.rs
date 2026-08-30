@@ -4,14 +4,18 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use futures_util::TryStreamExt;
 use janus_server::{
     AppState,
     config::{Config, RunMode},
     router,
 };
+use mongodb::bson::{Bson, Document, doc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -27,6 +31,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -102,31 +113,44 @@ async fn provider_embeds_models_and_masks_key_without_leaking() -> anyhow::Resul
     let provider_id = created["data"]["id"].as_str().expect("provider id");
 
     // The ciphertext is stored and does not contain the plaintext secret.
-    let stored = sqlx::query_as::<_, (Vec<u8>,)>(
-        "SELECT api_key_ciphertext FROM model_providers WHERE id = ?",
-    )
-    .bind(provider_id)
-    .fetch_one(state.pool())
-    .await?
-    .0;
+    let stored = state
+        .pool()
+        .collection::<Document>("model_providers")
+        .find_one(doc! {"_id": provider_id})
+        .await?
+        .expect("provider row")
+        .get("api_key_ciphertext")
+        .and_then(|value| match value {
+            Bson::Binary(binary) => Some(binary),
+            _ => None,
+        })
+        .expect("api_key_ciphertext stored as BSON binary")
+        .bytes
+        .clone();
     assert!(!String::from_utf8_lossy(&stored).contains(secret));
 
     // The masked preview is persisted alongside the ciphertext.
-    let stored_preview = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT api_key_preview FROM model_providers WHERE id = ?",
-    )
-    .bind(provider_id)
-    .fetch_one(state.pool())
-    .await?
-    .0;
+    let stored_preview = state
+        .pool()
+        .collection::<Document>("model_providers")
+        .find_one(doc! {"_id": provider_id})
+        .await?
+        .expect("provider row")
+        .get("api_key_preview")
+        .and_then(Bson::as_str)
+        .map(str::to_owned);
     assert_eq!(stored_preview.as_deref(), Some(preview));
 
     // The change is recorded as an event and the secret never leaks into it.
-    let event_payloads: Vec<(String,)> = sqlx::query_as(
-        "SELECT payload_json FROM public_events WHERE event_type = 'model_config.changed'",
-    )
-    .fetch_all(state.pool())
-    .await?;
+    let mut event_cursor = state
+        .pool()
+        .collection::<Document>("public_events")
+        .find(doc! {"event_type": "model_config.changed"})
+        .await?;
+    let mut event_payloads: Vec<(String,)> = Vec::new();
+    while let Some(document) = event_cursor.try_next().await? {
+        event_payloads.push((document.get_str("payload_json")?.to_owned(),));
+    }
     assert!(!event_payloads.is_empty());
     let events = serde_json::to_string(&event_payloads)?;
     assert!(!events.contains(secret));

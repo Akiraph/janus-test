@@ -13,7 +13,10 @@ use janus_server::{
     AppState,
     config::{Config, RunMode},
 };
+use mongodb::bson::{Document, doc};
 use tempfile::TempDir;
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -29,6 +32,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -313,9 +323,13 @@ async fn terminal_recovery_converts_running_to_lost_and_revokes_tickets() -> any
     .await;
     // Simulate a control-plane restart: force terminal back to a live state,
     // then run recovery.
-    sqlx::query("UPDATE terminals SET status = 'running' WHERE id = ?")
-        .bind(terminal_id.to_string())
-        .execute(state.pool())
+    state
+        .pool()
+        .collection::<Document>("terminals")
+        .update_one(
+            doc! {"_id": terminal_id.to_string()},
+            doc! {"$set": {"status": "running"}},
+        )
         .await?;
     state.runtime().recover_uncertain().await?;
     let recovered = state.runtime().terminal(terminal_id).await?;

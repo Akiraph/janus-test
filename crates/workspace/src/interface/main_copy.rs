@@ -1,5 +1,6 @@
 //! Main workspace copy lifecycle.
 use super::*;
+use futures_util::TryStreamExt;
 
 impl WorkspaceInterface {
     /// Create the Main workspace copy for a project and its first Content
@@ -17,49 +18,61 @@ impl WorkspaceInterface {
         let handle = WorkspaceHandle::main(&project_id);
         let now = now_utc_str();
 
-        let existing: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-
-        if let Some((Some(revision_id),)) = existing {
-            return Ok(RevisionRef(revision_id));
+        let existing = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .await?;
+        if let Some(revision_id) = existing
+            .as_ref()
+            .and_then(|document| document.get("current_revision_id").and_then(Bson::as_str))
+        {
+            return Ok(RevisionRef(revision_id.to_owned()));
         }
 
         let copy_version = format!("v_{}", Uuid::now_v7());
         let revision_ref = RevisionRef::new(Uuid::now_v7());
+        let actor_json = serde_json::to_string(&actor)?;
 
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO workspace_copies \
-             (handle, project_id, kind, managed_dir, current_revision_id, \
-              observation_generation, dirty, version, created_at, updated_at) \
-             VALUES (?, ?, 'main', ?, ?, 0, 0, ?, ?, ?)",
-        )
-        .bind(handle.as_str())
-        .bind(&project_id)
-        .bind(managed_dir)
-        .bind(revision_ref.0.clone())
-        .bind(&copy_version)
-        .bind(&now)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO content_revisions \
-             (revision_id, workspace_handle, sequence, manifest_root_hash, cause, \
-              actor_json, prev_revision_id, stable, occurred_at) \
-             VALUES (?, ?, 1, NULL, ?, ?, NULL, 1, ?)",
-        )
-        .bind(revision_ref.0.clone())
-        .bind(handle.as_str())
-        .bind(cause)
-        .bind(serde_json::to_string(&actor)?)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
+        // INSERT OR IGNORE: a copy created concurrently wins; the upsert leaves
+        // its row untouched but the revision below still commits independently.
+        self.pool
+            .collection::<Document>("workspace_copies")
+            .update_one(
+                doc! {"_id": handle.as_str()},
+                doc! {
+                    "$setOnInsert": {
+                        "project_id": &project_id,
+                        "kind": "main",
+                        "managed_dir": managed_dir,
+                        "current_revision_id": &revision_ref.0,
+                        "observation_generation": 0i64,
+                        "dirty": 0i64,
+                        "version": &copy_version,
+                        "created_at": &now,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .upsert(true)
+            .session(&mut session)
+            .await?;
+        self.pool
+            .collection::<Document>("content_revisions")
+            .insert_one(doc! {
+                "_id": &revision_ref.0,
+                "workspace_handle": handle.as_str(),
+                "sequence": 1i64,
+                "cause": cause,
+                "actor_json": &actor_json,
+                "stable": 1i64,
+                "occurred_at": &now,
+            })
+            .session(&mut session)
+            .await?;
+        session.commit_transaction().await?;
         Ok(revision_ref)
     }
 
@@ -67,18 +80,19 @@ impl WorkspaceInterface {
     /// copy. This covers a crash after `git clone` and before the first
     /// Workspace revision transaction commits.
     pub async fn recover_orphan_main_worktrees(&self) -> Result<usize, WorkspaceError> {
-        let registered: BTreeSet<String> =
-            sqlx::query_scalar("SELECT managed_dir FROM workspace_copies WHERE kind = 'main'")
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .filter_map(|managed_dir: String| {
-                    Path::new(&managed_dir)
-                        .parent()
-                        .and_then(Path::file_name)
-                        .map(|name| name.to_string_lossy().to_string())
-                })
-                .collect();
+        let mut cursor = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find(doc! {"kind": "main"})
+            .await?;
+        let mut registered = BTreeSet::new();
+        while let Some(document) = cursor.try_next().await? {
+            if let Ok(managed_dir) = document.get_str("managed_dir")
+                && let Some(name) = Path::new(managed_dir).parent().and_then(Path::file_name)
+            {
+                registered.insert(name.to_string_lossy().to_string());
+            }
+        }
         let main_root = self.data_root.join("workspaces").join("main");
         let mut entries = match tokio::fs::read_dir(&main_root).await {
             Ok(entries) => entries,
@@ -115,11 +129,15 @@ impl WorkspaceInterface {
         &self,
         handle: &WorkspaceHandle,
     ) -> Result<String, WorkspaceError> {
-        let row: Option<String> =
-            sqlx::query_scalar("SELECT managed_dir FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        row.ok_or(WorkspaceError::NotFound)
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .await?;
+        let managed_dir = document
+            .as_ref()
+            .and_then(|document| document.get_str("managed_dir").ok().map(str::to_owned))
+            .ok_or(WorkspaceError::NotFound)?;
+        Ok(managed_dir)
     }
 }

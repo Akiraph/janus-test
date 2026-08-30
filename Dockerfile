@@ -27,8 +27,8 @@ RUN bun run build
 # ============================================
 FROM rust:1.97.0-bookworm AS server-builder
 
-# ring and the bundled SQLite compile C sources; pkg-config keeps -sys crates
-# able to probe the sysroot.
+# ring (rustls) compiles C sources; pkg-config keeps any -sys crates able to
+# probe the sysroot during the build.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -57,9 +57,15 @@ RUN apt-get update \
 # JANUS_DEV_AUTH must be off because the listener is not loopback. Real
 # deployments additionally set JANUS_MODE=production and an https
 # JANUS_PUBLIC_ORIGIN pointing at the public hostname.
+#
+# MongoDB is the sole durable store and the connection must be a replica set
+# (multi-document transactions are required), so JANUS_MONGODB_URI here is only
+# the built-in default; deployments override it with their own address.
 ENV JANUS_BIND=0.0.0.0:4317 \
     JANUS_DEV_AUTH=false \
     JANUS_DATA_ROOT=/data \
+    JANUS_MONGODB_URI=mongodb://localhost:27017/?replicaSet=rs0 \
+    JANUS_MONGODB_DATABASE=janus \
     JANUS_WEB_DIST=/app/web
 
 WORKDIR /app

@@ -1,8 +1,12 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
+use futures_util::TryStreamExt;
 use janus_infrastructure::clock::{format_utc, now_utc, now_utc_str};
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+};
 use serde_json::json;
-use sqlx::{FromRow, SqliteConnection, SqlitePool};
 
 use super::{
     interface::{
@@ -23,7 +27,7 @@ use janus_infrastructure::{
 
 #[derive(Clone)]
 pub struct RuntimeInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     unit_of_work: UnitOfWork,
     logs: LogStore,
     executor: Arc<dyn RuntimeExecutor>,
@@ -32,7 +36,6 @@ pub struct RuntimeInterface {
     async_task_settled_tx: tokio::sync::broadcast::Sender<AsyncTaskId>,
 }
 
-#[derive(FromRow)]
 struct RuntimeRow {
     id: String,
     scope_kind: String,
@@ -46,7 +49,47 @@ struct RuntimeRow {
     stopped_at: Option<String>,
 }
 
-#[derive(FromRow)]
+impl RuntimeRow {
+    fn from_document(document: &Document) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            id: document.get_str("_id").map_err(storage_error)?.to_owned(),
+            scope_kind: document
+                .get_str("scope_kind")
+                .map_err(storage_error)?
+                .to_owned(),
+            scope_id: document
+                .get_str("scope_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            executor_nonce: document
+                .get_str("executor_nonce")
+                .map_err(storage_error)?
+                .to_owned(),
+            limits_json: document
+                .get_str("limits_json")
+                .map_err(storage_error)?
+                .to_owned(),
+            status: document
+                .get_str("status")
+                .map_err(storage_error)?
+                .to_owned(),
+            version: document
+                .get_str("version")
+                .map_err(storage_error)?
+                .to_owned(),
+            created_at: document
+                .get_str("created_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            updated_at: document
+                .get_str("updated_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            stopped_at: opt_str(document, "stopped_at"),
+        })
+    }
+}
+
 struct AsyncTaskRow {
     id: String,
     runtime_id: String,
@@ -65,7 +108,61 @@ struct AsyncTaskRow {
     ended_at: Option<String>,
 }
 
-#[derive(FromRow)]
+impl AsyncTaskRow {
+    fn from_document(document: &Document) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            id: document.get_str("_id").map_err(storage_error)?.to_owned(),
+            runtime_id: document
+                .get_str("runtime_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            session_id: document
+                .get_str("session_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            initiated_by_tool_call_id: document
+                .get_str("initiated_by_tool_call_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            controlling_turn_id: document
+                .get_str("controlling_turn_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            command_summary: document
+                .get_str("command_summary")
+                .map_err(storage_error)?
+                .to_owned(),
+            executor_nonce: document
+                .get_str("executor_nonce")
+                .map_err(storage_error)?
+                .to_owned(),
+            log_stream_id: document
+                .get_str("log_stream_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            status: document
+                .get_str("status")
+                .map_err(storage_error)?
+                .to_owned(),
+            exit_json: opt_str(document, "exit_json"),
+            usage_json: document
+                .get_str("usage_json")
+                .map_err(storage_error)?
+                .to_owned(),
+            version: document
+                .get_str("version")
+                .map_err(storage_error)?
+                .to_owned(),
+            created_at: document
+                .get_str("created_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            started_at: opt_str(document, "started_at"),
+            ended_at: opt_str(document, "ended_at"),
+        })
+    }
+}
+
 struct TerminalRow {
     id: String,
     runtime_id: String,
@@ -83,7 +180,54 @@ struct TerminalRow {
     ended_at: Option<String>,
 }
 
-#[derive(FromRow)]
+impl TerminalRow {
+    fn from_document(document: &Document) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            id: document.get_str("_id").map_err(storage_error)?.to_owned(),
+            runtime_id: document
+                .get_str("runtime_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            owner_kind: document
+                .get_str("owner_kind")
+                .map_err(storage_error)?
+                .to_owned(),
+            owner_id: document
+                .get_str("owner_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            executor_nonce: document
+                .get_str("executor_nonce")
+                .map_err(storage_error)?
+                .to_owned(),
+            cols: document.get_i64("cols").map_err(storage_error)?,
+            rows: document.get_i64("rows").map_err(storage_error)?,
+            scrollback_stream_id: document
+                .get_str("scrollback_stream_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            status: document
+                .get_str("status")
+                .map_err(storage_error)?
+                .to_owned(),
+            exit_json: opt_str(document, "exit_json"),
+            version: document
+                .get_str("version")
+                .map_err(storage_error)?
+                .to_owned(),
+            created_at: document
+                .get_str("created_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            updated_at: document
+                .get_str("updated_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            ended_at: opt_str(document, "ended_at"),
+        })
+    }
+}
+
 struct TerminalTicketRow {
     terminal_id: String,
     actor_id: String,
@@ -93,9 +237,38 @@ struct TerminalTicketRow {
     revoked_at: Option<String>,
 }
 
+impl TerminalTicketRow {
+    fn from_document(document: &Document) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            terminal_id: document
+                .get_str("terminal_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            actor_id: document
+                .get_str("actor_id")
+                .map_err(storage_error)?
+                .to_owned(),
+            origin: document
+                .get_str("origin")
+                .map_err(storage_error)?
+                .to_owned(),
+            expires_at: document
+                .get_str("expires_at")
+                .map_err(storage_error)?
+                .to_owned(),
+            consumed_at: opt_str(document, "consumed_at"),
+            revoked_at: opt_str(document, "revoked_at"),
+        })
+    }
+}
+
+fn opt_str(document: &Document, key: &str) -> Option<String> {
+    document.get(key).and_then(Bson::as_str).map(str::to_owned)
+}
+
 impl RuntimeInterface {
     pub fn new(
-        pool: SqlitePool,
+        pool: mongodb::Database,
         events: EventStore,
         data_root: &Path,
         executor: Arc<dyn RuntimeExecutor>,
@@ -118,21 +291,23 @@ impl RuntimeInterface {
 
     pub async fn has_unfinished_async_tasks_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_id: TurnId,
     ) -> Result<bool, RuntimeError> {
         Ok(self.unfinished_async_task_count_in_tx(tx, turn_id).await? > 0)
     }
 
     pub async fn unfinished_async_task_count(&self, turn_id: TurnId) -> Result<i64, RuntimeError> {
-        sqlx::query_scalar(
-            "SELECT COUNT(1) FROM async_tasks \
-             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(turn_id.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage_error)
+        let count = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .count_documents(doc! {
+                "controlling_turn_id": turn_id.to_string(),
+                "status": {"$in": ["queued", "running"]},
+            })
+            .await
+            .map_err(storage_error)?;
+        i64::try_from(count).map_err(storage_error)
     }
 
     /// Finite AsyncTasks still controlled by `turn_id` that have not reached a terminal
@@ -142,73 +317,108 @@ impl RuntimeInterface {
         &self,
         turn_id: TurnId,
     ) -> Result<Vec<AsyncTaskProjection>, RuntimeError> {
-        sqlx::query_as::<_, AsyncTaskRow>(&format!(
-            "{} WHERE controlling_turn_id = ? \
-             AND status IN ('queued', 'running') \
-             ORDER BY created_at, id",
-            ASYNC_TASK_SELECT
-        ))
-        .bind(turn_id.to_string())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(async_task_projection)
-        .collect()
+        let mut rows = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {
+                "controlling_turn_id": turn_id.to_string(),
+                "status": {"$in": ["queued", "running"]},
+            })
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .await
+            .map_err(storage_error)?;
+        let mut projections = Vec::new();
+        while let Some(document) = rows.try_next().await.map_err(storage_error)? {
+            projections.push(async_task_projection(AsyncTaskRow::from_document(
+                &document,
+            )?)?);
+        }
+        Ok(projections)
     }
 
     pub async fn unfinished_async_task_count_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_id: TurnId,
     ) -> Result<i64, RuntimeError> {
-        sqlx::query_scalar(
-            "SELECT COUNT(1) FROM async_tasks \
-             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(turn_id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage_error)
+        let mut rows = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {
+                "controlling_turn_id": turn_id.to_string(),
+                "status": {"$in": ["queued", "running"]},
+            })
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        let mut count: i64 = 0;
+        while rows
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+            .is_some()
+        {
+            count += 1;
+        }
+        Ok(count)
     }
 
     pub async fn transfer_unfinished_async_tasks_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         from_turn_id: TurnId,
         to_turn_id: TurnId,
     ) -> Result<u64, RuntimeError> {
-        sqlx::query(
-            "UPDATE async_tasks SET controlling_turn_id = ?, version = ? \
-             WHERE controlling_turn_id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(to_turn_id.to_string())
-        .bind(new_version())
-        .bind(from_turn_id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(storage_error)
+        let changed = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .update_many(
+                doc! {
+                    "controlling_turn_id": from_turn_id.to_string(),
+                    "status": {"$in": ["queued", "running"]},
+                },
+                doc! {
+                    "$set": {
+                        "controlling_turn_id": to_turn_id.to_string(),
+                        "version": new_version(),
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        Ok(changed.matched_count)
     }
 
     pub async fn terminal_async_tasks_for_turn_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         turn_id: TurnId,
     ) -> Result<Vec<AsyncTaskProjection>, RuntimeError> {
-        sqlx::query_as::<_, AsyncTaskRow>(&format!(
-            "{} WHERE controlling_turn_id = ? \
-             AND status IN ('succeeded', 'failed', 'canceled', 'lost') \
-             ORDER BY created_at, id",
-            ASYNC_TASK_SELECT
-        ))
-        .bind(turn_id.to_string())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(async_task_projection)
-        .collect()
+        let mut rows = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {
+                "controlling_turn_id": turn_id.to_string(),
+                "status": {"$in": ["succeeded", "failed", "canceled", "lost"]},
+            })
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        let mut projections = Vec::new();
+        while let Some(document) = rows
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            projections.push(async_task_projection(AsyncTaskRow::from_document(
+                &document,
+            )?)?);
+        }
+        Ok(projections)
     }
 
     pub async fn ensure_runtime(
@@ -230,69 +440,89 @@ impl RuntimeInterface {
                 if same_nonce {
                     return Ok(existing);
                 }
-                sqlx::query(
-                    "UPDATE runtimes SET executor_identity = ?, executor_nonce = ?, status = 'ready', \
-                     version = ?, updated_at = ? WHERE id = ? AND status IN ('starting', 'ready')",
-                )
-                .bind(handle.executor_identity)
-                .bind(handle.executor_nonce)
-                .bind(new_version())
-                .bind(now_utc_str())
-                .bind(existing.id.to_string())
-                .execute(&self.pool)
-                .await
-                .map_err(storage_error)?;
+                let now = now_utc_str();
+                let version = new_version();
+                self.pool
+                    .collection::<Document>("runtimes")
+                    .update_one(
+                        doc! {"_id": existing.id.to_string(), "status": {"$in": ["starting", "ready"]}},
+                        doc! {
+                            "$set": {
+                                "executor_identity": handle.executor_identity,
+                                "executor_nonce": handle.executor_nonce,
+                                "status": "ready",
+                                "version": version,
+                                "updated_at": now,
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(storage_error)?;
                 return self.runtime(existing.id).await;
             }
             return Err(RuntimeError::RuntimeUnavailable);
         }
         let now = now_utc_str();
         let placeholder_nonce = format!("pending-{}", spec.id());
-        sqlx::query(
-            "INSERT INTO runtimes \
-             (id, scope_kind, scope_id, executor_nonce, limits_json, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?)",
-        )
-        .bind(spec.id().to_string())
-        .bind(spec.scope().kind())
-        .bind(spec.scope().id())
-        .bind(placeholder_nonce)
-        .bind(serde_json::to_string(spec.limits()).map_err(storage_error)?)
-        .bind(new_version())
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let limits_json = serde_json::to_string(spec.limits()).map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("runtimes")
+            .insert_one(doc! {
+                "_id": spec.id().to_string(),
+                "scope_kind": spec.scope().kind(),
+                "scope_id": spec.scope().id(),
+                "executor_nonce": placeholder_nonce,
+                "limits_json": limits_json,
+                "status": "starting",
+                "version": version,
+                "created_at": &now,
+                "updated_at": &now,
+            })
+            .await
+            .map_err(storage_error)?;
 
         match self.executor.ensure_runtime(spec).await {
             Ok(handle) => {
-                sqlx::query(
-                    "UPDATE runtimes SET executor_identity = ?, executor_nonce = ?, status = 'ready', \
-                     version = ?, updated_at = ? WHERE id = ? AND status = 'starting'",
-                )
-                .bind(handle.executor_identity)
-                .bind(handle.executor_nonce)
-                .bind(new_version())
-                .bind(now_utc_str())
-                .bind(spec.id().to_string())
-                .execute(&self.pool)
-                .await
-                .map_err(storage_error)?;
+                let now = now_utc_str();
+                let version = new_version();
+                self.pool
+                    .collection::<Document>("runtimes")
+                    .update_one(
+                        doc! {"_id": spec.id().to_string(), "status": "starting"},
+                        doc! {
+                            "$set": {
+                                "executor_identity": handle.executor_identity,
+                                "executor_nonce": handle.executor_nonce,
+                                "status": "ready",
+                                "version": version,
+                                "updated_at": now,
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(storage_error)?;
                 self.runtime(spec.id()).await
             }
             Err(error) => {
-                let _ = sqlx::query(
-                    "UPDATE runtimes SET status = 'failed', stop_reason = ?, version = ?, \
-                     updated_at = ?, stopped_at = ? WHERE id = ?",
-                )
-                .bind(error.code().as_str())
-                .bind(new_version())
-                .bind(now_utc_str())
-                .bind(now_utc_str())
-                .bind(spec.id().to_string())
-                .execute(&self.pool)
-                .await;
+                let now = now_utc_str();
+                let version = new_version();
+                let _ = self
+                    .pool
+                    .collection::<Document>("runtimes")
+                    .update_one(
+                        doc! {"_id": spec.id().to_string()},
+                        doc! {
+                            "$set": {
+                                "status": "failed",
+                                "stop_reason": error.code().as_str(),
+                                "version": version,
+                                "updated_at": &now,
+                                "stopped_at": &now,
+                            }
+                        },
+                    )
+                    .await;
                 Err(error)
             }
         }
@@ -301,28 +531,34 @@ impl RuntimeInterface {
     pub async fn stop_runtime(&self, id: RuntimeId) -> Result<RuntimeProjection, RuntimeError> {
         let nonce = self.runtime_nonce(id).await?;
         let now = now_utc_str();
-        sqlx::query(
-            "UPDATE runtimes SET status = 'stopping', version = ?, updated_at = ? \
-             WHERE id = ? AND status IN ('starting', 'ready')",
-        )
-        .bind(new_version())
-        .bind(&now)
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("runtimes")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["starting", "ready"]}},
+                doc! {"$set": {"status": "stopping", "version": version, "updated_at": &now}},
+            )
+            .await
+            .map_err(storage_error)?;
         self.executor.stop_runtime(id, &nonce).await?;
-        sqlx::query(
-            "UPDATE runtimes SET status = 'stopped', stop_reason = 'requested', version = ?, \
-             updated_at = ?, stopped_at = ? WHERE id = ?",
-        )
-        .bind(new_version())
-        .bind(&now)
-        .bind(&now)
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let now = now_utc_str();
+        let version = new_version();
+        self.pool
+            .collection::<Document>("runtimes")
+            .update_one(
+                doc! {"_id": id.to_string()},
+                doc! {
+                    "$set": {
+                        "status": "stopped",
+                        "stop_reason": "requested",
+                        "version": version,
+                        "updated_at": &now,
+                        "stopped_at": &now,
+                    }
+                },
+            )
+            .await
+            .map_err(storage_error)?;
         self.runtime(id).await
     }
 
@@ -351,26 +587,26 @@ impl RuntimeInterface {
             )
             .await?;
         let now = now_utc_str();
-        sqlx::query(
-            "INSERT INTO async_tasks \
-             (id, runtime_id, session_id, initiated_by_tool_call_id, controlling_turn_id, \
-              command_summary, executor_nonce, log_stream_id, status, usage_json, version, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)",
-        )
-        .bind(async_task_id.to_string())
-        .bind(spec.execution.runtime_id().to_string())
-        .bind(spec.session_id.to_string())
-        .bind(spec.initiated_by_tool_call_id.to_string())
-        .bind(spec.controlling_turn_id.to_string())
-        .bind(command_summary(&spec))
-        .bind(&runtime_nonce)
-        .bind(log.id.to_string())
-        .bind(serde_json::to_string(&ResourceUsage::default()).map_err(storage_error)?)
-        .bind(new_version())
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let usage_json = serde_json::to_string(&ResourceUsage::default()).map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("async_tasks")
+            .insert_one(doc! {
+                "_id": async_task_id.to_string(),
+                "runtime_id": spec.execution.runtime_id().to_string(),
+                "session_id": spec.session_id.to_string(),
+                "initiated_by_tool_call_id": spec.initiated_by_tool_call_id.to_string(),
+                "controlling_turn_id": spec.controlling_turn_id.to_string(),
+                "command_summary": command_summary(&spec),
+                "executor_nonce": &runtime_nonce,
+                "log_stream_id": log.id.to_string(),
+                "status": "queued",
+                "usage_json": usage_json,
+                "version": version,
+                "created_at": &now,
+            })
+            .await
+            .map_err(storage_error)?;
         if self
             .async_task_cancellation_requested(async_task_id)
             .await?
@@ -394,19 +630,29 @@ impl RuntimeInterface {
             Ok(handle) if handle.executor_nonce == runtime_nonce => {
                 let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
                 let started_at = now_utc_str();
-                let changed = sqlx::query(
-                    "UPDATE async_tasks SET executor_process_identity = ?, status = 'running', \
-                     version = ?, started_at = ? WHERE id = ? AND status = 'queued' \
-                       AND cancellation_requested_at IS NULL",
-                )
-                .bind(handle.process_identity)
-                .bind(new_version())
-                .bind(&started_at)
-                .bind(async_task_id.to_string())
-                .execute(work.connection())
-                .await
-                .map_err(storage_error)?
-                .rows_affected();
+                let version = new_version();
+                let changed = self
+                    .pool
+                    .collection::<Document>("async_tasks")
+                    .update_one(
+                        doc! {
+                            "_id": async_task_id.to_string(),
+                            "status": "queued",
+                            "cancellation_requested_at": null,
+                        },
+                        doc! {
+                            "$set": {
+                                "executor_process_identity": handle.process_identity,
+                                "status": "running",
+                                "version": version,
+                                "started_at": started_at,
+                            }
+                        },
+                    )
+                    .session(work.connection())
+                    .await
+                    .map_err(storage_error)?
+                    .matched_count;
                 if changed == 0 {
                     work.rollback().await.map_err(storage_error)?;
                     return self
@@ -484,17 +730,20 @@ impl RuntimeInterface {
         &self,
         id: AsyncTaskId,
     ) -> Result<AsyncTaskProjection, RuntimeError> {
-        sqlx::query(
-            "UPDATE async_tasks SET cancellation_requested_at = ?, version = ? \
-             WHERE id = ? AND status IN ('queued', 'running') \
-               AND cancellation_requested_at IS NULL",
-        )
-        .bind(now_utc_str())
-        .bind(new_version())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let now = now_utc_str();
+        let version = new_version();
+        self.pool
+            .collection::<Document>("async_tasks")
+            .update_one(
+                doc! {
+                    "_id": id.to_string(),
+                    "status": {"$in": ["queued", "running"]},
+                    "cancellation_requested_at": null,
+                },
+                doc! {"$set": {"cancellation_requested_at": now, "version": version}},
+            )
+            .await
+            .map_err(storage_error)?;
         let deadline = tokio::time::Instant::now() + ASYNC_TASK_CANCEL_TIMEOUT;
         loop {
             let async_task = self.async_task(id).await?;
@@ -525,45 +774,44 @@ impl RuntimeInterface {
         &self,
         scope: RuntimeScope,
     ) -> Result<Option<RuntimeProjection>, RuntimeError> {
-        let row = sqlx::query_as::<_, RuntimeRow>(
-            "SELECT id, scope_kind, scope_id, executor_nonce, limits_json, \
-             status, version, created_at, updated_at, stopped_at \
-             FROM runtimes WHERE scope_kind = ? AND scope_id = ? \
-             AND status IN ('starting', 'ready', 'stopping')",
-        )
-        .bind(scope.kind())
-        .bind(scope.id())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)?;
-        row.map(runtime_projection).transpose()
+        let row = self
+            .pool
+            .collection::<Document>("runtimes")
+            .find_one(doc! {
+                "scope_kind": scope.kind(),
+                "scope_id": scope.id(),
+                "status": {"$in": ["starting", "ready", "stopping"]},
+            })
+            .await
+            .map_err(storage_error)?;
+        row.as_ref()
+            .map(RuntimeRow::from_document)
+            .transpose()?
+            .map(runtime_projection)
+            .transpose()
     }
 
     pub async fn live_runtimes(&self) -> Result<Vec<RuntimeProjection>, RuntimeError> {
-        sqlx::query_as::<_, RuntimeRow>(
-            "SELECT id, scope_kind, scope_id, executor_nonce, limits_json, \
-             status, version, created_at, updated_at, stopped_at \
-             FROM runtimes WHERE status IN ('starting', 'ready', 'stopping') \
-             ORDER BY created_at",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(runtime_projection)
-        .collect()
+        let mut rows = self
+            .pool
+            .collection::<Document>("runtimes")
+            .find(doc! {"status": {"$in": ["starting", "ready", "stopping"]}})
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .await
+            .map_err(storage_error)?;
+        let mut projections = Vec::new();
+        while let Some(document) = rows.try_next().await.map_err(storage_error)? {
+            projections.push(runtime_projection(RuntimeRow::from_document(&document)?)?);
+        }
+        Ok(projections)
     }
 
     pub async fn delete_session_log_files(
         &self,
         session_id: SessionId,
     ) -> Result<(), RuntimeError> {
-        let ids = sqlx::query_scalar::<_, String>(SESSION_LOG_STREAMS)
-            .bind(session_id.to_string())
-            .bind(session_id.to_string())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_error)?
+        let ids = self.session_log_stream_ids(&session_id.to_string()).await?;
+        let ids = ids
             .into_iter()
             .map(|id| id.parse().map_err(storage_error))
             .collect::<Result<Vec<LogStreamId>, _>>()?;
@@ -574,12 +822,8 @@ impl RuntimeInterface {
         &self,
         project_id: ProjectId,
     ) -> Result<(), RuntimeError> {
-        let ids = sqlx::query_scalar::<_, String>(PROJECT_LOG_STREAMS)
-            .bind(project_id.to_string())
-            .bind(project_id.to_string())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_error)?
+        let ids = self.project_log_stream_ids(&project_id.to_string()).await?;
+        let ids = ids
             .into_iter()
             .map(|id| id.parse().map_err(storage_error))
             .collect::<Result<Vec<LogStreamId>, _>>()?;
@@ -591,30 +835,43 @@ impl RuntimeInterface {
         project_id: ProjectId,
     ) -> Result<(), RuntimeError> {
         let project_id = project_id.to_string();
-        let log_ids = sqlx::query_scalar::<_, String>(PROJECT_LOG_STREAMS)
-            .bind(&project_id)
-            .bind(&project_id)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(storage_error)?;
+        let log_ids = self.project_log_stream_ids(&project_id).await?;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-        sqlx::query(
-            "DELETE FROM terminals WHERE runtime_id IN \
-             (SELECT id FROM runtimes WHERE scope_kind = 'project' AND scope_id = ?)",
-        )
-        .bind(&project_id)
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?;
-        sqlx::query("DELETE FROM runtimes WHERE scope_kind = 'project' AND scope_id = ?")
-            .bind(&project_id)
-            .execute(work.connection())
+        let mut runtime_ids = Vec::new();
+        let mut runtimes = self
+            .pool
+            .collection::<Document>("runtimes")
+            .find(doc! {"scope_kind": "project", "scope_id": &project_id})
+            .session(&mut *work.connection())
             .await
             .map_err(storage_error)?;
-        for log_id in log_ids {
-            sqlx::query("DELETE FROM log_streams WHERE id = ?")
-                .bind(log_id)
-                .execute(work.connection())
+        while let Some(document) = runtimes
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            runtime_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        if !runtime_ids.is_empty() {
+            self.pool
+                .collection::<Document>("terminals")
+                .delete_many(doc! {"runtime_id": {"$in": &runtime_ids}})
+                .session(&mut *work.connection())
+                .await
+                .map_err(storage_error)?;
+            self.pool
+                .collection::<Document>("runtimes")
+                .delete_many(doc! {"_id": {"$in": &runtime_ids}})
+                .session(&mut *work.connection())
+                .await
+                .map_err(storage_error)?;
+        }
+        if !log_ids.is_empty() {
+            self.pool
+                .collection::<Document>("log_streams")
+                .delete_many(doc! {"_id": {"$in": &log_ids}})
+                .session(&mut *work.connection())
                 .await
                 .map_err(storage_error)?;
         }
@@ -623,25 +880,22 @@ impl RuntimeInterface {
 
     pub async fn delete_session_resources_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         session_id: SessionId,
     ) -> Result<(), RuntimeError> {
         let session_id = session_id.to_string();
-        let log_ids = sqlx::query_scalar::<_, String>(SESSION_LOG_STREAMS)
-            .bind(&session_id)
-            .bind(&session_id)
-            .fetch_all(&mut *tx)
+        let log_ids = self.session_log_stream_ids_in_tx(tx, &session_id).await?;
+        self.pool
+            .collection::<Document>("async_tasks")
+            .delete_many(doc! {"session_id": &session_id})
+            .session(&mut *tx)
             .await
             .map_err(storage_error)?;
-        sqlx::query("DELETE FROM async_tasks WHERE session_id = ?")
-            .bind(&session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage_error)?;
-        for log_id in log_ids {
-            sqlx::query("DELETE FROM log_streams WHERE id = ?")
-                .bind(log_id)
-                .execute(&mut *tx)
+        if !log_ids.is_empty() {
+            self.pool
+                .collection::<Document>("log_streams")
+                .delete_many(doc! {"_id": {"$in": &log_ids}})
+                .session(&mut *tx)
                 .await
                 .map_err(storage_error)?;
         }
@@ -656,71 +910,85 @@ impl RuntimeInterface {
         &self,
         limit: usize,
     ) -> Result<Vec<AsyncTaskProjection>, RuntimeError> {
-        sqlx::query_as::<_, AsyncTaskRow>(&format!(
-            "{} ORDER BY created_at DESC, id DESC LIMIT ?",
-            ASYNC_TASK_SELECT
-        ))
-        .bind(i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(async_task_projection)
-        .collect()
+        let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
+        let mut rows = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {})
+            .sort(doc! {"created_at": -1, "_id": -1})
+            .limit(limit)
+            .await
+            .map_err(storage_error)?;
+        let mut projections = Vec::new();
+        while let Some(document) = rows.try_next().await.map_err(storage_error)? {
+            projections.push(async_task_projection(AsyncTaskRow::from_document(
+                &document,
+            )?)?);
+        }
+        Ok(projections)
     }
 
     pub async fn undelivered_terminal_task_ids(
         &self,
         limit: usize,
     ) -> Result<Vec<AsyncTaskId>, RuntimeError> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT id FROM async_tasks \
-             WHERE status IN ('succeeded', 'failed', 'canceled', 'lost') \
-               AND delivery_completed_at IS NULL \
-             ORDER BY ended_at, id LIMIT ?",
-        )
-        .bind(i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(|id| id.parse().map_err(storage_error))
-        .collect()
+        let limit = i64::try_from(limit.clamp(1, 1000)).unwrap_or(1000);
+        let mut rows = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {
+                "status": {"$in": ["succeeded", "failed", "canceled", "lost"]},
+                "delivery_completed_at": null,
+            })
+            .sort(doc! {"ended_at": 1, "_id": 1})
+            .limit(limit)
+            .await
+            .map_err(storage_error)?;
+        let mut ids = Vec::new();
+        while let Some(document) = rows.try_next().await.map_err(storage_error)? {
+            let id = document.get_str("_id").map_err(storage_error)?.to_owned();
+            ids.push(id.parse().map_err(storage_error)?);
+        }
+        Ok(ids)
     }
 
     pub async fn claim_task_delivery_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         id: AsyncTaskId,
     ) -> Result<bool, RuntimeError> {
-        let changed = sqlx::query(
-            "UPDATE async_tasks SET delivery_claimed_at = ? \
-             WHERE id = ? AND status IN ('succeeded', 'failed', 'canceled', 'lost') \
-               AND delivery_completed_at IS NULL AND delivery_claimed_at IS NULL",
-        )
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(storage_error)?
-        .rows_affected();
-        Ok(changed == 1)
+        let changed = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .update_one(
+                doc! {
+                    "_id": id.to_string(),
+                    "status": {"$in": ["succeeded", "failed", "canceled", "lost"]},
+                    "delivery_completed_at": null,
+                    "delivery_claimed_at": null,
+                },
+                doc! {"$set": {"delivery_claimed_at": now_utc_str()}},
+            )
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        Ok(changed.matched_count == 1)
     }
 
     pub async fn complete_task_delivery_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         id: AsyncTaskId,
     ) -> Result<(), RuntimeError> {
-        sqlx::query(
-            "UPDATE async_tasks SET delivery_completed_at = ? \
-             WHERE id = ? AND delivery_completed_at IS NULL",
-        )
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(storage_error)?;
+        self.pool
+            .collection::<Document>("async_tasks")
+            .update_one(
+                doc! {"_id": id.to_string(), "delivery_completed_at": null},
+                doc! {"$set": {"delivery_completed_at": now_utc_str()}},
+            )
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
         Ok(())
     }
 
@@ -746,42 +1014,48 @@ impl RuntimeInterface {
             )
             .await?;
         let now = now_utc_str();
-        sqlx::query(
-            "INSERT INTO terminals \
-             (id, runtime_id, owner_kind, owner_id, executor_nonce, cols, rows, \
-              scrollback_stream_id, status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting', ?, ?, ?)",
-        )
-        .bind(spec.id.to_string())
-        .bind(spec.runtime_id.to_string())
-        .bind("project")
-        .bind(spec.project_id.to_string())
-        .bind(&runtime_nonce)
-        .bind(i64::from(spec.size.cols))
-        .bind(i64::from(spec.size.rows))
-        .bind(scrollback.id.to_string())
-        .bind(new_version())
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("terminals")
+            .insert_one(doc! {
+                "_id": spec.id.to_string(),
+                "runtime_id": spec.runtime_id.to_string(),
+                "owner_kind": "project",
+                "owner_id": spec.project_id.to_string(),
+                "executor_nonce": &runtime_nonce,
+                "cols": i64::from(spec.size.cols),
+                "rows": i64::from(spec.size.rows),
+                "scrollback_stream_id": scrollback.id.to_string(),
+                "status": "starting",
+                "version": version,
+                "created_at": &now,
+                "updated_at": &now,
+            })
+            .await
+            .map_err(storage_error)?;
         let terminal_id = spec.id;
         match self.executor.start_terminal(spec, scrollback.id).await {
             Ok(handle) if handle.executor_nonce == runtime_nonce => {
                 let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-                let changed = sqlx::query(
-                    "UPDATE terminals SET executor_pty_identity = ?, status = 'running', \
-                     version = ?, updated_at = ? WHERE id = ? AND status = 'starting'",
-                )
-                .bind(&handle.process_identity)
-                .bind(new_version())
-                .bind(now_utc_str())
-                .bind(terminal_id.to_string())
-                .execute(work.connection())
-                .await
-                .map_err(storage_error)?
-                .rows_affected();
+                let version = new_version();
+                let changed = self
+                    .pool
+                    .collection::<Document>("terminals")
+                    .update_one(
+                        doc! {"_id": terminal_id.to_string(), "status": "starting"},
+                        doc! {
+                            "$set": {
+                                "executor_pty_identity": handle.process_identity,
+                                "status": "running",
+                                "version": version,
+                                "updated_at": now_utc_str(),
+                            }
+                        },
+                    )
+                    .session(work.connection())
+                    .await
+                    .map_err(storage_error)?
+                    .matched_count;
                 let terminal = if changed != 0 {
                     let terminal = self
                         .append_terminal_changed_in_tx(&mut work, terminal_id)
@@ -849,17 +1123,17 @@ impl RuntimeInterface {
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<TerminalProjection>, RuntimeError> {
-        let mut projections = sqlx::query_as::<_, TerminalRow>(&format!(
-            "{} WHERE owner_kind = 'project' AND owner_id = ? ORDER BY created_at",
-            TERMINAL_SELECT
-        ))
-        .bind(project_id.to_string())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(terminal_projection)
-        .collect::<Result<Vec<_>, RuntimeError>>()?;
+        let mut rows = self
+            .pool
+            .collection::<Document>("terminals")
+            .find(doc! {"owner_kind": "project", "owner_id": project_id.to_string()})
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .await
+            .map_err(storage_error)?;
+        let mut projections = Vec::new();
+        while let Some(document) = rows.try_next().await.map_err(storage_error)? {
+            projections.push(terminal_projection(TerminalRow::from_document(&document)?)?);
+        }
         for projection in &mut projections {
             self.attach_scrollback_cursors(projection).await;
         }
@@ -892,21 +1166,19 @@ impl RuntimeInterface {
         let token_hash = purpose_hash("terminal-ticket", &token);
         let now = now_utc();
         let expires_at = format_utc(now + TICKET_TTL);
-        sqlx::query(
-            "INSERT INTO runtime_access_tickets \
-             (id, terminal_id, token_hash, actor_id, origin, expires_at, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(row.id)
-        .bind(&token_hash)
-        .bind(&request.actor_id)
-        .bind(&request.origin)
-        .bind(&expires_at)
-        .bind(format_utc(now))
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        self.pool
+            .collection::<Document>("runtime_access_tickets")
+            .insert_one(doc! {
+                "_id": &id,
+                "terminal_id": &row.id,
+                "token_hash": &token_hash,
+                "actor_id": &request.actor_id,
+                "origin": &request.origin,
+                "expires_at": &expires_at,
+                "created_at": format_utc(now),
+            })
+            .await
+            .map_err(storage_error)?;
         Ok(TerminalTicket {
             terminal_id: request.terminal_id,
             token,
@@ -924,15 +1196,15 @@ impl RuntimeInterface {
         origin: &str,
     ) -> Result<TerminalId, RuntimeError> {
         let token_hash = purpose_hash("terminal-ticket", token);
-        let row = sqlx::query_as::<_, TerminalTicketRow>(
-            "SELECT terminal_id, actor_id, origin, expires_at, consumed_at, revoked_at \
-             FROM runtime_access_tickets WHERE token_hash = ?",
-        )
-        .bind(&token_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .ok_or(RuntimeError::TerminalTicketInvalid)?;
+        let row = self
+            .pool
+            .collection::<Document>("runtime_access_tickets")
+            .find_one(doc! {"token_hash": &token_hash})
+            .await
+            .map_err(storage_error)?
+            .map(|document| TerminalTicketRow::from_document(&document))
+            .transpose()?
+            .ok_or(RuntimeError::TerminalTicketInvalid)?;
         let now = now_utc();
         if row.consumed_at.is_some() || row.revoked_at.is_some() {
             return Err(RuntimeError::TerminalTicketInvalid);
@@ -943,17 +1215,20 @@ impl RuntimeInterface {
         if parse_iso(&row.expires_at)? <= now {
             return Err(RuntimeError::TerminalTicketInvalid);
         }
-        let changed = sqlx::query(
-            "UPDATE runtime_access_tickets SET consumed_at = ? \
-             WHERE token_hash = ? AND consumed_at IS NULL AND revoked_at IS NULL",
-        )
-        .bind(format_utc(now))
-        .bind(&token_hash)
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?
-        .rows_affected();
-        if changed == 0 {
+        let changed = self
+            .pool
+            .collection::<Document>("runtime_access_tickets")
+            .update_one(
+                doc! {
+                    "token_hash": &token_hash,
+                    "consumed_at": null,
+                    "revoked_at": null,
+                },
+                doc! {"$set": {"consumed_at": format_utc(now)}},
+            )
+            .await
+            .map_err(storage_error)?;
+        if changed.matched_count == 0 {
             return Err(RuntimeError::TerminalTicketInvalid);
         }
         row.terminal_id
@@ -978,18 +1253,23 @@ impl RuntimeInterface {
         let nonce = self.terminal_nonce(id).await?;
         self.executor.resize_terminal(id, &nonce, size).await?;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-        sqlx::query(
-            "UPDATE terminals SET cols = ?, rows = ?, version = ?, updated_at = ? \
-             WHERE id = ? AND status IN ('starting', 'running')",
-        )
-        .bind(i64::from(size.cols))
-        .bind(i64::from(size.rows))
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("terminals")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["starting", "running"]}},
+                doc! {
+                    "$set": {
+                        "cols": i64::from(size.cols),
+                        "rows": i64::from(size.rows),
+                        "version": version,
+                        "updated_at": now_utc_str(),
+                    }
+                },
+            )
+            .session(work.connection())
+            .await
+            .map_err(storage_error)?;
         let terminal = self.append_terminal_changed_in_tx(&mut work, id).await?;
         work.commit().await.map_err(storage_error)?;
         Ok(terminal)
@@ -1006,16 +1286,15 @@ impl RuntimeInterface {
 
     pub async fn close_terminal(&self, id: TerminalId) -> Result<TerminalProjection, RuntimeError> {
         let nonce = self.terminal_nonce(id).await?;
-        sqlx::query(
-            "UPDATE terminals SET status = 'closing', version = ?, updated_at = ? \
-             WHERE id = ? AND status IN ('starting', 'running')",
-        )
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("terminals")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["starting", "running"]}},
+                doc! {"$set": {"status": "closing", "version": version, "updated_at": now_utc_str()}},
+            )
+            .await
+            .map_err(storage_error)?;
         let completion = self.executor.close_terminal(id, &nonce).await?;
         self.finalize_terminal(id, completion).await?;
         self.terminal(id).await
@@ -1041,20 +1320,28 @@ impl RuntimeInterface {
         // completion decides the final projection.
         let status = TerminalStatus::Exited;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-        let changed = sqlx::query(
-            "UPDATE terminals SET status = ?, exit_json = ?, version = ?, updated_at = ?, \
-             ended_at = ? WHERE id = ? AND status IN ('starting', 'running', 'closing')",
-        )
-        .bind(terminal_status_str(status))
-        .bind(serde_json::to_string(&completion.exit).map_err(storage_error)?)
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?
-        .rows_affected();
+        let exit_json = serde_json::to_string(&completion.exit).map_err(storage_error)?;
+        let version = new_version();
+        let now = now_utc_str();
+        let changed = self
+            .pool
+            .collection::<Document>("terminals")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["starting", "running", "closing"]}},
+                doc! {
+                    "$set": {
+                        "status": terminal_status_str(status),
+                        "exit_json": exit_json,
+                        "version": version,
+                        "updated_at": &now,
+                        "ended_at": &now,
+                    }
+                },
+            )
+            .session(work.connection())
+            .await
+            .map_err(storage_error)?
+            .matched_count;
         if changed != 0 {
             self.append_terminal_changed_in_tx(&mut work, id).await?;
             work.commit().await.map_err(storage_error)?;
@@ -1065,18 +1352,24 @@ impl RuntimeInterface {
     }
 
     async fn mark_terminal_failed(&self, id: TerminalId) -> Result<(), RuntimeError> {
-        sqlx::query(
-            "UPDATE terminals SET status = 'failed', exit_json = ?, version = ?, updated_at = ?, \
-             ended_at = ? WHERE id = ? AND status = 'starting'",
-        )
-        .bind(json!({"exit_code": null, "signal": "start_failed"}).to_string())
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(storage_error)?;
+        let version = new_version();
+        let now = now_utc_str();
+        self.pool
+            .collection::<Document>("terminals")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": "starting"},
+                doc! {
+                    "$set": {
+                        "status": "failed",
+                        "exit_json": json!({"exit_code": null, "signal": "start_failed"}).to_string(),
+                        "version": version,
+                        "updated_at": &now,
+                        "ended_at": &now,
+                    }
+                },
+            )
+            .await
+            .map_err(storage_error)?;
         let _ = self
             .logs
             .close(
@@ -1092,27 +1385,34 @@ impl RuntimeInterface {
 
     async fn append_terminal_changed_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         id: TerminalId,
     ) -> Result<TerminalProjection, RuntimeError> {
-        let row = sqlx::query_as::<_, TerminalRow>(&format!("{} WHERE id = ?", TERMINAL_SELECT))
-            .bind(id.to_string())
-            .fetch_one(work.connection())
+        let document = self
+            .pool
+            .collection::<Document>("terminals")
+            .find_one(doc! {"_id": id.to_string()})
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?
+            .ok_or(RuntimeError::TerminalNotWritable(id))?;
+        let mut terminal = terminal_projection(TerminalRow::from_document(&document)?)?;
+        let stream = self
+            .pool
+            .collection::<Document>("log_streams")
+            .find_one(doc! {"_id": terminal.scrollback_stream_id.to_string()})
+            .session(&mut *work.connection())
             .await
             .map_err(storage_error)?;
-        let mut terminal = terminal_projection(row)?;
-        if let Some((first_cursor, next_cursor)) = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT first_cursor, next_cursor FROM log_streams WHERE id = ?",
-        )
-        .bind(terminal.scrollback_stream_id.to_string())
-        .fetch_optional(work.connection())
-        .await
-        .map_err(storage_error)?
-        {
-            terminal.first_cursor =
-                LogCursor::new(u64::try_from(first_cursor).map_err(storage_error)?);
-            terminal.next_cursor =
-                LogCursor::new(u64::try_from(next_cursor).map_err(storage_error)?);
+        if let Some(stream) = stream {
+            terminal.first_cursor = LogCursor::new(
+                u64::try_from(stream.get_i64("first_cursor").map_err(storage_error)?)
+                    .map_err(storage_error)?,
+            );
+            terminal.next_cursor = LogCursor::new(
+                u64::try_from(stream.get_i64("next_cursor").map_err(storage_error)?)
+                    .map_err(storage_error)?,
+            );
         }
         work.append_event(NewEvent {
             event_type: EventType::TerminalChanged,
@@ -1142,71 +1442,117 @@ impl RuntimeInterface {
 
     pub async fn recover_uncertain_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         now: &str,
     ) -> Result<(), RuntimeError> {
-        let runtime_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM runtimes \
-             WHERE status IN ('starting', 'ready', 'stopping') ORDER BY created_at, id",
-        )
-        .fetch_all(work.connection())
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(|id| id.parse::<RuntimeId>().map_err(storage_error))
-        .collect::<Result<Vec<_>, _>>()?;
-        let async_task_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM async_tasks WHERE status IN ('queued', 'running') ORDER BY created_at, id",
-        )
-        .fetch_all(work.connection())
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(|id| id.parse::<AsyncTaskId>().map_err(storage_error))
-        .collect::<Result<Vec<_>, _>>()?;
-        let terminal_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM terminals \
-             WHERE status IN ('starting', 'running', 'closing') \
-             ORDER BY created_at, id",
-        )
-        .fetch_all(work.connection())
-        .await
-        .map_err(storage_error)?
-        .into_iter()
-        .map(|id| id.parse::<TerminalId>().map_err(storage_error))
-        .collect::<Result<Vec<_>, _>>()?;
+        let mut runtime_ids = Vec::new();
+        let mut runtimes = self
+            .pool
+            .collection::<Document>("runtimes")
+            .find(doc! {"status": {"$in": ["starting", "ready", "stopping"]}})
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = runtimes
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            let id = document.get_str("_id").map_err(storage_error)?.to_owned();
+            runtime_ids.push(id.parse::<RuntimeId>().map_err(storage_error)?);
+        }
+        let mut async_task_ids = Vec::new();
+        let mut tasks = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {"status": {"$in": ["queued", "running"]}})
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = tasks
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            let id = document.get_str("_id").map_err(storage_error)?.to_owned();
+            async_task_ids.push(id.parse::<AsyncTaskId>().map_err(storage_error)?);
+        }
+        let mut terminal_ids = Vec::new();
+        let mut terminals = self
+            .pool
+            .collection::<Document>("terminals")
+            .find(doc! {"status": {"$in": ["starting", "running", "closing"]}})
+            .sort(doc! {"created_at": 1, "_id": 1})
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = terminals
+            .next(&mut *work.connection())
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            let id = document.get_str("_id").map_err(storage_error)?.to_owned();
+            terminal_ids.push(id.parse::<TerminalId>().map_err(storage_error)?);
+        }
 
-        sqlx::query(
-            "UPDATE runtimes SET status = 'lost', stop_reason = 'control_plane_restart', \
-             version = ?, updated_at = ?, stopped_at = ? \
-             WHERE status IN ('starting', 'ready', 'stopping')",
-        )
-        .bind(new_version())
-        .bind(now)
-        .bind(now)
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?;
-        sqlx::query(
-            "UPDATE async_tasks SET status = 'lost', exit_json = ?, version = ?, ended_at = ? \
-             WHERE status IN ('queued', 'running')",
-        )
-        .bind(json!({"exit_code": null, "signal": "control_plane_restart"}).to_string())
-        .bind(new_version())
-        .bind(now)
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?;
-        sqlx::query(
-            "UPDATE terminals SET status = 'lost', version = ?, updated_at = ?, ended_at = ? \
-             WHERE status IN ('starting', 'running', 'closing')",
-        )
-        .bind(new_version())
-        .bind(now)
-        .bind(now)
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("runtimes")
+            .update_many(
+                doc! {"status": {"$in": ["starting", "ready", "stopping"]}},
+                doc! {
+                    "$set": {
+                        "status": "lost",
+                        "stop_reason": "control_plane_restart",
+                        "version": version,
+                        "updated_at": now,
+                        "stopped_at": now,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("async_tasks")
+            .update_many(
+                doc! {"status": {"$in": ["queued", "running"]}},
+                doc! {
+                    "$set": {
+                        "status": "lost",
+                        "exit_json": json!({"exit_code": null, "signal": "control_plane_restart"})
+                            .to_string(),
+                        "version": version,
+                        "ended_at": now,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
+        let version = new_version();
+        self.pool
+            .collection::<Document>("terminals")
+            .update_many(
+                doc! {"status": {"$in": ["starting", "running", "closing"]}},
+                doc! {
+                    "$set": {
+                        "status": "lost",
+                        "version": version,
+                        "updated_at": now,
+                        "ended_at": now,
+                    }
+                },
+            )
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
         for id in &runtime_ids {
             self.append_runtime_changed_in_tx(work, *id)
                 .await
@@ -1222,28 +1568,32 @@ impl RuntimeInterface {
         for id in &terminal_ids {
             self.append_terminal_changed_in_tx(work, *id).await?;
         }
-        sqlx::query(
-            "UPDATE runtime_access_tickets SET revoked_at = ? \
-             WHERE consumed_at IS NULL AND revoked_at IS NULL",
-        )
-        .bind(now)
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?;
+        self.pool
+            .collection::<Document>("runtime_access_tickets")
+            .update_many(
+                doc! {"consumed_at": null, "revoked_at": null},
+                doc! {"$set": {"revoked_at": now}},
+            )
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?;
         Ok(())
     }
 
     async fn append_runtime_changed_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         id: RuntimeId,
     ) -> Result<RuntimeProjection, RuntimeError> {
-        let row = sqlx::query_as::<_, RuntimeRow>(RUNTIME_SELECT)
-            .bind(id.to_string())
-            .fetch_one(work.connection())
+        let document = self
+            .pool
+            .collection::<Document>("runtimes")
+            .find_one(doc! {"_id": id.to_string()})
+            .session(&mut *work.connection())
             .await
-            .map_err(storage_error)?;
-        let runtime = runtime_projection(row)?;
+            .map_err(storage_error)?
+            .ok_or(RuntimeError::RuntimeUnavailable)?;
+        let runtime = runtime_projection(RuntimeRow::from_document(&document)?)?;
         work.append_event(NewEvent {
             event_type: EventType::RuntimeChanged,
             actor: json!({"kind": "runtime_system"}),
@@ -1270,13 +1620,20 @@ impl RuntimeInterface {
         forced: Option<AsyncTaskStatus>,
     ) -> Result<(), RuntimeError> {
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-        let cancel_requested: bool = sqlx::query_scalar(
-            "SELECT cancellation_requested_at IS NOT NULL FROM async_tasks WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_one(work.connection())
-        .await
-        .map_err(storage_error)?;
+        let cancel_requested = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find_one(doc! {"_id": id.to_string()})
+            .session(&mut *work.connection())
+            .await
+            .map_err(storage_error)?
+            .map(|document| {
+                document
+                    .get("cancellation_requested_at")
+                    .and_then(Bson::as_str)
+                    .is_some()
+            })
+            .unwrap_or(false);
         let status = forced.unwrap_or_else(|| {
             if cancel_requested {
                 AsyncTaskStatus::Canceled
@@ -1286,20 +1643,29 @@ impl RuntimeInterface {
                 AsyncTaskStatus::Failed
             }
         });
-        let changed = sqlx::query(
-            "UPDATE async_tasks SET status = ?, exit_json = ?, usage_json = ?, version = ?, ended_at = ? \
-             WHERE id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(async_task_status_str(status))
-        .bind(serde_json::to_string(&completion.exit).map_err(storage_error)?)
-        .bind(serde_json::to_string(&completion.usage).map_err(storage_error)?)
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?
-        .rows_affected();
+        let version = new_version();
+        let now = now_utc_str();
+        let exit_json = serde_json::to_string(&completion.exit).map_err(storage_error)?;
+        let usage_json = serde_json::to_string(&completion.usage).map_err(storage_error)?;
+        let changed = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["queued", "running"]}},
+                doc! {
+                    "$set": {
+                        "status": async_task_status_str(status),
+                        "exit_json": exit_json,
+                        "usage_json": usage_json,
+                        "version": version,
+                        "ended_at": now,
+                    }
+                },
+            )
+            .session(work.connection())
+            .await
+            .map_err(storage_error)?
+            .matched_count;
         if changed != 0 {
             self.append_async_task_changed_in_tx(&mut work, id).await?;
             work.commit().await.map_err(storage_error)?;
@@ -1313,15 +1679,18 @@ impl RuntimeInterface {
 
     async fn append_async_task_changed_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         id: AsyncTaskId,
     ) -> Result<AsyncTaskProjection, RuntimeError> {
-        let row = sqlx::query_as::<_, AsyncTaskRow>(&format!("{} WHERE id = ?", ASYNC_TASK_SELECT))
-            .bind(id.to_string())
-            .fetch_one(work.connection())
+        let document = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find_one(doc! {"_id": id.to_string()})
+            .session(&mut *work.connection())
             .await
-            .map_err(storage_error)?;
-        let async_task = async_task_projection(row)?;
+            .map_err(storage_error)?
+            .ok_or(RuntimeError::AsyncTaskLost(id))?;
+        let async_task = async_task_projection(AsyncTaskRow::from_document(&document)?)?;
         work
             .append_event(NewEvent {
                 event_type: EventType::AsyncTaskChanged,
@@ -1337,11 +1706,13 @@ impl RuntimeInterface {
     }
 
     async fn runtime_row(&self, id: RuntimeId) -> Result<RuntimeRow, RuntimeError> {
-        sqlx::query_as::<_, RuntimeRow>(RUNTIME_SELECT)
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
+        self.pool
+            .collection::<Document>("runtimes")
+            .find_one(doc! {"_id": id.to_string()})
             .await
             .map_err(storage_error)?
+            .map(|document| RuntimeRow::from_document(&document))
+            .transpose()?
             .ok_or(RuntimeError::RuntimeUnavailable)
     }
 
@@ -1354,11 +1725,13 @@ impl RuntimeInterface {
     }
 
     async fn async_task_row(&self, id: AsyncTaskId) -> Result<AsyncTaskRow, RuntimeError> {
-        sqlx::query_as::<_, AsyncTaskRow>(&format!("{} WHERE id = ?", ASYNC_TASK_SELECT))
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
+        self.pool
+            .collection::<Document>("async_tasks")
+            .find_one(doc! {"_id": id.to_string()})
             .await
             .map_err(storage_error)?
+            .map(|document| AsyncTaskRow::from_document(&document))
+            .transpose()?
             .ok_or(RuntimeError::AsyncTaskLost(id))
     }
 
@@ -1367,11 +1740,13 @@ impl RuntimeInterface {
     }
 
     async fn terminal_row(&self, id: TerminalId) -> Result<TerminalRow, RuntimeError> {
-        sqlx::query_as::<_, TerminalRow>(&format!("{} WHERE id = ?", TERMINAL_SELECT))
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
+        self.pool
+            .collection::<Document>("terminals")
+            .find_one(doc! {"_id": id.to_string()})
             .await
             .map_err(storage_error)?
+            .map(|document| TerminalRow::from_document(&document))
+            .transpose()?
             .ok_or(RuntimeError::TerminalNotWritable(id))
     }
 
@@ -1390,13 +1765,17 @@ impl RuntimeInterface {
         &self,
         id: AsyncTaskId,
     ) -> Result<bool, RuntimeError> {
-        sqlx::query_scalar(
-            "SELECT cancellation_requested_at IS NOT NULL FROM async_tasks WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(storage_error)
+        let document = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find_one(doc! {"_id": id.to_string()})
+            .await
+            .map_err(storage_error)?
+            .ok_or(RuntimeError::AsyncTaskLost(id))?;
+        Ok(document
+            .get("cancellation_requested_at")
+            .and_then(Bson::as_str)
+            .is_some())
     }
 
     async fn cancel_started_async_task(
@@ -1433,18 +1812,26 @@ impl RuntimeInterface {
             .parse::<LogStreamId>()
             .map_err(storage_error)?;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-        let changed = sqlx::query(
-            "UPDATE async_tasks SET status = 'lost', exit_json = ?, version = ?, ended_at = ? \
-             WHERE id = ? AND status IN ('queued', 'running')",
-        )
-        .bind(json!({"exit_code": null, "signal": reason}).to_string())
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?
-        .rows_affected();
+        let version = new_version();
+        let now = now_utc_str();
+        let changed = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["queued", "running"]}},
+                doc! {
+                    "$set": {
+                        "status": "lost",
+                        "exit_json": json!({"exit_code": null, "signal": reason}).to_string(),
+                        "version": version,
+                        "ended_at": now,
+                    }
+                },
+            )
+            .session(work.connection())
+            .await
+            .map_err(storage_error)?
+            .matched_count;
         if changed == 0 {
             work.rollback().await.map_err(storage_error)?;
             return Ok(());
@@ -1464,20 +1851,27 @@ impl RuntimeInterface {
             .parse::<LogStreamId>()
             .map_err(storage_error)?;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
-        let changed = sqlx::query(
-            "UPDATE terminals SET status = 'lost', exit_json = ?, version = ?, \
-             updated_at = ?, ended_at = ? WHERE id = ? \
-             AND status IN ('starting', 'running', 'closing')",
-        )
-        .bind(json!({"exit_code": null, "signal": reason}).to_string())
-        .bind(new_version())
-        .bind(now_utc_str())
-        .bind(now_utc_str())
-        .bind(id.to_string())
-        .execute(work.connection())
-        .await
-        .map_err(storage_error)?
-        .rows_affected();
+        let version = new_version();
+        let now = now_utc_str();
+        let changed = self
+            .pool
+            .collection::<Document>("terminals")
+            .update_one(
+                doc! {"_id": id.to_string(), "status": {"$in": ["starting", "running", "closing"]}},
+                doc! {
+                    "$set": {
+                        "status": "lost",
+                        "exit_json": json!({"exit_code": null, "signal": reason}).to_string(),
+                        "version": version,
+                        "updated_at": &now,
+                        "ended_at": &now,
+                    }
+                },
+            )
+            .session(work.connection())
+            .await
+            .map_err(storage_error)?
+            .matched_count;
         if changed != 0 {
             self.append_terminal_changed_in_tx(&mut work, id).await?;
             work.commit().await.map_err(storage_error)?;
@@ -1487,23 +1881,124 @@ impl RuntimeInterface {
         let _ = self.logs.close(scrollback_stream_id).await;
         Ok(())
     }
-}
 
-const RUNTIME_SELECT: &str = "SELECT id, scope_kind, scope_id, executor_nonce, limits_json, \
-    status, version, created_at, updated_at, stopped_at FROM runtimes WHERE id = ?";
-const ASYNC_TASK_SELECT: &str = "SELECT id, runtime_id, session_id, initiated_by_tool_call_id, \
-    controlling_turn_id, command_summary, executor_nonce, log_stream_id, status, exit_json, \
-    usage_json, version, created_at, started_at, ended_at FROM async_tasks";
-const TERMINAL_SELECT: &str = "SELECT id, runtime_id, owner_kind, owner_id, \
-    executor_nonce, cols, rows, scrollback_stream_id, status, exit_json, version, created_at, \
-    updated_at, ended_at FROM terminals";
-const SESSION_LOG_STREAMS: &str = "SELECT id FROM log_streams WHERE \
-    owner_kind = 'async_task' AND owner_id IN (SELECT id FROM async_tasks WHERE session_id = ?)";
-const PROJECT_LOG_STREAMS: &str = "SELECT id FROM log_streams WHERE \
-    (owner_kind = 'terminal' AND owner_id IN (SELECT id FROM terminals WHERE runtime_id IN \
-        (SELECT id FROM runtimes WHERE scope_kind = 'project' AND scope_id = ?))) OR \
-    (owner_kind = 'sync' AND owner_id IN (SELECT id FROM runtimes \
-        WHERE scope_kind = 'project' AND scope_id = ?))";
+    async fn session_log_stream_ids(&self, session_id: &str) -> Result<Vec<String>, RuntimeError> {
+        let mut async_task_ids = Vec::new();
+        let mut tasks = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {"session_id": session_id})
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = tasks.try_next().await.map_err(storage_error)? {
+            async_task_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        if async_task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut log_ids = Vec::new();
+        let mut streams = self
+            .pool
+            .collection::<Document>("log_streams")
+            .find(doc! {"owner_kind": "async_task", "owner_id": {"$in": &async_task_ids}})
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = streams.try_next().await.map_err(storage_error)? {
+            log_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        Ok(log_ids)
+    }
+
+    async fn session_log_stream_ids_in_tx(
+        &self,
+        tx: &mut ClientSession,
+        session_id: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let mut async_task_ids = Vec::new();
+        let mut tasks = self
+            .pool
+            .collection::<Document>("async_tasks")
+            .find(doc! {"session_id": session_id})
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = tasks
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            async_task_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        if async_task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut log_ids = Vec::new();
+        let mut streams = self
+            .pool
+            .collection::<Document>("log_streams")
+            .find(doc! {"owner_kind": "async_task", "owner_id": {"$in": &async_task_ids}})
+            .session(&mut *tx)
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = streams
+            .next(&mut *tx)
+            .await
+            .transpose()
+            .map_err(storage_error)?
+        {
+            log_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        Ok(log_ids)
+    }
+
+    async fn project_log_stream_ids(&self, project_id: &str) -> Result<Vec<String>, RuntimeError> {
+        let mut runtime_ids = Vec::new();
+        let mut runtimes = self
+            .pool
+            .collection::<Document>("runtimes")
+            .find(doc! {"scope_kind": "project", "scope_id": project_id})
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = runtimes.try_next().await.map_err(storage_error)? {
+            runtime_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        if runtime_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut terminal_ids = Vec::new();
+        let mut terminals = self
+            .pool
+            .collection::<Document>("terminals")
+            .find(doc! {"runtime_id": {"$in": &runtime_ids}})
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = terminals.try_next().await.map_err(storage_error)? {
+            terminal_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        let mut log_ids = Vec::new();
+        let filter = if terminal_ids.is_empty() {
+            doc! {"owner_kind": "sync", "owner_id": {"$in": &runtime_ids}}
+        } else {
+            doc! {
+                "$or": [
+                    doc! {"owner_kind": "terminal", "owner_id": {"$in": &terminal_ids}},
+                    doc! {"owner_kind": "sync", "owner_id": {"$in": &runtime_ids}},
+                ]
+            }
+        };
+        let mut streams = self
+            .pool
+            .collection::<Document>("log_streams")
+            .find(filter)
+            .await
+            .map_err(storage_error)?;
+        while let Some(document) = streams.try_next().await.map_err(storage_error)? {
+            log_ids.push(document.get_str("_id").map_err(storage_error)?.to_owned());
+        }
+        Ok(log_ids)
+    }
+}
 
 const TICKET_TTL: chrono::TimeDelta = chrono::Duration::seconds(30);
 const ASYNC_TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);

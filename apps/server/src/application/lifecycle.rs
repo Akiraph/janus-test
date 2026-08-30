@@ -47,7 +47,7 @@ pub(crate) enum SessionLifecycleError {
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
     #[error(transparent)]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
     #[error("invalid lifecycle work item: {0}")]

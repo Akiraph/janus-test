@@ -7,7 +7,10 @@ use janus_server::{
     AppState,
     config::{Config, RunMode},
 };
+use mongodb::bson::{Document, doc};
 use tempfile::TempDir;
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -23,6 +26,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -190,13 +200,21 @@ async fn local_runtime_persists_sync_async_tasks_events_and_recovery() -> anyhow
             .any(|event| event.event_type == "async_task.changed")
     );
 
-    sqlx::query("UPDATE runtimes SET status = 'ready' WHERE id = ?")
-        .bind(runtime_id.to_string())
-        .execute(state.pool())
+    state
+        .pool()
+        .collection::<Document>("runtimes")
+        .update_one(
+            doc! {"_id": runtime_id.to_string()},
+            doc! {"$set": {"status": "ready"}},
+        )
         .await?;
-    sqlx::query("UPDATE async_tasks SET status = 'running', ended_at = NULL WHERE id = ?")
-        .bind(stdin_id.to_string())
-        .execute(state.pool())
+    state
+        .pool()
+        .collection::<Document>("async_tasks")
+        .update_one(
+            doc! {"_id": stdin_id.to_string()},
+            doc! {"$set": {"status": "running", "ended_at": null}},
+        )
         .await?;
     state
         .runtime()

@@ -1,5 +1,7 @@
 //! Content-revision identity, manifest collection, and revision advancement.
 use super::*;
+use futures_util::TryStreamExt;
+use mongodb::ClientSession;
 
 impl WorkspaceInterface {
     /// Read the current revision identity for any workspace copy.
@@ -7,14 +9,19 @@ impl WorkspaceInterface {
         &self,
         handle: &WorkspaceHandle,
     ) -> Result<RevisionRef, WorkspaceError> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            Some((Some(revision_id),)) => Ok(RevisionRef(revision_id)),
-            Some((None,)) => Err(WorkspaceError::Internal(anyhow!(
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .await?;
+        match document.as_ref().and_then(|document| {
+            document
+                .get("current_revision_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned)
+        }) {
+            Some(revision_id) => Ok(RevisionRef(revision_id)),
+            None if document.is_some() => Err(WorkspaceError::Internal(anyhow!(
                 "copy has no current revision"
             ))),
             None => Err(WorkspaceError::NotFound),
@@ -31,24 +38,23 @@ impl WorkspaceInterface {
         if handles.is_empty() {
             return Ok(HashMap::new());
         }
-
-        let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT handle, current_revision_id FROM workspace_copies WHERE handle IN (",
-        );
-        let mut separated = query.separated(", ");
-        for handle in handles {
-            separated.push_bind(handle.as_str());
+        let handles = handles
+            .iter()
+            .map(WorkspaceHandle::as_str)
+            .collect::<Vec<_>>();
+        let mut cursor = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find(doc! {"_id": {"$in": handles}})
+            .await?;
+        let mut revisions = HashMap::new();
+        while let Some(document) = cursor.try_next().await? {
+            let handle = document.get_str("_id")?.to_owned();
+            if let Some(revision) = document.get("current_revision_id").and_then(Bson::as_str) {
+                revisions.insert(handle, RevisionRef(revision.to_owned()));
+            }
         }
-        separated.push_unseparated(")");
-
-        let rows: Vec<(String, Option<String>)> =
-            query.build_query_as().fetch_all(&self.pool).await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|(handle, revision)| {
-                revision.map(|revision| (handle, RevisionRef(revision)))
-            })
-            .collect())
+        Ok(revisions)
     }
 
     /// Advance a copy to a new revision without collecting a Merkle root
@@ -87,10 +93,11 @@ impl WorkspaceInterface {
         manifest_root_hash: Option<&str>,
         snapshot_purpose: Option<&str>,
     ) -> Result<RevisionRef, WorkspaceError> {
-        let mut tx = self.pool.begin().await?;
+        let mut session = self.pool.client().start_session().await?;
+        session.start_transaction().await?;
         let revision = self
             .advance_revision_in_tx(
-                &mut tx,
+                &mut session,
                 handle,
                 expected,
                 cause,
@@ -98,26 +105,30 @@ impl WorkspaceInterface {
                 manifest_root_hash.zip(snapshot_purpose),
             )
             .await?;
-        tx.commit().await?;
+        session.commit_transaction().await?;
         Ok(revision)
     }
 
     pub(crate) async fn check_expected_revision_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         handle: &WorkspaceHandle,
         expected: Option<&RevisionRef>,
     ) -> Result<(), WorkspaceError> {
         let Some(expected) = expected else {
             return Ok(());
         };
-        let current: Option<Option<String>> =
-            sqlx::query_scalar("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let current = current
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .session(&mut *tx)
+            .await?;
+        let current = document
             .ok_or(WorkspaceError::NotFound)?
+            .get("current_revision_id")
+            .and_then(Bson::as_str)
+            .map(str::to_owned)
             .ok_or_else(|| WorkspaceError::Internal(anyhow!("copy has no revision")))?;
         if expected.0 != current {
             return Err(WorkspaceError::RevisionMismatch {
@@ -130,20 +141,24 @@ impl WorkspaceInterface {
 
     pub(crate) async fn advance_revision_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        tx: &mut ClientSession,
         handle: &WorkspaceHandle,
         expected: Option<&RevisionRef>,
         cause: &str,
         actor: serde_json::Value,
         snapshot: Option<(&str, &str)>,
     ) -> Result<RevisionRef, WorkspaceError> {
-        let current: Option<Option<String>> =
-            sqlx::query_scalar("SELECT current_revision_id FROM workspace_copies WHERE handle = ?")
-                .bind(handle.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let current = current
+        let document = self
+            .pool
+            .collection::<Document>("workspace_copies")
+            .find_one(doc! {"_id": handle.as_str()})
+            .session(&mut *tx)
+            .await?;
+        let current = document
             .ok_or(WorkspaceError::NotFound)?
+            .get("current_revision_id")
+            .and_then(Bson::as_str)
+            .map(str::to_owned)
             .ok_or_else(|| WorkspaceError::Internal(anyhow!("copy has no revision")))?;
         if let Some(expected_ref) = expected
             && expected_ref.0 != current
@@ -155,57 +170,69 @@ impl WorkspaceInterface {
         }
 
         let now = now_utc_str();
-        let next_sequence: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM content_revisions \
-             WHERE workspace_handle = ?",
-        )
-        .bind(handle.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
+        let max_sequence = self
+            .pool
+            .collection::<Document>("content_revisions")
+            .find_one(doc! {"workspace_handle": handle.as_str()})
+            .sort(doc! {"sequence": -1})
+            .session(&mut *tx)
+            .await?;
+        let next_sequence = max_sequence
+            .as_ref()
+            .and_then(|document| document.get("sequence").and_then(Bson::as_i64))
+            .unwrap_or(0)
+            + 1;
         let revision_ref = RevisionRef::new(Uuid::now_v7());
         let copy_version = format!("v_{}", Uuid::now_v7());
+        let actor_json = serde_json::to_string(&actor)?;
 
-        sqlx::query(
-            "INSERT INTO content_revisions \
-             (revision_id, workspace_handle, sequence, manifest_root_hash, cause, \
-              actor_json, prev_revision_id, stable, occurred_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
-        )
-        .bind(revision_ref.0.clone())
-        .bind(handle.as_str())
-        .bind(next_sequence)
-        .bind(snapshot.map(|(root, _)| root))
-        .bind(cause)
-        .bind(serde_json::to_string(&actor)?)
-        .bind(&current)
-        .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+        let mut document = doc! {
+            "_id": &revision_ref.0,
+            "workspace_handle": handle.as_str(),
+            "sequence": next_sequence,
+            "cause": cause,
+            "actor_json": &actor_json,
+            "prev_revision_id": &current,
+            "stable": 1i64,
+            "occurred_at": &now,
+        };
+        if let Some((root, _)) = snapshot {
+            document.insert("manifest_root_hash", root);
+        }
+        self.pool
+            .collection::<Document>("content_revisions")
+            .insert_one(document)
+            .session(&mut *tx)
+            .await?;
         if let Some((root, purpose)) = snapshot {
             let snapshot_id = Uuid::now_v7();
-            sqlx::query(
-                "INSERT INTO workspace_snapshots \
-                 (snapshot_id, revision_id, manifest_root_hash, purpose, integrity_state, created_at) \
-                 VALUES (?, ?, ?, ?, 'complete', ?)",
-            )
-            .bind(snapshot_id.to_string())
-            .bind(revision_ref.0.clone())
-            .bind(root)
-            .bind(purpose)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
+            self.pool
+                .collection::<Document>("workspace_snapshots")
+                .insert_one(doc! {
+                    "snapshot_id": snapshot_id.to_string(),
+                    "revision_id": &revision_ref.0,
+                    "manifest_root_hash": root,
+                    "purpose": purpose,
+                    "integrity_state": "complete",
+                    "created_at": &now,
+                })
+                .session(&mut *tx)
+                .await?;
         }
-        sqlx::query(
-            "UPDATE workspace_copies SET current_revision_id = ?, version = ?, updated_at = ? \
-             WHERE handle = ?",
-        )
-        .bind(revision_ref.0.clone())
-        .bind(&copy_version)
-        .bind(&now)
-        .bind(handle.as_str())
-        .execute(&mut *tx)
-        .await?;
+        self.pool
+            .collection::<Document>("workspace_copies")
+            .update_one(
+                doc! {"_id": handle.as_str()},
+                doc! {
+                    "$set": {
+                        "current_revision_id": &revision_ref.0,
+                        "version": &copy_version,
+                        "updated_at": &now,
+                    }
+                },
+            )
+            .session(&mut *tx)
+            .await?;
         Ok(revision_ref)
     }
 }

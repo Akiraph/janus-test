@@ -12,10 +12,13 @@ use janus_server::{
     config::{Config, RunMode},
     router,
 };
+use mongodb::bson::{Document, doc};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -31,6 +34,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -206,11 +216,14 @@ async fn github_credentials_require_explicit_automation_opt_in() -> anyhow::Resu
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
     let owner_id = "owner-automation-scope";
-    sqlx::query("INSERT INTO owners (id, display_name, created_at) VALUES (?, ?, ?)")
-        .bind(owner_id)
-        .bind("Automation scope test")
-        .bind("2026-01-01T00:00:00Z")
-        .execute(state.pool())
+    state
+        .pool()
+        .collection::<Document>("owners")
+        .insert_one(doc! {
+            "_id": owner_id,
+            "display_name": "Automation scope test",
+            "created_at": "2026-01-01T00:00:00Z",
+        })
         .await?;
 
     let created = state
@@ -341,14 +354,21 @@ async fn event_stream_replays_committed_rows_and_validates_cursors() -> anyhow::
 #[tokio::test]
 async fn data_root_lock_is_exclusive_and_reusable_after_close() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
-    let first = Database::open(directory.path(), janus_server::migrator()).await?;
+    let uri = std::env::var("JANUS_MONGODB_URI")
+        .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into());
+    let db_name = format!(
+        "janus_test_{}_{}",
+        std::process::id(),
+        TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let first = Database::open(directory.path(), &uri, &db_name).await?;
     assert!(
-        Database::open(directory.path(), janus_server::migrator())
+        Database::open(directory.path(), &uri, &db_name)
             .await
             .is_err()
     );
     drop(first);
-    let reopened = Database::open(directory.path(), janus_server::migrator()).await?;
+    let reopened = Database::open(directory.path(), &uri, &db_name).await?;
     assert!(reopened.ready().await);
     Ok(())
 }

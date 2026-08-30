@@ -9,17 +9,19 @@ use janus_models::interface::{
 };
 use janus_projects::interface::ProjectsInterface;
 use janus_workspace::interface::WorkspaceInterface;
-use sqlx::SqlitePool;
+use mongodb::bson::{Document, doc};
 use tempfile::TempDir;
 
 const OWNER_ID: &str = "owner-test";
 const PROJECT_ID: &str = "project-test";
 const NOW: &str = "2026-01-01T00:00:00.000Z";
 
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Fx {
     _temp: TempDir,
     _database: Database,
-    pool: SqlitePool,
+    pool: mongodb::Database,
     _projects: ProjectsInterface,
     models: ModelsInterface,
 }
@@ -27,7 +29,17 @@ struct Fx {
 impl Fx {
     async fn new() -> anyhow::Result<Self> {
         let temp = TempDir::new()?;
-        let database = Database::open(temp.path(), janus_server::migrator()).await?;
+        let database = Database::open(
+            temp.path(),
+            &std::env::var("JANUS_MONGODB_URI")
+                .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+            &format!(
+                "janus_test_{}_{}",
+                std::process::id(),
+                TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
+        .await?;
         let pool = database.pool().clone();
         seed_owner_and_project(&pool).await?;
         let cipher = SecretCipher::load(temp.path(), false)?;
@@ -53,29 +65,33 @@ impl Fx {
     }
 }
 
-async fn seed_owner_and_project(pool: &SqlitePool) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO owners (id, display_name, created_at) \
-         VALUES (?, 'Owner', ?)",
-    )
-    .bind(OWNER_ID)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO projects \
-         (id, owner_id, name, state, repo_access, repo_url, version, \
-          created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, 'Project', 'ready', 'public_https', \
-                 'https://example.com/repo.git', 'v1', ?, ?, ?)",
-    )
-    .bind(PROJECT_ID)
-    .bind(OWNER_ID)
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
+async fn seed_owner_and_project(pool: &mongodb::Database) -> anyhow::Result<()> {
+    pool.collection::<Document>("owners")
+        .insert_one(doc! {
+            "_id": OWNER_ID,
+            "display_name": "Owner",
+            "created_at": NOW,
+        })
+        .await?;
+    pool.collection::<Document>("projects")
+        .insert_one(doc! {
+            "_id": PROJECT_ID,
+            "owner_id": OWNER_ID,
+            "name": "Project",
+            "state": "ready",
+            "repo_access": "public_https",
+            "repo_url": "https://example.com/repo.git",
+            "repo_branch": null,
+            "github_credential_id": null,
+            "default_model_id": null,
+            "main_workspace_handle": null,
+            "clone_error": null,
+            "version": "v1",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
     Ok(())
 }
 fn provider_input(models: Vec<EmbeddedModelInput>) -> ProviderInput {
@@ -167,23 +183,24 @@ async fn normalized_models_keep_ids_and_validate_ordered_failover() -> anyhow::R
 async fn runtime_scope_uniqueness_rejects_duplicate_scope() -> anyhow::Result<()> {
     let fx = Fx::new().await?;
     async fn insert_runtime(
-        pool: &SqlitePool,
+        pool: &mongodb::Database,
         id: &str,
         scope_kind: &str,
         scope_id: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO runtimes (id, scope_kind, scope_id, executor_nonce, limits_json, \
-             status, version, created_at, updated_at) \
-             VALUES (?, ?, ?, 'nonce', '{}', 'ready', 'v1', ?, ?)",
-        )
-        .bind(id)
-        .bind(scope_kind)
-        .bind(scope_id)
-        .bind(NOW)
-        .bind(NOW)
-        .execute(pool)
-        .await?;
+        pool.collection::<Document>("runtimes")
+            .insert_one(doc! {
+                "_id": id,
+                "scope_kind": scope_kind,
+                "scope_id": scope_id,
+                "executor_nonce": "nonce",
+                "limits_json": "{}",
+                "status": "ready",
+                "version": "v1",
+                "created_at": NOW,
+                "updated_at": NOW,
+            })
+            .await?;
         Ok(())
     }
     insert_runtime(&fx.pool, "runtime-project", "project", "project-shared").await?;

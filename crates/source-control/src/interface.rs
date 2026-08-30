@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
 };
 
+use futures_util::TryStreamExt;
 use janus_infrastructure::{
     clock::now_utc_str,
     events::{EventStore, EventType, NewEvent},
@@ -24,8 +25,8 @@ use janus_infrastructure::{
     unit_of_work::UnitOfWork,
 };
 use janus_workspace::interface::{WorkspaceError, WorkspaceHandle, WorkspaceInterface};
+use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -344,13 +345,15 @@ pub enum SourceControlError {
     #[error("operation error: {0}")]
     Operation(#[from] janus_infrastructure::operations::OperationError),
     #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
 }
 
 /// Stable error codes for the `GIT_*` family and friends; transport maps these
@@ -370,13 +373,13 @@ impl SourceControlError {
             | Self::Storage(_)
             | Self::Serde(_)
             | Self::Io(_)
-            | Self::Internal(_) => "INTERNAL_ERROR",
+            | Self::Internal(_)
+            | Self::ValueAccess(_) => "INTERNAL_ERROR",
         }
     }
 }
 
 /// Repo config the git capability reads (read-only) from the `projects` table.
-#[derive(FromRow)]
 struct RepoConfigRow {
     state: String,
     repo_url: String,
@@ -385,12 +388,41 @@ struct RepoConfigRow {
     github_credential_id: Option<String>,
 }
 
-#[derive(FromRow)]
+impl RepoConfigRow {
+    fn from_doc(document: &Document) -> Result<Self, SourceControlError> {
+        Ok(Self {
+            state: document.get_str("state")?.to_owned(),
+            repo_url: document.get_str("repo_url")?.to_owned(),
+            repo_branch: document
+                .get("repo_branch")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            repo_access: document.get_str("repo_access")?.to_owned(),
+            github_credential_id: document
+                .get("github_credential_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+        })
+    }
+}
+
 struct CredentialRow {
     pat_ciphertext: Option<Vec<u8>>,
 }
 
-#[derive(FromRow)]
+impl CredentialRow {
+    fn from_doc(document: &Document) -> Result<Self, SourceControlError> {
+        Ok(Self {
+            pat_ciphertext: document
+                .get("pat_ciphertext")
+                .and_then(|value| match value {
+                    Bson::Binary(binary) => Some(binary.bytes.clone()),
+                    _ => None,
+                }),
+        })
+    }
+}
+
 struct ConflictRow {
     id: String,
     project_id: String,
@@ -404,7 +436,23 @@ struct ConflictRow {
     updated_at: String,
 }
 
-#[derive(FromRow)]
+impl ConflictRow {
+    fn from_doc(document: &Document) -> Result<Self, SourceControlError> {
+        Ok(Self {
+            id: document.get_str("_id")?.to_owned(),
+            project_id: document.get_str("project_id")?.to_owned(),
+            base_tree: document.get_str("base_tree")?.to_owned(),
+            remote_tree: document.get_str("remote_tree")?.to_owned(),
+            main_tree: document.get_str("main_tree")?.to_owned(),
+            state: document.get_str("state")?.to_owned(),
+            operation_id: document.get_str("operation_id")?.to_owned(),
+            version: document.get_str("version")?.to_owned(),
+            created_at: document.get_str("created_at")?.to_owned(),
+            updated_at: document.get_str("updated_at")?.to_owned(),
+        })
+    }
+}
+
 struct ConflictPathRow {
     path: String,
     kind: String,
@@ -412,6 +460,31 @@ struct ConflictPathRow {
     remote_hash: Option<String>,
     main_hash: Option<String>,
     choice: Option<String>,
+}
+
+impl ConflictPathRow {
+    fn from_doc(document: &Document) -> Result<Self, SourceControlError> {
+        Ok(Self {
+            path: document.get_str("path")?.to_owned(),
+            kind: document.get_str("kind")?.to_owned(),
+            base_hash: document
+                .get("base_hash")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            remote_hash: document
+                .get("remote_hash")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            main_hash: document
+                .get("main_hash")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            choice: document
+                .get("choice")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+        })
+    }
 }
 
 fn pat_aad(owner_id: &str, id: &str) -> String {
@@ -444,7 +517,7 @@ fn operation_problem(error: &GitError) -> serde_json::Value {
 /// it never writes project metadata or project states.
 #[derive(Clone)]
 pub struct SourceControlInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     unit_of_work: UnitOfWork,
     cipher: SecretCipher,
     operations: OperationInterface,
@@ -455,7 +528,7 @@ pub struct SourceControlInterface {
 
 impl SourceControlInterface {
     pub fn new(
-        pool: SqlitePool,
+        pool: mongodb::Database,
         cipher: SecretCipher,
         operations: OperationInterface,
         workspace: WorkspaceInterface,
@@ -507,15 +580,15 @@ impl SourceControlInterface {
         owner_id: &str,
         id: &str,
     ) -> Result<RepoConfigRow, SourceControlError> {
-        sqlx::query_as::<_, RepoConfigRow>(
-            "SELECT state, repo_url, repo_branch, repo_access, github_credential_id \
-             FROM projects WHERE id = ? AND owner_id = ?",
-        )
-        .bind(id)
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SourceControlError::NotFound)
+        let document = self
+            .pool
+            .collection::<Document>("projects")
+            .find_one(doc! {"_id": id, "owner_id": owner_id})
+            .await?;
+        let Some(document) = document else {
+            return Err(SourceControlError::NotFound);
+        };
+        RepoConfigRow::from_doc(&document)
     }
 
     async fn require_ready(
@@ -538,16 +611,15 @@ impl SourceControlInterface {
         owner_id: &str,
         credential_id: &str,
     ) -> Result<Option<String>, SourceControlError> {
-        let row: Option<CredentialRow> = sqlx::query_as(
-            "SELECT pat_ciphertext FROM github_credentials WHERE id = ? AND owner_id = ?",
-        )
-        .bind(credential_id)
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
+        let document = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .find_one(doc! {"_id": credential_id, "owner_id": owner_id})
+            .await?;
+        let Some(document) = document else {
             return Err(SourceControlError::CredentialNotFound);
         };
+        let row = CredentialRow::from_doc(&document)?;
         match row.pat_ciphertext {
             Some(stored) => {
                 let secret = self
@@ -1021,12 +1093,16 @@ impl SourceControlInterface {
         project_id: &str,
     ) -> Result<Vec<GitUpdateConflictView>, SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
-        let rows: Vec<ConflictRow> = sqlx::query_as(
-            "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE project_id = ? AND state IN ('open', 'applying') ORDER BY created_at DESC",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("git_update_conflicts")
+            .find(doc! {"project_id": project_id, "state": {"$in": ["open", "applying"]}})
+            .sort(doc! {"created_at": -1})
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push(ConflictRow::from_doc(&document)?);
+        }
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push(self.conflict_view(row).await?);
@@ -1041,14 +1117,15 @@ impl SourceControlInterface {
         conflict_id: &str,
     ) -> Result<GitUpdateConflictView, SourceControlError> {
         self.require_ready(owner_id, project_id).await?;
-        let row: ConflictRow = sqlx::query_as(
-            "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE id = ? AND project_id = ?",
-        )
-        .bind(conflict_id)
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SourceControlError::ConflictNotFound)?;
+        let document = self
+            .pool
+            .collection::<Document>("git_update_conflicts")
+            .find_one(doc! {"_id": conflict_id, "project_id": project_id})
+            .await?;
+        let Some(document) = document else {
+            return Err(SourceControlError::ConflictNotFound);
+        };
+        let row = ConflictRow::from_doc(&document)?;
         self.conflict_view(row).await
     }
 
@@ -1068,14 +1145,15 @@ impl SourceControlInterface {
             .workspace
             .acquire_project_mutation_lock(project_id)
             .await?;
-        let row: ConflictRow = sqlx::query_as(
-            "SELECT id, project_id, base_tree, remote_tree, main_tree, state, operation_id, version, created_at, updated_at FROM git_update_conflicts WHERE id = ? AND project_id = ?",
-        )
-        .bind(conflict_id)
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SourceControlError::ConflictNotFound)?;
+        let document = self
+            .pool
+            .collection::<Document>("git_update_conflicts")
+            .find_one(doc! {"_id": conflict_id, "project_id": project_id})
+            .await?;
+        let Some(document) = document else {
+            return Err(SourceControlError::ConflictNotFound);
+        };
+        let row = ConflictRow::from_doc(&document)?;
         if row.version != expected_version {
             return Err(SourceControlError::RevisionMismatch {
                 expected: expected_version.into(),
@@ -1111,17 +1189,19 @@ impl SourceControlInterface {
             } else {
                 None
             };
-            let changed = sqlx::query(
-                "UPDATE git_update_conflict_paths SET choice = ?, edited_blob_sha = ?, version = ? WHERE conflict_id = ? AND path = ?",
-            )
-            .bind(&path.choice)
-            .bind(edited_blob.as_deref())
-            .bind(format!("v_{}", GitUpdateConflictId::new()))
-            .bind(conflict_id)
-            .bind(&path.path)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+            let changed = self
+                .pool
+                .collection::<Document>("git_update_conflict_paths")
+                .update_one(
+                    doc! {"conflict_id": conflict_id, "path": &path.path},
+                    doc! {"$set": {
+                        "choice": &path.choice,
+                        "edited_blob_sha": edited_blob.as_deref(),
+                        "version": format!("v_{}", GitUpdateConflictId::new()),
+                    }},
+                )
+                .await?
+                .matched_count;
             if changed == 0 {
                 return Err(SourceControlError::Validation(format!(
                     "path is not part of this conflict: {}",
@@ -1136,22 +1216,22 @@ impl SourceControlInterface {
             }
         }
 
-        // Check whether every path now has a choice.
-        let unresolved: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM git_update_conflict_paths WHERE conflict_id = ? AND choice IS NULL",
-        )
-        .bind(conflict_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let unresolved = unresolved.map(|(c,)| c).unwrap_or(0);
+        // Check whether every path now has a choice. Paths with no choice are
+        // stored without a `choice` field, so `{choice: null}` matches them.
+        let unresolved = self
+            .pool
+            .collection::<Document>("git_update_conflict_paths")
+            .count_documents(doc! {"conflict_id": conflict_id, "choice": null})
+            .await?;
         if unresolved > 0 {
             // Partial save — stay open.
             let new_version = format!("v_{}", GitUpdateConflictId::new());
-            sqlx::query("UPDATE git_update_conflicts SET version = ?, updated_at = ? WHERE id = ?")
-                .bind(&new_version)
-                .bind(&now)
-                .bind(conflict_id)
-                .execute(&self.pool)
+            self.pool
+                .collection::<Document>("git_update_conflicts")
+                .update_one(
+                    doc! {"_id": conflict_id},
+                    doc! {"$set": {"version": &new_version, "updated_at": &now}},
+                )
                 .await?;
             return self
                 .get_update_conflict(owner_id, project_id, conflict_id)
@@ -1159,21 +1239,27 @@ impl SourceControlInterface {
         }
 
         // All paths chosen: apply and complete.
-        sqlx::query(
-            "UPDATE git_update_conflicts SET state = 'applying', version = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(format!("v_{}", GitUpdateConflictId::new()))
-        .bind(&now)
-        .bind(conflict_id)
-        .execute(&self.pool)
-        .await?;
+        self.pool
+            .collection::<Document>("git_update_conflicts")
+            .update_one(
+                doc! {"_id": conflict_id},
+                doc! {"$set": {
+                    "state": "applying",
+                    "version": format!("v_{}", GitUpdateConflictId::new()),
+                    "updated_at": &now,
+                }},
+            )
+            .await?;
 
-        let path_rows: Vec<ConflictPathRow> = sqlx::query_as(
-            "SELECT path, kind, base_hash, remote_hash, main_hash, choice FROM git_update_conflict_paths WHERE conflict_id = ?",
-        )
-        .bind(conflict_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("git_update_conflict_paths")
+            .find(doc! {"conflict_id": conflict_id})
+            .await?;
+        let mut path_rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            path_rows.push(ConflictPathRow::from_doc(&document)?);
+        }
         let dir = self.main_repo_dir(project_id);
         for path_row in &path_rows {
             let choice = path_row.choice.as_deref().unwrap_or("main");
@@ -1226,14 +1312,17 @@ impl SourceControlInterface {
                 )
                 .await;
         }
-        sqlx::query(
-            "UPDATE git_update_conflicts SET state = 'resolved', version = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(format!("v_{}", GitUpdateConflictId::new()))
-        .bind(&now)
-        .bind(conflict_id)
-        .execute(&self.pool)
-        .await?;
+        self.pool
+            .collection::<Document>("git_update_conflicts")
+            .update_one(
+                doc! {"_id": conflict_id},
+                doc! {"$set": {
+                    "state": "resolved",
+                    "version": format!("v_{}", GitUpdateConflictId::new()),
+                    "updated_at": &now,
+                }},
+            )
+            .await?;
         // Best-effort: mark the original operation succeeded if still open.
         let _ = self
             .operations
@@ -1287,30 +1376,24 @@ impl SourceControlInterface {
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query(
-            "INSERT INTO project_git_state (project_id, git_state_version, head_sha, branch, ahead, behind, last_scan_at, version, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(project_id) DO UPDATE SET
-               git_state_version = excluded.git_state_version,
-               head_sha = excluded.head_sha,
-               branch = excluded.branch,
-               ahead = excluded.ahead,
-               behind = excluded.behind,
-               last_scan_at = excluded.last_scan_at,
-               version = excluded.version,
-               updated_at = excluded.updated_at",
-        )
-        .bind(project_id)
-        .bind(&version)
-        .bind(status.head_sha.as_deref())
-        .bind(status.branch.as_deref())
-        .bind(i64::from(status.ahead))
-        .bind(i64::from(status.behind))
-        .bind(&now)
-        .bind(&version)
-        .bind(&now)
-        .execute(work.connection())
-        .await?;
+        self.pool
+            .collection::<Document>("project_git_state")
+            .update_one(
+                doc! {"_id": project_id},
+                doc! {"$set": {
+                    "git_state_version": &version,
+                    "head_sha": status.head_sha.as_deref(),
+                    "branch": status.branch.as_deref(),
+                    "ahead": i64::from(status.ahead),
+                    "behind": i64::from(status.behind),
+                    "last_scan_at": &now,
+                    "version": &version,
+                    "updated_at": &now,
+                }},
+            )
+            .upsert(true)
+            .session(&mut *work.connection())
+            .await?;
         work.append_event(NewEvent {
             event_type: EventType::GitStateChanged,
             actor: serde_json::json!({"kind": "owner", "id": owner_id}),
@@ -1337,54 +1420,86 @@ impl SourceControlInterface {
         let now = now_utc_str();
         let version = format!("v_{}", GitUpdateConflictId::new());
         // Supersede any previous open conflict for this project.
-        sqlx::query(
-            "UPDATE git_update_conflicts SET state = 'superseded', updated_at = ? WHERE project_id = ? AND state IN ('open', 'applying')",
-        )
-        .bind(&now)
-        .bind(project_id)
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO git_update_conflicts (id, project_id, base_tree, remote_tree, main_tree, state, operation_id, prev_conflict_id, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'open', ?, NULL, ?, ?, ?)",
-        )
-        .bind(&conflict_id)
-        .bind(project_id)
-        .bind(base_tree)
-        .bind(remote_tree)
-        .bind(main_tree)
-        .bind(operation_id)
-        .bind(&version)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-        for path in paths {
-            sqlx::query(
-                "INSERT INTO git_update_conflict_paths (conflict_id, path, kind, base_hash, remote_hash, main_hash, choice, edited_blob_sha, version) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+        self.pool
+            .collection::<Document>("git_update_conflicts")
+            .update_many(
+                doc! {"project_id": project_id, "state": {"$in": ["open", "applying"]}},
+                doc! {"$set": {"state": "superseded", "updated_at": &now}},
             )
-            .bind(&conflict_id)
-            .bind(&path.path)
-            .bind(&path.kind)
-            .bind(path.base_hash.as_deref())
-            .bind(path.remote_hash.as_deref())
-            .bind(path.main_hash.as_deref())
-            .bind(format!("v_{}", GitUpdateConflictId::new()))
-            .execute(&self.pool)
             .await?;
+        self.pool
+            .collection::<Document>("git_update_conflicts")
+            .insert_one(doc! {
+                "_id": &conflict_id,
+                "project_id": project_id,
+                "base_tree": base_tree,
+                "remote_tree": remote_tree,
+                "main_tree": main_tree,
+                "state": "open",
+                "operation_id": operation_id,
+                "version": &version,
+                "created_at": &now,
+                "updated_at": &now,
+            })
+            .await?;
+        for path in paths {
+            self.pool
+                .collection::<Document>("git_update_conflict_paths")
+                .insert_one(doc! {
+                    "conflict_id": &conflict_id,
+                    "path": &path.path,
+                    "kind": &path.kind,
+                    "base_hash": path.base_hash.as_deref(),
+                    "remote_hash": path.remote_hash.as_deref(),
+                    "main_hash": path.main_hash.as_deref(),
+                    "version": format!("v_{}", GitUpdateConflictId::new()),
+                })
+                .await?;
         }
         Ok(conflict_id)
+    }
+
+    /// Remove every git metadata row for a deleted Project. Mongo has no ON
+    /// DELETE CASCADE and the collection-ownership rules forbid `projects`
+    /// from writing these collections, so the application layer must call this
+    /// when a Project is deleted.
+    pub async fn delete_project_state(&self, project_id: &str) -> Result<(), SourceControlError> {
+        let conflict_ids = self
+            .pool
+            .collection::<Document>("git_update_conflicts")
+            .distinct("_id", doc! {"project_id": project_id})
+            .await?;
+        if !conflict_ids.is_empty() {
+            self.pool
+                .collection::<Document>("git_update_conflict_paths")
+                .delete_many(doc! {"conflict_id": {"$in": conflict_ids}})
+                .await?;
+        }
+        self.pool
+            .collection::<Document>("git_update_conflicts")
+            .delete_many(doc! {"project_id": project_id})
+            .await?;
+        self.pool
+            .collection::<Document>("project_git_state")
+            .delete_one(doc! {"_id": project_id})
+            .await?;
+        Ok(())
     }
 
     async fn conflict_view(
         &self,
         row: ConflictRow,
     ) -> Result<GitUpdateConflictView, SourceControlError> {
-        let paths: Vec<ConflictPathRow> = sqlx::query_as(
-            "SELECT path, kind, base_hash, remote_hash, main_hash, choice FROM git_update_conflict_paths WHERE conflict_id = ? ORDER BY path",
-        )
-        .bind(&row.id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("git_update_conflict_paths")
+            .find(doc! {"conflict_id": &row.id})
+            .sort(doc! {"path": 1})
+            .await?;
+        let mut paths = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            paths.push(ConflictPathRow::from_doc(&document)?);
+        }
         Ok(GitUpdateConflictView {
             id: row.id,
             project_id: row.project_id,

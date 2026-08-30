@@ -455,7 +455,8 @@ fn clone_failure_disposition(error: &anyhow::Error) -> WorkFailureDisposition {
             | SourceControlError::Storage(_)
             | SourceControlError::Serde(_)
             | SourceControlError::Io(_)
-            | SourceControlError::Internal(_) => WorkFailureDisposition::Retry,
+            | SourceControlError::Internal(_)
+            | SourceControlError::ValueAccess(_) => WorkFailureDisposition::Retry,
             SourceControlError::Validation(_)
             | SourceControlError::NotFound
             | SourceControlError::CredentialNotFound
@@ -478,7 +479,8 @@ fn clone_failure_disposition(error: &anyhow::Error) -> WorkFailureDisposition {
             | ProjectsError::Storage(_)
             | ProjectsError::Serde(_)
             | ProjectsError::Io(_)
-            | ProjectsError::Internal(_) => WorkFailureDisposition::Retry,
+            | ProjectsError::Internal(_)
+            | ProjectsError::ValueAccess(_) => WorkFailureDisposition::Retry,
         };
     }
     WorkFailureDisposition::Retry

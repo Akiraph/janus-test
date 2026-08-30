@@ -4,11 +4,18 @@
 //! Rebuilding the chat prefix remains an application decision, so this module
 //! does not silently rewrite prior context history.
 
-use janus_infrastructure::clock::now_utc_str;
-use serde_json::{Value, json};
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use std::collections::HashSet;
 
-use janus_infrastructure::id::{CompactSummaryId, ContextVersionId, SessionId};
+use futures_util::TryStreamExt;
+use janus_infrastructure::{
+    clock::now_utc_str,
+    id::{CompactSummaryId, ContextVersionId, SessionId},
+};
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+};
+use serde_json::{Value, json};
 
 pub const DEFAULT_CONTEXT_LIMIT: i64 = 1_000_000;
 pub const AUTO_COMPACT_THRESHOLD_PERCENT: i64 = 90;
@@ -58,12 +65,12 @@ Stop rules:
 - If evidence is insufficient to support a conclusion, say so explicitly rather than guessing; request only information that cannot be safely discovered.
 - Do not broaden the requested scope without user authorization."#;
 
-/// Record one `context_versions` row for a Session/Turn and return its id.
+/// Record one `context_versions` document for a Session/Turn and return its id.
 /// `estimated_input_tokens` is a coarse token estimate used to drive later
 /// automatic Compact scheduling; it is a rough `chars/4` of the
 /// assembled history so the column is populated for downstream decisions.
 pub async fn record_context_version(
-    pool: &SqlitePool,
+    pool: &mongodb::Database,
     session_id: SessionId,
     turn_id: Option<&str>,
     estimated_input_tokens: i64,
@@ -71,9 +78,11 @@ pub async fn record_context_version(
     compact_status: &str,
     selection_json: Value,
 ) -> anyhow::Result<String> {
-    let mut connection = pool.acquire().await?;
-    record_context_version_in_tx(
-        &mut connection,
+    let mut session = pool.client().start_session().await?;
+    session.start_transaction().await?;
+    let id = record_context_version_in_tx(
+        pool,
+        &mut session,
         session_id,
         turn_id,
         estimated_input_tokens,
@@ -81,11 +90,15 @@ pub async fn record_context_version(
         compact_status,
         selection_json,
     )
-    .await
+    .await?;
+    session.commit_transaction().await?;
+    Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_context_version_in_tx(
-    tx: &mut SqliteConnection,
+    database: &mongodb::Database,
+    session: &mut ClientSession,
     session_id: SessionId,
     turn_id: Option<&str>,
     estimated_input_tokens: i64,
@@ -95,50 +108,62 @@ pub async fn record_context_version_in_tx(
 ) -> anyhow::Result<String> {
     let id = ContextVersionId::new().to_string();
     let now = now_utc_str();
-    sqlx::query(
-        "INSERT INTO context_versions \
-         (id, session_id, turn_id, sequence, compact_summary_id, \
-          estimated_input_tokens, context_limit, compact_status, selection_json, created_at) \
-         VALUES (?, ?, ?, \
-          (SELECT COALESCE(MAX(sequence), 0) + 1 FROM context_versions WHERE session_id = ?), \
-          NULL, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(session_id.to_string())
-    .bind(turn_id)
-    .bind(session_id.to_string())
-    .bind(estimated_input_tokens)
-    .bind(context_limit)
-    .bind(compact_status)
-    .bind(selection_json.to_string())
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
+    let latest = database
+        .collection::<Document>("context_versions")
+        .find_one(doc! {"session_id": session_id.to_string()})
+        .sort(doc! {"sequence": -1})
+        .session(&mut *session)
+        .await?;
+    let sequence = latest
+        .and_then(|doc| doc.get("sequence").and_then(Bson::as_i64))
+        .unwrap_or(0)
+        .saturating_add(1);
+    let selection_json_str = selection_json.to_string();
+    let mut document = doc! {
+        "_id": &id,
+        "session_id": session_id.to_string(),
+        "sequence": sequence,
+        "estimated_input_tokens": estimated_input_tokens,
+        "context_limit": context_limit,
+        "compact_status": compact_status,
+        "selection_json": &selection_json_str,
+        "created_at": &now,
+    };
+    if let Some(turn_id) = turn_id {
+        document.insert("turn_id", turn_id);
+    }
+    database
+        .collection::<Document>("context_versions")
+        .insert_one(document)
+        .session(&mut *session)
+        .await?;
     Ok(id)
 }
 
 /// Schedule a manual Compact for a Session: persist one immutable
-/// `compact_summaries` row covering the supplied timeline range, and mark the
-/// session's latest `context_versions` row `compact_status = 'scheduled'` so
-/// the next Round can surface the compacted summary. Returns the summary id.
+/// `compact_summaries` document covering the supplied timeline range, and mark
+/// the session's latest `context_versions` document `compact_status = 'scheduled'`
+/// so the next Round can surface the compacted summary. Returns the summary id.
 ///
 /// This records durable intent and an immutable summary ledger. Replacing the
 /// chat history prefix remains a separate execution decision, so partial
 /// wiring cannot corrupt prior context.
 pub async fn schedule_compact(
-    pool: &SqlitePool,
+    pool: &mongodb::Database,
     session_id: SessionId,
     source_first: Option<&str>,
     source_last: &str,
     summary: Value,
 ) -> anyhow::Result<String> {
-    let mut connection = pool.acquire().await?;
+    let mut session = pool.client().start_session().await?;
+    session.start_transaction().await?;
     let id = CompactSummaryId::new().to_string();
     schedule_compact_in_tx(
-        &mut connection,
+        pool,
+        &mut session,
         ScheduleCompactInput {
             session_id,
-            compact_summary_id: id,
+            compact_summary_id: id.clone(),
             source_first: source_first.map(ToOwned::to_owned),
             source_last: source_last.to_owned(),
             summary,
@@ -146,11 +171,14 @@ pub async fn schedule_compact(
             context_limit: DEFAULT_CONTEXT_LIMIT,
         },
     )
-    .await
+    .await?;
+    session.commit_transaction().await?;
+    Ok(id)
 }
 
 pub async fn schedule_compact_in_tx(
-    tx: &mut SqliteConnection,
+    database: &mongodb::Database,
+    session: &mut ClientSession,
     input: ScheduleCompactInput,
 ) -> anyhow::Result<String> {
     let ScheduleCompactInput {
@@ -163,33 +191,54 @@ pub async fn schedule_compact_in_tx(
         context_limit,
     } = input;
     let now = now_utc_str();
-    sqlx::query(
-        "INSERT INTO compact_summaries \
-         (id, session_id, source_first_timeline_id, source_last_timeline_id, summary_json, \
-          model_attempt_id, input_tokens, output_tokens, created_at) \
-         VALUES (?, ?, ?, ?, ?, NULL, 0, 0, ?)",
-    )
-    .bind(&compact_summary_id)
-    .bind(session_id.to_string())
-    .bind(&source_first)
-    .bind(&source_last)
-    .bind(summary.to_string())
-    .bind(&now)
-    .execute(&mut *tx)
-    .await?;
-    let updated = sqlx::query(
-        "UPDATE context_versions \
-         SET compact_status = 'scheduled', compact_summary_id = ? \
-         WHERE id = (SELECT id FROM context_versions \
-                     WHERE session_id = ? ORDER BY sequence DESC LIMIT 1)",
-    )
-    .bind(&compact_summary_id)
-    .bind(session_id.to_string())
-    .execute(&mut *tx)
-    .await?;
-    if updated.rows_affected() == 0 {
+    let summary_json = summary.to_string();
+    let mut summary_document = doc! {
+        "_id": &compact_summary_id,
+        "session_id": session_id.to_string(),
+        "source_last_timeline_id": &source_last,
+        "summary_json": &summary_json,
+        "input_tokens": 0i64,
+        "output_tokens": 0i64,
+        "created_at": &now,
+    };
+    if let Some(source_first) = source_first {
+        summary_document.insert("source_first_timeline_id", source_first);
+    }
+    database
+        .collection::<Document>("compact_summaries")
+        .insert_one(summary_document)
+        .session(&mut *session)
+        .await?;
+    let latest = database
+        .collection::<Document>("context_versions")
+        .find_one(doc! {"session_id": session_id.to_string()})
+        .sort(doc! {"sequence": -1})
+        .session(&mut *session)
+        .await?;
+    let updated = match latest {
+        Some(document) => {
+            let id = document.get_str("_id")?.to_owned();
+            database
+                .collection::<Document>("context_versions")
+                .update_one(
+                    doc! {"_id": &id},
+                    doc! {
+                        "$set": {
+                            "compact_status": "scheduled",
+                            "compact_summary_id": &compact_summary_id,
+                        }
+                    },
+                )
+                .session(&mut *session)
+                .await?
+                .matched_count
+        }
+        None => 0,
+    };
+    if updated == 0 {
         let context_version_id = record_context_version_in_tx(
-            tx,
+            database,
+            session,
             session_id,
             None,
             estimated_input_tokens,
@@ -198,88 +247,112 @@ pub async fn schedule_compact_in_tx(
             json!({"kind": "manual_compact"}),
         )
         .await?;
-        sqlx::query("UPDATE context_versions SET compact_summary_id = ? WHERE id = ?")
-            .bind(&compact_summary_id)
-            .bind(context_version_id)
-            .execute(&mut *tx)
+        database
+            .collection::<Document>("context_versions")
+            .update_one(
+                doc! {"_id": context_version_id},
+                doc! {"$set": {"compact_summary_id": &compact_summary_id}},
+            )
+            .session(&mut *session)
             .await?;
     } else {
-        sqlx::query(
-            "UPDATE context_versions SET estimated_input_tokens = ?, context_limit = ? \
-             WHERE compact_summary_id = ? AND session_id = ?",
-        )
-        .bind(estimated_input_tokens)
-        .bind(context_limit)
-        .bind(&compact_summary_id)
-        .bind(session_id.to_string())
-        .execute(&mut *tx)
-        .await?;
+        database
+            .collection::<Document>("context_versions")
+            .update_many(
+                doc! {
+                    "compact_summary_id": &compact_summary_id,
+                    "session_id": session_id.to_string(),
+                },
+                doc! {
+                    "$set": {
+                        "estimated_input_tokens": estimated_input_tokens,
+                        "context_limit": context_limit,
+                    }
+                },
+            )
+            .session(&mut *session)
+            .await?;
     }
     Ok(compact_summary_id)
 }
 
 pub async fn begin_compact_in_tx(
-    tx: &mut SqliteConnection,
+    database: &mongodb::Database,
+    session: &mut ClientSession,
     session_id: SessionId,
     compact_summary_id: &str,
 ) -> anyhow::Result<bool> {
-    let changed = sqlx::query(
-        "UPDATE context_versions SET compact_status = 'running' \
-         WHERE session_id = ? AND compact_summary_id = ? AND compact_status = 'scheduled'",
-    )
-    .bind(session_id.to_string())
-    .bind(compact_summary_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let changed = database
+        .collection::<Document>("context_versions")
+        .update_one(
+            doc! {
+                "session_id": session_id.to_string(),
+                "compact_summary_id": compact_summary_id,
+                "compact_status": "scheduled",
+            },
+            doc! {"$set": {"compact_status": "running"}},
+        )
+        .session(&mut *session)
+        .await?
+        .matched_count;
     Ok(changed == 1)
 }
 
 pub async fn complete_compact_in_tx(
-    tx: &mut SqliteConnection,
+    database: &mongodb::Database,
+    session: &mut ClientSession,
     session_id: SessionId,
     compact_summary_id: &str,
     estimated_input_tokens: i64,
 ) -> anyhow::Result<bool> {
-    let changed = sqlx::query(
-        "UPDATE context_versions \
-         SET compact_status = 'succeeded', estimated_input_tokens = ? \
-         WHERE session_id = ? AND compact_summary_id = ? \
-           AND compact_status IN ('scheduled', 'running')",
-    )
-    .bind(estimated_input_tokens)
-    .bind(session_id.to_string())
-    .bind(compact_summary_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let changed = database
+        .collection::<Document>("context_versions")
+        .update_one(
+            doc! {
+                "session_id": session_id.to_string(),
+                "compact_summary_id": compact_summary_id,
+                "compact_status": {"$in": ["scheduled", "running"]},
+            },
+            doc! {
+                "$set": {
+                    "compact_status": "succeeded",
+                    "estimated_input_tokens": estimated_input_tokens,
+                }
+            },
+        )
+        .session(&mut *session)
+        .await?
+        .matched_count;
     Ok(changed == 1)
 }
 
-/// Backfill a compact summary row with the model-generated summary and its
-/// real token usage once the summary attempt settles. The row is created at
-/// schedule time with the placeholder digest; this records what the model
-/// actually produced and how much it cost.
+/// Backfill a compact summary document with the model-generated summary and
+/// its real token usage once the summary attempt settles. The document is
+/// created at schedule time with the placeholder digest; this records what the
+/// model actually produced and how much it cost.
 pub async fn finalize_compact_summary_in_tx(
-    tx: &mut SqliteConnection,
+    database: &mongodb::Database,
+    session: &mut ClientSession,
     compact_summary_id: &str,
     summary: Value,
     model_attempt_id: Option<&str>,
     input_tokens: i64,
     output_tokens: i64,
 ) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE compact_summaries \
-         SET summary_json = ?, model_attempt_id = ?, input_tokens = ?, output_tokens = ? \
-         WHERE id = ?",
-    )
-    .bind(summary.to_string())
-    .bind(model_attempt_id)
-    .bind(input_tokens)
-    .bind(output_tokens)
-    .bind(compact_summary_id)
-    .execute(&mut *tx)
-    .await?;
+    let summary_json = summary.to_string();
+    let mut set = doc! {
+        "summary_json": &summary_json,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    };
+    if let Some(model_attempt_id) = model_attempt_id {
+        set.insert("model_attempt_id", model_attempt_id);
+    }
+    database
+        .collection::<Document>("compact_summaries")
+        .update_one(doc! {"_id": compact_summary_id}, doc! {"$set": set})
+        .session(&mut *session)
+        .await?;
     Ok(())
 }
 
@@ -287,28 +360,42 @@ pub async fn finalize_compact_summary_in_tx(
 /// Round's context assembly to decide whether a compacted prefix should be
 /// prepended instead of the raw history. Returns `(summary_json, source_last)`.
 pub async fn latest_compact_summary(
-    pool: &SqlitePool,
+    pool: &mongodb::Database,
     session_id: SessionId,
 ) -> anyhow::Result<Option<(Value, String)>> {
-    let row = sqlx::query(
-        "SELECT summary_json, source_last_timeline_id FROM compact_summaries \
-         WHERE session_id = ? AND EXISTS(SELECT 1 FROM context_versions \
-             WHERE context_versions.session_id = compact_summaries.session_id \
-               AND context_versions.compact_summary_id = compact_summaries.id \
-               AND context_versions.compact_status = 'succeeded') \
-         ORDER BY created_at DESC, id DESC LIMIT 1",
-    )
-    .bind(session_id.to_string())
-    .fetch_optional(pool)
-    .await?;
-    if let Some(row) = row {
-        let s: String = row.try_get("summary_json")?;
-        let last: String = row.try_get("source_last_timeline_id")?;
-        let v: Value = serde_json::from_str(&s).unwrap_or(json!({}));
-        Ok(Some((v, last)))
-    } else {
-        Ok(None)
+    // Succeeded context versions referencing a compact summary for this session.
+    let mut versions = pool
+        .collection::<Document>("context_versions")
+        .find(doc! {
+            "session_id": session_id.to_string(),
+            "compact_status": "succeeded",
+        })
+        .await?;
+    let mut summary_ids = HashSet::new();
+    while let Some(document) = versions.try_next().await? {
+        if let Ok(id) = document.get_str("compact_summary_id") {
+            summary_ids.insert(id.to_owned());
+        }
     }
+    if summary_ids.is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<&str> = summary_ids.iter().map(String::as_str).collect();
+    let document = pool
+        .collection::<Document>("compact_summaries")
+        .find_one(doc! {
+            "session_id": session_id.to_string(),
+            "_id": {"$in": ids},
+        })
+        .sort(doc! {"created_at": -1, "_id": -1})
+        .await?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let summary_json = document.get_str("summary_json")?;
+    let summary: Value = serde_json::from_str(summary_json).unwrap_or(json!({}));
+    let last = document.get_str("source_last_timeline_id")?.to_owned();
+    Ok(Some((summary, last)))
 }
 
 #[cfg(test)]

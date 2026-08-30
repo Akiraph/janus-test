@@ -12,12 +12,15 @@ use janus_server::{
     config::{Config, RunMode},
     router,
 };
+use mongodb::bson::{Bson, Document, doc};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
 
 const NOW: &str = "2026-07-31T00:00:00.000Z";
+
+static TEST_DB_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn test_config(data_root: PathBuf) -> Config {
     Config {
@@ -33,6 +36,13 @@ fn test_config(data_root: PathBuf) -> Config {
         automation_webhook_enabled: false,
         automation_webhook_secret: None,
         automation_github_token: None,
+        mongodb_uri: std::env::var("JANUS_MONGODB_URI")
+            .unwrap_or_else(|_| "mongodb://localhost:27017/?replicaSet=rs0".into()),
+        mongodb_database: format!(
+            "janus_test_{}_{}",
+            std::process::id(),
+            TEST_DB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
     }
 }
 
@@ -71,68 +81,87 @@ async fn seed_session(
     state: &AppState,
     include_queued_turn: bool,
 ) -> anyhow::Result<SeededSession> {
-    let pool = state.pool();
+    let db = state.pool();
     let project_id = ProjectId::new();
     let session_id = SessionId::new();
     let active_turn_id = TurnId::new();
     let queued_turn_id = include_queued_turn.then(TurnId::new);
 
-    sqlx::query(
-        "INSERT INTO owners (id, display_name, created_at) \
-         VALUES ('owner-cancel-test', 'Owner', ?)",
-    )
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO projects \
-         (id, owner_id, name, state, repo_access, repo_url, version, \
-          created_at, updated_at, last_activity_at) \
-         VALUES (?, 'owner-cancel-test', 'Project', 'ready', \
-                 'public_https', 'https://example.com/repo.git', 'v_project', ?, ?, ?)",
-    )
-    .bind(project_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO sessions \
-         (id, project_id, state, active_turn_id, version, created_at, updated_at, last_activity_at) \
-         VALUES (?, ?, 'active', ?, 'v_session', ?, ?, ?)",
-    )
-    .bind(session_id.to_string())
-    .bind(project_id.to_string())
-    .bind(active_turn_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO turns \
-         (id, session_id, sequence, status, model_snapshot_json, version, created_at, updated_at) \
-         VALUES (?, ?, 1, 'running', '{}', 'v_turn_1', ?, ?)",
-    )
-    .bind(active_turn_id.to_string())
-    .bind(session_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    if let Some(turn_id) = queued_turn_id {
-        sqlx::query(
-            "INSERT INTO turns \
-             (id, session_id, sequence, status, model_snapshot_json, version, created_at, updated_at) \
-             VALUES (?, ?, 2, 'queued', '{}', 'v_turn_2', ?, ?)",
-        )
-        .bind(turn_id.to_string())
-        .bind(session_id.to_string())
-        .bind(NOW)
-        .bind(NOW)
-        .execute(pool)
+    db.collection::<Document>("owners")
+        .insert_one(doc! {
+            "_id": "owner-cancel-test",
+            "display_name": "Owner",
+            "created_at": NOW,
+        })
         .await?;
+    db.collection::<Document>("projects")
+        .insert_one(doc! {
+            "_id": project_id.to_string(),
+            "owner_id": "owner-cancel-test",
+            "name": "Project",
+            "state": "ready",
+            "repo_access": "public_https",
+            "repo_url": "https://example.com/repo.git",
+            "repo_branch": null,
+            "github_credential_id": null,
+            "default_model_id": null,
+            "main_workspace_handle": null,
+            "clone_error": null,
+            "version": "v_project",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
+    db.collection::<Document>("sessions")
+        .insert_one(doc! {
+            "_id": session_id.to_string(),
+            "project_id": project_id.to_string(),
+            "title": null,
+            "state": "active",
+            "next_model_ref": null,
+            "active_turn_id": active_turn_id.to_string(),
+            "version": "v_session",
+            "created_at": NOW,
+            "updated_at": NOW,
+            "last_activity_at": NOW,
+        })
+        .await?;
+    db.collection::<Document>("turns")
+        .insert_one(doc! {
+            "_id": active_turn_id.to_string(),
+            "session_id": session_id.to_string(),
+            "sequence": 1i64,
+            "status": "running",
+            "input_message_id": null,
+            "model_snapshot_json": "{}",
+            "goal_mode": 0i64,
+            "predecessor_turn_id": null,
+            "completion_reason": null,
+            "cancellation_reason": null,
+            "version": "v_turn_1",
+            "created_at": NOW,
+            "updated_at": NOW,
+        })
+        .await?;
+    if let Some(turn_id) = queued_turn_id {
+        db.collection::<Document>("turns")
+            .insert_one(doc! {
+                "_id": turn_id.to_string(),
+                "session_id": session_id.to_string(),
+                "sequence": 2i64,
+                "status": "queued",
+                "input_message_id": null,
+                "model_snapshot_json": "{}",
+                "goal_mode": 0i64,
+                "predecessor_turn_id": null,
+                "completion_reason": null,
+                "cancellation_reason": null,
+                "version": "v_turn_2",
+                "created_at": NOW,
+                "updated_at": NOW,
+            })
+            .await?;
     }
 
     Ok(SeededSession {
@@ -145,33 +174,44 @@ async fn seed_session(
 #[tokio::test]
 async fn restart_persists_wake_for_unstarted_turn() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
+    let config = test_config(directory.path().into());
     let active_turn_id;
     {
-        let state = AppState::initialize(test_config(directory.path().into())).await?;
+        let state = AppState::initialize(config.clone()).await?;
         active_turn_id = seed_session(&state, false).await?.active_turn_id;
     }
 
-    let state = AppState::initialize(test_config(directory.path().into())).await?;
-    let (status, active_session_turn): (String, Option<String>) = sqlx::query_as(
-        "SELECT turns.status, sessions.active_turn_id \
-         FROM turns JOIN sessions ON sessions.id = turns.session_id \
-         WHERE turns.id = ?",
-    )
-    .bind(active_turn_id.to_string())
-    .fetch_one(state.pool())
-    .await?;
+    let state = AppState::initialize(config).await?;
+    let db = state.pool();
+    let turn = db
+        .collection::<Document>("turns")
+        .find_one(doc! {"_id": active_turn_id.to_string()})
+        .await?
+        .expect("seeded active turn exists");
+    let status = turn.get_str("status")?.to_owned();
+    let session = db
+        .collection::<Document>("sessions")
+        .find_one(doc! {"_id": turn.get_str("session_id")?})
+        .await?
+        .expect("session owning the seeded turn exists");
+    let active_session_turn = session
+        .get("active_turn_id")
+        .and_then(Bson::as_str)
+        .map(str::to_owned);
     assert_eq!(status, "running");
     assert_eq!(
         active_session_turn.as_deref(),
         Some(active_turn_id.to_string().as_str())
     );
 
-    let (handler_kind, payload_json): (String, String) = sqlx::query_as(
-        "SELECT handler_kind, payload_json FROM work_items \
-         WHERE handler_kind = 'turn.execute' ORDER BY created_at DESC LIMIT 1",
-    )
-    .fetch_one(state.pool())
-    .await?;
+    let work = db
+        .collection::<Document>("work_items")
+        .find_one(doc! {"handler_kind": "turn.execute"})
+        .sort(doc! {"created_at": -1})
+        .await?
+        .expect("a turn.execute wake work item should be enqueued");
+    let handler_kind = work.get_str("handler_kind")?.to_owned();
+    let payload_json = work.get_str("payload_json")?.to_owned();
     assert_eq!(handler_kind, "turn.execute");
     let payload: Value = serde_json::from_str(&payload_json)?;
     assert_eq!(payload["turn_id"], active_turn_id.to_string());
@@ -183,17 +223,21 @@ async fn restart_persists_wake_for_unstarted_turn() -> anyhow::Result<()> {
 async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Result<()> {
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
+    let db = state.pool();
     let now = janus_infrastructure::clock::now_utc_str();
-    sqlx::query(
-        "INSERT INTO work_items \
-         (id, handler_kind, payload_json, not_before, lease_nonce, lease_expires_at, \
-          attempts, dead, created_at) \
-         VALUES ('bounded-work', 'test.failure', '{}', ?, NULL, NULL, 0, 0, ?)",
-    )
-    .bind(&now)
-    .bind(&now)
-    .execute(state.pool())
-    .await?;
+    db.collection::<Document>("work_items")
+        .insert_one(doc! {
+            "_id": "bounded-work",
+            "handler_kind": "test.failure",
+            "payload_json": "{}",
+            "not_before": &now,
+            "lease_nonce": null,
+            "lease_expires_at": null,
+            "attempts": 0i64,
+            "dead": false,
+            "created_at": &now,
+        })
+        .await?;
 
     for expected_attempt in 1..=5_i64 {
         let claimed = state
@@ -201,10 +245,12 @@ async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Resul
             .claim_work("test.failure", 60)
             .await?
             .expect("work item should remain claimable until the fifth attempt");
-        let attempts: i64 =
-            sqlx::query_scalar("SELECT attempts FROM work_items WHERE id = 'bounded-work'")
-                .fetch_one(state.pool())
-                .await?;
+        let work = db
+            .collection::<Document>("work_items")
+            .find_one(doc! {"_id": "bounded-work"})
+            .await?
+            .expect("bounded work item exists");
+        let attempts = work.get_i64("attempts")?;
         assert_eq!(attempts, expected_attempt);
         assert!(
             state
@@ -214,19 +260,24 @@ async fn work_queue_bounds_attempts_and_dead_letters_failures() -> anyhow::Resul
         );
         if expected_attempt < 5 {
             // Bypass the real delay so the test exercises the bound quickly.
-            sqlx::query("UPDATE work_items SET not_before = ? WHERE id = 'bounded-work'")
-                .bind(janus_infrastructure::clock::now_utc_str())
-                .execute(state.pool())
+            db.collection::<Document>("work_items")
+                .update_one(
+                    doc! {"_id": "bounded-work"},
+                    doc! {"$set": {"not_before": janus_infrastructure::clock::now_utc_str()}},
+                )
                 .await?;
         }
     }
 
-    let (attempts, dead): (i64, i64) =
-        sqlx::query_as("SELECT attempts, dead FROM work_items WHERE id = 'bounded-work'")
-            .fetch_one(state.pool())
-            .await?;
+    let work = db
+        .collection::<Document>("work_items")
+        .find_one(doc! {"_id": "bounded-work"})
+        .await?
+        .expect("bounded work item exists");
+    let attempts = work.get_i64("attempts")?;
+    let dead = work.get_bool("dead")?;
     assert_eq!(attempts, 5);
-    assert_eq!(dead, 1);
+    assert!(dead);
 
     Ok(())
 }
@@ -280,8 +331,13 @@ async fn stale_operation_worker_cannot_publish_terminal_state() -> anyhow::Resul
             .await?
     );
 
-    sqlx::query("UPDATE work_items SET lease_expires_at = '2000-01-01T00:00:00.000Z'")
-        .execute(state.pool())
+    state
+        .pool()
+        .collection::<Document>("work_items")
+        .update_many(
+            doc! {},
+            doc! {"$set": {"lease_expires_at": "2000-01-01T00:00:00.000Z"}},
+        )
         .await?;
     assert!(
         !state
@@ -470,20 +526,28 @@ async fn cancel_endpoint_validates_version_and_preserves_active_turn_when_cancel
         .expect("Session version in cancellation response");
     assert_ne!(next_version, "v_session");
 
-    let pool = state.pool();
-    let queued_status: String = sqlx::query_scalar("SELECT status FROM turns WHERE id = ?")
-        .bind(queued_turn_id.to_string())
-        .fetch_one(pool)
-        .await?;
+    let db = state.pool();
+    let queued = db
+        .collection::<Document>("turns")
+        .find_one(doc! {"_id": queued_turn_id.to_string()})
+        .await?
+        .expect("queued turn exists");
+    let queued_status = queued.get_str("status")?.to_owned();
     assert_eq!(queued_status, "canceled");
-    let session: (String, Option<String>, String) =
-        sqlx::query_as("SELECT state, active_turn_id, version FROM sessions WHERE id = ?")
-            .bind(seeded.session_id.to_string())
-            .fetch_one(pool)
-            .await?;
-    assert_eq!(session.0, "active");
-    assert_eq!(session.1, Some(seeded.active_turn_id.to_string()));
-    assert_eq!(session.2, next_version);
+    let session = db
+        .collection::<Document>("sessions")
+        .find_one(doc! {"_id": seeded.session_id.to_string()})
+        .await?
+        .expect("session exists");
+    let session_state = session.get_str("state")?.to_owned();
+    let active_session_turn = session
+        .get("active_turn_id")
+        .and_then(Bson::as_str)
+        .map(str::to_owned);
+    let session_version = session.get_str("version")?.to_owned();
+    assert_eq!(session_state, "active");
+    assert_eq!(active_session_turn, Some(seeded.active_turn_id.to_string()));
+    assert_eq!(session_version, next_version);
 
     Ok(())
 }
@@ -521,19 +585,33 @@ async fn cancel_endpoint_settles_active_turn_and_releases_session() -> anyhow::R
         .expect("Session version in cancellation response");
     assert_ne!(next_version, "v_session");
 
-    let pool = state.pool();
-    let turn: (String, Option<String>) =
-        sqlx::query_as("SELECT status, cancellation_reason FROM turns WHERE id = ?")
-            .bind(seeded.active_turn_id.to_string())
-            .fetch_one(pool)
-            .await?;
-    assert_eq!(turn, ("canceled".into(), Some("user_cancel".into())));
-    let session: (String, Option<String>, String) =
-        sqlx::query_as("SELECT state, active_turn_id, version FROM sessions WHERE id = ?")
-            .bind(seeded.session_id.to_string())
-            .fetch_one(pool)
-            .await?;
-    assert_eq!(session, ("ready".into(), None, next_version.into()));
+    let db = state.pool();
+    let turn = db
+        .collection::<Document>("turns")
+        .find_one(doc! {"_id": seeded.active_turn_id.to_string()})
+        .await?
+        .expect("turn exists");
+    let turn_status = turn.get_str("status")?.to_owned();
+    let cancellation_reason = turn
+        .get("cancellation_reason")
+        .and_then(Bson::as_str)
+        .map(str::to_owned);
+    assert_eq!(turn_status, "canceled");
+    assert_eq!(cancellation_reason.as_deref(), Some("user_cancel"));
+    let session = db
+        .collection::<Document>("sessions")
+        .find_one(doc! {"_id": seeded.session_id.to_string()})
+        .await?
+        .expect("session exists");
+    let session_state = session.get_str("state")?.to_owned();
+    let active_session_turn = session
+        .get("active_turn_id")
+        .and_then(Bson::as_str)
+        .map(str::to_owned);
+    let session_version = session.get_str("version")?.to_owned();
+    assert_eq!(session_state, "ready");
+    assert_eq!(active_session_turn, None);
+    assert_eq!(session_version, next_version);
 
     Ok(())
 }
@@ -543,37 +621,51 @@ async fn a_new_turn_keeps_durable_messages_from_a_canceled_turn() -> anyhow::Res
     let directory = TempDir::new()?;
     let state = AppState::initialize(test_config(directory.path().into())).await?;
     let seeded = seed_session(&state, false).await?;
-    let pool = state.pool();
+    let db = state.pool();
     let prior_turn_id = seeded.active_turn_id;
     let next_turn_id = TurnId::new();
 
-    sqlx::query(
-        "UPDATE turns SET status = 'canceled', cancellation_reason = 'user_cancel', updated_at = ? \
-         WHERE id = ?",
-    )
-    .bind(NOW)
-    .bind(prior_turn_id.to_string())
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO turns \
-         (id, session_id, sequence, status, model_snapshot_json, version, created_at, updated_at) \
-         VALUES (?, ?, 2, 'running', '{}', 'v_turn_2', ?, ?)",
-    )
-    .bind(next_turn_id.to_string())
-    .bind(seeded.session_id.to_string())
-    .bind(NOW)
-    .bind(NOW)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "UPDATE sessions SET state = 'active', active_turn_id = ?, version = 'v_session_2' \
-         WHERE id = ?",
-    )
-    .bind(next_turn_id.to_string())
-    .bind(seeded.session_id.to_string())
-    .execute(pool)
-    .await?;
+    db.collection::<Document>("turns")
+        .update_one(
+            doc! {"_id": prior_turn_id.to_string()},
+            doc! {
+                "$set": {
+                    "status": "canceled",
+                    "cancellation_reason": "user_cancel",
+                    "updated_at": NOW,
+                }
+            },
+        )
+        .await?;
+    db.collection::<Document>("turns")
+        .insert_one(doc! {
+            "_id": next_turn_id.to_string(),
+            "session_id": seeded.session_id.to_string(),
+            "sequence": 2i64,
+            "status": "running",
+            "input_message_id": null,
+            "model_snapshot_json": "{}",
+            "goal_mode": 0i64,
+            "predecessor_turn_id": null,
+            "completion_reason": null,
+            "cancellation_reason": null,
+            "version": "v_turn_2",
+            "created_at": NOW,
+            "updated_at": NOW,
+        })
+        .await?;
+    db.collection::<Document>("sessions")
+        .update_one(
+            doc! {"_id": seeded.session_id.to_string()},
+            doc! {
+                "$set": {
+                    "state": "active",
+                    "active_turn_id": next_turn_id.to_string(),
+                    "version": "v_session_2",
+                }
+            },
+        )
+        .await?;
 
     for (id, turn_id, kind, sequence, text) in [
         (
@@ -591,22 +683,20 @@ async fn a_new_turn_keeps_durable_messages_from_a_canceled_turn() -> anyhow::Res
             "The canceled turn had useful context",
         ),
     ] {
-        sqlx::query(
-            "INSERT INTO messages \
-             (id, session_id, turn_id, actor_json, kind, body_json, status, \
-              timeline_sequence, version, created_at) \
-             VALUES (?, ?, ?, '{}', ?, ?, 'active', ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(seeded.session_id.to_string())
-        .bind(turn_id)
-        .bind(kind)
-        .bind(json!({"parts": [{"type": "text", "text": text}]}).to_string())
-        .bind(sequence)
-        .bind(format!("v_{id}"))
-        .bind(NOW)
-        .execute(pool)
-        .await?;
+        db.collection::<Document>("messages")
+            .insert_one(doc! {
+                "_id": id,
+                "session_id": seeded.session_id.to_string(),
+                "turn_id": turn_id,
+                "actor_json": "{}",
+                "kind": kind,
+                "body_json": json!({"parts": [{"type": "text", "text": text}]}).to_string(),
+                "status": "active",
+                "timeline_sequence": sequence,
+                "version": format!("v_{id}"),
+                "created_at": NOW,
+            })
+            .await?;
     }
 
     let context = state

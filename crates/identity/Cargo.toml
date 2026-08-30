@@ -7,10 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 janus-infrastructure = { path = "../infrastructure" }
+mongodb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
 thiserror.workspace = true
 url.workspace = true
 utoipa.workspace = true

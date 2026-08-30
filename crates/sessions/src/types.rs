@@ -37,7 +37,7 @@ pub enum SessionsError {
     #[error("workspace error: {0}")]
     Workspace(#[from] WorkspaceError),
     #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("internal error: {0}")]
@@ -387,7 +387,7 @@ pub struct QueuedTurnCandidate {
 
 /// A queued Turn shown in the conversation's QueuedMessagesBar: enough to
 /// render the message text and delete (cancel) the Turn out of order.
-#[derive(Debug, Clone, sqlx::FromRow, ToSchema, Serialize)]
+#[derive(Debug, Clone, ToSchema, Serialize)]
 pub struct QueuedTurnItem {
     pub turn_id: String,
     pub sequence: i64,

@@ -1116,8 +1116,8 @@ mod tests {
     use tokio::process::Command;
 
     use super::LocalExecutor;
-    use janus_infrastructure::database::Database;
     use janus_infrastructure::id::{AsyncTaskId, ProjectId, SessionId, ToolCallId, TurnId};
+    use janus_infrastructure::testing::TestDb;
 
     fn limits(timeout_ms: u64) -> ResourceLimits {
         ResourceLimits {
@@ -1135,8 +1135,8 @@ mod tests {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
-        let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
-        let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
+        let test_db = TestDb::open().await?;
+        let logs = LogStore::new(test_db.database().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
         let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let runtime = RuntimeSpec::new(
@@ -1197,8 +1197,8 @@ mod tests {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
-        let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
-        let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
+        let test_db = TestDb::open().await?;
+        let logs = LogStore::new(test_db.database().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
         let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let runtime = RuntimeSpec::new(
@@ -1231,8 +1231,8 @@ mod tests {
         let temp = TempDir::new()?;
         let workspace = temp.path().join("workspace");
         tokio::fs::create_dir_all(&workspace).await?;
-        let database = Database::open(&temp.path().join("data"), crate::migrator()).await?;
-        let logs = LogStore::new(database.pool().clone(), &temp.path().join("data"));
+        let test_db = TestDb::open().await?;
+        let logs = LogStore::new(test_db.database().clone(), &temp.path().join("data"));
         let executor = LocalExecutor::new(logs.clone());
         let runtime_id = janus_infrastructure::id::RuntimeId::new();
         let session_id = SessionId::new();

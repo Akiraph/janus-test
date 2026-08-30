@@ -81,7 +81,7 @@ impl ModelsInterface {
         let row = self
             .provider_row_public(&req.owner_id, &req.provider_id)
             .await?;
-        if row.enabled == 0 {
+        if !row.enabled {
             return Err(ModelsError::Validation("provider is disabled".into()));
         }
         let kind = parse_kind_pub(&row.kind)?;

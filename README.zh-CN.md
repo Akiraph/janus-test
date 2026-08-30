@@ -3,7 +3,7 @@
 [English](./README.md) | 简体中文
 
 Janus 是一个面向 AI 辅助软件开发的本地优先(local-first)控制平面。单个 Rust
-进程在一个 SQLite 数据库之上持有项目、工作区、会话、轮次(Turn)、终端和持久化的
+进程在一个 MongoDB 数据库之上持有项目、工作区、会话、轮次(Turn)、终端和持久化的
 后台 Operation,并通过带版本的 HTTP + SSE + WebSocket API 对外发布。两个客户端消费
 这套 API:`apps/web` 下的 SolidJS Web 应用,以及 `janus-test` —— 一个只使用公开协议
 的黑盒 CLI。
@@ -33,6 +33,7 @@ Janus 是一个面向 AI 辅助软件开发的本地优先(local-first)控制平
 | Rust | `1.97.0` | 由 `rust-toolchain.toml` 固定,含 `clippy` + `rustfmt` |
 | Bun | `1.3.14` | 由 `apps/web/package.json` 的 `packageManager` 固定 |
 | Git | 2.54 或更高 | 源码控制适配器直接调用系统 Git |
+| MongoDB | 7.x | 多文档事务所需的单节点副本集;通过 `JANUS_MONGODB_URI` 访问 |
 
 整个 workspace 禁止 `unsafe_code`,并通过根 `Cargo.toml` 中声明的 Clippy lint 拒绝
 `dbg!`、`todo!` 和 `unwrap()`。
@@ -48,6 +49,10 @@ cargo xtask dev
 Web 依赖。`dev` 同时启动 Vite 和控制平面:API 监听 `http://127.0.0.1:4317`,Web 应用
 监听 `http://127.0.0.1:5173`,Vite 把 `/api`(含 WebSocket)和 `/health` 代理到 API。
 运行时数据落在 `.janus-dev/`,可用 `JANUS_DATA_ROOT` 改变位置。
+
+`dev` 也需要一个可达的 MongoDB 副本集。默认的 `JANUS_MONGODB_URI`
+(`mongodb://localhost:27017/?replicaSet=rs0`)指向一个以 `--replSet rs0` 启动的本地
+`mongo:7` 实例;单个非副本集的 `mongod` 会拒绝事务调用。
 
 `cargo xtask dev` 还会导出 `JANUS_PUBLIC_ORIGIN=http://localhost:<port>` 和
 `JANUS_WEBAUTHN_RP_ID=localhost`,因为 WebAuthn 不接受 IP 地址作为 relying-party ID。
@@ -77,7 +82,6 @@ passkey。
 
 ```text
 apps/server/          部署组装根,公开控制平面
-  migrations/         有序的 SQLx 迁移,带模块归属头
   src/application/    跨能力工作流、后台 worker、恢复逻辑
   src/transport/http/ HTTP、SSE、WebSocket 协议转换
   src/adapters/       系统 Git 与运行时/进程实现
@@ -95,10 +99,10 @@ scripts/              CI 使用的镜像部署脚本
 
 ### 能力模块
 
-`crates/` 下的每个模块都在 `module.toml` 里声明自己的契约:公开根、它拥有的表、它
+`crates/` 下的每个模块都在 `module.toml` 里声明自己的契约:公开根、它拥有的集合、它
 发布的事件,以及它可以依赖的模块。`cargo xtask check architecture` 会强制执行该文件。
 
-| 模块 | Crate | 拥有的表 | 发布的事件 | 可依赖 |
+| 模块 | Crate | 拥有的集合 | 发布的事件 | 可依赖 |
 | --- | --- | --- | --- | --- |
 | identity | `janus-identity` | `owners`, `initialization_tokens`, `passkeys`, `ceremonies`, `login_sessions`, `recovery_batches`, `recovery_codes`, `recovery_states` | — | — |
 | models | `janus-models` | `model_providers`, `models`, `model_failover`, `model_attempts`, `model_usage_ledger`, `automation_settings` | `model_config.changed` | — |
@@ -111,9 +115,9 @@ scripts/              CI 使用的镜像部署脚本
 | execution | `janus-execution` | `rounds`, `tool_calls`, `plan_versions`, `compact_summaries`, `context_versions` | `round.changed`, `tool_call.created`, `tool_call.changed`, `context.changed` | models, projects, runtime, sessions, workspace |
 
 `janus-infrastructure` 位于所有模块之下,只包含通用的技术构件:ID 与关联 ID、时钟、
-SQLite 连接池与事务辅助、公开事件日志、Operation 日志、工作项、幂等记录、Blob 存储、
-加密的密钥,以及可移植的进程辅助。它不含任何工作种类,也不含服务端工作流。它的表,
-加上 Operation 和 Blob 相关的表,归属 `platform` 这个 owner:`public_events`、
+MongoDB 连接与事务辅助、公开事件日志、Operation 日志、工作项、幂等记录、Blob 存储、
+加密的密钥,以及可移植的进程辅助。它不含任何工作种类,也不含服务端工作流。它的集合,
+加上 Operation 和 Blob 相关的集合,归属 `platform` 这个 owner:`public_events`、
 `projection_cursor`、`operations`、`operation_steps`、`work_items`、
 `idempotency_records`、`command_idempotency_records`、`blob_objects`、
 `blob_references`、`blob_cleanup_intents`。
@@ -133,10 +137,11 @@ SQLite 连接池与事务辅助、公开事件日志、Operation 日志、工作
 
 - 每个模块都要暴露 `interface.rs` 或 `interface/mod.rs`,跨模块引用必须走这条接口路径。
 - 模块依赖必须在 `module.toml` 中声明,并保持无环。
-- 一张表只有一个 owner,一个事件名只有一个发布者。
-- 允许跨模块 SQL 读取,不允许跨模块写入。生产代码只能写自己模块拥有的表。
-- 每个迁移文件都以 `-- janus-module: <module>` 头开始,声明该迁移触及的每张表的
-  owner;并且每张被拥有的表都必须由某个迁移创建。
+- 一个集合只有一个 owner,一个事件名只有一个发布者。
+- 允许跨模块集合读取,不允许跨模块写入。生产代码只能写自己模块拥有的集合。
+- 集合归属在 `crates/infrastructure/src/schema.rs` 中声明,并与每个 `module.toml`
+  对照检查:每个集合要么带索引要么无索引,有且仅有一个声明的 owner,并且生产代码必须
+  用内联字符串字面量调用 `.collection("...")` —— 绝不允许绑定的句柄。
 - 禁止 `apps/server/src/ports/` 和 `crates/ports/`;同样禁止在
   `tools/test-cli/Cargo.toml` 中依赖 `janus-server`。
 
@@ -145,8 +150,8 @@ SQLite 连接池与事务辅助、公开事件日志、Operation 日志、工作
 下面的顺序是部署契约,不是后台杂务。
 
 1. 从环境解析配置;非法输入直接终止进程。
-2. `AppState::initialize` 打开数据库并运行 SQLx 迁移,构建基础设施与能力接口,重新
-   挂接孤立的 main 工作树,然后恢复被中断的工作区变更和执行状态。
+2. `AppState::initialize` 打开 MongoDB 数据库(创建 schema 目录声明的集合与索引),构建
+   基础设施与能力接口,重新挂接孤立的 main 工作树,然后恢复被中断的工作区变更和执行状态。
 3. 恢复完成前,`/health/ready` 返回 503。
 4. 清除上一次运行遗留的 Blob 入站残留。
 5. 把每个仍处于 `running` 的 Operation 标记为 `needs_attention`,附
@@ -160,19 +165,20 @@ SQLite 连接池与事务辅助、公开事件日志、Operation 日志、工作
 
 ## 持久化
 
-状态存放在 `JANUS_DATA_ROOT` 下的单个 SQLite 数据库中,工作区副本和 Blob 存储与它
-并列。迁移按顺序从 `apps/server/migrations/` 应用:
+状态放在 `JANUS_MONGODB_URI` 指向的副本集上的一个 MongoDB 数据库里(默认库名 `janus`),
+工作区副本和 Blob 存储与它并列放在 `JANUS_DATA_ROOT` 下。MongoDB 没有 SQL 迁移;schema
+是一个 Rust 目录 `crates/infrastructure/src/schema.rs`,声明每个集合及其 owner 模块:
 
-| 迁移 | 新增内容 |
-| --- | --- |
-| `0001_initial.sql` | 完整的初始 schema;声明全部十个 owner |
-| `0002_github_credential_automation.sql` | `github_credentials.automation_enabled` |
-| `0003_automation_settings.sql` | `automation_settings`(owner、provider、model) |
-| `0004_automation_reasoning_effort.sql` | `automation_settings.reasoning_effort`,默认 `high` |
+- `COLLECTIONS` 以 `(name, owner)` 对列出全部 54 个集合。
+- `INDEXLESS_COLLECTIONS` 列出不带索引、在打开时显式创建的集合(例如事件游标计数器单例
+  `event_seq`,以及 `owners`)。
+- `index_specs()` 把每个带索引的集合映射到它的 `IndexModel`;SQLite 里的复合主键表变成
+  `_pk` 唯一索引,status `IN (...)` 部分过滤在 MongoDB 5–7 上展开为 `$or`/`$eq`。
 
-`apps/server/migrations/README.md` 把 `0001_initial.sql` 视为一个压缩后的单一迁移:
-被移除的特性会折叠回该文件,而不是新增兼容性补丁,并且不假设存在已部署的数据库。
-每个迁移文件仍必须声明自己的 `-- janus-module:` owner。
+打开全新数据库是一次逐集合的 `create_indexes` 操作(幂等),外加显式创建无索引集合;
+`Database::open` 还会播种 `event_seq` 计数器。`SCHEMA_VERSION` 保持为 4 —— 最后一个
+SQL 迁移号 —— 所以 `/api/v1/system/info` 不显示回归。不存在数据迁移:已有的 SQLite
+存储不会被导入,部署从全新 MongoDB 开始。
 
 ## 公开 API
 
@@ -434,9 +440,11 @@ Cmd+S 保存并在 `beforeunload` 时告警;而输给乐观并发的保存
 
 ## 验证
 
-`cargo xtask check` 是唯一的质量门,按以下顺序执行:架构检查、OpenAPI + 客户端类型
-生成、`cargo fmt --check`、`cargo clippy --workspace --all-targets -- -D warnings`、
-`cargo test --workspace`,然后是 Web 的 `typecheck`、`lint` 和 `build`。`cargo xtask`
+`cargo xtask check` 是唯一的质量门,按以下顺序执行:架构检查、
+`cargo check --workspace --all-targets --keep-going`(先于代码生成的类型/借用检查门,
+`--keep-going` 让 rustc 在一次运行中报告相互独立 crate 的错误)、OpenAPI + 客户端类型
+生成、`cargo fmt --check`、`cargo clippy --workspace --all-targets --keep-going -- -D warnings`、
+`cargo test --workspace --no-fail-fast`,然后是 Web 的 `typecheck`、`lint` 和 `build`。`cargo xtask`
 是 `.cargo/config.toml` 中声明的 `cargo run --package xtask --` 别名。
 
 | 目的 | 命令 |
@@ -454,7 +462,7 @@ Cmd+S 保存并在 `beforeunload` 时告警;而输给乐观并发的保存
 ### 黑盒 CLI
 
 `janus-test` 只通过公开的 HTTP、SSE 和 WebSocket 表面来验证运行中的服务。它从不打开
-SQLite,也绝不能依赖 `janus-server`;架构检查会强制这一点。用 `--base-url` 或
+MongoDB 数据存储,也绝不能依赖 `janus-server`;架构检查会强制这一点。用 `--base-url` 或
 `JANUS_BASE_URL` 指定目标。
 
 ```text
@@ -481,7 +489,7 @@ cargo run -p janus-test -- events follow --count 1
 
 | 工作流 | 触发 | 任务 |
 | --- | --- | --- |
-| `.github/workflows/quality.yml` | 推送到 `main`、每个 pull request | 固定 Rust `1.97.0` + Bun `1.3.14`,`bun install --frozen-lockfile`,为需要提交的测试设置 git 身份,然后执行 `cargo xtask check` |
+| `.github/workflows/quality.yml` | 推送到 `main`、每个 pull request | 固定 Rust `1.97.0` + Bun `1.3.14`,启动 `mongo:7` 副本集 service 容器,`bun install --frozen-lockfile`,为需要提交的测试设置 git 身份,然后执行 `cargo xtask check` |
 | `.github/workflows/ci.yml` | pull request、推送到 `main`/`master`/`dev`、手动 | PR 上构建 Docker 镜像做验证;由允许的 actor 推送时,发布 `linux/amd64` 标签到 GHCR 并运行部署脚本 |
 
 发布的标签是 `ghcr.io/<owner>/<repo>` 下的 `<ref>-amd64` 和 `<short-sha>-amd64`,另有
@@ -502,13 +510,17 @@ GitHub Actions 是正确性的权威:用 `gh run list` 和 `gh run view --log-fa
 
 ```text
 docker build -t janus:local .
-docker run --rm -p 4317:4317 -v janus-data:/data janus:local
+docker run --rm -p 4317:4317 -v janus-data:/data \
+  -e JANUS_MONGODB_URI=mongodb://host.docker.internal:27017/?replicaSet=rs0 \
+  janus:local
 ```
 
 镜像默认值是 `JANUS_BIND=0.0.0.0:4317`、`JANUS_DEV_AUTH=false`、
 `JANUS_DATA_ROOT=/data` 和 `JANUS_WEB_DIST=/app/web`;`/data` 是一个卷,进程以非特权的
-`janus` 用户运行,4317 端口同时提供 API、健康探针和 Web 客户端。真实部署还需设置
-`JANUS_MODE=production`,以及与公开主机名匹配的 https `JANUS_PUBLIC_ORIGIN`。
+`janus` 用户运行,4317 端口同时提供 API、健康探针和 Web 客户端。需要一个可达的 MongoDB
+副本集——用 `JANUS_MONGODB_URI` 指向它(`host.docker.internal` 可达宿主机上运行的副本集)。
+真实部署还需设置 `JANUS_MODE=production`,以及与公开主机名匹配的 https
+`JANUS_PUBLIC_ORIGIN`。
 
 `janus-admin` 与 `janus-server` 一起打进镜像,因此管理令牌直接用部署好的镜像签发,不
 需要代码检出。它会独占打开数据根,所以要在服务端容器停止时,以一次性容器的形式针对同
@@ -550,9 +562,8 @@ classic PAT。它只会作为加密的项目凭据存储,并以 `GH_TOKEN`/`GITH
 
 各边界的首要参考是目录内的 README:`crates/README.md` 说明模块归属,
 `apps/server/README.md` 和各 `src/*/README.md` 说明服务端分层,`apps/web/src/*/README.md`
-说明客户端分层,`apps/server/migrations/README.md` 说明迁移策略。长期有效的设计与规划
-决策放在 `docs/aegis/`,由 `docs/aegis/INDEX.md` 索引,基线在 `baseline/`,设计在
-`specs/`。
+说明客户端分层。长期有效的设计与规划决策放在 `docs/aegis/`,由 `docs/aegis/INDEX.md`
+索引,基线在 `baseline/`,设计在 `specs/`。
 
 ## 约定
 

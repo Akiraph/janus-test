@@ -1,6 +1,6 @@
 name = "identity"
 public_root = "interface.rs"
-owned_tables = [
+owned_collections = [
   "owners",
   "initialization_tokens",
   "passkeys",

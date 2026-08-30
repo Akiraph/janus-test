@@ -31,11 +31,6 @@ use janus_sessions::interface::SessionsInterface;
 use janus_source_control::SourceControlInterface;
 use janus_workspace::interface::WorkspaceInterface;
 use system::SystemRead;
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
-pub const fn migrator() -> &'static sqlx::migrate::Migrator {
-    &MIGRATOR
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,10 +39,10 @@ pub struct AppState {
 
 struct AppStateInner {
     config: Config,
-    /// Raw connection pool for test assertions and admin tooling. Transport
-    /// handlers must not reach SQL directly; they use the capability
+    /// Raw database handle for test assertions and admin tooling. Transport
+    /// handlers must not reach the database directly; they use the capability
     /// interfaces or `system()`.
-    pool: sqlx::SqlitePool,
+    pool: mongodb::Database,
     identity: IdentityInterface,
     application: Application,
     system: SystemRead,
@@ -60,9 +55,13 @@ struct AppStateInner {
 
 impl AppState {
     pub async fn initialize(config: Config) -> anyhow::Result<Self> {
-        let database = Database::open(&config.data_root, migrator())
-            .await
-            .with_context(|| format!("initialize data root {}", config.data_root.display()))?;
+        let database = Database::open(
+            &config.data_root,
+            &config.mongodb_uri,
+            &config.mongodb_database,
+        )
+        .await
+        .with_context(|| format!("initialize data root {}", config.data_root.display()))?;
         let pool = database.pool().clone();
         let events = EventStore::new(pool.clone());
         let state_broadcaster = StateBroadcaster::new();
@@ -197,9 +196,9 @@ impl AppState {
         &self.inner.config
     }
 
-    /// Raw connection pool, reserved for test assertions. Transport handlers
+    /// Raw database handle, reserved for test assertions. Transport handlers
     /// must read through capability interfaces or `system()` instead.
-    pub fn pool(&self) -> &sqlx::SqlitePool {
+    pub fn pool(&self) -> &mongodb::Database {
         &self.inner.pool
     }
 

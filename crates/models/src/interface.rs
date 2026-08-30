@@ -2,9 +2,13 @@
 
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use janus_infrastructure::clock::now_utc_str;
+use mongodb::{
+    ClientSession,
+    bson::{Bson, Document, doc},
+};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqliteConnection, SqlitePool};
 use thiserror::Error;
 use url::Url;
 use utoipa::ToSchema;
@@ -214,22 +218,23 @@ pub enum ModelsError {
     #[error("the provider was not found")]
     ProviderNotFound,
     #[error("model storage failed")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("model data is invalid")]
     Data(#[from] serde_json::Error),
     #[error("model operation failed")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
 }
 
 #[derive(Clone)]
 pub struct ModelsInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     unit_of_work: UnitOfWork,
     cipher: SecretCipher,
     client: reqwest::Client,
 }
 
-#[derive(FromRow)]
 pub(crate) struct ProviderRow {
     pub id: String,
     pub client: String,
@@ -240,37 +245,95 @@ pub(crate) struct ProviderRow {
     pub api_key_fingerprint: Option<String>,
     pub api_key_preview: Option<String>,
     pub models_json: String,
-    pub enabled: i64,
+    pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
 }
 
-#[derive(FromRow)]
+impl ProviderRow {
+    fn from_doc(doc: &Document) -> Result<Self, ModelsError> {
+        Ok(Self {
+            id: doc.get_str("_id")?.to_owned(),
+            client: doc.get_str("client")?.to_owned(),
+            kind: doc.get_str("kind")?.to_owned(),
+            display_name: doc.get_str("display_name")?.to_owned(),
+            base_url: doc.get_str("base_url")?.to_owned(),
+            api_key_ciphertext: doc.get("api_key_ciphertext").and_then(|value| match value {
+                Bson::Binary(binary) => Some(binary.bytes.clone()),
+                _ => None,
+            }),
+            api_key_fingerprint: doc
+                .get("api_key_fingerprint")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            api_key_preview: doc
+                .get("api_key_preview")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            models_json: doc.get_str("models_json")?.to_owned(),
+            enabled: doc.get("enabled").and_then(Bson::as_bool).unwrap_or(false),
+            created_at: doc.get_str("created_at")?.to_owned(),
+            updated_at: doc.get_str("updated_at")?.to_owned(),
+        })
+    }
+}
+
 struct ModelRow {
     id: String,
     provider_id: String,
     display_name: String,
     upstream_model_id: String,
     context_limit: i64,
-    supports_images: i64,
-    supports_tools: i64,
+    supports_images: bool,
+    supports_tools: bool,
     parameters_json: String,
-    enabled: i64,
+    enabled: bool,
     created_at: String,
     updated_at: String,
+}
+
+impl ModelRow {
+    fn from_doc(doc: &Document) -> Result<Self, ModelsError> {
+        Ok(Self {
+            id: doc.get_str("_id")?.to_owned(),
+            provider_id: doc.get_str("provider_id")?.to_owned(),
+            display_name: doc.get_str("display_name")?.to_owned(),
+            upstream_model_id: doc.get_str("upstream_model_id")?.to_owned(),
+            context_limit: doc
+                .get("context_limit")
+                .and_then(Bson::as_i64)
+                .unwrap_or_default(),
+            supports_images: doc
+                .get("supports_images")
+                .and_then(Bson::as_bool)
+                .unwrap_or(false),
+            supports_tools: doc
+                .get("supports_tools")
+                .and_then(Bson::as_bool)
+                .unwrap_or(false),
+            parameters_json: doc.get_str("parameters_json")?.to_owned(),
+            enabled: doc.get("enabled").and_then(Bson::as_bool).unwrap_or(false),
+            created_at: doc.get_str("created_at")?.to_owned(),
+            updated_at: doc.get_str("updated_at")?.to_owned(),
+        })
+    }
 }
 
 /// The model an owner picked for Automation runs. Both fields are nullable
 /// because the row also carries `reasoning_effort`, so a row can exist with no
 /// model chosen.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct AutomationModelSelection {
     pub model_provider_id: Option<String>,
     pub model_upstream_id: Option<String>,
 }
 
 impl ModelsInterface {
-    pub fn new(pool: SqlitePool, cipher: SecretCipher, events: EventStore) -> anyhow::Result<Self> {
+    pub fn new(
+        pool: mongodb::Database,
+        cipher: SecretCipher,
+        events: EventStore,
+    ) -> anyhow::Result<Self> {
         let unit_of_work = UnitOfWork::new(pool.clone(), events);
         Ok(Self {
             pool,
@@ -284,37 +347,93 @@ impl ModelsInterface {
     }
 
     pub async fn providers(&self, owner_id: &str) -> Result<Vec<ProviderView>, ModelsError> {
-        let rows = sqlx::query_as::<_, ProviderRow>("SELECT id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE owner_id = ? ORDER BY display_name")
-            .bind(owner_id).fetch_all(&self.pool).await?;
-        rows.into_iter().map(provider_view).collect()
+        let mut cursor = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find(doc! {"owner_id": owner_id})
+            .sort(doc! {"display_name": 1, "_id": 1})
+            .await?;
+        let mut views = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            views.push(provider_view(ProviderRow::from_doc(&document)?)?);
+        }
+        Ok(views)
     }
 
     pub async fn models(&self, owner_id: &str) -> Result<Vec<ModelView>, ModelsError> {
-        let rows = sqlx::query_as::<_, ModelRow>(
-            "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
-             model.context_limit, model.supports_images, model.supports_tools, model.parameters_json, \
-             model.enabled, model.created_at, model.updated_at FROM models AS model \
-             JOIN model_providers AS provider ON provider.id = model.provider_id \
-             WHERE provider.owner_id = ? ORDER BY provider.display_name, model.display_name",
-        )
-        .bind(owner_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(model_view).collect()
+        let mut provider_cursor = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find(doc! {"owner_id": owner_id})
+            .sort(doc! {"display_name": 1, "_id": 1})
+            .await?;
+        let mut provider_names = Vec::new();
+        while let Some(document) = provider_cursor.try_next().await? {
+            let id = document.get_str("_id")?.to_owned();
+            let display_name = document.get_str("display_name")?.to_owned();
+            provider_names.push((id, display_name));
+        }
+        if provider_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider_name: std::collections::HashMap<String, String> =
+            provider_names.into_iter().collect();
+        let provider_ids: Vec<&str> = provider_name.keys().map(String::as_str).collect();
+        let mut model_cursor = self
+            .pool
+            .collection::<Document>("models")
+            .find(doc! {"provider_id": {"$in": provider_ids}})
+            .await?;
+        let mut documents = Vec::new();
+        while let Some(document) = model_cursor.try_next().await? {
+            documents.push(document);
+        }
+        documents.sort_by(|a, b| {
+            let an = provider_name
+                .get(a.get_str("provider_id").unwrap_or_default())
+                .map(String::as_str)
+                .unwrap_or_default();
+            let bn = provider_name
+                .get(b.get_str("provider_id").unwrap_or_default())
+                .map(String::as_str)
+                .unwrap_or_default();
+            an.cmp(bn)
+                .then_with(|| {
+                    a.get_str("display_name")
+                        .unwrap_or_default()
+                        .cmp(b.get_str("display_name").unwrap_or_default())
+                })
+                .then_with(|| {
+                    a.get_str("_id")
+                        .unwrap_or_default()
+                        .cmp(b.get_str("_id").unwrap_or_default())
+                })
+        });
+        documents
+            .into_iter()
+            .map(|document| model_view(ModelRow::from_doc(&document)?))
+            .collect()
     }
 
     pub async fn automation_model_selection(
         &self,
         owner_id: &str,
     ) -> Result<Option<AutomationModelSelection>, ModelsError> {
-        let selection = sqlx::query_as::<_, AutomationModelSelection>(
-            "SELECT model_provider_id, model_upstream_id FROM automation_settings \
-             WHERE owner_id = ?",
-        )
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(selection)
+        let document = self
+            .pool
+            .collection::<Document>("automation_settings")
+            .find_one(doc! {"_id": owner_id})
+            .await?;
+        Ok(document.map(|document| AutomationModelSelection {
+            model_provider_id: document
+                .get("model_provider_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            model_upstream_id: document
+                .get("model_upstream_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+        }))
     }
 
     pub async fn set_automation_model_selection(
@@ -324,93 +443,82 @@ impl ModelsInterface {
         model_upstream_id: Option<&str>,
         now: &str,
     ) -> Result<(), ModelsError> {
-        sqlx::query(
-            "INSERT INTO automation_settings \
-             (owner_id, model_provider_id, model_upstream_id, updated_at) \
-             VALUES (?, ?, ?, ?) \
-             ON CONFLICT(owner_id) DO UPDATE SET \
-                    model_provider_id = excluded.model_provider_id, \
-                    model_upstream_id = excluded.model_upstream_id, \
-                    updated_at = excluded.updated_at",
-        )
-        .bind(owner_id)
-        .bind(model_provider_id)
-        .bind(model_upstream_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
+        let mut set = doc! {"updated_at": now};
+        match model_provider_id {
+            Some(value) => {
+                set.insert("model_provider_id", value);
+            }
+            None => {
+                set.insert("model_provider_id", Bson::Null);
+            }
+        }
+        match model_upstream_id {
+            Some(value) => {
+                set.insert("model_upstream_id", value);
+            }
+            None => {
+                set.insert("model_upstream_id", Bson::Null);
+            }
+        }
+        self.pool
+            .collection::<Document>("automation_settings")
+            .update_one(doc! {"_id": owner_id}, doc! {"$set": set})
+            .upsert(true)
+            .await?;
         Ok(())
     }
 
     pub async fn provider_kind_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         provider_id: &str,
     ) -> Result<ProviderKind, ModelsError> {
-        let kind = sqlx::query_scalar::<_, String>(
-            "SELECT kind FROM model_providers WHERE id = ? AND enabled = 1",
-        )
-        .bind(provider_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(ModelsError::ProviderNotFound)?;
+        let kind = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find_one(doc! {"_id": provider_id, "enabled": true})
+            .session(&mut *session)
+            .await?
+            .ok_or(ModelsError::ProviderNotFound)?
+            .get_str("kind")?
+            .to_owned();
         parse_kind(&kind)
     }
 
     pub async fn resolve_for_turn_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         owner_id: &str,
         preference: ModelPreference<'_>,
     ) -> Result<Option<ResolvedModel>, ModelsError> {
-        let row = if let (Some(provider_id), Some(upstream_model_id)) =
+        let (provider_filter, model_filter) = if let (Some(provider_id), Some(upstream_model_id)) =
             (preference.provider_id, preference.upstream_model_id)
         {
-            sqlx::query_as::<_, ModelRow>(
-                "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
-                        model.context_limit, model.supports_images, model.supports_tools, \
-                        model.parameters_json, model.enabled, model.created_at, model.updated_at \
-                 FROM models AS model \
-                 JOIN model_providers AS provider ON provider.id = model.provider_id \
-                 WHERE provider.owner_id = ? AND provider.id = ? AND provider.client = 'supervisor' \
-                   AND model.upstream_model_id = ? AND provider.enabled = 1 AND model.enabled = 1 \
-                 ORDER BY model.display_name, model.id LIMIT 1",
+            (
+                doc! {
+                    "_id": provider_id,
+                    "owner_id": owner_id,
+                    "client": "supervisor",
+                    "enabled": true,
+                },
+                doc! {"upstream_model_id": upstream_model_id},
             )
-            .bind(owner_id)
-            .bind(provider_id)
-            .bind(upstream_model_id)
-            .fetch_optional(&mut *tx)
-            .await?
         } else if let Some(model_id) = preference.model_id {
-            sqlx::query_as::<_, ModelRow>(
-                "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
-                        model.context_limit, model.supports_images, model.supports_tools, \
-                        model.parameters_json, model.enabled, model.created_at, model.updated_at \
-                 FROM models AS model \
-                 JOIN model_providers AS provider ON provider.id = model.provider_id \
-                 WHERE provider.owner_id = ? AND model.id = ? AND provider.client = 'supervisor' \
-                   AND provider.enabled = 1 AND model.enabled = 1",
+            (
+                doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
+                doc! {"_id": model_id},
             )
-            .bind(owner_id)
-            .bind(model_id)
-            .fetch_optional(&mut *tx)
-            .await?
         } else {
-            sqlx::query_as::<_, ModelRow>(
-                "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
-                        model.context_limit, model.supports_images, model.supports_tools, \
-                        model.parameters_json, model.enabled, model.created_at, model.updated_at \
-                 FROM models AS model \
-                 JOIN model_providers AS provider ON provider.id = model.provider_id \
-                 WHERE provider.owner_id = ? AND provider.client = 'supervisor' \
-                   AND provider.enabled = 1 AND model.enabled = 1 \
-                 ORDER BY provider.display_name, model.display_name, model.id LIMIT 1",
+            (
+                doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
+                doc! {},
             )
-            .bind(owner_id)
-            .fetch_optional(&mut *tx)
-            .await?
         };
-        row.map(resolved_model).transpose()
+        Ok(self
+            .resolve_models_in_tx(session, provider_filter, model_filter)
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// Resolve the configured fallback chain at Turn creation time. The
@@ -418,21 +526,25 @@ impl ModelsInterface {
     /// Turn does not silently change route when model configuration changes.
     pub async fn failover_candidates_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         owner_id: &str,
         primary_model_id: &str,
     ) -> Result<Vec<ResolvedModel>, ModelsError> {
-        let candidate_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT candidate_model_id FROM model_failover \
-             WHERE primary_model_id = ? ORDER BY ordinal",
-        )
-        .bind(primary_model_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("model_failover")
+            .find(doc! {"primary_model_id": primary_model_id})
+            .sort(doc! {"ordinal": 1})
+            .session(&mut *session)
+            .await?;
+        let mut candidate_ids = Vec::new();
+        while let Some(document) = cursor.next(&mut *session).await.transpose()? {
+            candidate_ids.push(document.get_str("candidate_model_id")?.to_owned());
+        }
         let mut candidates = Vec::with_capacity(candidate_ids.len());
         for candidate_id in candidate_ids {
             if let Some(model) = self
-                .resolve_model_id_in_tx(tx, owner_id, &candidate_id)
+                .resolve_model_id_in_tx(session, owner_id, &candidate_id)
                 .await?
             {
                 candidates.push(model);
@@ -443,25 +555,90 @@ impl ModelsInterface {
 
     async fn resolve_model_id_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         owner_id: &str,
         model_id: &str,
     ) -> Result<Option<ResolvedModel>, ModelsError> {
-        sqlx::query_as::<_, ModelRow>(
-            "SELECT model.id, model.provider_id, model.display_name, model.upstream_model_id, \
-                    model.context_limit, model.supports_images, model.supports_tools, \
-                    model.parameters_json, model.enabled, model.created_at, model.updated_at \
-             FROM models AS model \
-             JOIN model_providers AS provider ON provider.id = model.provider_id \
-              WHERE provider.owner_id = ? AND model.id = ? AND provider.client = 'supervisor' \
-               AND provider.enabled = 1 AND model.enabled = 1",
-        )
-        .bind(owner_id)
-        .bind(model_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(resolved_model)
-        .transpose()
+        Ok(self
+            .resolve_models_in_tx(
+                session,
+                doc! {"owner_id": owner_id, "client": "supervisor", "enabled": true},
+                doc! {"_id": model_id},
+            )
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Enabled supervisor models for an owner, joined with their provider
+    /// display names and ordered exactly like the old `ORDER BY
+    /// provider.display_name, model.display_name, model.id`.
+    async fn resolve_models_in_tx(
+        &self,
+        session: &mut ClientSession,
+        provider_filter: Document,
+        model_filter: Document,
+    ) -> Result<Vec<ResolvedModel>, ModelsError> {
+        let mut provider_cursor = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find(provider_filter)
+            .sort(doc! {"display_name": 1, "_id": 1})
+            .session(&mut *session)
+            .await?;
+        let mut provider_names = Vec::new();
+        while let Some(document) = provider_cursor.next(&mut *session).await.transpose()? {
+            let id = document.get_str("_id")?.to_owned();
+            let display_name = document.get_str("display_name")?.to_owned();
+            provider_names.push((id, display_name));
+        }
+        if provider_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider_name: std::collections::HashMap<String, String> =
+            provider_names.into_iter().collect();
+        let provider_ids: Vec<&str> = provider_name.keys().map(String::as_str).collect();
+        let mut filter = doc! {
+            "provider_id": {"$in": provider_ids},
+            "enabled": true,
+        };
+        filter.extend(model_filter);
+        let mut model_cursor = self
+            .pool
+            .collection::<Document>("models")
+            .find(filter)
+            .session(&mut *session)
+            .await?;
+        let mut documents = Vec::new();
+        while let Some(document) = model_cursor.next(&mut *session).await.transpose()? {
+            documents.push(document);
+        }
+        documents.sort_by(|a, b| {
+            let an = provider_name
+                .get(a.get_str("provider_id").unwrap_or_default())
+                .map(String::as_str)
+                .unwrap_or_default();
+            let bn = provider_name
+                .get(b.get_str("provider_id").unwrap_or_default())
+                .map(String::as_str)
+                .unwrap_or_default();
+            an.cmp(bn)
+                .then_with(|| {
+                    a.get_str("display_name")
+                        .unwrap_or_default()
+                        .cmp(b.get_str("display_name").unwrap_or_default())
+                })
+                .then_with(|| {
+                    a.get_str("_id")
+                        .unwrap_or_default()
+                        .cmp(b.get_str("_id").unwrap_or_default())
+                })
+        });
+        let mut resolved = Vec::with_capacity(documents.len());
+        for document in documents {
+            resolved.push(resolved_model(ModelRow::from_doc(&document)?)?);
+        }
+        Ok(resolved)
     }
 
     pub async fn set_failover(
@@ -488,16 +665,28 @@ impl ModelsInterface {
         ids.push(primary_model_id);
         ids.extend(candidates.iter().map(String::as_str));
         for id in ids {
-            let belongs: i64 = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM models AS model JOIN model_providers AS provider \
-                 ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ? \
-                  AND provider.client = 'supervisor' AND model.enabled = 1 AND provider.enabled = 1)",
-            )
-            .bind(id)
-            .bind(owner_id)
-            .fetch_one(&self.pool)
-            .await?;
-            if belongs == 0 {
+            let model = self
+                .pool
+                .collection::<Document>("models")
+                .find_one(doc! {"_id": id, "enabled": true})
+                .await?;
+            let Some(model) = model else {
+                return Err(ModelsError::Validation(
+                    "every failover model must be enabled and owned by the current owner".into(),
+                ));
+            };
+            let provider_id = model.get_str("provider_id")?;
+            let provider = self
+                .pool
+                .collection::<Document>("model_providers")
+                .find_one(doc! {
+                    "_id": provider_id,
+                    "owner_id": owner_id,
+                    "client": "supervisor",
+                    "enabled": true,
+                })
+                .await?;
+            if provider.is_none() {
                 return Err(ModelsError::Validation(
                     "every failover model must be enabled and owned by the current owner".into(),
                 ));
@@ -505,21 +694,22 @@ impl ModelsInterface {
         }
         let now = now_utc_str();
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query("DELETE FROM model_failover WHERE primary_model_id = ?")
-            .bind(primary_model_id)
-            .execute(work.connection())
+        self.pool
+            .collection::<Document>("model_failover")
+            .delete_many(doc! {"primary_model_id": primary_model_id})
+            .session(work.connection())
             .await?;
         for (ordinal, candidate) in candidates.iter().enumerate() {
-            sqlx::query(
-                "INSERT INTO model_failover \
-                 (primary_model_id, candidate_model_id, ordinal, created_at) VALUES (?, ?, ?, ?)",
-            )
-            .bind(primary_model_id)
-            .bind(candidate)
-            .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-            .bind(&now)
-            .execute(work.connection())
-            .await?;
+            self.pool
+                .collection::<Document>("model_failover")
+                .insert_one(doc! {
+                    "primary_model_id": primary_model_id,
+                    "candidate_model_id": candidate,
+                    "ordinal": i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    "created_at": &now,
+                })
+                .session(work.connection())
+                .await?;
         }
         self.append_config_changed_in_tx(
             &mut work,
@@ -542,24 +732,37 @@ impl ModelsInterface {
         owner_id: &str,
         primary_model_id: &str,
     ) -> Result<ModelFailoverView, ModelsError> {
-        let belongs: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM models AS model JOIN model_providers AS provider \
-             ON provider.id = model.provider_id WHERE model.id = ? AND provider.owner_id = ? \
-              AND provider.client = 'supervisor')",
-        )
-        .bind(primary_model_id)
-        .bind(owner_id)
-        .fetch_one(&self.pool)
-        .await?;
-        if belongs == 0 {
+        let model = self
+            .pool
+            .collection::<Document>("models")
+            .find_one(doc! {"_id": primary_model_id})
+            .await?;
+        let Some(model) = model else {
+            return Err(ModelsError::ProviderNotFound);
+        };
+        let provider_id = model.get_str("provider_id")?;
+        let provider = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find_one(doc! {
+                "_id": provider_id,
+                "owner_id": owner_id,
+                "client": "supervisor",
+            })
+            .await?;
+        if provider.is_none() {
             return Err(ModelsError::ProviderNotFound);
         }
-        let candidates = sqlx::query_scalar::<_, String>(
-            "SELECT candidate_model_id FROM model_failover WHERE primary_model_id = ? ORDER BY ordinal",
-        )
-        .bind(primary_model_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("model_failover")
+            .find(doc! {"primary_model_id": primary_model_id})
+            .sort(doc! {"ordinal": 1})
+            .await?;
+        let mut candidates = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            candidates.push(document.get_str("candidate_model_id")?.to_owned());
+        }
         Ok(ModelFailoverView {
             primary_model_id: primary_model_id.into(),
             candidates,
@@ -587,9 +790,36 @@ impl ModelsInterface {
                 .map(EmbeddedModelInput::to_view)
                 .collect::<Vec<_>>(),
         )?;
+        let base_url = normalize_url(input.kind, &input.base_url)?;
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query("INSERT INTO model_providers (id, owner_id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&id).bind(owner_id).bind(client_str(input.client)).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(&now).execute(work.connection()).await?;
+        let mut document = doc! {
+            "_id": &id,
+            "owner_id": owner_id,
+            "client": client_str(input.client),
+            "kind": kind_str(input.kind),
+            "display_name": input.display_name.trim(),
+            "base_url": &base_url,
+            "api_key_fingerprint": &key_fingerprint,
+            "api_key_preview": &key_preview,
+            "models_json": &models_json,
+            "enabled": input.enabled,
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if let Some(bytes) = &ciphertext {
+            document.insert(
+                "api_key_ciphertext",
+                Bson::Binary(mongodb::bson::Binary {
+                    subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                    bytes: bytes.clone(),
+                }),
+            );
+        }
+        self.pool
+            .collection::<Document>("model_providers")
+            .insert_one(document)
+            .session(work.connection())
+            .await?;
         self.sync_normalized_models(work.connection(), &id, &input.models, &now)
             .await?;
         self.append_config_changed_in_tx(
@@ -637,9 +867,40 @@ impl ModelsInterface {
                 .collect::<Vec<_>>(),
         )?;
         let now = now_utc_str();
+        let base_url = normalize_url(input.kind, &input.base_url)?;
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query("UPDATE model_providers SET client=?, kind=?, display_name=?, base_url=?, api_key_ciphertext=?, api_key_fingerprint=?, api_key_preview=?, models_json=?, enabled=?, updated_at=? WHERE id=? AND owner_id=?")
-            .bind(client_str(input.client)).bind(kind_str(input.kind)).bind(input.display_name.trim()).bind(normalize_url(input.kind, &input.base_url)?).bind(ciphertext).bind(key_fingerprint).bind(key_preview).bind(models_json).bind(input.enabled).bind(&now).bind(id).bind(owner_id).execute(work.connection()).await?.rows_affected();
+        let mut set = doc! {
+            "client": client_str(input.client),
+            "kind": kind_str(input.kind),
+            "display_name": input.display_name.trim(),
+            "base_url": &base_url,
+            "api_key_fingerprint": &key_fingerprint,
+            "api_key_preview": &key_preview,
+            "models_json": &models_json,
+            "enabled": input.enabled,
+            "updated_at": &now,
+        };
+        match &ciphertext {
+            Some(bytes) => {
+                set.insert(
+                    "api_key_ciphertext",
+                    Bson::Binary(mongodb::bson::Binary {
+                        subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                        bytes: bytes.clone(),
+                    }),
+                );
+            }
+            None => {
+                set.insert("api_key_ciphertext", Bson::Null);
+            }
+        }
+        let changed = self
+            .pool
+            .collection::<Document>("model_providers")
+            .update_one(doc! {"_id": id, "owner_id": owner_id}, doc! {"$set": set})
+            .session(work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ModelsError::ProviderNotFound);
@@ -666,14 +927,14 @@ impl ModelsInterface {
         correlation_id: &str,
     ) -> Result<(), ModelsError> {
         let mut work = self.unit_of_work.begin().await?;
-        if sqlx::query("DELETE FROM model_providers WHERE id=? AND owner_id=?")
-            .bind(id)
-            .bind(owner_id)
-            .execute(work.connection())
+        let deleted = self
+            .pool
+            .collection::<Document>("model_providers")
+            .delete_one(doc! {"_id": id, "owner_id": owner_id})
+            .session(work.connection())
             .await?
-            .rows_affected()
-            == 0
-        {
+            .deleted_count;
+        if deleted == 0 {
             work.rollback().await?;
             return Err(ModelsError::ProviderNotFound);
         }
@@ -755,7 +1016,13 @@ impl ModelsInterface {
         owner_id: &str,
         id: &str,
     ) -> Result<ProviderRow, ModelsError> {
-        sqlx::query_as::<_, ProviderRow>("SELECT id, client, kind, display_name, base_url, api_key_ciphertext, api_key_fingerprint, api_key_preview, models_json, enabled, created_at, updated_at FROM model_providers WHERE id=? AND owner_id=?").bind(id).bind(owner_id).fetch_optional(&self.pool).await?.ok_or(ModelsError::ProviderNotFound)
+        let document = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find_one(doc! {"_id": id, "owner_id": owner_id})
+            .await?
+            .ok_or(ModelsError::ProviderNotFound)?;
+        ProviderRow::from_doc(&document)
     }
 
     async fn ensure_provider_name_available(
@@ -766,29 +1033,21 @@ impl ModelsInterface {
         excluded_id: Option<&str>,
     ) -> Result<(), ModelsError> {
         let name = display_name.trim();
-        let exists = if let Some(excluded_id) = excluded_id {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM model_providers \
-                 WHERE owner_id = ? AND client = ? AND display_name = ? AND id <> ?)",
-            )
-            .bind(owner_id)
-            .bind(client_str(client))
-            .bind(name)
-            .bind(excluded_id)
-            .fetch_one(&self.pool)
-            .await?
-        } else {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM model_providers \
-                 WHERE owner_id = ? AND client = ? AND display_name = ?)",
-            )
-            .bind(owner_id)
-            .bind(client_str(client))
-            .bind(name)
-            .fetch_one(&self.pool)
-            .await?
+        let mut filter = doc! {
+            "owner_id": owner_id,
+            "client": client_str(client),
+            "display_name": name,
         };
-        if exists != 0 {
+        if let Some(excluded_id) = excluded_id {
+            filter.insert("_id", doc! {"$ne": excluded_id});
+        }
+        let exists = self
+            .pool
+            .collection::<Document>("model_providers")
+            .find_one(filter)
+            .await?
+            .is_some();
+        if exists {
             return Err(ModelsError::Validation(
                 "provider display names must be unique for each client".into(),
             ));
@@ -830,30 +1089,26 @@ impl ModelsInterface {
         // event is gone. Deriving it from the attempts already recorded for
         // this Round and candidate keeps the column authoritative without the
         // caller having to thread the loop counter through.
-        let attempt_number = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(1) FROM model_attempts WHERE round_id = ? AND candidate_order = ?",
-        )
-        .bind(round_id)
-        .bind(candidate_order)
-        .fetch_one(&self.pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO model_attempts \
-             (id, round_id, candidate_order, attempt_number, provider_id, upstream_model_id, \
-              attempt_type, status, normalized_error_json, upstream_request_id, input_tokens, \
-              output_tokens, created_at, ended_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'running', NULL, NULL, NULL, NULL, ?, NULL)",
-        )
-        .bind(attempt_id)
-        .bind(round_id)
-        .bind(candidate_order)
-        .bind(attempt_number)
-        .bind(provider_id)
-        .bind(upstream_model_id)
-        .bind(attempt_type.as_str())
-        .bind(created_at)
-        .execute(&self.pool)
-        .await?;
+        let count = self
+            .pool
+            .collection::<Document>("model_attempts")
+            .count_documents(doc! {"round_id": round_id, "candidate_order": candidate_order})
+            .await?;
+        let attempt_number = count_to_i64(count, "attempt")?;
+        self.pool
+            .collection::<Document>("model_attempts")
+            .insert_one(doc! {
+                "_id": attempt_id,
+                "round_id": round_id,
+                "candidate_order": candidate_order,
+                "attempt_number": attempt_number,
+                "provider_id": provider_id,
+                "upstream_model_id": upstream_model_id,
+                "attempt_type": attempt_type.as_str(),
+                "status": "running",
+                "created_at": created_at,
+            })
+            .await?;
         Ok(())
     }
 
@@ -871,19 +1126,43 @@ impl ModelsInterface {
             request: req,
         } = finalization;
         let ended = now_utc_str();
-        let changed = sqlx::query(
-            "UPDATE model_attempts SET status = ?, input_tokens = ?, output_tokens = ?, \
-             normalized_error_json = ?, ended_at = ? WHERE id = ? AND status = 'running'",
-        )
-        .bind(status)
-        .bind(input_tokens)
-        .bind(output_tokens)
-        .bind(error_json.map(|v| v.to_string()))
-        .bind(&ended)
-        .bind(attempt_id)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let mut set = doc! {
+            "status": status,
+            "ended_at": &ended,
+        };
+        match input_tokens {
+            Some(value) => {
+                set.insert("input_tokens", value);
+            }
+            None => {
+                set.insert("input_tokens", Bson::Null);
+            }
+        }
+        match output_tokens {
+            Some(value) => {
+                set.insert("output_tokens", value);
+            }
+            None => {
+                set.insert("output_tokens", Bson::Null);
+            }
+        }
+        match error_json {
+            Some(value) => {
+                set.insert("normalized_error_json", value.to_string());
+            }
+            None => {
+                set.insert("normalized_error_json", Bson::Null);
+            }
+        }
+        let changed = self
+            .pool
+            .collection::<Document>("model_attempts")
+            .update_one(
+                doc! {"_id": attempt_id, "status": "running"},
+                doc! {"$set": set},
+            )
+            .await?
+            .matched_count;
 
         // Ledger only when usage was reported (including failed attempts with tokens).
         if changed == 1
@@ -896,82 +1175,94 @@ impl ModelsInterface {
             )
         {
             let ledger_id = AttemptId::new().to_string();
-            sqlx::query(
-                "INSERT INTO model_usage_ledger \
-                 (id, attempt_id, project_id, session_id, turn_id, round_id, provider_id, \
-                  upstream_model_id, input_tokens, output_tokens, cache_tokens, \
-                  attempt_result, occurred_at) \
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&ledger_id)
-            .bind(attempt_id)
-            .bind(project_id)
-            .bind(session_id)
-            .bind(turn_id)
-            .bind(round_id)
-            .bind(&req.provider_id)
-            .bind(&req.upstream_model_id)
-            .bind(inp)
-            .bind(out)
-            .bind(cache_tokens.unwrap_or(0))
-            .bind(status)
-            .bind(&ended)
-            .execute(&self.pool)
-            .await?;
+            self.pool
+                .collection::<Document>("model_usage_ledger")
+                .insert_one(doc! {
+                    "_id": &ledger_id,
+                    "attempt_id": attempt_id,
+                    "project_id": project_id,
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "round_id": round_id,
+                    "provider_id": &req.provider_id,
+                    "upstream_model_id": &req.upstream_model_id,
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "cache_tokens": cache_tokens.unwrap_or(0),
+                    "attempt_result": status,
+                    "occurred_at": &ended,
+                })
+                .await?;
         }
         Ok(())
     }
 
     pub async fn interrupt_running_attempts_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         now: &str,
     ) -> Result<(), ModelsError> {
-        sqlx::query(
-            "UPDATE model_attempts SET status = 'interrupted', normalized_error_json = ?, \
-                    ended_at = ? WHERE status = 'running'",
-        )
-        .bind(serde_json::json!({"code": "CONTROL_PLANE_RESTART"}).to_string())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+        let error_json = serde_json::json!({"code": "CONTROL_PLANE_RESTART"}).to_string();
+        self.pool
+            .collection::<Document>("model_attempts")
+            .update_many(
+                doc! {"status": "running"},
+                doc! {
+                    "$set": {
+                        "status": "interrupted",
+                        "normalized_error_json": &error_json,
+                        "ended_at": now,
+                    }
+                },
+            )
+            .session(&mut *session)
+            .await?;
         Ok(())
     }
 
     pub async fn cancel_running_attempts_for_rounds_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         round_ids: &[RoundId],
         now: &str,
     ) -> Result<u64, ModelsError> {
-        let mut canceled = 0;
+        let error_json = serde_json::json!({"code": "USER_CANCEL"}).to_string();
+        let mut canceled = 0u64;
         for round_id in round_ids {
-            canceled += sqlx::query(
-                "UPDATE model_attempts SET status = 'canceled', normalized_error_json = ?, \
-                        ended_at = ? WHERE round_id = ? AND status = 'running'",
-            )
-            .bind(serde_json::json!({"code": "USER_CANCEL"}).to_string())
-            .bind(now)
-            .bind(round_id.to_string())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            let updated = self
+                .pool
+                .collection::<Document>("model_attempts")
+                .update_many(
+                    doc! {"round_id": round_id.to_string(), "status": "running"},
+                    doc! {
+                        "$set": {
+                            "status": "canceled",
+                            "normalized_error_json": &error_json,
+                            "ended_at": now,
+                        }
+                    },
+                )
+                .session(&mut *session)
+                .await?;
+            canceled += updated.matched_count;
         }
         Ok(canceled)
     }
 
     pub async fn delete_attempts_for_rounds_in_tx(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         round_ids: &[RoundId],
     ) -> Result<u64, ModelsError> {
-        let mut deleted = 0;
+        let mut deleted = 0u64;
         for round_id in round_ids {
-            deleted += sqlx::query("DELETE FROM model_attempts WHERE round_id = ?")
-                .bind(round_id.to_string())
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+            let result = self
+                .pool
+                .collection::<Document>("model_attempts")
+                .delete_many(doc! {"round_id": round_id.to_string()})
+                .session(&mut *session)
+                .await?;
+            deleted += result.deleted_count;
         }
         Ok(deleted)
     }
@@ -983,20 +1274,24 @@ impl ModelsInterface {
         if round_ids.is_empty() {
             return Ok(None);
         }
-        let placeholders = vec!["?"; round_ids.len()].join(", ");
-        let statement = format!(
-            "SELECT attempt_number, status, normalized_error_json FROM model_attempts \
-             WHERE round_id IN ({placeholders}) ORDER BY created_at DESC, id DESC LIMIT 1"
-        );
-        let mut query = sqlx::query_as::<_, (i64, String, Option<String>)>(&statement);
-        for round_id in round_ids {
-            query = query.bind(round_id.to_string());
-        }
-        let Some((attempt, status, error_json)) = query.fetch_optional(&self.pool).await? else {
+        let round_id_strs: Vec<String> = round_ids.iter().map(|id| id.to_string()).collect();
+        let document = self
+            .pool
+            .collection::<Document>("model_attempts")
+            .find_one(doc! {"round_id": {"$in": &round_id_strs}})
+            .sort(doc! {"created_at": -1, "_id": -1})
+            .await?;
+        let Some(document) = document else {
             return Ok(None);
         };
-        let detail = error_json
-            .as_deref()
+        let attempt = document
+            .get("attempt_number")
+            .and_then(Bson::as_i64)
+            .unwrap_or_default();
+        let status = document.get_str("status")?.to_owned();
+        let detail = document
+            .get("normalized_error_json")
+            .and_then(Bson::as_str)
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
             .and_then(|value| {
                 value
@@ -1014,17 +1309,24 @@ impl ModelsInterface {
 
     async fn sync_normalized_models(
         &self,
-        tx: &mut SqliteConnection,
+        session: &mut ClientSession,
         provider_id: &str,
         inputs: &[EmbeddedModelInput],
         now: &str,
     ) -> Result<(), ModelsError> {
-        let existing: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT id, display_name, upstream_model_id FROM models WHERE provider_id = ?",
-        )
-        .bind(provider_id)
-        .fetch_all(&mut *tx)
-        .await?;
+        let mut existing_cursor = self
+            .pool
+            .collection::<Document>("models")
+            .find(doc! {"provider_id": provider_id})
+            .session(&mut *session)
+            .await?;
+        let mut existing = Vec::new();
+        while let Some(document) = existing_cursor.next(&mut *session).await.transpose()? {
+            let id = document.get_str("_id")?.to_owned();
+            let display_name = document.get_str("display_name")?.to_owned();
+            let upstream_model_id = document.get_str("upstream_model_id")?.to_owned();
+            existing.push((id, display_name, upstream_model_id));
+        }
         let mut retained = std::collections::BTreeSet::new();
         for input in inputs {
             let display_name = input.display_name.trim();
@@ -1040,32 +1342,42 @@ impl ModelsInterface {
                 .map(|(id, _, _)| id.clone());
             let id = existing_id.unwrap_or_else(|| ModelId::new().to_string());
             retained.insert(id.clone());
-            sqlx::query(
-                "INSERT INTO models \
-                 (id, provider_id, display_name, upstream_model_id, context_limit, supports_images, \
-                  supports_tools, parameters_json, enabled, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, 1, '{}', ?, ?, ?) \
-                 ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name, \
-                  upstream_model_id=excluded.upstream_model_id, context_limit=excluded.context_limit, \
-                  supports_images=excluded.supports_images, enabled=excluded.enabled, updated_at=excluded.updated_at",
-            )
-            .bind(&id)
-            .bind(provider_id)
-            .bind(display_name)
-            .bind(upstream_model_id)
-            .bind(if input.supports_1m { 1_000_000 } else { 200_000 })
-            .bind(input.supports_images)
-            .bind(input.enabled)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            let context_limit = if input.supports_1m {
+                1_000_000i64
+            } else {
+                200_000i64
+            };
+            self.pool
+                .collection::<Document>("models")
+                .update_one(
+                    doc! {"_id": &id},
+                    doc! {
+                        "$set": {
+                            "display_name": display_name,
+                            "upstream_model_id": upstream_model_id,
+                            "context_limit": context_limit,
+                            "supports_images": input.supports_images,
+                            "enabled": input.enabled,
+                            "updated_at": now,
+                        },
+                        "$setOnInsert": {
+                            "provider_id": provider_id,
+                            "supports_tools": true,
+                            "parameters_json": "{}",
+                            "created_at": now,
+                        }
+                    },
+                )
+                .upsert(true)
+                .session(&mut *session)
+                .await?;
         }
         for (id, _, _) in existing {
             if !retained.contains(&id) {
-                sqlx::query("DELETE FROM models WHERE id = ?")
-                    .bind(id)
-                    .execute(&mut *tx)
+                self.pool
+                    .collection::<Document>("models")
+                    .delete_one(doc! {"_id": &id})
+                    .session(&mut *session)
                     .await?;
             }
         }
@@ -1074,7 +1386,7 @@ impl ModelsInterface {
 
     async fn append_config_changed_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         owner_id: &str,
         resource_id: &str,
         resource_kind: &str,
@@ -1115,6 +1427,11 @@ impl ModelsInterface {
 }
 
 type EncryptedKeyMaterial = (Option<Vec<u8>>, Option<String>, Option<String>);
+
+fn count_to_i64(count: u64, what: &str) -> Result<i64, ModelsError> {
+    i64::try_from(count)
+        .map_err(|_| ModelsError::Internal(anyhow::anyhow!("{what} count overflow")))
+}
 
 fn default_true() -> bool {
     true
@@ -1249,7 +1566,7 @@ fn provider_view(row: ProviderRow) -> Result<ProviderView, ModelsError> {
         api_key_fingerprint: row.api_key_fingerprint,
         api_key_preview: row.api_key_preview,
         models,
-        enabled: row.enabled != 0,
+        enabled: row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -1263,10 +1580,10 @@ fn model_view(row: ModelRow) -> Result<ModelView, ModelsError> {
         upstream_model_id: row.upstream_model_id,
         context_limit: u32::try_from(row.context_limit)
             .map_err(|_| ModelsError::Validation("invalid stored context limit".into()))?,
-        supports_images: row.supports_images != 0,
-        supports_tools: row.supports_tools != 0,
+        supports_images: row.supports_images,
+        supports_tools: row.supports_tools,
         parameters: serde_json::from_str(&row.parameters_json)?,
-        enabled: row.enabled != 0,
+        enabled: row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -1280,8 +1597,8 @@ fn resolved_model(row: ModelRow) -> Result<ResolvedModel, ModelsError> {
         upstream_model_id: row.upstream_model_id,
         context_limit: u32::try_from(row.context_limit)
             .map_err(|_| ModelsError::Validation("invalid stored context limit".into()))?,
-        supports_images: row.supports_images != 0,
-        supports_tools: row.supports_tools != 0,
+        supports_images: row.supports_images,
+        supports_tools: row.supports_tools,
         parameters: serde_json::from_str(&row.parameters_json)?,
     })
 }

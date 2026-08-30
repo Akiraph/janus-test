@@ -10,9 +10,10 @@
 //! application layer) executes them through the Operation interface so a
 //! process restart cannot silently drop a half-done clone.
 
+use futures_util::TryStreamExt;
 use janus_infrastructure::clock::now_utc_str;
+use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
 use utoipa::ToSchema;
 
 use janus_infrastructure::{
@@ -191,13 +192,15 @@ pub enum ProjectsError {
     #[error("operation error: {0}")]
     Operation(#[from] janus_infrastructure::operations::OperationError),
     #[error("storage error: {0}")]
-    Storage(#[from] sqlx::Error),
+    Storage(#[from] mongodb::error::Error),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
+    #[error("document value access error: {0}")]
+    ValueAccess(#[from] mongodb::bson::document::ValueAccessError),
 }
 
 impl From<PathError> for ProjectsError {
@@ -243,14 +246,15 @@ impl ProjectsError {
             | Self::Storage(_)
             | Self::Serde(_)
             | Self::Io(_)
-            | Self::Internal(_) => "INTERNAL_ERROR",
+            | Self::Internal(_)
+            | Self::ValueAccess(_) => "INTERNAL_ERROR",
         }
     }
 }
 
 #[derive(Clone)]
 pub struct ProjectsInterface {
-    pool: SqlitePool,
+    pool: mongodb::Database,
     unit_of_work: UnitOfWork,
     cipher: SecretCipher,
     operations: OperationInterface,
@@ -258,7 +262,6 @@ pub struct ProjectsInterface {
     workspaces_root: std::path::PathBuf,
 }
 
-#[derive(FromRow)]
 struct ProjectRow {
     id: String,
     name: String,
@@ -275,6 +278,41 @@ struct ProjectRow {
     updated_at: String,
 }
 
+impl ProjectRow {
+    fn from_doc(document: &Document) -> Result<Self, ProjectsError> {
+        Ok(Self {
+            id: document.get_str("_id")?.to_owned(),
+            name: document.get_str("name")?.to_owned(),
+            state: document.get_str("state")?.to_owned(),
+            repo_access: document.get_str("repo_access")?.to_owned(),
+            repo_url: document.get_str("repo_url")?.to_owned(),
+            repo_branch: document
+                .get("repo_branch")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            github_credential_id: document
+                .get("github_credential_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            default_model_id: document
+                .get("default_model_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            main_workspace_handle: document
+                .get("main_workspace_handle")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            clone_error: document
+                .get("clone_error")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            version: document.get_str("version")?.to_owned(),
+            created_at: document.get_str("created_at")?.to_owned(),
+            updated_at: document.get_str("updated_at")?.to_owned(),
+        })
+    }
+}
+
 /// The event metadata shared by every Main Workspace file mutation.
 struct MainRevisionEvent<'a> {
     owner_id: &'a str,
@@ -284,7 +322,7 @@ struct MainRevisionEvent<'a> {
 
 impl ProjectsInterface {
     pub fn new(
-        pool: SqlitePool,
+        pool: mongodb::Database,
         cipher: SecretCipher,
         operations: OperationInterface,
         workspace: WorkspaceInterface,
@@ -303,36 +341,39 @@ impl ProjectsInterface {
     }
 
     pub async fn owner_id(&self, project_id: ProjectId) -> Result<String, ProjectsError> {
-        sqlx::query_scalar("SELECT owner_id FROM projects WHERE id = ?")
-            .bind(project_id.to_string())
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(ProjectsError::NotFound)
+        let document = self
+            .pool
+            .collection::<Document>("projects")
+            .find_one(doc! {"_id": project_id.to_string()})
+            .await?;
+        let Some(document) = document else {
+            return Err(ProjectsError::NotFound);
+        };
+        Ok(document.get_str("owner_id")?.to_owned())
     }
 
     pub async fn list_memories(
         &self,
         project_id: ProjectId,
     ) -> Result<Vec<MemoryView>, ProjectsError> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT memory_key, content, version, created_at, updated_at \
-             FROM memories WHERE project_id = ? ORDER BY memory_key LIMIT 200",
-        )
-        .bind(project_id.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(key, content, version, created_at, updated_at)| MemoryView {
-                    key,
-                    content,
-                    version,
-                    created_at,
-                    updated_at,
-                },
-            )
-            .collect())
+        let mut cursor = self
+            .pool
+            .collection::<Document>("memories")
+            .find(doc! {"project_id": project_id.to_string()})
+            .sort(doc! {"memory_key": 1})
+            .limit(200)
+            .await?;
+        let mut views = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            views.push(MemoryView {
+                key: document.get_str("memory_key")?.to_owned(),
+                content: document.get_str("content")?.to_owned(),
+                version: document.get_str("version")?.to_owned(),
+                created_at: document.get_str("created_at")?.to_owned(),
+                updated_at: document.get_str("updated_at")?.to_owned(),
+            });
+        }
+        Ok(views)
     }
 
     pub async fn memory_context(&self, project_id: ProjectId) -> Result<String, ProjectsError> {
@@ -372,20 +413,17 @@ impl ProjectsInterface {
         }
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
-        sqlx::query(
-            "INSERT INTO memories (project_id, memory_key, content, version, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(project_id, memory_key) DO UPDATE SET content = excluded.content, \
-             version = excluded.version, updated_at = excluded.updated_at",
-        )
-        .bind(project_id.to_string())
-        .bind(key)
-        .bind(content)
-        .bind(&version)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        self.pool
+            .collection::<Document>("memories")
+            .update_one(
+                doc! {"project_id": project_id.to_string(), "memory_key": key},
+                doc! {
+                    "$set": {"content": content, "version": &version, "updated_at": &now},
+                    "$setOnInsert": {"created_at": &now},
+                },
+            )
+            .upsert(true)
+            .await?;
         Ok(MemoryView {
             key: key.to_owned(),
             content: content.to_owned(),
@@ -400,15 +438,12 @@ impl ProjectsInterface {
         project_id: ProjectId,
         key: &str,
     ) -> Result<bool, ProjectsError> {
-        Ok(
-            sqlx::query("DELETE FROM memories WHERE project_id = ? AND memory_key = ?")
-                .bind(project_id.to_string())
-                .bind(key.trim())
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-                == 1,
-        )
+        let result = self
+            .pool
+            .collection::<Document>("memories")
+            .delete_one(doc! {"project_id": project_id.to_string(), "memory_key": key.trim()})
+            .await?;
+        Ok(result.deleted_count > 0)
     }
 
     /// Return the PAT for a ready project's GitHub credential to the
@@ -430,19 +465,25 @@ impl ProjectsInterface {
 
     pub async fn model_preference_in_tx(
         &self,
-        tx: &mut sqlx::SqliteConnection,
+        session: &mut mongodb::ClientSession,
         project_id: ProjectId,
     ) -> Result<ProjectModelPreference, ProjectsError> {
-        let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT owner_id, default_model_id FROM projects WHERE id = ?")
-                .bind(project_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
-        row.map(|(owner_id, default_model_id)| ProjectModelPreference {
-            owner_id,
-            default_model_id,
+        let document = self
+            .pool
+            .collection::<Document>("projects")
+            .find_one(doc! {"_id": project_id.to_string()})
+            .session(&mut *session)
+            .await?;
+        let Some(document) = document else {
+            return Err(ProjectsError::NotFound);
+        };
+        Ok(ProjectModelPreference {
+            owner_id: document.get_str("owner_id")?.to_owned(),
+            default_model_id: document
+                .get("default_model_id")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
         })
-        .ok_or(ProjectsError::NotFound)
     }
 
     pub async fn ensure_ready(
@@ -526,19 +567,28 @@ impl ProjectsInterface {
 
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
-        sqlx::query("INSERT INTO projects (id, owner_id, name, state, repo_access, repo_url, repo_branch, github_credential_id, default_model_id, main_workspace_handle, clone_error, version, created_at, updated_at, last_activity_at) VALUES (?, ?, ?, 'creating', ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)")
-            .bind(provisional_id.to_string())
-            .bind(owner_id)
-            .bind(input.name.trim())
-            .bind(input.repository.access.as_str())
-            .bind(&input.repository.url)
-            .bind(input.repository.branch.as_deref())
-            .bind(input.repository.github_credential_id.as_deref())
-            .bind(&version)
-            .bind(&now)
-            .bind(&now)
-            .bind(&now)
-            .execute(work.connection())
+        let branch = input.repository.branch.as_deref();
+        let credential_id = input.repository.github_credential_id.as_deref();
+        self.pool
+            .collection::<Document>("projects")
+            .insert_one(doc! {
+                "_id": &project_id,
+                "owner_id": owner_id,
+                "name": input.name.trim(),
+                "state": "creating",
+                "repo_access": input.repository.access.as_str(),
+                "repo_url": &input.repository.url,
+                "repo_branch": branch,
+                "github_credential_id": credential_id,
+                "default_model_id": null,
+                "main_workspace_handle": null,
+                "clone_error": null,
+                "version": &version,
+                "created_at": &now,
+                "updated_at": &now,
+                "last_activity_at": &now,
+            })
+            .session(&mut *work.connection())
             .await?;
         self.append_project_changed_in_tx(
             &mut work,
@@ -564,13 +614,17 @@ impl ProjectsInterface {
         limit: u32,
     ) -> Result<Vec<ProjectView>, ProjectsError> {
         let limit = i64::from(limit.clamp(1, 100));
-        let rows = sqlx::query_as::<_, ProjectRow>(
-            "SELECT id, name, state, repo_access, repo_url, repo_branch, github_credential_id, default_model_id, main_workspace_handle, clone_error, version, created_at, updated_at FROM projects WHERE owner_id = ? ORDER BY last_activity_at DESC LIMIT ?",
-        )
-        .bind(owner_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("projects")
+            .find(doc! {"owner_id": owner_id})
+            .sort(doc! {"last_activity_at": -1})
+            .limit(limit)
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push(ProjectRow::from_doc(&document)?);
+        }
         let mut views = Vec::with_capacity(rows.len());
         for row in rows {
             views.push(self.view_from_row(owner_id, row).await?);
@@ -588,14 +642,15 @@ impl ProjectsInterface {
     }
 
     async fn fetch_project(&self, owner_id: &str, id: &str) -> Result<ProjectRow, ProjectsError> {
-        sqlx::query_as::<_, ProjectRow>(
-            "SELECT id, name, state, repo_access, repo_url, repo_branch, github_credential_id, default_model_id, main_workspace_handle, clone_error, version, created_at, updated_at FROM projects WHERE id = ? AND owner_id = ?",
-        )
-        .bind(id)
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(ProjectsError::NotFound)
+        let document = self
+            .pool
+            .collection::<Document>("projects")
+            .find_one(doc! {"_id": id, "owner_id": owner_id})
+            .await?;
+        let Some(document) = document else {
+            return Err(ProjectsError::NotFound);
+        };
+        ProjectRow::from_doc(&document)
     }
 
     async fn view_from_row(
@@ -641,16 +696,24 @@ impl ProjectsInterface {
         _owner_id: &str,
         project_id: &str,
     ) -> (Option<String>, Option<String>) {
-        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT branch, git_state_version FROM project_git_state WHERE project_id = ?",
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
-        match row {
-            Some((branch, version)) => (branch, version),
+        let document = self
+            .pool
+            .collection::<Document>("project_git_state")
+            .find_one(doc! {"_id": project_id})
+            .await
+            .ok()
+            .flatten();
+        match document {
+            Some(document) => (
+                document
+                    .get("branch")
+                    .and_then(Bson::as_str)
+                    .map(str::to_owned),
+                document
+                    .get("git_state_version")
+                    .and_then(Bson::as_str)
+                    .map(str::to_owned),
+            ),
             None => (None, None),
         }
     }
@@ -668,31 +731,34 @@ impl ProjectsInterface {
     ) -> Result<ProjectView, ProjectsError> {
         let now = now_utc_str();
         let new_version = format!("v_{}", ProjectId::new());
+        let mut set = doc! {"version": &new_version, "updated_at": &now};
+        // SQL `name = COALESCE(?, name)`: only touch the column when a new name
+        // is supplied. The default model, by contrast, is always written (even
+        // when explicitly cleared), matching the always-set column.
+        if let Some(name) = name {
+            set.insert("name", name.trim());
+        }
+        if let Some(model) = default_model_id {
+            match model {
+                Some(value) => {
+                    set.insert("default_model_id", value);
+                }
+                None => {
+                    set.insert("default_model_id", Bson::Null);
+                }
+            }
+        }
         let mut work = self.unit_of_work.begin().await?;
-        let changed = if let Some(model) = default_model_id {
-            sqlx::query("UPDATE projects SET name = COALESCE(?, name), default_model_id = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?")
-                .bind(name.map(str::trim))
-                .bind(model)
-                .bind(&new_version)
-                .bind(&now)
-                .bind(id)
-                .bind(owner_id)
-                .bind(expected_version)
-                .execute(work.connection())
-                .await?
-                .rows_affected()
-        } else {
-            sqlx::query("UPDATE projects SET name = COALESCE(?, name), version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?")
-                .bind(name.map(str::trim))
-                .bind(&new_version)
-                .bind(&now)
-                .bind(id)
-                .bind(owner_id)
-                .bind(expected_version)
-                .execute(work.connection())
-                .await?
-                .rows_affected()
-        };
+        let changed = self
+            .pool
+            .collection::<Document>("projects")
+            .update_one(
+                doc! {"_id": id, "owner_id": owner_id, "version": expected_version},
+                doc! {"$set": set},
+            )
+            .session(&mut *work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ProjectsError::NotFound);
@@ -730,19 +796,22 @@ impl ProjectsInterface {
         let now = now_utc_str();
         let new_version = format!("v_{}", ProjectId::new());
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query(
-            "UPDATE projects SET repo_access = ?, github_credential_id = ?, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ? AND owner_id = ? AND state != 'deleting'",
-        )
-        .bind(REPO_KIND_GITHUB_PRIVATE)
-        .bind(credential_id)
-        .bind(&new_version)
-        .bind(&now)
-        .bind(&now)
-        .bind(id)
-        .bind(owner_id)
-        .execute(work.connection())
-        .await?
-        .rows_affected();
+        let changed = self
+            .pool
+            .collection::<Document>("projects")
+            .update_one(
+                doc! {"_id": id, "owner_id": owner_id, "state": {"$ne": "deleting"}},
+                doc! {"$set": {
+                    "repo_access": REPO_KIND_GITHUB_PRIVATE,
+                    "github_credential_id": credential_id,
+                    "version": &new_version,
+                    "updated_at": &now,
+                    "last_activity_at": &now,
+                }},
+            )
+            .session(&mut *work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ProjectsError::NotFound);
@@ -798,15 +867,21 @@ impl ProjectsInterface {
             work.commit().await?;
             return Ok(created.operation);
         }
-        let changed = sqlx::query("UPDATE projects SET state = 'deleting', version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ? AND state != 'deleting'")
-            .bind(&new_version)
-            .bind(&now)
-            .bind(id)
-            .bind(owner_id)
-            .bind(expected_version)
-            .execute(work.connection())
+        let changed = self
+            .pool
+            .collection::<Document>("projects")
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "owner_id": owner_id,
+                    "version": expected_version,
+                    "state": {"$ne": "deleting"},
+                },
+                doc! {"$set": {"state": "deleting", "version": &new_version, "updated_at": &now}},
+            )
+            .session(&mut *work.connection())
             .await?
-            .rows_affected();
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ProjectsError::NotFound);
@@ -846,18 +921,40 @@ impl ProjectsInterface {
         let branch = input.branch.or(row.repo_branch);
         let cred = input.github_credential_id.or(row.github_credential_id);
         let event_correlation_id = correlation_id.to_string();
+        let mut set = doc! {
+            "state": "creating",
+            "clone_error": null,
+            "version": &new_version,
+            "updated_at": &now,
+            "last_activity_at": &now,
+        };
+        match &branch {
+            Some(branch) => {
+                set.insert("repo_branch", branch.as_str());
+            }
+            None => {
+                set.insert("repo_branch", Bson::Null);
+            }
+        }
+        match &cred {
+            Some(cred) => {
+                set.insert("github_credential_id", cred.as_str());
+            }
+            None => {
+                set.insert("github_credential_id", Bson::Null);
+            }
+        }
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query("UPDATE projects SET state = 'creating', repo_branch = ?, github_credential_id = ?, clone_error = NULL, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ? AND owner_id = ? AND state = 'error'")
-            .bind(branch.as_deref())
-            .bind(cred.as_deref())
-            .bind(&new_version)
-            .bind(&now)
-            .bind(&now)
-            .bind(id)
-            .bind(owner_id)
-            .execute(work.connection())
+        let changed = self
+            .pool
+            .collection::<Document>("projects")
+            .update_one(
+                doc! {"_id": id, "owner_id": owner_id, "state": "error"},
+                doc! {"$set": set},
+            )
+            .session(&mut *work.connection())
             .await?
-            .rows_affected();
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ProjectsError::NotFound);
@@ -907,12 +1004,16 @@ impl ProjectsInterface {
         &self,
         owner_id: &str,
     ) -> Result<Vec<GithubCredentialView>, ProjectsError> {
-        let rows = sqlx::query_as::<_, CredentialRow>(
-            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, version, created_at, updated_at FROM github_credentials WHERE owner_id = ? ORDER BY name",
-        )
-        .bind(owner_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .find(doc! {"owner_id": owner_id})
+            .sort(doc! {"name": 1})
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push(CredentialRow::from_doc(&document)?);
+        }
         rows.into_iter().map(credential_view).collect()
     }
 
@@ -923,12 +1024,16 @@ impl ProjectsInterface {
         &self,
         owner_id: &str,
     ) -> Result<Vec<GithubCredentialView>, ProjectsError> {
-        let rows = sqlx::query_as::<_, CredentialRow>(
-            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, version, created_at, updated_at FROM github_credentials WHERE owner_id = ? AND automation_enabled = 1 ORDER BY name",
-        )
-        .bind(owner_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut cursor = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .find(doc! {"owner_id": owner_id, "automation_enabled": true})
+            .sort(doc! {"name": 1})
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(document) = cursor.try_next().await? {
+            rows.push(CredentialRow::from_doc(&document)?);
+        }
         rows.into_iter().map(credential_view).collect()
     }
 
@@ -945,19 +1050,32 @@ impl ProjectsInterface {
         let now = now_utc_str();
         let version = format!("v_{}", GithubCredentialId::new());
         let (ciphertext, fingerprint) = self.encrypt_pat(owner_id, &id.to_string(), input.pat)?;
+        let mut document = doc! {
+            "_id": id.to_string(),
+            "owner_id": owner_id,
+            "name": input.name.trim(),
+            "github_host": input.github_host.trim(),
+            "pat_fingerprint": fingerprint,
+            "automation_enabled": input.automation_enabled,
+            "state": "ready",
+            "version": &version,
+            "created_at": &now,
+            "updated_at": &now,
+        };
+        if let Some(ciphertext) = ciphertext {
+            document.insert(
+                "pat_ciphertext",
+                Bson::Binary(mongodb::bson::Binary {
+                    subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                    bytes: ciphertext,
+                }),
+            );
+        }
         let mut work = self.unit_of_work.begin().await?;
-        sqlx::query("INSERT INTO github_credentials (id, owner_id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, probe_summary_json, state, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'ready', ?, ?, ?)")
-            .bind(id.to_string())
-            .bind(owner_id)
-            .bind(input.name.trim())
-            .bind(input.github_host.trim())
-            .bind(ciphertext)
-            .bind(fingerprint)
-            .bind(input.automation_enabled)
-            .bind(&version)
-            .bind(&now)
-            .bind(&now)
-            .execute(work.connection())
+        self.pool
+            .collection::<Document>("github_credentials")
+            .insert_one(document)
+            .session(&mut *work.connection())
             .await?;
         self.append_project_changed_in_tx(
             &mut work,
@@ -989,17 +1107,27 @@ impl ProjectsInterface {
         }
         let name = "Janus webhook automation";
         let pat_fingerprint = fingerprint(pat);
-        let existing: Option<(String, bool)> = sqlx::query_as(
-            "SELECT id, automation_enabled FROM github_credentials \
-             WHERE owner_id = ? AND name = ? AND github_host = ? AND pat_fingerprint = ? \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(owner_id)
-        .bind(name)
-        .bind(github_host.trim())
-        .bind(pat_fingerprint)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .find_one(doc! {
+                "owner_id": owner_id,
+                "name": name,
+                "github_host": github_host.trim(),
+                "pat_fingerprint": pat_fingerprint,
+            })
+            .sort(doc! {"updated_at": -1})
+            .await?;
+        let existing = existing
+            .map(|document| -> Result<(String, bool), ProjectsError> {
+                let id = document.get_str("_id")?.to_owned();
+                let automation_enabled = document
+                    .get("automation_enabled")
+                    .and_then(Bson::as_bool)
+                    .unwrap_or(false);
+                Ok((id, automation_enabled))
+            })
+            .transpose()?;
         if let Some((id, automation_enabled)) = existing {
             if !automation_enabled {
                 self.set_automation_enabled(owner_id, &id, true, correlation_id)
@@ -1036,18 +1164,20 @@ impl ProjectsInterface {
         let now = now_utc_str();
         let version = format!("v_{}", GithubCredentialId::new());
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query(
-            "UPDATE github_credentials SET automation_enabled = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
-        )
-        .bind(enabled)
-        .bind(&version)
-        .bind(&now)
-        .bind(id)
-        .bind(owner_id)
-        .bind(&existing.version)
-        .execute(work.connection())
-        .await?
-        .rows_affected();
+        let changed = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .update_one(
+                doc! {"_id": id, "owner_id": owner_id, "version": &existing.version},
+                doc! {"$set": {
+                    "automation_enabled": enabled,
+                    "version": &version,
+                    "updated_at": &now,
+                }},
+            )
+            .session(&mut *work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ProjectsError::CredentialNotFound);
@@ -1116,23 +1246,39 @@ impl ProjectsInterface {
         let automation_enabled = input
             .automation_enabled
             .unwrap_or(existing.automation_enabled);
+        let mut set = doc! {
+            "name": name,
+            "github_host": host,
+            "pat_fingerprint": fingerprint,
+            "automation_enabled": automation_enabled,
+            "version": &new_version,
+            "updated_at": &now,
+        };
+        match &ciphertext {
+            Some(bytes) => {
+                set.insert(
+                    "pat_ciphertext",
+                    Bson::Binary(mongodb::bson::Binary {
+                        subtype: mongodb::bson::spec::BinarySubtype::Generic,
+                        bytes: bytes.clone(),
+                    }),
+                );
+            }
+            None => {
+                set.insert("pat_ciphertext", Bson::Null);
+            }
+        }
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query(
-            "UPDATE github_credentials SET name = ?, github_host = ?, pat_ciphertext = ?, pat_fingerprint = ?, automation_enabled = ?, version = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND version = ?",
-        )
-        .bind(name)
-        .bind(host)
-        .bind(ciphertext)
-        .bind(fingerprint)
-        .bind(automation_enabled)
-        .bind(&new_version)
-        .bind(&now)
-        .bind(id)
-        .bind(owner_id)
-        .bind(expected_version)
-        .execute(work.connection())
-        .await?
-        .rows_affected();
+        let changed = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .update_one(
+                doc! {"_id": id, "owner_id": owner_id, "version": expected_version},
+                doc! {"$set": set},
+            )
+            .session(&mut *work.connection())
+            .await?
+            .matched_count;
         if changed == 0 {
             work.rollback().await?;
             return Err(ProjectsError::CredentialNotFound);
@@ -1159,26 +1305,29 @@ impl ProjectsInterface {
         id: &str,
         correlation_id: &str,
     ) -> Result<(), ProjectsError> {
-        let dependent: Option<(String,)> = sqlx::query_as(
-            "SELECT id FROM projects WHERE owner_id = ? AND github_credential_id = ? AND state != 'deleting' LIMIT 1",
-        )
-        .bind(owner_id)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let dependent = self
+            .pool
+            .collection::<Document>("projects")
+            .find_one(doc! {
+                "owner_id": owner_id,
+                "github_credential_id": id,
+                "state": {"$ne": "deleting"},
+            })
+            .await?;
         if dependent.is_some() {
             return Err(ProjectsError::Validation(
                 "credential is in use by a project; reassign or delete the project first".into(),
             ));
         }
         let mut work = self.unit_of_work.begin().await?;
-        let changed = sqlx::query("DELETE FROM github_credentials WHERE id = ? AND owner_id = ?")
-            .bind(id)
-            .bind(owner_id)
-            .execute(work.connection())
+        let deleted = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .delete_one(doc! {"_id": id, "owner_id": owner_id})
+            .session(&mut *work.connection())
             .await?
-            .rows_affected();
-        if changed == 0 {
+            .deleted_count;
+        if deleted == 0 {
             work.rollback().await?;
             return Err(ProjectsError::CredentialNotFound);
         }
@@ -1267,14 +1416,15 @@ impl ProjectsInterface {
         owner_id: &str,
         id: &str,
     ) -> Result<CredentialRow, ProjectsError> {
-        sqlx::query_as::<_, CredentialRow>(
-            "SELECT id, name, github_host, pat_ciphertext, pat_fingerprint, automation_enabled, version, created_at, updated_at FROM github_credentials WHERE id = ? AND owner_id = ?",
-        )
-        .bind(id)
-        .bind(owner_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(ProjectsError::CredentialNotFound)
+        let document = self
+            .pool
+            .collection::<Document>("github_credentials")
+            .find_one(doc! {"_id": id, "owner_id": owner_id})
+            .await?;
+        let Some(document) = document else {
+            return Err(ProjectsError::CredentialNotFound);
+        };
+        CredentialRow::from_doc(&document)
     }
 
     fn encrypt_pat(
@@ -1353,8 +1503,11 @@ impl ProjectsInterface {
     }
 
     /// Execute the cascade delete for a `deleting` Project: remove the
-    /// workspace directory and all Project rows. Never touches the remote repo
-    /// or global model and identity state.
+    /// workspace directory and the Project-owned rows. Mongo has no ON DELETE
+    /// CASCADE, and the collection-ownership rules forbid `projects` from
+    /// writing git-state/conflict/workspace/session rows, so the application
+    /// layer must additionally call `source_control.delete_project_state` and
+    /// clear workspace copies for a fully consistent delete.
     pub async fn run_delete(&self, project_id: &str) -> Result<(), ProjectsError> {
         let owner_id = self.project_owner(project_id).await?;
         let _lock = self
@@ -1365,22 +1518,27 @@ impl ProjectsInterface {
         // filesystem delete leaves the Project in `deleting` so the durable
         // Operation can retry instead of orphaning its Main copy.
         self.remove_main_workspace(project_id).await?;
-        // Cascade FKs (ON DELETE CASCADE) remove github_credentials refs,
-        // project_git_state and git_update_conflicts*.
-        sqlx::query("DELETE FROM projects WHERE id = ? AND owner_id = ?")
-            .bind(project_id)
-            .bind(&owner_id)
-            .execute(&self.pool)
+        self.pool
+            .collection::<Document>("memories")
+            .delete_many(doc! {"project_id": project_id})
+            .await?;
+        self.pool
+            .collection::<Document>("projects")
+            .delete_one(doc! {"_id": project_id, "owner_id": &owner_id})
             .await?;
         Ok(())
     }
 
     async fn project_owner(&self, project_id: &str) -> Result<String, ProjectsError> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT owner_id FROM projects WHERE id = ?")
-            .bind(project_id)
-            .fetch_optional(&self.pool)
+        let document = self
+            .pool
+            .collection::<Document>("projects")
+            .find_one(doc! {"_id": project_id})
             .await?;
-        row.map(|(o,)| o).ok_or(ProjectsError::NotFound)
+        let Some(document) = document else {
+            return Err(ProjectsError::NotFound);
+        };
+        Ok(document.get_str("owner_id")?.to_owned())
     }
 
     async fn mark_project_state(
@@ -1391,14 +1549,23 @@ impl ProjectsInterface {
     ) -> Result<(), ProjectsError> {
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
-        sqlx::query("UPDATE projects SET state = ?, clone_error = ?, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
-            .bind(state)
-            .bind(error)
-            .bind(&version)
-            .bind(&now)
-            .bind(&now)
-            .bind(project_id)
-            .execute(&self.pool)
+        let mut set = doc! {
+            "state": state,
+            "version": &version,
+            "updated_at": &now,
+            "last_activity_at": &now,
+        };
+        match &error {
+            Some(error) => {
+                set.insert("clone_error", error.as_str());
+            }
+            None => {
+                set.insert("clone_error", Bson::Null);
+            }
+        }
+        self.pool
+            .collection::<Document>("projects")
+            .update_one(doc! {"_id": project_id}, doc! {"$set": set})
             .await?;
         Ok(())
     }
@@ -1407,16 +1574,20 @@ impl ProjectsInterface {
         let handle = format!("main:{project_id}");
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE projects SET state = 'ready', clone_error = NULL, main_workspace_handle = ?, version = ?, updated_at = ?, last_activity_at = ? WHERE id = ?")
-            .bind(&handle)
-            .bind(&version)
-            .bind(&now)
-            .bind(&now)
-            .bind(project_id)
-            .execute(&mut *tx)
+        self.pool
+            .collection::<Document>("projects")
+            .update_one(
+                doc! {"_id": project_id},
+                doc! {"$set": {
+                    "state": "ready",
+                    "clone_error": null,
+                    "main_workspace_handle": &handle,
+                    "version": &version,
+                    "updated_at": &now,
+                    "last_activity_at": &now,
+                }},
+            )
             .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -1640,7 +1811,7 @@ impl ProjectsInterface {
 
     async fn append_project_changed_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         owner_id: &str,
         resource_id: &str,
         resource_kind: &str,
@@ -1661,7 +1832,7 @@ impl ProjectsInterface {
 
     async fn append_main_revision_changed_in_tx(
         &self,
-        work: &mut UnitOfWorkTransaction<'_>,
+        work: &mut UnitOfWorkTransaction,
         owner_id: &str,
         project_id: &str,
         revision: &RevisionRef,
@@ -1698,7 +1869,6 @@ fn main_revision_event_context(
     }
 }
 
-#[derive(FromRow)]
 struct CredentialRow {
     id: String,
     name: String,
@@ -1709,6 +1879,33 @@ struct CredentialRow {
     version: String,
     created_at: String,
     updated_at: String,
+}
+
+impl CredentialRow {
+    fn from_doc(document: &Document) -> Result<Self, ProjectsError> {
+        Ok(Self {
+            id: document.get_str("_id")?.to_owned(),
+            name: document.get_str("name")?.to_owned(),
+            github_host: document.get_str("github_host")?.to_owned(),
+            pat_ciphertext: document
+                .get("pat_ciphertext")
+                .and_then(|value| match value {
+                    Bson::Binary(binary) => Some(binary.bytes.clone()),
+                    _ => None,
+                }),
+            pat_fingerprint: document
+                .get("pat_fingerprint")
+                .and_then(Bson::as_str)
+                .map(str::to_owned),
+            automation_enabled: document
+                .get("automation_enabled")
+                .and_then(Bson::as_bool)
+                .unwrap_or(false),
+            version: document.get_str("version")?.to_owned(),
+            created_at: document.get_str("created_at")?.to_owned(),
+            updated_at: document.get_str("updated_at")?.to_owned(),
+        })
+    }
 }
 
 fn credential_view(row: CredentialRow) -> Result<GithubCredentialView, ProjectsError> {

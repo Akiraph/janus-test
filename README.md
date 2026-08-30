@@ -4,7 +4,7 @@ English | [简体中文](./README.zh-CN.md)
 
 Janus is a local-first control plane for AI-assisted software work. A single
 Rust process owns projects, workspaces, sessions, turns, terminals, and durable
-background operations on top of one SQLite database, and publishes them over a
+background operations on top of one MongoDB database, and publishes them over a
 versioned HTTP + SSE + WebSocket API. Two clients consume that API: the SolidJS
 web app in `apps/web`, and `janus-test`, a black-box CLI that speaks only the
 public protocol.
@@ -38,6 +38,7 @@ public protocol.
 | Rust | `1.97.0` | pinned by `rust-toolchain.toml` with `clippy` + `rustfmt` |
 | Bun | `1.3.14` | pinned by `apps/web/package.json` `packageManager` |
 | Git | 2.54 or newer | the source-control adapter shells out to system Git |
+| MongoDB | 7.x | single-node replica set for multi-document transactions; reached via `JANUS_MONGODB_URI` |
 
 The workspace forbids `unsafe_code` and denies `dbg!`, `todo!`, and
 `unwrap()` through Clippy lints declared in the root `Cargo.toml`.
@@ -55,6 +56,11 @@ together: the API listens on `http://127.0.0.1:4317`, the web app on
 `http://127.0.0.1:5173`, and Vite proxies `/api` (WebSocket included) and
 `/health` to the API. Runtime data lands in `.janus-dev/`; set `JANUS_DATA_ROOT`
 to move it.
+
+`dev` also needs a reachable MongoDB replica set. The default `JANUS_MONGODB_URI`
+(`mongodb://localhost:27017/?replicaSet=rs0`) targets a local `mongo:7`
+instance started with `--replSet rs0`; a single non-replica-set `mongod` will
+reject the transaction calls.
 
 `cargo xtask dev` also exports `JANUS_PUBLIC_ORIGIN=http://localhost:<port>` and
 `JANUS_WEBAUTHN_RP_ID=localhost`, because WebAuthn rejects an IP address as a
@@ -85,7 +91,6 @@ and `/complete`, which register the owner's first passkey.
 
 ```text
 apps/server/          deployment composition root, public control plane
-  migrations/         ordered SQLx migrations with module-owner headers
   src/application/    cross-capability workflows, workers, recovery
   src/transport/http/ HTTP, SSE, and WebSocket protocol conversion
   src/adapters/       system Git and runtime/process implementations
@@ -104,7 +109,7 @@ scripts/              image deployment script used by CI
 ### Capability modules
 
 Each module in `crates/` declares its contract in `module.toml`: the public
-root, the tables it owns, the events it publishes, and the modules it may
+root, the collections it owns, the events it publishes, and the modules it may
 depend on. `cargo xtask check architecture` enforces that file.
 
 | Module | Crate | Owns | Publishes | May depend on |
@@ -120,11 +125,12 @@ depend on. `cargo xtask check architecture` enforces that file.
 | execution | `janus-execution` | `rounds`, `tool_calls`, `plan_versions`, `compact_summaries`, `context_versions` | `round.changed`, `tool_call.created`, `tool_call.changed`, `context.changed` | models, projects, runtime, sessions, workspace |
 
 `janus-infrastructure` sits under every module and contains only generic
-technical building blocks: IDs and correlation IDs, clocks, the SQLite pool and
-transaction helpers, the public event log, the Operation journal, work items,
-idempotency records, Blob storage, encrypted secrets, and portable process
-helpers. It contains no work kinds and no server workflows. Its tables, plus
-the Operation and Blob tables, belong to the `platform` owner:
+technical building blocks: IDs and correlation IDs, clocks, the MongoDB
+connection and transaction helpers, the public event log, the Operation
+journal, work items, idempotency records, Blob storage, encrypted secrets, and
+portable process helpers. It contains no work kinds and no server workflows.
+Its collections, plus the Operation and Blob collections, belong to the
+`platform` owner:
 `public_events`, `projection_cursor`, `operations`, `operation_steps`,
 `work_items`, `idempotency_records`, `command_idempotency_records`,
 `blob_objects`, `blob_references`, `blob_cleanup_intents`.
@@ -148,12 +154,13 @@ the Operation and Blob tables, belong to the `platform` owner:
 - Every module exposes `interface.rs` or `interface/mod.rs`, and cross-module
   references must go through that interface path.
 - Module dependencies must be declared in `module.toml` and stay acyclic.
-- One owner per table and one publisher per event name.
-- Cross-module SQL reads are allowed; cross-module writes are not. Production
-  code may only write tables its own module owns.
-- Every migration starts with `-- janus-module: <module>` headers that declare
-  the owner of every table the migration touches, and every owned table must be
-  created by some migration.
+- One owner per collection and one publisher per event name.
+- Cross-module collection reads are allowed; cross-module writes are not.
+  Production code may only write collections its own module owns.
+- Collection ownership is declared in `crates/infrastructure/src/schema.rs` and
+  checked against every `module.toml`: each collection is exactly one of indexed
+  or indexless, has a single declared owner, and production code must call
+  `.collection("...")` with an inline string literal — never a bound handle.
 - `apps/server/src/ports/` and `crates/ports/` are forbidden; so is a
   `janus-server` dependency in `tools/test-cli/Cargo.toml`.
 
@@ -162,9 +169,10 @@ the Operation and Blob tables, belong to the `platform` owner:
 The order below is a deployment contract, not background housekeeping.
 
 1. Parse configuration from the environment; invalid input aborts the process.
-2. `AppState::initialize` opens the database and runs the SQLx migrations, builds
-   the infrastructure and capability interfaces, reattaches orphaned main
-   worktrees, then recovers interrupted workspace mutations and execution state.
+2. `AppState::initialize` opens the MongoDB database (creating the schema
+   catalog's collections and indexes), builds the infrastructure and capability
+   interfaces, reattaches orphaned main worktrees, then recovers interrupted
+   workspace mutations and execution state.
 3. `/health/ready` reports 503 while recovery finishes.
 4. Remove incoming Blob leftovers from the previous run.
 5. Mark every still-`running` Operation as `needs_attention` with
@@ -179,21 +187,26 @@ The order below is a deployment contract, not background housekeeping.
 
 ## Persistence
 
-State lives in one SQLite database under `JANUS_DATA_ROOT`, alongside workspace
-copies and Blob storage. Migrations are applied in order from
-`apps/server/migrations/`:
+State lives in one MongoDB database — by default `janus` on the replica set at
+`JANUS_MONGODB_URI` — alongside workspace copies and Blob storage under
+`JANUS_DATA_ROOT`. MongoDB has no SQL migrations; the schema is a Rust catalog,
+`crates/infrastructure/src/schema.rs`, that declares every collection and its
+owning module:
 
-| Migration | Adds |
-| --- | --- |
-| `0001_initial.sql` | the full initial schema; declares all ten owners |
-| `0002_github_credential_automation.sql` | `github_credentials.automation_enabled` |
-| `0003_automation_settings.sql` | `automation_settings` (owner, provider, model) |
-| `0004_automation_reasoning_effort.sql` | `automation_settings.reasoning_effort`, default `high` |
+- `COLLECTIONS` lists all 54 collections as `(name, owner)` pairs.
+- `INDEXLESS_COLLECTIONS` lists the collections that carry no index and are
+  created explicitly at open time (for example `event_seq`, the event-cursor
+  counter singleton, and `owners`).
+- `index_specs()` maps each indexed collection to its `IndexModel`s; composite
+  primary-key tables from SQLite become `_pk` unique indexes, and status
+  `IN (...)` partial filters are expanded to `$or`/`$eq` for MongoDB 5–7.
 
-`apps/server/migrations/README.md` treats `0001_initial.sql` as a squashed
-single migration: removed features are folded back into it instead of gaining
-compatibility shims, and no deployed database is assumed. Every migration file
-must still declare its `-- janus-module:` owners.
+Opening a fresh database is a per-collection `create_indexes` pass (idempotent)
+plus explicit creation of the index-less collections; `Database::open` also
+seeds the `event_seq` counter. `SCHEMA_VERSION` stays at 4 — the last SQL
+migration number — so `/api/v1/system/info` shows no regression. There is no
+data migration: existing SQLite stores are not imported and deployments start
+fresh.
 
 ## Public API
 
@@ -369,6 +382,8 @@ to start on invalid input. Most of the surface is parsed and validated in
 | `JANUS_WEBAUTHN_RP_ID` | host of the public origin, else `localhost` | WebAuthn relying-party ID |
 | `JANUS_WEBAUTHN_RP_NAME` | `Janus` | relying-party display name |
 | `JANUS_DATA_ROOT` | `.janus-dev` | database, workspaces, and blobs; resolved to an absolute path |
+| `JANUS_MONGODB_URI` | `mongodb://localhost:27017/?replicaSet=rs0` | replica-set connection string; must be `mongodb://` or `mongodb+srv://` |
+| `JANUS_MONGODB_DATABASE` | `janus` | database name for the Janus schema |
 | `JANUS_WEB_DIST` | unset | directory of the built web client to serve same-origin |
 | `JANUS_MASTER_KEY` | unset | base64url-without-padding key decoding to exactly 32 bytes; encrypts stored secrets. Required in production; development generates and reuses `<data root>/development-master.key` |
 | `JANUS_AUTOMATION_WEBHOOK_ENABLED` | `false` | enable `/api/v1/automation/webhook` |
@@ -483,9 +498,12 @@ only — there is no dark theme to contrast-check.
 ## Verification
 
 `cargo xtask check` is the single quality gate, and it runs in that order:
-architecture check, OpenAPI + client type generation, `cargo fmt --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, then web `typecheck`, `lint`, and `build`.
+architecture check, `cargo check --workspace --all-targets --keep-going` (a
+type/borrow gate ahead of codegen that reports errors from independent crates
+in one run), OpenAPI + client type generation, `cargo fmt --check`,
+`cargo clippy --workspace --all-targets --keep-going -- -D warnings`,
+`cargo test --workspace --no-fail-fast`, then web `typecheck`, `lint`, and
+`build`.
 `cargo xtask` is the alias for `cargo run --package xtask --` declared in
 `.cargo/config.toml`.
 
@@ -504,9 +522,9 @@ architecture check, OpenAPI + client type generation, `cargo fmt --check`,
 ### Black-box CLI
 
 `janus-test` verifies a running service through the public HTTP, SSE, and
-WebSocket surface only. It never opens SQLite and must never depend on
-`janus-server`; the architecture check enforces that. Point it somewhere with
-`--base-url` or `JANUS_BASE_URL`.
+WebSocket surface only. It never opens the MongoDB data store and must never
+depend on `janus-server`; the architecture check enforces that. Point it
+somewhere with `--base-url` or `JANUS_BASE_URL`.
 
 ```text
 cargo run -p janus-test -- health
@@ -533,7 +551,7 @@ flow; external tokens must never leak into ordinary tests, logs, or commits.
 
 | Workflow | Trigger | Jobs |
 | --- | --- | --- |
-| `.github/workflows/quality.yml` | push to `main`, every pull request | pin Rust `1.97.0` + Bun `1.3.14`, `bun install --frozen-lockfile`, set a git identity for tests that commit, then `cargo xtask check` |
+| `.github/workflows/quality.yml` | push to `main`, every pull request | pin Rust `1.97.0` + Bun `1.3.14`, start a `mongo:7` replica-set service container, `bun install --frozen-lockfile`, set a git identity for tests that commit, then `cargo xtask check` |
 | `.github/workflows/ci.yml` | pull requests, pushes to `main`/`master`/`dev`, manual | build the Docker image for verification on PRs; on pushes by allowed actors, publish `linux/amd64` tags to GHCR and run the deployment script |
 
 Published tags are `<ref>-amd64` and `<short-sha>-amd64` under
@@ -558,13 +576,17 @@ processes).
 
 ```text
 docker build -t janus:local .
-docker run --rm -p 4317:4317 -v janus-data:/data janus:local
+docker run --rm -p 4317:4317 -v janus-data:/data \
+  -e JANUS_MONGODB_URI=mongodb://host.docker.internal:27017/?replicaSet=rs0 \
+  janus:local
 ```
 
 Image defaults are `JANUS_BIND=0.0.0.0:4317`, `JANUS_DEV_AUTH=false`,
 `JANUS_DATA_ROOT=/data`, and `JANUS_WEB_DIST=/app/web`; `/data` is a volume,
 the process runs as the unprivileged `janus` user, and port 4317 serves the API,
-the health probes, and the web client. A real deployment additionally sets
+the health probes, and the web client. A reachable MongoDB replica set is
+required — point `JANUS_MONGODB_URI` at it (`host.docker.internal` reaches a
+replica set running on the host). A real deployment additionally sets
 `JANUS_MODE=production` and an https `JANUS_PUBLIC_ORIGIN` matching the public
 hostname.
 
@@ -619,11 +641,10 @@ used by automation sessions are owner settings under
 
 Directory READMEs are the primary reference for each boundary:
 `crates/README.md` for module ownership, `apps/server/README.md` and the
-`src/*/README.md` files for the server layers, `apps/web/src/*/README.md` for
-the client layers, and `apps/server/migrations/README.md` for the migration
-policy. Durable design and planning decisions live in `docs/aegis/`, indexed by
-`docs/aegis/INDEX.md` with baselines under `baseline/` and designs under
-`specs/`.
+`src/*/README.md` files for the server layers, and `apps/web/src/*/README.md`
+for the client layers. Durable design and planning decisions live in
+`docs/aegis/`, indexed by `docs/aegis/INDEX.md` with baselines under
+`baseline/` and designs under `specs/`.
 
 ## Conventions
 

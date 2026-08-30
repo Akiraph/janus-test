@@ -1,6 +1,6 @@
 name = "projects"
 public_root = "interface.rs"
-owned_tables = [
+owned_collections = [
   "projects",
   "github_credentials",
   "memories",
