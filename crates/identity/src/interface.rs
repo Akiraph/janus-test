@@ -1177,7 +1177,7 @@ impl IdentityInterface {
             .pool
             .collection::<Document>("recovery_codes")
             .find_one(doc! {"code_hash": &code_hash, "used_at": null})
-            .session(session)
+            .session(&mut *session)
             .await?
             .ok_or(IdentityError::InvalidRecoveryCode)?;
         let code_id = recovery_code.get_str("_id")?.to_owned();
@@ -1186,7 +1186,7 @@ impl IdentityInterface {
             .pool
             .collection::<Document>("recovery_batches")
             .find_one(doc! {"_id": &batch_id, "revoked_at": null})
-            .session(session)
+            .session(&mut *session)
             .await?
             .ok_or(IdentityError::InvalidRecoveryCode)?;
         let owner_id = batch.get_str("owner_id")?.to_owned();
@@ -1197,7 +1197,7 @@ impl IdentityInterface {
                 doc! {"_id": &code_id, "used_at": null},
                 doc! {"$set": {"used_at": format_utc(now)}},
             )
-            .session(session)
+            .session(&mut *session)
             .await?
             .matched_count;
         if consumed != 1 {
