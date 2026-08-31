@@ -1114,7 +1114,7 @@ impl ProjectsInterface {
                 "owner_id": owner_id,
                 "name": name,
                 "github_host": github_host.trim(),
-                "pat_fingerprint": pat_fingerprint,
+                "pat_fingerprint": &pat_fingerprint,
             })
             .sort(doc! {"updated_at": -1})
             .await?;
@@ -1159,7 +1159,7 @@ impl ProjectsInterface {
                         "owner_id": owner_id,
                         "name": name,
                         "github_host": github_host.trim(),
-                        "pat_fingerprint": pat_fingerprint,
+                        "pat_fingerprint": pat_fingerprint.clone(),
                     })
                     .sort(doc! {"updated_at": -1})
                     .await?
