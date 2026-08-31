@@ -1151,7 +1151,7 @@ impl ProjectsInterface {
             Ok(view) => Ok(view.id),
             // Concurrent webhook deliveries can race the unique
             // (owner_id, name) index; the loser reuses the winner's row.
-            Err(ProjectsError::Storage(error)) if error.is_duplicate_key() => {
+            Err(ProjectsError::Storage(error)) if is_duplicate_key(&error) => {
                 let winner = self
                     .pool
                     .collection::<Document>("github_credentials")
@@ -2029,4 +2029,12 @@ fn validate_repository_input(repo: &RepositoryInput) -> Result<(), ProjectsError
         ));
     }
     Ok(())
+}
+
+fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write))
+            if write.code == 11000
+    )
 }
