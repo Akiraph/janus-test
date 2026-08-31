@@ -152,13 +152,19 @@ async fn collect_dir(
                 let bytes = tokio::fs::read(&child_abs).await?;
                 let mode = file_mode(&meta);
                 let len = bytes.len() as u64;
-                let blob_ref =
-                    BlobReference::new("workspace", "manifest_file", blob_owner_id, "content");
+                // One reference edge per file: a shared tuple would leave every
+                // blob but the last unreferenced and sweepable by the GC.
+                let rel_key = path_to_rel(&child_rel);
+                let blob_ref = BlobReference::new(
+                    "workspace",
+                    "manifest_file",
+                    &format!("{blob_owner_id}:{rel_key}"),
+                    "content",
+                );
                 let blob_sha = blobs.write(&bytes, blob_ref).await?;
                 // node_hash is over line-normalized text so CRLF/LF do not differ.
                 let is_text = is_text_bytes(&bytes);
                 let node_hash = hash_file_node(mode, &bytes, is_text);
-                let rel_key = path_to_rel(&child_rel);
                 all_nodes.insert(
                     rel_key,
                     ManifestNode {
