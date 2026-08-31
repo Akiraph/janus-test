@@ -383,14 +383,43 @@ impl ExecutionInterface {
             })
             .session(&mut *tx)
             .await;
-        if let Err(error) = inserted
-            && !is_duplicate_key(&error)
-        {
-            return Err(error.into());
-        }
-        if let Some(object) = summary.as_object_mut() {
-            object.insert("plan_version_id".into(), Value::String(plan_id.into()));
-            object.insert("sequence".into(), Value::from(sequence));
+        match inserted {
+            Ok(_) => {
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert("plan_version_id".into(), Value::String(plan_id.into()));
+                    object.insert("sequence".into(), Value::from(sequence));
+                }
+            }
+            Err(error) if is_duplicate_key(&error) => {
+                // The model reused a plan.id that was already recorded; point
+                // the summary at the row that actually exists, with its real
+                // sequence, instead of a version that was never inserted.
+                let existing = self
+                    .pool
+                    .collection::<Document>("plan_versions")
+                    .find_one(doc! {"_id": plan_id})
+                    .session(&mut *tx)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("plan version vanished after duplicate create")
+                    })?;
+                if let Some(object) = summary.as_object_mut() {
+                    object.insert(
+                        "plan_version_id".into(),
+                        Value::String(existing.get_str("_id")?.to_owned()),
+                    );
+                    object.insert(
+                        "sequence".into(),
+                        Value::from(
+                            existing
+                                .get("sequence")
+                                .and_then(Bson::as_i64)
+                                .unwrap_or(sequence),
+                        ),
+                    );
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
         Ok(())
     }

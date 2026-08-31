@@ -116,9 +116,9 @@ async fn build_snapshot(state: &AppState, owner_id: &str) -> SnapshotFrame {
                     "schema_version": schema_version,
                     "mode": state.config().mode.as_str(),
                     "database": {
-                        "engine": "sqlite",
-                        "journal_mode": "wal",
-                        "ready": true,
+                        "engine": "mongodb",
+                        "journal_mode": "on",
+                        "ready": state.system().ready().await,
                     },
                     "events": {
                         "min_cursor": bounds.min.to_string(),

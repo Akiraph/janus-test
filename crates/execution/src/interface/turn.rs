@@ -447,7 +447,7 @@ impl ExecutionInterface {
                                 }),
                             );
                             // Also persist to EventStore for replay
-                            let _ = events
+                            if let Err(error) = events
                                 .append(NewEvent {
                                     event_type: EventType::ModelStreamDelta,
                                     actor,
@@ -467,7 +467,10 @@ impl ExecutionInterface {
                                         "usage": usage_value,
                                     }),
                                 })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(%error, "persist stream delta event failed");
+                            }
                         }
                         ModelStreamEvent::Retrying {
                             attempt_id,
@@ -499,7 +502,7 @@ impl ExecutionInterface {
                                     "direction": "upload",
                                 }),
                             );
-                            let _ = events
+                            if let Err(error) = events
                                 .append(NewEvent {
                                     event_type: EventType::ModelAttemptRetrying,
                                     actor,
@@ -517,7 +520,10 @@ impl ExecutionInterface {
                                         "retry_after_ms": retry_after_ms,
                                     }),
                                 })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(%error, "persist retry notice event failed");
+                            }
                         }
                         ModelStreamEvent::ToolCallDelta { .. }
                         | ModelStreamEvent::Completed { .. }

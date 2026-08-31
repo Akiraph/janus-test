@@ -192,7 +192,7 @@ impl BlobStore {
                     "owner_id": reference.owner_id.as_str(),
                     "purpose": reference.purpose,
                 },
-                doc! {"$setOnInsert": {"blob_sha": sha, "created_at": &now}},
+                doc! {"$set": {"blob_sha": sha}, "$setOnInsert": {"created_at": &now}},
             )
             .upsert(true)
             .session(&mut session)

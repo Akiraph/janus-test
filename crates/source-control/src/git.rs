@@ -1095,7 +1095,7 @@ pub async fn complete_fast_forward(
     // Clear the index and re-add the working tree so status is consistent.
     let mut reset = SystemGit::base(repo);
     reset.arg("read-tree").arg("HEAD");
-    let _ = SystemGit::run(&mut reset).await;
+    SystemGit::run(&mut reset).await?;
     rev_parse(repo, "HEAD").await
 }
 

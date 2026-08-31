@@ -986,6 +986,23 @@ impl ModelsInterface {
         correlation_id: &str,
     ) -> Result<(), ModelsError> {
         let mut work = self.unit_of_work.begin().await?;
+        // Collect the normalized model rows this provider owns so the same
+        // transaction can drop them and their failover references; otherwise
+        // `models`/`model_failover` keep orphan rows after the provider is gone.
+        let mut model_cursor = self
+            .pool
+            .collection::<Document>("models")
+            .find(doc! {"provider_id": id})
+            .session(work.connection())
+            .await?;
+        let mut model_ids = Vec::new();
+        while let Some(document) = model_cursor
+            .next(&mut *work.connection())
+            .await
+            .transpose()?
+        {
+            model_ids.push(document.get_str("_id")?.to_owned());
+        }
         let deleted = self
             .pool
             .collection::<Document>("model_providers")
@@ -996,6 +1013,23 @@ impl ModelsInterface {
         if deleted == 0 {
             work.rollback().await?;
             return Err(ModelsError::ProviderNotFound);
+        }
+        self.pool
+            .collection::<Document>("models")
+            .delete_many(doc! {"provider_id": id})
+            .session(work.connection())
+            .await?;
+        if !model_ids.is_empty() {
+            self.pool
+                .collection::<Document>("model_failover")
+                .delete_many(doc! {
+                    "$or": [
+                        {"primary_model_id": {"$in": &model_ids}},
+                        {"candidate_model_id": {"$in": &model_ids}},
+                    ]
+                })
+                .session(work.connection())
+                .await?;
         }
         self.append_config_changed_in_tx(
             &mut work,
@@ -1213,6 +1247,7 @@ impl ModelsInterface {
                 set.insert("normalized_error_json", Bson::Null);
             }
         }
+        let mut work = self.unit_of_work.begin().await?;
         let changed = self
             .pool
             .collection::<Document>("model_attempts")
@@ -1220,6 +1255,7 @@ impl ModelsInterface {
                 doc! {"_id": attempt_id, "status": "running"},
                 doc! {"$set": set},
             )
+            .session(work.connection())
             .await?
             .matched_count;
 
@@ -1251,8 +1287,10 @@ impl ModelsInterface {
                     "attempt_result": status,
                     "occurred_at": &ended,
                 })
+                .session(work.connection())
                 .await?;
         }
+        work.commit().await?;
         Ok(())
     }
 

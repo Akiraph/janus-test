@@ -1114,7 +1114,7 @@ impl ProjectsInterface {
                 "owner_id": owner_id,
                 "name": name,
                 "github_host": github_host.trim(),
-                "pat_fingerprint": pat_fingerprint,
+                "pat_fingerprint": &pat_fingerprint,
             })
             .sort(doc! {"updated_at": -1})
             .await?;
@@ -1135,7 +1135,7 @@ impl ProjectsInterface {
             }
             return Ok(id);
         }
-        Ok(self
+        match self
             .create_credential(
                 owner_id,
                 CreateGithubCredentialInput {
@@ -1146,8 +1146,32 @@ impl ProjectsInterface {
                 },
                 correlation_id,
             )
-            .await?
-            .id)
+            .await
+        {
+            Ok(view) => Ok(view.id),
+            // Concurrent webhook deliveries can race the unique
+            // (owner_id, name) index; the loser reuses the winner's row.
+            Err(ProjectsError::Storage(error)) if is_duplicate_key(&error) => {
+                let winner = self
+                    .pool
+                    .collection::<Document>("github_credentials")
+                    .find_one(doc! {
+                        "owner_id": owner_id,
+                        "name": name,
+                        "github_host": github_host.trim(),
+                        "pat_fingerprint": pat_fingerprint.clone(),
+                    })
+                    .sort(doc! {"updated_at": -1})
+                    .await?
+                    .ok_or_else(|| {
+                        ProjectsError::Internal(anyhow::anyhow!(
+                            "automation credential disappeared after duplicate create"
+                        ))
+                    })?;
+                Ok(winner.get_str("_id")?.to_owned())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn set_automation_enabled(
@@ -1491,15 +1515,23 @@ impl ProjectsInterface {
                 serde_json::json!({"kind": "owner", "id": owner_id}),
             )
             .await?;
-        self.mark_project_ready(project_id).await?;
+        self.mark_project_ready(project_id, &owner_id, &CorrelationId::new().to_string())
+            .await?;
         Ok(())
     }
 
     /// Record a failed clone: leave the Project in `error` so it can be retried
     /// or deleted. Only used when the git clone itself failed.
     pub async fn fail_clone(&self, project_id: &str, error: &str) -> Result<(), ProjectsError> {
-        self.mark_project_state(project_id, "error", Some(error.to_owned()))
-            .await
+        let owner_id = self.project_owner(project_id).await?;
+        self.mark_project_state(
+            project_id,
+            &owner_id,
+            "error",
+            Some(error.to_owned()),
+            &CorrelationId::new().to_string(),
+        )
+        .await
     }
 
     /// Execute the cascade delete for a `deleting` Project: remove the
@@ -1544,8 +1576,10 @@ impl ProjectsInterface {
     async fn mark_project_state(
         &self,
         project_id: &str,
+        owner_id: &str,
         state: &str,
         error: Option<String>,
+        correlation_id: &str,
     ) -> Result<(), ProjectsError> {
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
@@ -1563,21 +1597,49 @@ impl ProjectsInterface {
                 set.insert("clone_error", Bson::Null);
             }
         }
-        self.pool
+        let mut work = self.unit_of_work.begin().await?;
+        let changed = self
+            .pool
             .collection::<Document>("projects")
-            .update_one(doc! {"_id": project_id}, doc! {"$set": set})
-            .await?;
+            .update_one(
+                doc! {"_id": project_id, "owner_id": owner_id},
+                doc! {"$set": set},
+            )
+            .session(work.connection())
+            .await?
+            .matched_count;
+        if changed == 0 {
+            work.rollback().await?;
+            return Err(ProjectsError::NotFound);
+        }
+        self.append_project_changed_in_tx(
+            &mut work,
+            owner_id,
+            project_id,
+            "project",
+            state,
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
         Ok(())
     }
 
-    async fn mark_project_ready(&self, project_id: &str) -> Result<(), ProjectsError> {
+    async fn mark_project_ready(
+        &self,
+        project_id: &str,
+        owner_id: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProjectsError> {
         let handle = format!("main:{project_id}");
         let now = now_utc_str();
         let version = format!("v_{}", ProjectId::new());
-        self.pool
+        let mut work = self.unit_of_work.begin().await?;
+        let changed = self
+            .pool
             .collection::<Document>("projects")
             .update_one(
-                doc! {"_id": project_id},
+                doc! {"_id": project_id, "owner_id": owner_id, "state": "creating"},
                 doc! {"$set": {
                     "state": "ready",
                     "clone_error": null,
@@ -1587,7 +1649,25 @@ impl ProjectsInterface {
                     "last_activity_at": &now,
                 }},
             )
-            .await?;
+            .session(work.connection())
+            .await?
+            .matched_count;
+        if changed == 0 {
+            work.rollback().await?;
+            return Err(ProjectsError::Validation(
+                "project is not creating (state changed concurrently)".to_owned(),
+            ));
+        }
+        self.append_project_changed_in_tx(
+            &mut work,
+            owner_id,
+            project_id,
+            "project",
+            "ready",
+            correlation_id,
+        )
+        .await?;
+        work.commit().await?;
         Ok(())
     }
 
@@ -1945,4 +2025,12 @@ fn validate_repository_input(repo: &RepositoryInput) -> Result<(), ProjectsError
         ));
     }
     Ok(())
+}
+
+fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write))
+            if write.code == 11000
+    )
 }
