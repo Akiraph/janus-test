@@ -1314,7 +1314,8 @@ impl RuntimeInterface {
         self.executor.resize_terminal(id, &nonce, size).await?;
         let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
         let version = new_version();
-        self.pool
+        let changed = self
+            .pool
             .collection::<Document>("terminals")
             .update_one(
                 doc! {"_id": id.to_string(), "status": {"$in": ["starting", "running"]}},
@@ -1329,7 +1330,12 @@ impl RuntimeInterface {
             )
             .session(work.connection())
             .await
-            .map_err(storage_error)?;
+            .map_err(storage_error)?
+            .matched_count;
+        if changed == 0 {
+            work.rollback().await.map_err(storage_error)?;
+            return Err(RuntimeError::TerminalNotWritable(id));
+        }
         let terminal = self.append_terminal_changed_in_tx(&mut work, id).await?;
         work.commit().await.map_err(storage_error)?;
         Ok(terminal)
@@ -1412,9 +1418,17 @@ impl RuntimeInterface {
     }
 
     async fn mark_terminal_failed(&self, id: TerminalId) -> Result<(), RuntimeError> {
+        let scrollback_stream_id = self
+            .terminal_row(id)
+            .await?
+            .scrollback_stream_id
+            .parse::<LogStreamId>()
+            .map_err(storage_error)?;
+        let mut work = self.unit_of_work.begin().await.map_err(storage_error)?;
         let version = new_version();
         let now = now_utc_str();
-        self.pool
+        let changed = self
+            .pool
             .collection::<Document>("terminals")
             .update_one(
                 doc! {"_id": id.to_string(), "status": "starting"},
@@ -1428,18 +1442,17 @@ impl RuntimeInterface {
                     }
                 },
             )
+            .session(work.connection())
             .await
-            .map_err(storage_error)?;
-        let _ = self
-            .logs
-            .close(
-                self.terminal_row(id)
-                    .await?
-                    .scrollback_stream_id
-                    .parse()
-                    .map_err(storage_error)?,
-            )
-            .await;
+            .map_err(storage_error)?
+            .matched_count;
+        if changed != 0 {
+            self.append_terminal_changed_in_tx(&mut work, id).await?;
+            work.commit().await.map_err(storage_error)?;
+        } else {
+            work.rollback().await.map_err(storage_error)?;
+        }
+        let _ = self.logs.close(scrollback_stream_id).await;
         Ok(())
     }
 
