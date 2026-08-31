@@ -1270,18 +1270,27 @@ impl SourceControlInterface {
                 .await;
         }
 
-        // All paths chosen: apply and complete.
-        self.pool
+        // All paths chosen: apply and complete. The version filter stops a
+        // concurrent resolver from entering the apply phase too.
+        let applying_version = format!("v_{}", GitUpdateConflictId::new());
+        let applied = self
+            .pool
             .collection::<Document>("git_update_conflicts")
             .update_one(
-                doc! {"_id": conflict_id},
+                doc! {"_id": conflict_id, "version": expected_version},
                 doc! {"$set": {
                     "state": "applying",
-                    "version": format!("v_{}", GitUpdateConflictId::new()),
+                    "version": &applying_version,
                     "updated_at": &now,
                 }},
             )
-            .await?;
+            .await?
+            .matched_count;
+        if applied == 0 {
+            return Err(SourceControlError::Validation(format!(
+                "conflict version changed while resolving; reload and retry"
+            )));
+        }
 
         let mut cursor = self
             .pool
@@ -1344,17 +1353,24 @@ impl SourceControlInterface {
                 )
                 .await;
         }
-        self.pool
+        let resolved = self
+            .pool
             .collection::<Document>("git_update_conflicts")
             .update_one(
-                doc! {"_id": conflict_id},
+                doc! {"_id": conflict_id, "version": &applying_version},
                 doc! {"$set": {
                     "state": "resolved",
                     "version": format!("v_{}", GitUpdateConflictId::new()),
                     "updated_at": &now,
                 }},
             )
-            .await?;
+            .await?
+            .matched_count;
+        if resolved == 0 {
+            return Err(SourceControlError::Validation(format!(
+                "conflict changed while applying resolution; reload and retry"
+            )));
+        }
         // Best-effort: mark the original operation succeeded if still open.
         let _ = self
             .operations
@@ -1451,13 +1467,16 @@ impl SourceControlInterface {
         let conflict_id = GitUpdateConflictId::new().to_string();
         let now = now_utc_str();
         let version = format!("v_{}", GitUpdateConflictId::new());
-        // Supersede any previous open conflict for this project.
+        // Supersede + insert + paths are one logical write: a partial failure
+        // must not leave a conflict row without its paths.
+        let mut work = self.unit_of_work.begin().await?;
         self.pool
             .collection::<Document>("git_update_conflicts")
             .update_many(
                 doc! {"project_id": project_id, "state": {"$in": ["open", "applying"]}},
                 doc! {"$set": {"state": "superseded", "updated_at": &now}},
             )
+            .session(work.connection())
             .await?;
         self.pool
             .collection::<Document>("git_update_conflicts")
@@ -1473,6 +1492,7 @@ impl SourceControlInterface {
                 "created_at": &now,
                 "updated_at": &now,
             })
+            .session(work.connection())
             .await?;
         for path in paths {
             self.pool
@@ -1486,8 +1506,10 @@ impl SourceControlInterface {
                     "main_hash": path.main_hash.as_deref(),
                     "version": format!("v_{}", GitUpdateConflictId::new()),
                 })
+                .session(work.connection())
                 .await?;
         }
+        work.commit().await?;
         Ok(conflict_id)
     }
 
