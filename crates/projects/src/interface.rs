@@ -1515,12 +1515,8 @@ impl ProjectsInterface {
                 serde_json::json!({"kind": "owner", "id": owner_id}),
             )
             .await?;
-        self.mark_project_ready(
-            project_id,
-            &owner_id,
-            &CorrelationId::new().to_string(),
-        )
-        .await?;
+        self.mark_project_ready(project_id, &owner_id, &CorrelationId::new().to_string())
+            .await?;
         Ok(())
     }
 

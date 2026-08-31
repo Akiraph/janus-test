@@ -996,7 +996,11 @@ impl ModelsInterface {
             .session(work.connection())
             .await?;
         let mut model_ids = Vec::new();
-        while let Some(document) = model_cursor.next(&mut *work.connection()).await.transpose()? {
+        while let Some(document) = model_cursor
+            .next(&mut *work.connection())
+            .await
+            .transpose()?
+        {
             model_ids.push(document.get_str("_id")?.to_owned());
         }
         let deleted = self
