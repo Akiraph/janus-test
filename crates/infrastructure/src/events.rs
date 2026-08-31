@@ -186,6 +186,10 @@ struct EventStoreInner {
     append_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// A session with the event-cursor lock already held. Returned by
+/// `begin_append_tx` so the guard outlives the transaction it protects.
+type AppendSession = (tokio::sync::OwnedMutexGuard<()>, mongodb::ClientSession);
+
 impl EventStore {
     pub fn new(pool: mongodb::Database) -> Self {
         let (notifier, _) = broadcast::channel(64);
@@ -208,10 +212,21 @@ impl EventStore {
         self.inner.append_serial.clone().lock_owned().await
     }
 
-    pub async fn append(&self, event: NewEvent) -> anyhow::Result<EventEnvelope> {
-        let _guard = self.append_lock().await;
+    /// Start a transaction with the event-cursor lock already held. The lock
+    /// must be acquired BEFORE `start_transaction`: under MongoDB snapshot
+    /// isolation the `$inc` on `event_seq` conflicts when a transaction that
+    /// committed after our snapshot has already bumped the counter, so taking
+    /// the lock after the transaction starts makes every append that races
+    /// another commit fail with "allocate event cursor".
+    pub(crate) async fn begin_append_tx(&self) -> Result<AppendSession, mongodb::error::Error> {
+        let guard = self.append_lock().await;
         let mut session = self.inner.pool.client().start_session().await?;
         session.start_transaction().await?;
+        Ok((guard, session))
+    }
+
+    pub async fn append(&self, event: NewEvent) -> anyhow::Result<EventEnvelope> {
+        let (_guard, mut session) = self.begin_append_tx().await?;
         let envelope = self.append_in_tx(&mut session, event).await?;
         session.commit_transaction().await?;
         // Standalone append path: same commit-then-notify rule as `UnitOfWork`.

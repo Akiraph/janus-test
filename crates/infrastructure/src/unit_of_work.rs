@@ -7,14 +7,15 @@ use super::events::{EventEnvelope, EventStore, NewEvent};
 /// Writer serialization for the shared `event_seq` cursor counter.
 ///
 /// The cursor is allocated and stored inside the same transaction as the event
-/// (a rollback must not leave a gap in the log). Two overlapping transactions
-/// that both `$inc` the same `event_seq` document conflict at the server, so the
-/// append mutex is held from the first event append until commit — the MongoDB
-/// analogue of SQLite's `BEGIN IMMEDIATE` single-writer semantics, acquired
-/// lazily so a transaction that only writes non-event state never contends.
+/// (a rollback must not leave a gap in the log). The append mutex is therefore
+/// held from the transaction start, not lazily on the first event append:
+/// MongoDB snapshot isolation fails the `$inc` with a write conflict whenever
+/// a transaction that committed after our snapshot has already bumped the
+/// counter, so the lock must be acquired BEFORE `start_transaction`. This is
+/// the MongoDB analogue of SQLite's `BEGIN IMMEDIATE` single-writer semantics.
 /// Standalone appends (`EventStore::append`) take the same lock, so no path may
-/// call that method from inside an open `UnitOfWorkTransaction` that has already
-/// appended, or it would self-deadlock.
+/// call that method from inside an open `UnitOfWorkTransaction`, or it would
+/// self-deadlock.
 #[derive(Clone)]
 pub struct UnitOfWork {
     pool: Database,
@@ -32,14 +33,13 @@ impl UnitOfWork {
 
     pub async fn begin(&self) -> Result<UnitOfWorkTransaction, mongodb::error::Error> {
         for attempt in 0_u32..=4 {
-            let mut session = self.pool.client().start_session().await?;
-            match session.start_transaction().await {
-                Ok(()) => {
+            match self.events.begin_append_tx().await {
+                Ok((guard, session)) => {
                     return Ok(UnitOfWorkTransaction {
                         session,
                         events: self.events.clone(),
                         event_count: 0,
-                        _append_serial: None,
+                        _append_serial: guard,
                     });
                 }
                 Err(error)
@@ -62,11 +62,12 @@ pub struct UnitOfWorkTransaction {
     session: ClientSession,
     events: EventStore,
     event_count: usize,
-    /// Acquired on the first event append, so a transaction that only writes
-    /// non-event state never contends on the process-wide event-cursor lock.
-    /// Released on drop/commit/rollback. `OwnedMutexGuard` owns the mutex Arc,
-    /// so holding it next to the transaction avoids a self-referential borrow.
-    _append_serial: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Held from transaction start (acquired before `start_transaction` in
+    /// `begin`) until drop/commit/rollback, so the event-cursor `$inc` can
+    /// never conflict with a transaction that committed earlier. `OwnedMutexGuard`
+    /// owns the mutex Arc, so holding it next to the transaction avoids a
+    /// self-referential borrow.
+    _append_serial: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl UnitOfWorkTransaction {
@@ -75,9 +76,6 @@ impl UnitOfWorkTransaction {
     }
 
     pub async fn append_event(&mut self, event: NewEvent) -> anyhow::Result<EventEnvelope> {
-        if self._append_serial.is_none() {
-            self._append_serial = Some(self.events.append_lock().await);
-        }
         let events = self.events.clone();
         let envelope = events.append_in_tx(&mut self.session, event).await?;
         self.event_count += 1;
