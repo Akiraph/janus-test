@@ -99,7 +99,7 @@ async fn probes_expose_request_and_snapshot_cursors() -> anyhow::Result<()> {
     assert!(info.status().is_success());
     let body: Value = info.json().await?;
     assert_eq!(body["data"]["database"]["engine"], "mongodb");
-    assert_eq!(body["data"]["database"]["journal_mode"], "on");
+    assert_eq!(body["data"]["database"]["journaling"], "on");
 
     task.abort();
     Ok(())

@@ -131,7 +131,7 @@ pub async fn system_info(
                 mode: state.config().mode.as_str().into(),
                 database: DatabaseInfo {
                     engine: "mongodb",
-                    journal_mode: "on",
+                    journaling: "on",
                     ready: state.system().ready().await,
                 },
                 events: EventInfo {

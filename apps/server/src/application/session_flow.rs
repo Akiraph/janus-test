@@ -1,7 +1,7 @@
 //! Cross-module Turn coordination.
 //!
 //! Lives in `application` because it must update more than one module's owned
-//! tables in one SQLite transaction. Sessions owns turns/sessions/checkpoints;
+//! tables in one MongoDB transaction. Sessions owns turns/sessions/checkpoints;
 //! runtime owns global async tasks. This module opens one transaction
 //! against the shared pool and drives each owner's `*_in_tx` primitive inside
 //! it, then commits and schedules further work only after commit.

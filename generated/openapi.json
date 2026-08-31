@@ -6512,7 +6512,7 @@
               },
               "token": {
                 "type": "string",
-                "description": "The raw bearer token to hand to the WebSocket client. Never put this\ninto SQLite or an event payload."
+                "description": "The raw bearer token to hand to the WebSocket client. Never put this\ninto MongoDB or an event payload."
               }
             }
           }
@@ -7415,14 +7415,14 @@
         "type": "object",
         "required": [
           "engine",
-          "journal_mode",
+          "journaling",
           "ready"
         ],
         "properties": {
           "engine": {
             "type": "string"
           },
-          "journal_mode": {
+          "journaling": {
             "type": "string"
           },
           "ready": {
@@ -9337,7 +9337,7 @@
           },
           "token": {
             "type": "string",
-            "description": "The raw bearer token to hand to the WebSocket client. Never put this\ninto SQLite or an event payload."
+            "description": "The raw bearer token to hand to the WebSocket client. Never put this\ninto MongoDB or an event payload."
           }
         }
       },

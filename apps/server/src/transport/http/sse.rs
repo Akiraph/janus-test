@@ -117,7 +117,7 @@ async fn build_snapshot(state: &AppState, owner_id: &str) -> SnapshotFrame {
                     "mode": state.config().mode.as_str(),
                     "database": {
                         "engine": "mongodb",
-                        "journal_mode": "on",
+                        "journaling": "on",
                         "ready": state.system().ready().await,
                     },
                     "events": {

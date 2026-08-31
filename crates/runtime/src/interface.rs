@@ -441,7 +441,7 @@ pub enum TerminalSignal {
 pub struct TerminalTicket {
     pub terminal_id: TerminalId,
     /// The raw bearer token to hand to the WebSocket client. Never put this
-    /// into SQLite or an event payload.
+    /// into MongoDB or an event payload.
     #[serde(rename = "token")]
     pub token: String,
     pub expires_at: String,

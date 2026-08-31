@@ -2,7 +2,7 @@
 
 ## Mission
 
-`janus-infrastructure` gives capability modules and the server composition root durable technical primitives for a local, single-owner deployment: typed identifiers, UTC values, SQLite access, transactional writes, public event replay, resumable operations, content-addressed bytes, encrypted secret values, and portable process helpers. It preserves storage and recovery semantics without knowing what a project, session, turn, or work kind means.
+`janus-infrastructure` gives capability modules and the server composition root durable technical primitives for a local, single-owner deployment: typed identifiers, UTC values, MongoDB access, transactional writes, public event replay, resumable operations, content-addressed bytes, encrypted secret values, and portable process helpers. It preserves storage and recovery semantics without knowing what a project, session, turn, or work kind means.
 
 ## Observable behavior
 
@@ -17,7 +17,7 @@
 ## Invariants
 
 - This crate depends only downward on generic technical libraries. It must not depend on server, deployment policy, or capability modules.
-- The server composition root supplies migration order. Infrastructure may run that migrator, but it does not own the migration set or decide schema evolution.
+- The server composition root owns the schema catalog. Infrastructure runs idempotent collection creation at open but does not decide collection ownership or schema evolution.
 - Event notifications follow commit. A rollback must never wake a consumer as if an event had become visible.
 - An idempotency key with the same request digest reuses the stored operation; a different digest is an error, never an overwrite.
 - A lease nonce is the ownership proof for completing or failing leased work. Expired leases may be reclaimed, but a stale holder may not mutate the new lease.
@@ -34,8 +34,8 @@ Do not add a generic repository, service locator, or convenience coordinator her
 ## Design decisions
 
 - Keep this as an independent crate so the compiler enforces the dependency ceiling; a `platform/` folder inside server would not.
-- Inject the migrator so the connection layer can remain reusable while the composition root retains ownership of the complete, ordered schema.
-- Reserve SQLite's writer lock at the start of short write transactions. Deferred transactions make contention appear later, after application code has already done work that cannot be committed safely.
+- Keep collection creation inside `Database::open` so the connection layer stays reusable while the composition root retains ownership of the complete schema catalog.
+- Reserve the single-writer lock at the start of short write transactions. Deferred transactions make contention appear later, after application code has already done work that cannot be committed safely.
 - Treat event broadcast as a post-commit wake-up, not durable delivery. The database cursor is the durable source of truth and polling repairs lost notifications.
 - Store blobs with a same-filesystem temporary file and atomic rename before committing references. This leaves a recoverable crash boundary without allowing a reference to point at a missing object.
 - Keep operation journaling separate from side effects. The journal records intent, leases, and completed steps; the owning workflow decides how to execute or recover the side effect.

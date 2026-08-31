@@ -25,7 +25,7 @@ server composes it with the Git adapter and durable operation worker.
 
 `janus-projects` writes only `projects`, `github_credentials`,
 `project_git_state`, `git_update_conflicts`, and `git_update_conflict_paths`.
-The server still owns the ordered SQLx migrations;
+Schema is the Rust catalog owned by the server composition root;
 the historical table names and event names must remain unchanged.
 
 `janus-workspace` owns Main file bytes, revisions, and manifests,

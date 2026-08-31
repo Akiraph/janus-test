@@ -11,9 +11,10 @@ use super::events::{EventEnvelope, EventStore, NewEvent};
 /// held from the transaction start, not lazily on the first event append:
 /// MongoDB snapshot isolation fails the `$inc` with a write conflict whenever
 /// a transaction that committed after our snapshot has already bumped the
-/// counter, so the lock must be acquired BEFORE `start_transaction`. This is
-/// the MongoDB analogue of SQLite's `BEGIN IMMEDIATE` single-writer semantics.
-/// Standalone appends (`EventStore::append`) take the same lock, so no path may
+/// counter, so the lock must be acquired BEFORE `start_transaction`. Holding it
+/// across the whole transaction gives single-writer serialization of the
+/// counter. Standalone appends (`EventStore::append`) take the same lock, so
+/// no path may
 /// call that method from inside an open `UnitOfWorkTransaction`, or it would
 /// self-deadlock.
 #[derive(Clone)]
