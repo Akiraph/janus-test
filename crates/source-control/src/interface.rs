@@ -1287,9 +1287,9 @@ impl SourceControlInterface {
             .await?
             .matched_count;
         if applied == 0 {
-            return Err(SourceControlError::Validation(format!(
-                "conflict version changed while resolving; reload and retry"
-            )));
+            return Err(SourceControlError::Validation(
+                "conflict version changed while resolving; reload and retry".into(),
+            ));
         }
 
         let mut cursor = self
@@ -1367,9 +1367,9 @@ impl SourceControlInterface {
             .await?
             .matched_count;
         if resolved == 0 {
-            return Err(SourceControlError::Validation(format!(
-                "conflict changed while applying resolution; reload and retry"
-            )));
+            return Err(SourceControlError::Validation(
+                "conflict changed while applying resolution; reload and retry".into(),
+            ));
         }
         // Best-effort: mark the original operation succeeded if still open.
         let _ = self
