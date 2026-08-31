@@ -1,6 +1,6 @@
 //! UTC clock helpers.
 //!
-//! Millisecond RFC 3339 is shared by SQLite text columns and public wire data.
+//! Millisecond RFC 3339 is shared by MongoDB document fields and public wire data.
 //! Changing precision or offset formatting would break cross-boundary ordering.
 
 use chrono::{DateTime, SecondsFormat, Utc};

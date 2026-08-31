@@ -62,7 +62,7 @@ pub struct SystemInfo {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DatabaseInfo {
     pub engine: &'static str,
-    pub journal_mode: &'static str,
+    pub journaling: &'static str,
     pub ready: bool,
 }
 

@@ -17,7 +17,7 @@ the object-safe `GitRunner` port.
 
 ## Boundaries
 
-This crate does not depend on Projects, SQLite, migrations, HTTP, operations,
+This crate does not depend on Projects, migrations, HTTP, operations,
 or a process launcher. The server adapter implements `GitRunner`; the current
 Projects capability still owns Git projections and conflict transactions while
 the next extraction moves those tables behind this interface.

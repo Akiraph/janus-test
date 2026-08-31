@@ -1750,7 +1750,7 @@ export interface components {
         terminal_id: components["schemas"]["TerminalId"];
         /**
          * @description The raw bearer token to hand to the WebSocket client. Never put this
-         *     into SQLite or an event payload.
+         *     into MongoDB or an event payload.
          */
         token: string;
       };
@@ -1958,7 +1958,7 @@ export interface components {
     };
     DatabaseInfo: {
       engine: string;
-      journal_mode: string;
+      journaling: string;
       ready: boolean;
     };
     DeleteFileInput: {
@@ -2491,7 +2491,7 @@ export interface components {
       terminal_id: components["schemas"]["TerminalId"];
       /**
        * @description The raw bearer token to hand to the WebSocket client. Never put this
-       *     into SQLite or an event payload.
+       *     into MongoDB or an event payload.
        */
       token: string;
     };

@@ -200,7 +200,7 @@ impl WorkspaceInterface {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        // The project lock replaces the SQLite `BEGIN IMMEDIATE` write lock.
+        // The project lock provides single-writer serialization for this transaction.
         let mut session = self.pool.client().start_session().await?;
         session.start_transaction().await?;
         self.check_expected_revision_in_tx(

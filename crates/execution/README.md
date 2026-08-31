@@ -25,8 +25,8 @@ around it.
 ## Boundaries
 
 `janus-execution` writes only `rounds`, `tool_calls`, `plan_versions`,
-`compact_summaries`, and `context_versions`. The server owns the single
-`0001_initial.sql` migration; see `CLAUDE.md` for the no-compat schema convention.
+`compact_summaries`, and `context_versions`. Schema is the Rust catalog
+under the no-compat convention; see `CLAUDE.md`.
 
 Models, Projects, Runtime, Sessions, and Workspace are injected capability
 interfaces. Execution does not own their tables. `ExecutionCoordinator`,

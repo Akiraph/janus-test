@@ -639,7 +639,7 @@ fn to_u64(value: i64, field: &str) -> Result<u64, RuntimeError> {
 
 fn to_i64(value: u64) -> Result<i64, RuntimeError> {
     i64::try_from(value)
-        .map_err(|_| RuntimeError::InvalidSpec("log cursor exceeds SQLite range".into()))
+        .map_err(|_| RuntimeError::InvalidSpec("log cursor exceeds signed 64-bit range".into()))
 }
 
 fn storage_error(error: impl Into<anyhow::Error>) -> RuntimeError {
